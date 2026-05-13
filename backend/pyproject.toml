@@ -1,0 +1,33 @@
+[project]
+name = "cpa-helper-backend"
+version = "0.1.0"
+description = "Local FastAPI backend for CPA Helper"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.13.2",
+    "croniter>=6.2.2",
+    "fastapi>=0.115.0",
+    "httpx>=0.27.2",
+    "pydantic-settings>=2.4.0",
+    "sqlmodel>=0.0.22",
+    "uvicorn[standard]>=0.30.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.2",
+    "ruff>=0.6.4",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+

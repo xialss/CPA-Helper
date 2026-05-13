@@ -1,0 +1,10 @@
+services:
+  cpa-helper:
+    image: walkingd/cpa-helper:latest
+    container_name: cpa-helper
+    restart: always
+    network_mode: host
+    ports:
+      - "18317:18317"
+    volumes:
+      - ./data:/app/data
