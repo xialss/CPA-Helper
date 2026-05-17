@@ -27,6 +27,8 @@ type changeCredentialsRequest struct {
 	CurrentPassword *string `json:"current_password"`
 }
 
+var apiKeySyncTimeout = 8 * time.Second
+
 func (a *App) handleAuth(w http.ResponseWriter, r *http.Request) error {
 	path := strings.TrimPrefix(r.URL.Path, "/api/auth")
 	switch path {
@@ -407,7 +409,16 @@ func (a *App) addRemoteAPIKey(ctx context.Context, apiKey string) error {
 	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
 		return validationError("管理密钥未设置，无法同步 CPA API KEY")
 	}
-	keys, err := a.remoteAPIKeys(ctx, cfg)
+	syncCtx, cancel := context.WithTimeout(ctx, apiKeySyncTimeout)
+	defer cancel()
+	unsupported, err := a.patchRemoteAPIKey(syncCtx, cfg, apiKey)
+	if err != nil {
+		return err
+	}
+	if !unsupported {
+		return nil
+	}
+	keys, err := a.remoteAPIKeys(syncCtx, cfg)
 	if err != nil {
 		return err
 	}
@@ -417,7 +428,7 @@ func (a *App) addRemoteAPIKey(ctx context.Context, apiKey string) error {
 		}
 	}
 	keys = append(keys, apiKey)
-	return a.putRemoteAPIKeys(ctx, cfg, keys)
+	return a.putRemoteAPIKeys(syncCtx, cfg, keys)
 }
 
 func (a *App) removeRemoteAPIKeyHash(ctx context.Context, apiKeyHash string) error {
@@ -428,7 +439,9 @@ func (a *App) removeRemoteAPIKeyHash(ctx context.Context, apiKeyHash string) err
 	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
 		return validationError("管理密钥未设置，无法同步 CPA API KEY")
 	}
-	keys, err := a.remoteAPIKeys(ctx, cfg)
+	syncCtx, cancel := context.WithTimeout(ctx, apiKeySyncTimeout)
+	defer cancel()
+	keys, err := a.remoteAPIKeys(syncCtx, cfg)
 	if err != nil {
 		return err
 	}
@@ -444,13 +457,13 @@ func (a *App) removeRemoteAPIKeyHash(ctx context.Context, apiKeyHash string) err
 	if !changed {
 		return nil
 	}
-	return a.putRemoteAPIKeys(ctx, cfg, next)
+	return a.putRemoteAPIKeys(syncCtx, cfg, next)
 }
 
 func (a *App) remoteAPIKeys(ctx context.Context, cfg AppConfig) ([]string, error) {
-	response, payload, err := doJSON(ctx, httpClient(8*time.Second), http.MethodGet, makeURL(cfg.Collector.CLIProxyURL, "/v0/management/api-keys", nil), managementHeaders(cfg.Collector.ManagementKey), nil)
+	response, payload, err := doJSON(ctx, httpClient(apiKeySyncTimeout), http.MethodGet, makeURL(cfg.Collector.CLIProxyURL, "/v0/management/api-keys", nil), managementHeaders(cfg.Collector.ManagementKey), nil)
 	if err != nil {
-		return nil, validationError(fmt.Sprintf("读取 CPA API KEY 失败：%s", err.Error()))
+		return nil, remoteAPIKeyError("读取 CPA API KEY", err)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, validationError(fmt.Sprintf("读取 CPA API KEY 失败：HTTP %d", response.StatusCode))
@@ -459,14 +472,36 @@ func (a *App) remoteAPIKeys(ctx context.Context, cfg AppConfig) ([]string, error
 }
 
 func (a *App) putRemoteAPIKeys(ctx context.Context, cfg AppConfig, keys []string) error {
-	response, _, err := doJSON(ctx, httpClient(8*time.Second), http.MethodPut, makeURL(cfg.Collector.CLIProxyURL, "/v0/management/api-keys", nil), managementHeaders(cfg.Collector.ManagementKey), keys)
+	response, _, err := doJSON(ctx, httpClient(apiKeySyncTimeout), http.MethodPut, makeURL(cfg.Collector.CLIProxyURL, "/v0/management/api-keys", nil), managementHeaders(cfg.Collector.ManagementKey), keys)
 	if err != nil {
-		return validationError(fmt.Sprintf("写入 CPA API KEY 失败：%s", err.Error()))
+		return remoteAPIKeyError("写入 CPA API KEY", err)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return validationError(fmt.Sprintf("写入 CPA API KEY 失败：HTTP %d", response.StatusCode))
 	}
 	return nil
+}
+
+func (a *App) patchRemoteAPIKey(ctx context.Context, cfg AppConfig, apiKey string) (bool, error) {
+	payload := map[string]string{"old": apiKey, "new": apiKey}
+	response, _, err := doJSON(ctx, httpClient(apiKeySyncTimeout), http.MethodPatch, makeURL(cfg.Collector.CLIProxyURL, "/v0/management/api-keys", nil), managementHeaders(cfg.Collector.ManagementKey), payload)
+	if err != nil {
+		return false, remoteAPIKeyError("写入 CPA API KEY", err)
+	}
+	if response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusMethodNotAllowed {
+		return true, nil
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return false, validationError(fmt.Sprintf("写入 CPA API KEY 失败：HTTP %d", response.StatusCode))
+	}
+	return false, nil
+}
+
+func remoteAPIKeyError(action string, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return validationError(action + " 超时，请检查 CLIProxyAPI 地址和管理密钥")
+	}
+	return validationError(fmt.Sprintf("%s 失败：%s", action, err.Error()))
 }
 
 func parseStringList(payload []byte) []string {

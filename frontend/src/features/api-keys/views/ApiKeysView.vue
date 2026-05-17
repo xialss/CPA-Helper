@@ -207,6 +207,9 @@ async function refresh() {
 }
 
 async function saveApiKey() {
+  if (isSaving.value) {
+    return
+  }
   const description = apiKeyDescription.value.trim()
   if (!description) {
     message.error('API KEY 描述不能为空')
@@ -400,13 +403,14 @@ onMounted(refresh)
         <NFormItem label="API KEY 描述">
           <NInput
             v-model:value="apiKeyDescription"
+            :disabled="isSaving"
             placeholder="例如：VSCode"
             @keyup.enter="saveApiKey"
           />
         </NFormItem>
         <div class="modal-actions">
-          <NButton secondary @click="editorVisible = false">取消</NButton>
-          <NButton type="primary" :loading="isSaving" @click="saveApiKey">
+          <NButton secondary :disabled="isSaving" @click="editorVisible = false">取消</NButton>
+          <NButton type="primary" :loading="isSaving" :disabled="isSaving" @click="saveApiKey">
             {{ editingApiKeyHash ? '保存' : '创建' }}
           </NButton>
         </div>
