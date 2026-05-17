@@ -7,6 +7,7 @@ import {
   NDescriptionsItem,
   NDrawer,
   NDrawerContent,
+  NDropdown,
   NIcon,
   NInput,
   NInputNumber,
@@ -19,7 +20,20 @@ import {
   type DataTableColumns,
   type DataTableRowKey,
 } from 'naive-ui'
-import { Activity, AlertTriangle, Gauge, PauseCircle, RefreshCw, Users, Zap } from 'lucide-vue-next'
+import {
+  Activity,
+  AlertTriangle,
+  ArrowLeft,
+  BarChart3,
+  ChevronDown,
+  CircleDot,
+  Gauge,
+  PauseCircle,
+  RefreshCw,
+  Table2,
+  Users,
+  Zap,
+} from 'lucide-vue-next'
 
 import {
   bulkDeleteCodexKeeperAccounts,
@@ -38,10 +52,22 @@ type PriorityTypeFilter = `type:${string}`
 type PriorityFilter = FixedPriorityFilter | PriorityTypeFilter
 type AccountStatusFilter = 'all' | 'enabled' | 'disabled' | 'error'
 type AccountDisplaySize = 50 | 100 | 150 | 200 | 'all'
+type AccountListViewMode = 'table' | 'bar' | 'ring'
+type AccountSortKey = 'quotaDay' | 'quotaWeek' | 'accountType' | 'status' | 'priority' | 'lastCheckedAt'
+type SortDirection = 'asc' | 'desc'
 type PriorityMode = 'low' | 'high' | 'default'
 type AccountAction = 'toggle' | 'priority' | 'delete'
 type QuotaWindowItem = { label: string; remainingPercent: number; resetAt: string | null }
+type AccountStatusPreferences = {
+  displaySize?: unknown
+  viewMode?: unknown
+  sort?: {
+    key?: unknown
+    direction?: unknown
+  }
+}
 
+const ACCOUNT_STATUS_PREFERENCE_STORAGE_KEY = 'cpa-helper-codex-keeper-status-preferences'
 const ACCOUNT_TABLE_MIN_ROW_HEIGHT = 52
 const ACCOUNT_TABLE_MAX_HEIGHT = 'min(620px, max(320px, calc(100dvh - 430px)))'
 const ACCOUNT_TABLE_VIRTUAL_THRESHOLD = 200
@@ -57,11 +83,16 @@ const selectedAccount = ref<CodexKeeperAccount | null>(null)
 const selectedDisabledAccountKeys = ref<DataTableRowKey[]>([])
 const detailOpen = ref(false)
 const accountDisplaySize = ref<AccountDisplaySize>(50)
+const accountListViewMode = ref<AccountListViewMode>('table')
 const filters = reactive({
   keyword: '',
   accountType: null as string | null,
   priority: 'all' as PriorityFilter,
   status: 'all' as AccountStatusFilter,
+})
+const accountSort = reactive({
+  key: null as AccountSortKey | null,
+  direction: 'asc' as SortDirection,
 })
 const bulkDeleteDialog = reactive({
   show: false,
@@ -101,6 +132,15 @@ const accountDisplaySizeOptions: Array<{ label: string; value: AccountDisplaySiz
   { label: '200', value: 200 },
   { label: '全部', value: 'all' },
 ]
+const accountListViewOptions = [
+  { label: '表格', key: 'table', icon: () => h(NIcon, null, { default: () => h(Table2) }) },
+  { label: '进度条卡片', key: 'bar', icon: () => h(NIcon, null, { default: () => h(BarChart3) }) },
+  { label: '圆环卡片', key: 'ring', icon: () => h(NIcon, null, { default: () => h(CircleDot) }) },
+]
+const quotaSortOptions = [
+  { label: '天', key: 'quotaDay' },
+  { label: '周', key: 'quotaWeek' },
+]
 
 const accountTypeOptions = computed(() =>
   [...new Set(accounts.value.map((item) => item.account_type).filter(Boolean))]
@@ -124,10 +164,13 @@ const filteredAccounts = computed(() =>
   }),
 )
 const filteredDisabledAccounts = computed(() =>
-  filteredAccounts.value.filter((account) => account.disabled),
+  sortAccountsForDisplay(filteredAccounts.value.filter((account) => account.disabled)),
 )
 const filteredNormalAccounts = computed(() =>
-  filteredAccounts.value.filter((account) => !account.disabled).sort(compareNormalAccounts),
+  sortAccountsForDisplay(
+    filteredAccounts.value.filter((account) => !account.disabled),
+    compareNormalAccounts,
+  ),
 )
 const tableLoading = computed(() => isLoading.value)
 const enabledAccountCount = computed(() => accounts.value.filter((account) => !account.disabled).length)
@@ -157,6 +200,18 @@ const activeFilterCount = computed(
     Number(filters.priority !== 'all') +
     Number(filters.status !== 'all'),
 )
+const isTableView = computed(() => accountListViewMode.value === 'table')
+const isBarCardView = computed(() => accountListViewMode.value === 'bar')
+const accountListViewLabel = computed(() => {
+  if (accountListViewMode.value === 'bar') {
+    return '进度条卡片'
+  }
+  if (accountListViewMode.value === 'ring') {
+    return '圆环卡片'
+  }
+  return '表格'
+})
+const sortedCardAccounts = computed(() => sortAccountsForDisplay(filteredAccounts.value))
 const isDisplayAllAccounts = computed(() => accountDisplaySize.value === 'all')
 const disabledTableDisplayProps = computed(() =>
   accountTableDisplayProps(visibleDisabledAccounts.value.length),
@@ -173,11 +228,28 @@ const visibleDisabledAccounts = computed(() =>
 const visibleNormalAccounts = computed(() =>
   filteredNormalAccounts.value.slice(0, displayLimit.value),
 )
-const displaySizeHelpText = computed(() =>
-  isDisplayAllAccounts.value
-    ? '当前筛选结果全部展示，账号较多时自动使用虚拟滚动。'
-    : `每个分组最多显示 ${accountDisplaySize.value} 个账号。`,
+const visibleCardAccounts = computed(() =>
+  sortedCardAccounts.value.slice(0, displayLimit.value),
 )
+const displaySizeHelpText = computed(() =>
+  isTableView.value
+    ? isDisplayAllAccounts.value
+      ? '当前筛选结果全部展示，账号较多时自动使用虚拟滚动。'
+      : `每个分组最多显示 ${accountDisplaySize.value} 个账号。`
+    : isDisplayAllAccounts.value
+      ? '当前筛选结果全部以卡片展示，账号较多时使用轻量渲染优化。'
+      : `统一列表最多显示 ${accountDisplaySize.value} 个账号。`,
+)
+const activeQuotaSortLabel = computed(() => {
+  if (accountSort.key === 'quotaDay') {
+    return '天'
+  }
+  if (accountSort.key === 'quotaWeek') {
+    return '周'
+  }
+  return ''
+})
+const sortDirectionMark = computed(() => (accountSort.direction === 'asc' ? '↑' : '↓'))
 
 function accountTableDisplayProps(rowCount: number) {
   return isDisplayAllAccounts.value && rowCount > ACCOUNT_TABLE_VIRTUAL_THRESHOLD
@@ -189,6 +261,92 @@ function accountTableDisplayProps(rowCount: number) {
     : {
         virtualScroll: false,
       }
+}
+
+function isAccountDisplaySize(value: unknown): value is AccountDisplaySize {
+  return value === 50 || value === 100 || value === 150 || value === 200 || value === 'all'
+}
+
+function isAccountListViewMode(value: unknown): value is AccountListViewMode {
+  return value === 'table' || value === 'bar' || value === 'ring'
+}
+
+function isAccountSortKey(value: unknown): value is AccountSortKey {
+  return (
+    value === 'quotaDay' ||
+    value === 'quotaWeek' ||
+    value === 'accountType' ||
+    value === 'status' ||
+    value === 'priority' ||
+    value === 'lastCheckedAt'
+  )
+}
+
+function isSortDirection(value: unknown): value is SortDirection {
+  return value === 'asc' || value === 'desc'
+}
+
+function readAccountStatusPreferences(): AccountStatusPreferences | null {
+  if (typeof localStorage === 'undefined') {
+    return null
+  }
+  const raw = localStorage.getItem(ACCOUNT_STATUS_PREFERENCE_STORAGE_KEY)
+  if (!raw) {
+    return null
+  }
+  try {
+    const value: unknown = JSON.parse(raw)
+    return value && typeof value === 'object' ? (value as AccountStatusPreferences) : null
+  } catch {
+    return null
+  }
+}
+
+function restoreAccountStatusPreferences() {
+  const preferences = readAccountStatusPreferences()
+  if (!preferences) {
+    return
+  }
+  if (isAccountDisplaySize(preferences.displaySize)) {
+    accountDisplaySize.value = preferences.displaySize
+  }
+  if (isAccountListViewMode(preferences.viewMode)) {
+    accountListViewMode.value = preferences.viewMode
+  }
+  const sort = preferences.sort
+  if (!sort || typeof sort !== 'object') {
+    return
+  }
+  if (sort.key === null) {
+    accountSort.key = null
+    accountSort.direction = 'asc'
+    return
+  }
+  if (isAccountSortKey(sort.key) && isSortDirection(sort.direction)) {
+    accountSort.key = sort.key
+    accountSort.direction = sort.direction
+  }
+}
+
+function saveAccountStatusPreferences() {
+  if (typeof localStorage === 'undefined') {
+    return
+  }
+  try {
+    localStorage.setItem(
+      ACCOUNT_STATUS_PREFERENCE_STORAGE_KEY,
+      JSON.stringify({
+        displaySize: accountDisplaySize.value,
+        viewMode: accountListViewMode.value,
+        sort: {
+          key: accountSort.key,
+          direction: accountSort.direction,
+        },
+      }),
+    )
+  } catch {
+    // 本地存储不可用时不影响页面继续使用。
+  }
 }
 const selectedDisabledAccountNames = computed(() =>
   selectedDisabledAccountKeys.value.map((key) => String(key)),
@@ -292,6 +450,39 @@ function isStatusFilterActive(value: Exclude<AccountStatusFilter, 'all'>): boole
   return filters.status === value
 }
 
+function handleAccountListViewSelect(key: string | number) {
+  if (key === 'table' || key === 'bar' || key === 'ring') {
+    accountListViewMode.value = key
+  }
+}
+
+function defaultSortDirection(key: AccountSortKey): SortDirection {
+  return key === 'priority' || key === 'lastCheckedAt' ? 'desc' : 'asc'
+}
+
+function handleQuotaSortSelect(key: string | number) {
+  if (key === 'quotaDay' || key === 'quotaWeek') {
+    toggleAccountSort(key)
+  }
+}
+
+function toggleAccountSort(key: AccountSortKey) {
+  if (accountSort.key === key) {
+    accountSort.direction = accountSort.direction === 'asc' ? 'desc' : 'asc'
+    return
+  }
+  accountSort.key = key
+  accountSort.direction = defaultSortDirection(key)
+}
+
+function isAccountSortActive(key: AccountSortKey): boolean {
+  return accountSort.key === key
+}
+
+function accountSortMark(key: AccountSortKey): string {
+  return isAccountSortActive(key) ? sortDirectionMark.value : ''
+}
+
 function accountPriority(account: CodexKeeperAccount): number {
   return account.priority ?? 0
 }
@@ -317,6 +508,99 @@ function compareNormalAccounts(left: CodexKeeperAccount, right: CodexKeeperAccou
     return priorityDiff
   }
   return (left.email ?? left.name).localeCompare(right.email ?? right.name)
+}
+
+function sortAccountsForDisplay(
+  source: CodexKeeperAccount[],
+  defaultCompare?: (left: CodexKeeperAccount, right: CodexKeeperAccount) => number,
+): CodexKeeperAccount[] {
+  const rows = [...source]
+  if (accountSort.key === null) {
+    return defaultCompare ? rows.sort(defaultCompare) : rows
+  }
+  return rows.sort(compareAccountsByActiveSort)
+}
+
+function compareAccountsByActiveSort(left: CodexKeeperAccount, right: CodexKeeperAccount): number {
+  const direction = accountSort.direction
+  let result = 0
+  switch (accountSort.key) {
+    case 'quotaDay':
+    case 'quotaWeek':
+      result = compareNullableNumber(
+        quotaSortRemainingPercent(left, accountSort.key),
+        quotaSortRemainingPercent(right, accountSort.key),
+        direction,
+      )
+      break
+    case 'accountType':
+      result = compareNullableString(left.account_type, right.account_type, direction)
+      break
+    case 'status':
+      result = compareNullableNumber(left.disabled ? 1 : 0, right.disabled ? 1 : 0, direction)
+      break
+    case 'priority':
+      result = compareNullableNumber(accountPriority(left), accountPriority(right), direction)
+      break
+    case 'lastCheckedAt':
+      result = compareNullableNumber(
+        timestampValue(left.last_checked_at),
+        timestampValue(right.last_checked_at),
+        direction,
+      )
+      break
+    default:
+      result = 0
+  }
+  return result === 0 ? accountIdentityText(left).localeCompare(accountIdentityText(right)) : result
+}
+
+function compareNullableNumber(
+  left: number | null,
+  right: number | null,
+  direction: SortDirection,
+): number {
+  if (left === null && right === null) {
+    return 0
+  }
+  if (left === null) {
+    return 1
+  }
+  if (right === null) {
+    return -1
+  }
+  const result = left - right
+  return direction === 'asc' ? result : -result
+}
+
+function compareNullableString(
+  left: string | null,
+  right: string | null,
+  direction: SortDirection,
+): number {
+  if (left === null && right === null) {
+    return 0
+  }
+  if (left === null) {
+    return 1
+  }
+  if (right === null) {
+    return -1
+  }
+  const result = left.localeCompare(right)
+  return direction === 'asc' ? result : -result
+}
+
+function timestampValue(value: string | null): number | null {
+  if (!value) {
+    return null
+  }
+  const timestamp = new Date(value).getTime()
+  return Number.isNaN(timestamp) ? null : timestamp
+}
+
+function accountIdentityText(account: CodexKeeperAccount): string {
+  return account.email ?? account.name
 }
 
 function defaultPriority(account: CodexKeeperAccount): number | null {
@@ -362,6 +646,29 @@ function quotaWindowItems(account: CodexKeeperAccount): QuotaWindowItem[] {
     })
   }
   return items
+}
+
+function quotaSortRemainingPercent(account: CodexKeeperAccount, key: AccountSortKey): number | null {
+  const normalized = account.account_type?.trim().toLowerCase()
+  if (key === 'quotaDay') {
+    if (normalized === 'free') {
+      return nullableRemainingQuotaPercent(account.secondary_used_percent)
+    }
+    return nullableRemainingQuotaPercent(account.primary_used_percent)
+  }
+  if (key === 'quotaWeek') {
+    if (normalized === 'free') {
+      return nullableRemainingQuotaPercent(account.primary_used_percent)
+    }
+    if (isPaidQuotaWindowAccount(account.account_type)) {
+      return nullableRemainingQuotaPercent(account.secondary_used_percent)
+    }
+  }
+  return null
+}
+
+function nullableRemainingQuotaPercent(usedPercent: number | null): number | null {
+  return usedPercent === null ? null : remainingQuotaPercent(usedPercent)
 }
 
 function remainingQuotaPercent(usedPercent: number): number {
@@ -577,6 +884,33 @@ async function submitPriorityDialog() {
   priorityDialog.show = false
 }
 
+function enableAccount(account: CodexKeeperAccount) {
+  return runAccountAction(
+    account,
+    'toggle',
+    () => enableCodexKeeperAccount(account.name),
+    '账号已启用',
+  )
+}
+
+function disableAccount(account: CodexKeeperAccount) {
+  return runAccountAction(
+    account,
+    'toggle',
+    () => disableCodexKeeperAccount(account.name),
+    '账号已禁用',
+  )
+}
+
+function deleteAccount(account: CodexKeeperAccount) {
+  return runAccountAction(
+    account,
+    'delete',
+    () => deleteCodexKeeperAccount(account.name),
+    '账号已删除',
+  )
+}
+
 function accountActionKey(account: CodexKeeperAccount, action: AccountAction): string {
   return `${action}\u0000${account.name}`
 }
@@ -606,6 +940,11 @@ async function runAccountAction(
     await action()
     message.success(successText)
     await loadAccounts()
+    if (selectedAccount.value?.name === account.name) {
+      const freshAccount = accounts.value.find((item) => item.name === account.name) ?? null
+      selectedAccount.value = freshAccount
+      detailOpen.value = freshAccount !== null
+    }
   } catch (error) {
     message.error(error instanceof Error ? error.message : '账号操作失败')
   } finally {
@@ -685,12 +1024,7 @@ const disabledActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
             NPopconfirm,
             {
               onPositiveClick: () =>
-                runAccountAction(
-                  row,
-                  'toggle',
-                  () => enableCodexKeeperAccount(row.name),
-                  '账号已启用',
-                ),
+                enableAccount(row),
             },
             {
               trigger: () =>
@@ -713,12 +1047,7 @@ const disabledActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
             {
               disabled: isBulkDeleting.value,
               onPositiveClick: () =>
-                runAccountAction(
-                  row,
-                  'delete',
-                  () => deleteCodexKeeperAccount(row.name),
-                  '账号已删除',
-                ),
+                deleteAccount(row),
             },
             {
               trigger: () =>
@@ -762,12 +1091,7 @@ const normalActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
             NPopconfirm,
             {
               onPositiveClick: () =>
-                runAccountAction(
-                  row,
-                  'toggle',
-                  () => disableCodexKeeperAccount(row.name),
-                  '账号已禁用',
-                ),
+                disableAccount(row),
             },
             {
               trigger: () =>
@@ -816,6 +1140,12 @@ const normalColumns = computed<DataTableColumns<CodexKeeperAccount>>(() => [
   normalActionColumn,
 ])
 
+restoreAccountStatusPreferences()
+
+watch(
+  [accountDisplaySize, accountListViewMode, () => accountSort.key, () => accountSort.direction],
+  saveAccountStatusPreferences,
+)
 watch(visibleDisabledAccounts, pruneSelectedDisabledAccountKeys)
 
 onMounted(loadAccounts)
@@ -937,9 +1267,67 @@ onMounted(loadAccounts)
             :options="priorityFilterOptions"
           />
         </div>
+        <div class="list-control-row">
+          <NDropdown
+            trigger="click"
+            :options="accountListViewOptions"
+            @select="handleAccountListViewSelect"
+          >
+            <NButton secondary size="small">
+              <template #icon>
+                <NIcon :component="ChevronDown" />
+              </template>
+              切换样式：{{ accountListViewLabel }}
+            </NButton>
+          </NDropdown>
+          <div class="sort-control-row" aria-label="账号排序">
+            <span class="sort-control-label">排序</span>
+            <NDropdown trigger="click" :options="quotaSortOptions" @select="handleQuotaSortSelect">
+              <NButton
+                secondary
+                size="small"
+                :type="accountSort.key === 'quotaDay' || accountSort.key === 'quotaWeek' ? 'primary' : 'default'"
+              >
+                额度窗口{{ activeQuotaSortLabel ? `：${activeQuotaSortLabel} ${sortDirectionMark}` : '' }}
+              </NButton>
+            </NDropdown>
+            <NButton
+              secondary
+              size="small"
+              :type="isAccountSortActive('accountType') ? 'primary' : 'default'"
+              @click="toggleAccountSort('accountType')"
+            >
+              类型 {{ accountSortMark('accountType') }}
+            </NButton>
+            <NButton
+              secondary
+              size="small"
+              :type="isAccountSortActive('status') ? 'primary' : 'default'"
+              @click="toggleAccountSort('status')"
+            >
+              状态 {{ accountSortMark('status') }}
+            </NButton>
+            <NButton
+              secondary
+              size="small"
+              :type="isAccountSortActive('priority') ? 'primary' : 'default'"
+              @click="toggleAccountSort('priority')"
+            >
+              优先级 {{ accountSortMark('priority') }}
+            </NButton>
+            <NButton
+              secondary
+              size="small"
+              :type="isAccountSortActive('lastCheckedAt') ? 'primary' : 'default'"
+              @click="toggleAccountSort('lastCheckedAt')"
+            >
+              最近巡检 {{ accountSortMark('lastCheckedAt') }}
+            </NButton>
+          </div>
+        </div>
       </div>
 
-      <div class="account-sections">
+      <div v-if="isTableView" class="account-sections">
         <section v-if="showDisabledSection" class="account-section">
           <div class="account-section-header">
             <div class="account-section-title-group">
@@ -1006,6 +1394,114 @@ onMounted(loadAccounts)
           </NDataTable>
         </section>
       </div>
+      <div v-else class="account-card-shell">
+        <section class="account-section account-card-section">
+          <div class="account-section-header">
+            <div class="account-section-title-group">
+              <h3 class="account-section-title">{{ accountListViewLabel }}</h3>
+              <p class="account-section-subtitle">
+                显示 {{ visibleCardAccounts.length }} / {{ sortedCardAccounts.length }} 个账号
+              </p>
+            </div>
+          </div>
+          <div v-if="isLoading" class="empty-state">账号加载中...</div>
+          <div v-else-if="visibleCardAccounts.length === 0" class="empty-state">
+            当前筛选下暂无账号
+          </div>
+          <div
+            v-else
+            class="account-card-grid"
+            :class="{ 'is-bar': isBarCardView, 'is-ring': !isBarCardView }"
+          >
+            <button
+              v-for="account in visibleCardAccounts"
+              :key="account.name"
+              type="button"
+              class="account-card"
+              :class="{
+                'is-disabled': account.disabled,
+                'is-enabled': !account.disabled,
+                'has-error': hasAccountError(account),
+              }"
+              :aria-label="`查看 ${account.email ?? account.name} 详情`"
+              @click="openDetail(account)"
+            >
+              <div class="account-card-top">
+                <div class="account-card-identity">
+                  <span class="account-card-email">{{ account.email ?? account.name }}</span>
+                  <span class="account-card-name">{{ account.name }}</span>
+                </div>
+                <span
+                  class="account-status-pill"
+                  :class="account.disabled ? 'is-warning' : 'is-success'"
+                >
+                  {{ account.disabled ? '已禁用' : '启用中' }}
+                </span>
+              </div>
+              <div class="account-card-meta-grid">
+                <div class="account-card-meta-item">
+                  <span>类型</span>
+                  <strong>{{ account.account_type ?? '未知' }}</strong>
+                </div>
+                <div class="account-card-meta-item">
+                  <span>优先级</span>
+                  <strong>{{ formatInteger(accountPriority(account)) }}</strong>
+                </div>
+                <div class="account-card-meta-item">
+                  <span>最近巡检</span>
+                  <strong>{{ formatDateTime(account.last_checked_at) }}</strong>
+                </div>
+              </div>
+              <div class="account-card-quota">
+                <template v-if="quotaWindowItems(account).length > 0">
+                  <template v-if="isBarCardView">
+                    <div
+                      v-for="item in quotaWindowItems(account)"
+                      :key="item.label"
+                      class="card-quota-bar"
+                    >
+                      <div class="card-quota-head">
+                        <span>{{ item.label }}</span>
+                        <strong>{{ item.remainingPercent }}%</strong>
+                      </div>
+                      <div class="card-quota-track">
+                        <div
+                          class="card-quota-fill"
+                          :class="quotaBarTone(item.remainingPercent)"
+                          :style="{ width: `${item.remainingPercent}%` }"
+                        />
+                      </div>
+                      <span class="card-quota-reset">
+                        {{ formatQuotaResetTime(item.resetAt) ?? '未记录刷新时间' }}
+                      </span>
+                    </div>
+                  </template>
+                  <div v-else class="card-quota-rings">
+                    <div
+                      v-for="item in quotaWindowItems(account)"
+                      :key="item.label"
+                      class="card-quota-ring-item"
+                    >
+                      <div
+                        class="quota-ring"
+                        :class="quotaBarTone(item.remainingPercent)"
+                        :style="{ '--quota-deg': `${item.remainingPercent * 3.6}deg` }"
+                      >
+                        <span>{{ item.remainingPercent }}%</span>
+                      </div>
+                      <div class="quota-ring-caption">
+                        <strong>{{ item.label }}</strong>
+                        <span>{{ formatQuotaResetTime(item.resetAt) ?? '未记录刷新时间' }}</span>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+                <div v-else class="card-quota-empty">暂无额度窗口</div>
+              </div>
+            </button>
+          </div>
+        </section>
+      </div>
 
       <div class="display-control-row">
         <div class="display-control-copy">
@@ -1022,7 +1518,18 @@ onMounted(loadAccounts)
     </section>
 
     <NDrawer v-model:show="detailOpen" placement="right" :width="420">
-      <NDrawerContent title="账号详情">
+      <NDrawerContent>
+        <template #header>
+          <div class="detail-drawer-header">
+            <NButton quaternary size="small" class="detail-back-button" @click="detailOpen = false">
+              <template #icon>
+                <NIcon :component="ArrowLeft" />
+              </template>
+              返回
+            </NButton>
+            <span class="detail-drawer-title">账号详情</span>
+          </div>
+        </template>
         <NDescriptions v-if="selectedAccount" label-placement="left" :column="1" size="small" bordered>
           <NDescriptionsItem label="账号">{{ selectedAccount.name }}</NDescriptionsItem>
           <NDescriptionsItem label="邮箱">{{ selectedAccount.email ?? '-' }}</NDescriptionsItem>
@@ -1052,6 +1559,68 @@ onMounted(loadAccounts)
             {{ latestActionText(selectedAccount) }}
           </NDescriptionsItem>
         </NDescriptions>
+        <div v-if="selectedAccount" class="detail-action-row">
+          <NSpace :size="8" wrap>
+            <NPopconfirm
+              v-if="selectedAccount.disabled"
+              @positive-click="enableAccount(selectedAccount)"
+            >
+              <template #trigger>
+                <NButton
+                  size="small"
+                  type="primary"
+                  secondary
+                  :disabled="isRowActing(selectedAccount) || isBulkDeleting"
+                  :loading="isActionLoading(selectedAccount, 'toggle')"
+                >
+                  启用
+                </NButton>
+              </template>
+              启用 {{ selectedAccount.name }}？
+            </NPopconfirm>
+            <NPopconfirm v-else @positive-click="disableAccount(selectedAccount)">
+              <template #trigger>
+                <NButton
+                  size="small"
+                  type="warning"
+                  secondary
+                  :disabled="isRowActing(selectedAccount) || isBulkDeleting"
+                  :loading="isActionLoading(selectedAccount, 'toggle')"
+                >
+                  禁用
+                </NButton>
+              </template>
+              禁用 {{ selectedAccount.name }}？
+            </NPopconfirm>
+            <NButton
+              size="small"
+              secondary
+              :disabled="isRowActing(selectedAccount) || isBulkDeleting"
+              :loading="isActionLoading(selectedAccount, 'priority')"
+              @click="openPriorityDialog(selectedAccount)"
+            >
+              修改优先级
+            </NButton>
+            <NPopconfirm
+              v-if="selectedAccount.disabled"
+              :disabled="isBulkDeleting"
+              @positive-click="deleteAccount(selectedAccount)"
+            >
+              <template #trigger>
+                <NButton
+                  size="small"
+                  type="error"
+                  secondary
+                  :disabled="isRowActing(selectedAccount) || isBulkDeleting"
+                  :loading="isActionLoading(selectedAccount, 'delete')"
+                >
+                  删除
+                </NButton>
+              </template>
+              删除 {{ selectedAccount.name }}？此操作会从 CPA 删除 auth file。
+            </NPopconfirm>
+          </NSpace>
+        </div>
       </NDrawerContent>
     </NDrawer>
 
@@ -1120,6 +1689,7 @@ onMounted(loadAccounts)
 .account-status-page,
 .account-list-panel,
 .account-section,
+.account-card-shell,
 .account-table {
   min-width: 0;
 }
@@ -1207,9 +1777,38 @@ onMounted(loadAccounts)
   min-width: 0;
 }
 
+.list-control-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.sort-control-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sort-control-label {
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
 .account-sections {
   display: grid;
   gap: 14px;
+  padding: 14px;
+}
+
+.account-card-shell {
   padding: 14px;
 }
 
@@ -1290,6 +1889,309 @@ onMounted(loadAccounts)
   flex-shrink: 0;
   align-items: center;
   justify-content: flex-end;
+}
+
+.account-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 10px;
+}
+
+.account-card {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  min-height: 176px;
+  padding: 12px;
+  color: var(--cpa-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  appearance: none;
+  content-visibility: auto;
+  contain-intrinsic-size: 220px;
+  background: var(--cpa-surface-raised);
+  border: 1px solid var(--cpa-border);
+  border-radius: var(--cpa-radius);
+  box-shadow: var(--cpa-shadow-card), var(--cpa-shadow-hairline);
+}
+
+.account-card:hover {
+  border-color: color-mix(in srgb, var(--cpa-primary) 36%, var(--cpa-border));
+  transform: translateY(-1px);
+}
+
+.account-card:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--cpa-primary) 70%, transparent);
+  outline-offset: 2px;
+}
+
+.account-card.has-error {
+  border-color: color-mix(in srgb, var(--cpa-danger) 42%, var(--cpa-border));
+}
+
+.account-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.account-card-identity {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.account-card-email,
+.account-card-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-card-email {
+  color: var(--cpa-text-strong);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.account-card-name {
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+}
+
+.account-status-pill {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.45;
+  border: 1px solid transparent;
+  border-radius: var(--cpa-radius-sm);
+}
+
+.account-status-pill.is-success {
+  color: var(--cpa-success);
+  background: var(--cpa-success-weak);
+  border-color: color-mix(in srgb, var(--cpa-success) 28%, transparent);
+}
+
+.account-status-pill.is-warning {
+  color: var(--cpa-warning);
+  background: var(--cpa-warning-weak);
+  border-color: color-mix(in srgb, var(--cpa-warning) 28%, transparent);
+}
+
+.account-card-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.account-card-meta-item {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 7px 8px;
+  background: var(--cpa-surface-muted);
+  border: 1px solid color-mix(in srgb, var(--cpa-border) 70%, transparent);
+  border-radius: var(--cpa-radius-sm);
+}
+
+.account-card-meta-item span {
+  overflow: hidden;
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-card-meta-item strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--cpa-text);
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-card-quota {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.card-quota-bar {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.card-quota-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.card-quota-head span,
+.card-quota-reset {
+  overflow: hidden;
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-quota-head strong {
+  flex-shrink: 0;
+  color: var(--cpa-text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.card-quota-track {
+  height: 6px;
+  overflow: hidden;
+  background: var(--cpa-surface-muted);
+  border-radius: 999px;
+}
+
+.card-quota-fill {
+  height: 100%;
+  min-width: 3px;
+  border-radius: inherit;
+}
+
+.card-quota-fill.is-healthy,
+.quota-ring.is-healthy {
+  --quota-color: var(--cpa-success);
+}
+
+.card-quota-fill.is-warning,
+.quota-ring.is-warning {
+  --quota-color: var(--cpa-warning);
+}
+
+.card-quota-fill.is-danger,
+.quota-ring.is-danger {
+  --quota-color: var(--cpa-danger);
+}
+
+.card-quota-fill {
+  background: var(--quota-color, var(--cpa-success));
+}
+
+.card-quota-rings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.card-quota-ring-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 132px;
+  flex: 1 1 132px;
+}
+
+.quota-ring {
+  --quota-color: var(--cpa-success);
+  display: grid;
+  position: relative;
+  width: 54px;
+  height: 54px;
+  flex-shrink: 0;
+  place-items: center;
+  overflow: hidden;
+  background:
+    conic-gradient(
+      var(--quota-color) var(--quota-deg),
+      color-mix(in srgb, var(--cpa-text-muted) 18%, transparent) 0
+    );
+  border-radius: 50%;
+}
+
+.quota-ring::before {
+  position: absolute;
+  inset: 6px;
+  content: "";
+  background: var(--cpa-surface-raised);
+  border-radius: inherit;
+}
+
+.quota-ring span {
+  position: relative;
+  color: var(--cpa-text-strong);
+  font-size: 11px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.quota-ring-caption {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.quota-ring-caption strong,
+.quota-ring-caption span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quota-ring-caption strong {
+  color: var(--cpa-text);
+  font-size: 12px;
+}
+
+.quota-ring-caption span,
+.card-quota-empty {
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+}
+
+.card-quota-empty {
+  padding: 10px;
+  text-align: center;
+  background: var(--cpa-surface-muted);
+  border: 1px dashed var(--cpa-border);
+  border-radius: var(--cpa-radius-sm);
+}
+
+.detail-action-row {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--cpa-border);
+}
+
+.detail-drawer-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.detail-back-button {
+  flex-shrink: 0;
+}
+
+.detail-drawer-title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--cpa-text-strong);
+  font-size: 16px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .account-table :deep(.n-data-table-th) {
@@ -1443,6 +2345,11 @@ onMounted(loadAccounts)
   .filter-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .list-control-row,
+  .sort-control-row {
+    justify-content: flex-start;
+  }
 }
 
 @media (max-width: 560px) {
@@ -1461,12 +2368,29 @@ onMounted(loadAccounts)
     justify-content: flex-start;
   }
 
+  .sort-control-row {
+    width: 100%;
+  }
+
   .filter-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .filter-grid .n-input {
     grid-column: 1 / -1;
+  }
+
+  .account-card-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .account-card-top {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .account-card-meta-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 </style>
