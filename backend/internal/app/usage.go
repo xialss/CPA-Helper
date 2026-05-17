@@ -69,6 +69,11 @@ type usageAccessScope struct {
 	IsAdmin  bool
 }
 
+type usageRedactionOptions struct {
+	MaskSource    bool
+	MaskAuthIndex bool
+}
+
 func (a *App) handleUsage(w http.ResponseWriter, r *http.Request) error {
 	user, err := a.readyUser(r.Context(), r)
 	if err != nil {
@@ -387,8 +392,9 @@ func (a *App) usageRecords(w http.ResponseWriter, r *http.Request, filters Usage
 		return err
 	}
 	items := make([]map[string]any, 0, len(records))
+	redaction := usageRedactionOptions{MaskAuthIndex: !scope.IsAdmin}
 	for _, record := range records {
-		items = append(items, listItemFromRecord(record, users, prices))
+		items = append(items, listItemFromRecord(record, users, prices, redaction))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items":     items,
@@ -418,8 +424,9 @@ func (a *App) usageRecordDetail(w http.ResponseWriter, r *http.Request, recordID
 	if err != nil {
 		return err
 	}
-	item := listItemFromRecord(record, users, prices)
-	item["raw_json"] = redactedRawJSON(record.RawJSON)
+	redaction := usageRedactionOptions{MaskSource: !scope.IsAdmin, MaskAuthIndex: !scope.IsAdmin}
+	item := listItemFromRecord(record, users, prices, redaction)
+	item["raw_json"] = redactedRawJSON(record.RawJSON, usageRecordAuth(record), redaction)
 	writeJSON(w, http.StatusOK, item)
 	return nil
 }
@@ -668,7 +675,7 @@ func (a *App) userLookup(ctx context.Context, scope usageAccessScope) (map[strin
 	return lookup, nil
 }
 
-func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices map[[2]string]ModelPrice) map[string]any {
+func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices map[[2]string]ModelPrice, redaction usageRedactionOptions) map[string]any {
 	amount, unpriced := recordCost(record, prices)
 	userID := (*int)(nil)
 	userLabel := "未绑定"
@@ -681,11 +688,8 @@ func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices ma
 			userLabel = *record.UsageUsername
 		}
 	}
-	authIndex := rawJSONStringField(record.RawJSON, "auth_index")
-	auth := rawJSONStringField(record.RawJSON, "auth_type")
-	if auth == nil {
-		auth = record.Auth
-	}
+	authIndex := redactedAuthIndex(rawJSONStringField(record.RawJSON, "auth_index"), redaction)
+	auth := usageRecordAuth(record)
 	return map[string]any{
 		"id":                  record.ID,
 		"timestamp":           usageAPITime(record.Timestamp),
@@ -695,7 +699,7 @@ func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices ma
 		"provider":            record.Provider,
 		"model":               record.Model,
 		"endpoint":            record.Endpoint,
-		"source":              record.Source,
+		"source":              redactedUsageSource(record.Source, auth, redaction),
 		"request_id":          record.RequestID,
 		"auth_index":          authIndex,
 		"auth":                auth,
@@ -950,22 +954,68 @@ func rawJSONStringField(rawJSON, fieldName string) *string {
 	}
 }
 
-func redactedRawJSON(rawJSON string) any {
+func usageRecordAuth(record UsageRecord) *string {
+	auth := rawJSONStringField(record.RawJSON, "auth_type")
+	if auth == nil {
+		auth = record.Auth
+	}
+	return auth
+}
+
+func redactedUsageSource(source *string, authType *string, redaction usageRedactionOptions) *string {
+	if source == nil {
+		return nil
+	}
+	if !redaction.MaskSource && !isAPIKeyAuth(authType) {
+		return source
+	}
+	masked := maskSecret(source)
+	return &masked
+}
+
+func redactedAuthIndex(authIndex *string, redaction usageRedactionOptions) *string {
+	if authIndex == nil || !redaction.MaskAuthIndex {
+		return authIndex
+	}
+	masked := maskSecret(authIndex)
+	return &masked
+}
+
+func isAPIKeyAuth(authType *string) bool {
+	if authType == nil {
+		return false
+	}
+	normalized := strings.ToLower(strings.TrimSpace(*authType))
+	normalized = strings.ReplaceAll(normalized, "-", "")
+	normalized = strings.ReplaceAll(normalized, "_", "")
+	return normalized == "apikey"
+}
+
+func redactedRawJSON(rawJSON string, authType *string, redaction usageRedactionOptions) any {
 	var payload any
 	if err := json.Unmarshal([]byte(rawJSON), &payload); err != nil {
 		value := rawJSON
 		return maskSecret(&value)
 	}
-	return redactJSON(payload)
+	return redactJSON(payload, authType, redaction)
 }
 
-func redactJSON(value any) any {
+func redactJSON(value any, inheritedAuthType *string, redaction usageRedactionOptions) any {
 	switch typed := value.(type) {
 	case map[string]any:
 		result := map[string]any{}
+		authType := jsonStringField(typed, "auth_type")
+		if authType == nil {
+			authType = jsonStringField(typed, "authType")
+		}
+		if authType == nil {
+			authType = jsonStringField(typed, "auth")
+		}
+		if authType == nil {
+			authType = inheritedAuthType
+		}
 		for key, child := range typed {
-			lower := strings.ToLower(key)
-			if strings.Contains(lower, "api_key") || strings.Contains(lower, "apikey") || strings.Contains(lower, "authorization") || strings.Contains(lower, "bearer") || strings.Contains(lower, "cookie") || strings.Contains(lower, "key") || strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "token") {
+			if shouldRedactJSONField(key, authType, redaction) {
 				if child == nil {
 					result[key] = nil
 				} else {
@@ -973,19 +1023,50 @@ func redactJSON(value any) any {
 					result[key] = maskSecret(&text)
 				}
 			} else {
-				result[key] = redactJSON(child)
+				result[key] = redactJSON(child, authType, redaction)
 			}
 		}
 		return result
 	case []any:
 		result := make([]any, 0, len(typed))
 		for _, child := range typed {
-			result = append(result, redactJSON(child))
+			result = append(result, redactJSON(child, inheritedAuthType, redaction))
 		}
 		return result
 	default:
 		return value
 	}
+}
+
+func jsonStringField(payload map[string]any, fieldName string) *string {
+	value, ok := payload[fieldName]
+	if !ok || value == nil {
+		return nil
+	}
+	text := strings.TrimSpace(fmt.Sprint(value))
+	if text == "" {
+		return nil
+	}
+	return &text
+}
+
+func shouldRedactJSONField(key string, authType *string, redaction usageRedactionOptions) bool {
+	lower := strings.ToLower(key)
+	if (redaction.MaskSource || isAPIKeyAuth(authType)) && lower == "source" {
+		return true
+	}
+	if redaction.MaskAuthIndex && (lower == "auth_index" || lower == "authindex") {
+		return true
+	}
+	return strings.Contains(lower, "api_key") ||
+		strings.Contains(lower, "apikey") ||
+		strings.Contains(lower, "authorization") ||
+		strings.Contains(lower, "bearer") ||
+		strings.Contains(lower, "cookie") ||
+		strings.Contains(lower, "key") ||
+		strings.Contains(lower, "password") ||
+		strings.Contains(lower, "secret") ||
+		strings.Contains(lower, "token")
 }
 
 func (a *App) saveUsageMessage(ctx context.Context, raw []byte) (UsageRecord, bool, error) {

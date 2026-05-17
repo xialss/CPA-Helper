@@ -92,7 +92,11 @@ const form = reactive({
 
 const stats = computed(() => status.value?.stats)
 const isRunning = computed(() => status.value?.running === true)
+const runningModes = computed(() => new Set(status.value?.running_modes ?? []))
 const isDaemonRunning = computed(() => status.value?.daemon_running === true)
+const isRunOnceBlocked = computed(
+  () => runningModes.value.has('once') || runningModes.value.has('daemon'),
+)
 const statusLogs = computed(() =>
   Array.isArray(status.value?.logs) ? status.value.logs : [],
 )
@@ -555,7 +559,7 @@ onBeforeUnmount(() => {
                 size="small"
                 secondary
                 :loading="isActing"
-                :disabled="isRunning"
+                :disabled="isRunOnceBlocked"
                 @click="runAction(runCodexKeeperOnce, '已开始执行一轮')"
               >
                 执行一轮
@@ -564,7 +568,7 @@ onBeforeUnmount(() => {
                 size="small"
                 type="primary"
                 :loading="isActing"
-                :disabled="isRunning || isDaemonRunning"
+                :disabled="isDaemonRunning"
                 @click="runAction(startCodexKeeper, '已开始自动巡检')"
               >
                 开始自动巡检

@@ -120,6 +120,7 @@ export interface CodexKeeperStats {
 
 export interface CodexKeeperStatus {
   running: boolean
+  running_modes: string[]
   daemon_running: boolean
   state: string
   detail: string

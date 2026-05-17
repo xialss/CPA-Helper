@@ -3,12 +3,16 @@
 .trellis
 .agents
 .codex
+.playwright-cli
 
 data
 docs
 pictures
 
 .venv
+**/.playwright-cli
+**/.vite
+**/node_modules
 backend/.venv
 backend/bin
 backend/cpa-helper
@@ -19,5 +23,8 @@ frontend/.playwright-cli
 frontend/.vite
 
 **/*.test
+**/*_test.go
+**/*.test.*
+**/*.spec.*
 **/*.log
 **/*.tsbuildinfo

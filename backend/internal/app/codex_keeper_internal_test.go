@@ -178,6 +178,74 @@ func TestAutomaticKeeperRunsRespectCacheButManualRefreshBypasses(t *testing.T) {
 	}
 }
 
+func TestKeeperRunSkipsInFlightAuthBeforeProcessing(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	downloadCalls := 0
+	usageCalls := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{{"name": "busy.json", "type": "codex"}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			downloadCalls++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name":         "busy.json",
+				"type":         "codex",
+				"account_type": "free",
+				"disabled":     false,
+				"priority":     0,
+				"access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			usageCalls++
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+
+	stats, _, err := app.executeKeeperRunWithOptions(context.Background(), keeperRunOptions{
+		Mode:            "accounts",
+		AuthNames:       []string{"busy.json"},
+		ManualRefresh:   true,
+		UseRefreshCache: false,
+		PersistRun:      false,
+		TryLockAuthName: func(mode string, name string) bool {
+			if mode != "accounts" || name != "busy.json" {
+				t.Fatalf("TryLockAuthName(%q, %q), want accounts/busy.json", mode, name)
+			}
+			return false
+		},
+		UnlockAuthName: func(name string) {
+			t.Fatalf("UnlockAuthName(%q) called after a failed lock", name)
+		},
+	}, func(string) {})
+	if err != nil {
+		t.Fatalf("account refresh: %v", err)
+	}
+	if stats.Skipped != 1 {
+		t.Fatalf("skipped = %d, want 1", stats.Skipped)
+	}
+	if downloadCalls != 0 {
+		t.Fatalf("download calls = %d, want 0", downloadCalls)
+	}
+	if usageCalls != 0 {
+		t.Fatalf("usage calls = %d, want 0", usageCalls)
+	}
+}
+
 func TestConditionalKeeperRunUsesAutomaticPriorityPolicy(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 

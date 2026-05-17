@@ -1185,7 +1185,10 @@ async function pollRefreshUntilIdle() {
     }
     try {
       const status = await getCodexKeeperStatus()
-      if (status.running) {
+      const runningModes = status.running_modes ?? []
+      const accountRefreshRunning =
+        runningModes.length > 0 ? runningModes.includes('accounts') : status.running
+      if (accountRefreshRunning) {
         continue
       }
       await loadAccounts()

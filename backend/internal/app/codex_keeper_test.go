@@ -20,6 +20,7 @@ import (
 
 type keeperStatusResponse struct {
 	Running       bool     `json:"running"`
+	RunningModes  []string `json:"running_modes"`
 	DaemonRunning bool     `json:"daemon_running"`
 	Logs          []string `json:"logs"`
 }
@@ -116,6 +117,9 @@ func TestKeeperAutoStartReportsDaemonRunning(t *testing.T) {
 	}
 	if status.Running {
 		t.Fatal("running = true, want false while daemon is only waiting for the next cron tick")
+	}
+	if status.RunningModes == nil {
+		t.Fatal("running_modes is nil, want empty list")
 	}
 
 	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/stop", nil, cookies, nil)

@@ -34,6 +34,8 @@ type KeeperRunner struct {
 	daemonStop     chan struct{}
 	daemonDone     chan struct{}
 	running        bool
+	runningModes   map[string]struct{}
+	inFlightAuths  map[string]string
 	state          string
 	detail         string
 	mode           *string
@@ -56,6 +58,7 @@ type keeperStats struct {
 
 type keeperStatusResponse struct {
 	Running        bool        `json:"running"`
+	RunningModes   []string    `json:"running_modes"`
 	DaemonRunning  bool        `json:"daemon_running"`
 	State          string      `json:"state"`
 	Detail         string      `json:"detail"`
@@ -315,8 +318,10 @@ func (r *KeeperRunner) ClearLogs() {
 func (r *KeeperRunner) Status() keeperStatusResponse {
 	r.mu.Lock()
 	logs := append([]string{}, r.logs...)
+	runningModes := r.runningModeListLocked()
 	response := keeperStatusResponse{
-		Running:        r.running,
+		Running:        len(runningModes) > 0,
+		RunningModes:   runningModes,
 		DaemonRunning:  r.daemonRunningLocked(),
 		State:          r.state,
 		Detail:         r.detail,
@@ -392,7 +397,7 @@ func (r *KeeperRunner) daemonLoop(stop <-chan struct{}, done chan<- struct{}) {
 					conditionalTicker.Stop()
 				}
 				if r.markRunning("daemon") {
-					r.run("daemon")
+					go r.run("daemon")
 				}
 				restartCycle = true
 			case <-conditionalC:
@@ -419,7 +424,7 @@ func (r *KeeperRunner) daemonLoop(stop <-chan struct{}, done chan<- struct{}) {
 					continue
 				}
 				if r.markRunning("conditional") {
-					r.runAccounts("conditional", names)
+					go r.runAccounts("conditional", names)
 				}
 			}
 		}
@@ -441,24 +446,127 @@ func keeperConditionalRefreshInterval(cfg AppConfig) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+func (r *KeeperRunner) ensureRunningModesLocked() {
+	if r.runningModes == nil {
+		r.runningModes = map[string]struct{}{}
+	}
+}
+
+func (r *KeeperRunner) runningModeListLocked() []string {
+	r.ensureRunningModesLocked()
+	modes := make([]string, 0, len(r.runningModes))
+	for mode := range r.runningModes {
+		modes = append(modes, mode)
+	}
+	sort.Slice(modes, func(i, j int) bool {
+		leftOrder := keeperModeOrder(modes[i])
+		rightOrder := keeperModeOrder(modes[j])
+		if leftOrder != rightOrder {
+			return leftOrder < rightOrder
+		}
+		return modes[i] < modes[j]
+	})
+	return modes
+}
+
+func (r *KeeperRunner) ensureInFlightAuthsLocked() {
+	if r.inFlightAuths == nil {
+		r.inFlightAuths = map[string]string{}
+	}
+}
+
+func (r *KeeperRunner) tryLockAuthName(mode string, name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ensureInFlightAuthsLocked()
+	if _, exists := r.inFlightAuths[name]; exists {
+		return false
+	}
+	r.inFlightAuths[name] = mode
+	return true
+}
+
+func (r *KeeperRunner) unlockAuthName(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inFlightAuths == nil {
+		return
+	}
+	delete(r.inFlightAuths, name)
+}
+
+func keeperModeOrder(mode string) int {
+	switch mode {
+	case "daemon":
+		return 0
+	case "once":
+		return 1
+	case "conditional":
+		return 2
+	case "accounts":
+		return 3
+	default:
+		return 99
+	}
+}
+
+func keeperModesConflict(existingMode string, nextMode string) bool {
+	if existingMode == nextMode {
+		return true
+	}
+	return (existingMode == "once" && nextMode == "daemon") ||
+		(existingMode == "daemon" && nextMode == "once")
+}
+
+func keeperStatusModePtr(modes []string) *string {
+	if len(modes) == 0 {
+		return nil
+	}
+	mode := modes[0]
+	return &mode
+}
+
+func keeperRunningDetail(modes []string) string {
+	if len(modes) > 1 {
+		return "正在运行多个 Codex Keeper 任务"
+	}
+	if len(modes) == 0 {
+		return "尚未运行"
+	}
+	switch modes[0] {
+	case "accounts":
+		return "正在刷新 Codex 账号"
+	case "conditional":
+		return "正在按条件刷新 Codex 账号"
+	default:
+		return "正在巡检 Codex 账号"
+	}
+}
+
 func (r *KeeperRunner) markRunning(mode string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.running {
-		return false
+	r.ensureRunningModesLocked()
+	for runningMode := range r.runningModes {
+		if keeperModesConflict(runningMode, mode) {
+			return false
+		}
 	}
+	r.runningModes[mode] = struct{}{}
 	now := time.Now().In(appTimeLocation)
-	runningMode := mode
 	r.running = true
 	r.state = "running"
-	if mode == "accounts" {
-		r.detail = "正在刷新 Codex 账号"
-	} else if mode == "conditional" {
-		r.detail = "正在按条件刷新 Codex 账号"
-	} else {
-		r.detail = "正在巡检 Codex 账号"
-	}
-	r.mode = &runningMode
+	runningModes := r.runningModeListLocked()
+	r.detail = keeperRunningDetail(runningModes)
+	r.mode = keeperStatusModePtr(runningModes)
 	r.lastStartedAt = &now
 	r.lastFinishedAt = nil
 	r.stats = keeperStats{}
@@ -470,18 +578,32 @@ func (r *KeeperRunner) run(mode string) {
 }
 
 func (r *KeeperRunner) runAccounts(mode string, authNames []string) {
-	stats, detail, err := r.app.executeKeeperRunForAccounts(context.Background(), mode, authNames, r.log)
+	options := keeperRunOptionsForMode(mode, authNames)
+	options.TryLockAuthName = r.tryLockAuthName
+	options.UnlockAuthName = r.unlockAuthName
+	stats, detail, err := r.app.executeKeeperRunWithOptions(context.Background(), options, r.log)
 	finishedAt := time.Now().In(appTimeLocation)
 	logMessage := detail
+	if err != nil {
+		logMessage = "巡检失败：" + err.Error()
+	}
 	r.mu.Lock()
-	r.running = false
+	r.ensureRunningModesLocked()
+	delete(r.runningModes, mode)
+	runningModes := r.runningModeListLocked()
+	r.running = len(runningModes) > 0
 	r.lastFinishedAt = &finishedAt
 	r.stats = stats
-	if err != nil {
+	if r.running {
+		r.state = "running"
+		r.detail = keeperRunningDetail(runningModes)
+		r.mode = keeperStatusModePtr(runningModes)
+	} else if err != nil {
 		r.state = "failed"
 		r.detail = err.Error()
-		logMessage = "巡检失败：" + err.Error()
 	} else {
+		completedMode := mode
+		r.mode = &completedMode
 		r.state = "completed"
 		r.detail = detail
 	}
@@ -954,16 +1076,22 @@ type keeperRunOptions struct {
 	ManualRefresh   bool
 	UseRefreshCache bool
 	PersistRun      bool
+	TryLockAuthName func(string, string) bool
+	UnlockAuthName  func(string)
 }
 
 func (a *App) executeKeeperRunForAccounts(ctx context.Context, mode string, authNames []string, logFn func(string)) (keeperStats, string, error) {
-	return a.executeKeeperRunWithOptions(ctx, keeperRunOptions{
+	return a.executeKeeperRunWithOptions(ctx, keeperRunOptionsForMode(mode, authNames), logFn)
+}
+
+func keeperRunOptionsForMode(mode string, authNames []string) keeperRunOptions {
+	return keeperRunOptions{
 		Mode:            mode,
 		AuthNames:       authNames,
 		ManualRefresh:   mode == "accounts",
 		UseRefreshCache: mode == "daemon" || mode == "conditional",
 		PersistRun:      keeperModePersistsRun(mode),
-	}, logFn)
+	}
 }
 
 func keeperModePersistsRun(mode string) bool {
@@ -1064,7 +1192,41 @@ func (a *App) executeKeeperRunWithOptions(ctx context.Context, options keeperRun
 		return stats, detail, nil
 	}
 	for _, item := range filtered {
+		name := keeperString(item["name"])
+		locked := false
+		if options.TryLockAuthName != nil && name != "" {
+			if !options.TryLockAuthName(options.Mode, name) {
+				stats.Skipped++
+				logFn(name + ": 正在其他 Keeper 任务处理中，跳过")
+				continue
+			}
+			locked = true
+		}
+		unlock := func() {
+			if locked && options.UnlockAuthName != nil {
+				options.UnlockAuthName(name)
+				locked = false
+			}
+		}
+		if locked && options.UseRefreshCache {
+			cutoff := time.Now().In(appTimeLocation).Add(-keeperRefreshCacheDuration(cfg))
+			cached, err := a.keeperAuthCheckedSince(ctx, name, cutoff)
+			if err != nil {
+				unlock()
+				if runID > 0 {
+					_ = a.finishKeeperRun(ctx, runID, "failed", err.Error(), stats)
+				}
+				return stats, "", err
+			}
+			if cached {
+				unlock()
+				stats.Skipped++
+				logFn(name + ": 缓存时间内已刷新，跳过")
+				continue
+			}
+		}
 		result := a.processKeeperAuth(ctx, cfg, item, logFn, options.ManualRefresh)
+		unlock()
 		a.mergeKeeperStats(&stats, result)
 		if runID > 0 {
 			if err := a.recordKeeperRunAccount(ctx, runID, result); err != nil {
