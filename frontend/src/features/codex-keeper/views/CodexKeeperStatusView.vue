@@ -1153,18 +1153,20 @@ onMounted(loadAccounts)
 
 <template>
   <section class="page account-status-page">
-    <div class="page-header">
-      <div>
-        <h1 class="page-title">账号状态</h1>
+    <div class="page-header account-page-header">
+      <div class="account-header-copy">
+        <div class="account-header-title-row">
+          <h1 class="page-title">账号状态</h1>
+          <div class="header-actions">
+            <NButton secondary :loading="isLoading" @click="loadAccounts">
+              <template #icon>
+                <NIcon :component="RefreshCw" />
+              </template>
+              重新加载
+            </NButton>
+          </div>
+        </div>
         <p class="page-subtitle">查看 Codex auth file 的健康、额度和优先级维护结果</p>
-      </div>
-      <div class="header-actions">
-        <NButton secondary :loading="isLoading" @click="loadAccounts">
-          <template #icon>
-            <NIcon :component="RefreshCw" />
-          </template>
-          重新加载
-        </NButton>
       </div>
     </div>
 
@@ -1694,8 +1696,30 @@ onMounted(loadAccounts)
   min-width: 0;
 }
 
+.account-page-header {
+  align-items: flex-start;
+}
+
+.account-header-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.account-header-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.account-header-title-row .page-title {
+  min-width: 0;
+}
+
 .header-actions {
   display: flex;
+  flex-shrink: 0;
   justify-content: flex-end;
 }
 
@@ -2355,6 +2379,15 @@ onMounted(loadAccounts)
 @media (max-width: 560px) {
   .account-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .account-page-header {
+    align-items: stretch;
+    flex-direction: row;
+  }
+
+  .account-header-title-row {
+    gap: 8px;
   }
 
   .toolbar-heading,
