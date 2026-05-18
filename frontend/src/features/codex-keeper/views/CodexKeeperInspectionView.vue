@@ -80,7 +80,7 @@ const conditionalRefreshIntervalOptions = [
 const form = reactive({
   schedule_cron: '*/30 * * * *',
   quota_threshold: 100,
-  usage_timeout_seconds: 15,
+  usage_timeout_seconds: 30,
   cpa_timeout_seconds: 30,
   max_retries: 2,
   worker_threads: 8,
@@ -637,16 +637,16 @@ onBeforeUnmount(() => {
                   <NFormItem label="额度阈值（%）">
                     <NInputNumber v-model:value="form.quota_threshold" :min="0" :max="100" />
                   </NFormItem>
-                  <NFormItem label="Usage 超时（秒）">
+                  <NFormItem label="额度检测超时（秒）">
                     <NInputNumber v-model:value="form.usage_timeout_seconds" :min="1" />
                   </NFormItem>
-                  <NFormItem label="CPA 超时（秒）">
+                  <NFormItem label="账号管理接口超时（秒）">
                     <NInputNumber v-model:value="form.cpa_timeout_seconds" :min="1" />
                   </NFormItem>
-                  <NFormItem label="重试次数">
+                  <NFormItem label="失败重试次数">
                     <NInputNumber v-model:value="form.max_retries" :min="0" :max="5" />
                   </NFormItem>
-                  <NFormItem label="Worker 数">
+                  <NFormItem label="账号处理并发数">
                     <NInputNumber v-model:value="form.worker_threads" :min="1" :max="64" />
                   </NFormItem>
                 </div>

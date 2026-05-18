@@ -2373,14 +2373,47 @@ func (a *App) deleteKeeperRemoteAuthFile(ctx context.Context, cfg AppConfig, nam
 }
 
 func (a *App) keeperRequest(ctx context.Context, cfg AppConfig, method, path string, query url.Values, body any, timeout time.Duration) (*http.Response, []byte, error) {
-	response, payload, err := doJSON(ctx, httpClient(timeout), method, makeURL(cfg.Collector.CLIProxyURL, path, query), managementHeaders(cfg.Collector.ManagementKey), body)
+	attempts := keeperRequestAttempts(cfg.CodexKeeper)
+	target := makeURL(cfg.Collector.CLIProxyURL, path, query)
+	headers := managementHeaders(cfg.Collector.ManagementKey)
+	var lastResponse *http.Response
+	var lastPayload []byte
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		response, payload, err := doJSON(ctx, httpClient(timeout), method, target, headers, body)
+		lastResponse = response
+		lastPayload = payload
+		if err != nil {
+			lastErr = validationError("CLIProxyAPI 管理请求失败：" + err.Error())
+			if keeperShouldRetryRequest(ctx, attempt, attempts, response, err) {
+				continue
+			}
+			return nil, nil, lastErr
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			lastErr = validationError(fmt.Sprintf("CLIProxyAPI 管理请求失败：HTTP %d", response.StatusCode))
+			if keeperShouldRetryRequest(ctx, attempt, attempts, response, nil) {
+				continue
+			}
+			return response, payload, lastErr
+		}
+		return response, payload, nil
+	}
+	return lastResponse, lastPayload, lastErr
+}
+
+func keeperRequestAttempts(cfg KeeperConfig) int {
+	return clampInt(cfg.MaxRetries, 0, 5, 2) + 1
+}
+
+func keeperShouldRetryRequest(ctx context.Context, attempt, attempts int, response *http.Response, err error) bool {
+	if attempt >= attempts || ctx.Err() != nil {
+		return false
+	}
 	if err != nil {
-		return nil, nil, validationError("CLIProxyAPI 管理请求失败：" + err.Error())
+		return true
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return response, payload, validationError(fmt.Sprintf("CLIProxyAPI 管理请求失败：HTTP %d", response.StatusCode))
-	}
-	return response, payload, nil
+	return response != nil && response.StatusCode >= 500
 }
 
 func (a *App) checkKeeperUsage(ctx context.Context, cfg AppConfig, detail map[string]any) keeperHTTPResult {

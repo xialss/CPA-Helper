@@ -461,7 +461,7 @@ func defaultConfig() (AppConfig, error) {
 		CodexKeeper: KeeperConfig{
 			ScheduleCron:                      "*/30 * * * *",
 			QuotaThreshold:                    100,
-			UsageTimeoutSeconds:               15,
+			UsageTimeoutSeconds:               30,
 			CPATimeoutSeconds:                 30,
 			MaxRetries:                        2,
 			WorkerThreads:                     8,
@@ -536,7 +536,7 @@ func normalizeKeeperConfig(cfg KeeperConfig) KeeperConfig {
 		cfg.ScheduleCron = "*/30 * * * *"
 	}
 	cfg.QuotaThreshold = clampInt(cfg.QuotaThreshold, 0, 100, 100)
-	cfg.UsageTimeoutSeconds = maxInt(cfg.UsageTimeoutSeconds, 1, 15)
+	cfg.UsageTimeoutSeconds = maxInt(cfg.UsageTimeoutSeconds, 1, 30)
 	cfg.CPATimeoutSeconds = maxInt(cfg.CPATimeoutSeconds, 1, 30)
 	cfg.MaxRetries = clampInt(cfg.MaxRetries, 0, 5, 2)
 	cfg.WorkerThreads = clampInt(cfg.WorkerThreads, 1, 64, 8)

@@ -11,6 +11,76 @@ import (
 	"time"
 )
 
+func TestKeeperUsageTimeoutDefaultIsThirtyButExistingValueIsPreserved(t *testing.T) {
+	cfg, err := defaultConfig()
+	if err != nil {
+		t.Fatalf("defaultConfig: %v", err)
+	}
+	if cfg.CodexKeeper.UsageTimeoutSeconds != 30 {
+		t.Fatalf("default usage_timeout_seconds = %d, want 30", cfg.CodexKeeper.UsageTimeoutSeconds)
+	}
+	normalized := normalizeKeeperConfig(KeeperConfig{UsageTimeoutSeconds: 15})
+	if normalized.UsageTimeoutSeconds != 15 {
+		t.Fatalf("normalized existing usage_timeout_seconds = %d, want 15", normalized.UsageTimeoutSeconds)
+	}
+}
+
+func TestKeeperRequestRetriesTransientManagementFailures(t *testing.T) {
+	attempts := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		if attempts <= 2 {
+			http.Error(w, "temporary failure", http.StatusBadGateway)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	}))
+	defer cpa.Close()
+
+	cfg := AppConfig{
+		Collector: CollectorConfig{
+			CLIProxyURL:   cpa.URL,
+			ManagementKey: "test-management-key",
+		},
+		CodexKeeper: KeeperConfig{MaxRetries: 2},
+	}
+	_, payload, err := (&App{}).keeperRequest(context.Background(), cfg, http.MethodGet, "/v0/management/auth-files", nil, nil, time.Second)
+	if err != nil {
+		t.Fatalf("keeperRequest: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+	if !strings.Contains(string(payload), `"ok":true`) {
+		t.Fatalf("payload = %s, want ok response", payload)
+	}
+}
+
+func TestKeeperRequestDoesNotRetryManagementClientErrors(t *testing.T) {
+	attempts := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		http.Error(w, "bad key", http.StatusUnauthorized)
+	}))
+	defer cpa.Close()
+
+	cfg := AppConfig{
+		Collector: CollectorConfig{
+			CLIProxyURL:   cpa.URL,
+			ManagementKey: "test-management-key",
+		},
+		CodexKeeper: KeeperConfig{MaxRetries: 2},
+	}
+	_, _, err := (&App{}).keeperRequest(context.Background(), cfg, http.MethodGet, "/v0/management/auth-files", nil, nil, time.Second)
+	if err == nil {
+		t.Fatal("keeperRequest error is nil, want HTTP 401 error")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
 func TestConditionalKeeperRefreshCandidatesUseUsageQuotaAndCache(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()
