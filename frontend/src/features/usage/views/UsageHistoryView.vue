@@ -35,7 +35,7 @@ import {
 } from '@/shared/utils/format'
 
 type FailedFilter = 'all' | 'success' | 'failed'
-type QuickRangeKey = 'today' | 'last24h' | 'last3d' | 'last7d'
+type QuickRangeKey = 'today' | 'last24h' | 'last3d' | 'last7d' | 'last30d'
 type UsageScope = 'admin' | 'account'
 
 interface RefreshOptions {
@@ -54,6 +54,7 @@ const quickRangeOptions: Array<{ key: QuickRangeKey; label: string }> = [
   { key: 'last24h', label: '近24小时' },
   { key: 'last3d', label: '近3日' },
   { key: 'last7d', label: '近7日' },
+  { key: 'last30d', label: '近30日' },
 ]
 
 interface MetricCardConfig {
@@ -296,6 +297,10 @@ function buildQuickRange(key: QuickRangeKey): [number, number] {
     case 'last7d': {
       const end = Date.now()
       return [end - 7 * DAY_MS, end]
+    }
+    case 'last30d': {
+      const end = Date.now()
+      return [end - 30 * DAY_MS, end]
     }
   }
 }

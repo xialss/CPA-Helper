@@ -31,7 +31,7 @@ import {
 } from '@/shared/utils/format'
 
 type FailedFilter = 'all' | 'success' | 'failed'
-type QuickRangeKey = 'today' | 'last24h' | 'last3d' | 'last7d'
+type QuickRangeKey = 'today' | 'last24h' | 'last3d' | 'last7d' | 'all'
 type UsageScope = 'admin' | 'account'
 type RecordsTableLayoutProps =
   | { flexHeight: true }
@@ -49,6 +49,8 @@ interface Props {
 const AUTO_REFRESH_INTERVAL_MS = 5000
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
+const ALL_RECORDS_START_PARAM = '0001-01-01T00:00:00+08:00'
+const ALL_RECORDS_END_PARAM = '9999-12-31T23:59:59+08:00'
 const RECORDS_TABLE_MIN_ROW_HEIGHT = 40
 const RECORDS_TABLE_COLUMN_WIDTHS = {
   timestamp: 150,
@@ -83,6 +85,7 @@ const quickRangeOptions: Array<{ key: QuickRangeKey; label: string }> = [
   { key: 'last24h', label: '近24小时' },
   { key: 'last3d', label: '近3日' },
   { key: 'last7d', label: '近7日' },
+  { key: 'all', label: '全部' },
 ]
 const desktopRecordsLayoutQuery = window.matchMedia('(min-width: 861px)')
 
@@ -152,10 +155,15 @@ function numberFromQuery(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
-const initialDateRange = initialRange()
+const initialIsAllRange = route.query.range === 'all'
+const initialDateRange = initialIsAllRange ? null : initialRange()
 const dateRange = ref<[number, number] | null>(initialDateRange)
 const activeQuickRange = ref<QuickRangeKey | null>(
-  initialDateRange === null || isTodayRange(initialDateRange) ? 'today' : null,
+  initialIsAllRange
+    ? 'all'
+    : initialDateRange === null || isTodayRange(initialDateRange)
+      ? 'today'
+      : null,
 )
 const filterForm = reactive({
   user_id: numberFromQuery(route.query.user_id),
@@ -294,10 +302,22 @@ const refreshStatusText = computed(() => {
 function buildFilters(): UsageFilters {
   const failed =
     filterForm.failed === 'all' ? undefined : filterForm.failed === 'failed' ? true : false
+  const start =
+    activeQuickRange.value === 'all'
+      ? ALL_RECORDS_START_PARAM
+      : dateRange.value
+        ? formatLocalDateTimeParam(dateRange.value[0])
+        : undefined
+  const end =
+    activeQuickRange.value === 'all'
+      ? ALL_RECORDS_END_PARAM
+      : dateRange.value
+        ? formatLocalDateTimeParam(dateRange.value[1])
+        : undefined
   return {
     scope: props.scope,
-    start: dateRange.value ? formatLocalDateTimeParam(dateRange.value[0]) : undefined,
-    end: dateRange.value ? formatLocalDateTimeParam(dateRange.value[1]) : undefined,
+    start,
+    end,
     user_id: isAccountScope.value ? undefined : (filterForm.user_id ?? undefined),
     api_key_description: filterForm.api_key_description ?? undefined,
     provider: filterForm.provider ?? undefined,
@@ -307,17 +327,25 @@ function buildFilters(): UsageFilters {
   }
 }
 
-function filtersToQuery(filters: UsageFilters): Record<string, string> {
+function filtersToQuery(
+  filters: UsageFilters,
+  rangeKey: QuickRangeKey | null = null,
+): Record<string, string> {
   const query: Record<string, string> = {}
   Object.entries(filters).forEach(([key, value]) => {
     if (key !== 'scope' && value !== undefined && value !== '') {
       query[key] = String(value)
     }
   })
+  if (rangeKey === 'all') {
+    delete query.start
+    delete query.end
+    query.range = 'all'
+  }
   return query
 }
 
-function buildQuickRange(key: QuickRangeKey): [number, number] {
+function buildQuickRange(key: QuickRangeKey): [number, number] | null {
   switch (key) {
     case 'today':
       return todayRange()
@@ -333,6 +361,8 @@ function buildQuickRange(key: QuickRangeKey): [number, number] {
       const end = Date.now()
       return [end - 7 * DAY_MS, end]
     }
+    case 'all':
+      return null
   }
 }
 
@@ -452,6 +482,7 @@ async function refresh({ resetPage = false, silent = false }: RefreshOptions = {
         usedServerDefaultRange
           ? { ...filters, start: nextRecords.start, end: nextRecords.end }
           : filters,
+        activeQuickRange.value,
       ),
     })
     autoRefreshError.value = null
