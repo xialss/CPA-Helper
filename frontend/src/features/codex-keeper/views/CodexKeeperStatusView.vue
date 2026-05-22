@@ -31,6 +31,7 @@ import {
   PauseCircle,
   RefreshCw,
   Table2,
+  Trash2,
   Users,
   Zap,
 } from 'lucide-vue-next'
@@ -475,8 +476,18 @@ function saveAccountStatusPreferences() {
 const selectedDisabledAccountNames = computed(() =>
   selectedDisabledAccountKeys.value.map((key) => String(key)),
 )
+const filteredDisabledAccountNames = computed(() =>
+  filteredDisabledAccounts.value.map((account) => account.name),
+)
 const selectedDisabledCount = computed(() => selectedDisabledAccountNames.value.length)
 const canBulkDelete = computed(() => selectedDisabledCount.value > 0 && !isBulkDeleting.value)
+const canBulkDeleteFilteredDisabledAccounts = computed(
+  () =>
+    filteredDisabledAccountNames.value.length > 0 &&
+    !isBulkDeleting.value &&
+    !isBulkRefreshing.value &&
+    !isLoading.value,
+)
 const filteredAccountNames = computed(() => filteredAccounts.value.map((account) => account.name))
 const selectedRefreshAccountNameSet = computed(() => new Set(selectedRefreshAccountNames.value))
 const selectedRefreshCount = computed(() => selectedRefreshAccountNames.value.length)
@@ -1171,6 +1182,14 @@ function openBulkDeleteDialog() {
     return
   }
   bulkDeleteDialog.show = true
+}
+
+function openFilteredDisabledBulkDeleteDialog() {
+  if (!canBulkDeleteFilteredDisabledAccounts.value) {
+    return
+  }
+  selectedDisabledAccountKeys.value = filteredDisabledAccountNames.value
+  openBulkDeleteDialog()
 }
 
 async function submitBulkDelete() {
@@ -1909,6 +1928,9 @@ onBeforeUnmount(() => {
                 :loading="isBulkDeleting"
                 @click="openBulkDeleteDialog"
               >
+                <template #icon>
+                  <NIcon :component="Trash2" />
+                </template>
                 批量删除（{{ selectedDisabledCount }}）
               </NButton>
             </div>
@@ -1986,6 +2008,21 @@ onBeforeUnmount(() => {
               <p class="account-section-subtitle">
                 {{ cardSectionDisplayText }}
               </p>
+            </div>
+            <div v-if="filteredDisabledAccounts.length > 0" class="account-section-actions">
+              <NButton
+                secondary
+                type="error"
+                size="small"
+                :disabled="!canBulkDeleteFilteredDisabledAccounts"
+                :loading="isBulkDeleting"
+                @click="openFilteredDisabledBulkDeleteDialog"
+              >
+                <template #icon>
+                  <NIcon :component="Trash2" />
+                </template>
+                批量删除已禁用（{{ filteredDisabledAccounts.length }}）
+              </NButton>
             </div>
           </div>
           <div v-if="showCardLoadingState" class="empty-state">账号加载中...</div>

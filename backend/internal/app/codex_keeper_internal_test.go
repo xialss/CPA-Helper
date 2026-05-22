@@ -111,6 +111,12 @@ func TestConditionalKeeperRefreshCandidatesUseUsageQuotaAndCache(t *testing.T) {
 			"type":  "codex",
 			"email": "list@example.com",
 		},
+		"remote-disabled-detail-email.json": {
+			"name":     "remote-disabled-detail-email.json",
+			"type":     "codex",
+			"email":    "disabled-detail@example.com",
+			"disabled": true,
+		},
 	}
 	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -121,6 +127,8 @@ func TestConditionalKeeperRefreshCandidatesUseUsageQuotaAndCache(t *testing.T) {
 					{"name": "remote-detail-email.json", "type": "codex"},
 					{"name": "remote-short-index.json", "type": "codex"},
 					{"name": "remote-list-email.json", "type": "codex", "email": "list@example.com"},
+					{"name": "remote-disabled-list-email.json", "type": "codex", "email": "disabled-list@example.com", "disabled": true},
+					{"name": "remote-disabled-detail-email.json", "type": "codex"},
 					{"name": "email-match.json", "type": "codex"},
 					{"name": "source-match.json", "type": "codex"},
 					{"name": "cached-request.json", "type": "codex"},
@@ -155,6 +163,8 @@ func TestConditionalKeeperRefreshCandidatesUseUsageQuotaAndCache(t *testing.T) {
 	insertKeeperUsageRecord(t, app, "remote-detail-email-request", now.Add(-time.Minute), `{"auth_index":"remote@example.com"}`)
 	insertKeeperUsageRecord(t, app, "remote-list-email-request", now.Add(-time.Minute), `{"auth_index":"list@example.com"}`)
 	insertKeeperUsageRecord(t, app, "remote-short-index-request", now.Add(-time.Minute), `{"auth_index":"short-auth-index"}`)
+	insertKeeperUsageRecord(t, app, "remote-disabled-list-email-request", now.Add(-time.Minute), `{"auth_index":"disabled-list@example.com"}`)
+	insertKeeperUsageRecord(t, app, "remote-disabled-detail-email-request", now.Add(-time.Minute), `{"auth_index":"disabled-detail@example.com"}`)
 	insertKeeperUsageRecord(t, app, "unknown-email-request", now.Add(-time.Minute), `{"auth_index":"unknown@example.com"}`)
 	insertKeeperUsageRecord(t, app, "old-request", now.Add(-20*time.Minute), `{"auth_index":"old-request.json"}`)
 	insertKeeperUsageRecord(t, app, "cached-request", now.Add(-time.Minute), `{"auth_index":"cached-request.json"}`)
@@ -188,6 +198,49 @@ func TestConditionalKeeperRefreshCandidatesUseUsageQuotaAndCache(t *testing.T) {
 	})
 }
 
+func TestConditionalKeeperRefreshCandidatesSkipDisabledLocalAccounts(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = ""
+	cfg.CodexKeeper.AccountRefreshCacheMinutes = 10
+	now := time.Now().In(appTimeLocation)
+
+	insertKeeperUsageRecord(t, app, "enabled-request", now.Add(-time.Minute), `{"auth_index":"enabled-request.json","failed":true}`)
+	insertKeeperUsageRecord(t, app, "disabled-request", now.Add(-time.Minute), `{"auth_index":"disabled-request.json","failed":true}`)
+	insertKeeperUsageRecord(t, app, "disabled-email-request", now.Add(-time.Minute), `{"auth_index":"disabled@example.com","failed":true}`)
+
+	insertKeeperStateForCandidate(t, app, "disabled-request.json", nil, nil)
+	markKeeperStateDisabled(t, app, "disabled-request.json")
+	insertKeeperStateForCandidateWithEmail(t, app, "disabled-email.json", stringPtr("disabled@example.com"), nil, nil)
+	markKeeperStateDisabled(t, app, "disabled-email.json")
+	insertKeeperStateForCandidate(t, app, "enabled-quota.json", timePtrValue(now.Add(-time.Minute)), nil)
+	insertKeeperStateForCandidate(t, app, "disabled-quota.json", timePtrValue(now.Add(-time.Minute)), nil)
+	markKeeperStateDisabled(t, app, "disabled-quota.json")
+	insertKeeperStateForCandidateWithError(t, app, "enabled-error.json", "network check failed", timePtrValue(now.Add(-20*time.Minute)))
+	insertKeeperStateForCandidateWithError(t, app, "disabled-error.json", "network check failed", timePtrValue(now.Add(-20*time.Minute)))
+	markKeeperStateDisabled(t, app, "disabled-error.json")
+
+	names, err := app.conditionalKeeperRefreshCandidates(ctx, cfg)
+	if err != nil {
+		t.Fatalf("conditionalKeeperRefreshCandidates: %v", err)
+	}
+	assertStringSet(t, names, []string{
+		"enabled-request.json",
+		"enabled-quota.json",
+		"enabled-error.json",
+	})
+}
+
 func TestConditionalKeeperRefreshCandidatesReconcileRemoteAuthStates(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 
@@ -199,6 +252,7 @@ func TestConditionalKeeperRefreshCandidatesReconcileRemoteAuthStates(t *testing.
 				"files": []map[string]any{
 					{"name": "kept.json", "type": "codex"},
 					{"name": "new-remote.json", "type": "codex"},
+					{"name": "disabled-remote.json", "type": "codex", "disabled": true},
 					{"name": "not-codex.json", "type": "other"},
 				},
 			})
@@ -540,13 +594,6 @@ func TestAutomaticKeeperRunsRespectCacheButManualRefreshBypasses(t *testing.T) {
 		cfg.CodexKeeper.AccountRefreshCacheMinutes = 10
 	})
 	insertKeeperStateForCandidate(t, app, "cached.json", nil, timePtrValue(time.Now().In(appTimeLocation).Add(-time.Minute)))
-	if _, err := app.db.Exec(`
-		UPDATE codex_keeper_auth_states
-		SET last_healthy_at = ?
-		WHERE auth_name = ?
-	`, dbTime(time.Now().In(appTimeLocation).Add(-time.Minute)), "cached.json"); err != nil {
-		t.Fatalf("mark cached healthy state: %v", err)
-	}
 
 	stats, _, err := app.executeKeeperRunForAccounts(context.Background(), "daemon", nil, func(string) {})
 	if err != nil {
@@ -556,7 +603,7 @@ func TestAutomaticKeeperRunsRespectCacheButManualRefreshBypasses(t *testing.T) {
 		t.Fatalf("daemon skipped = %d, want 1", stats.Skipped)
 	}
 	if stats.Healthy != 1 {
-		t.Fatalf("daemon healthy = %d, want cached healthy state to count", stats.Healthy)
+		t.Fatalf("daemon healthy = %d, want clean cached checked state to count", stats.Healthy)
 	}
 	if usageCalls != 0 {
 		t.Fatalf("daemon usage calls = %d, want 0", usageCalls)
@@ -630,6 +677,60 @@ func TestAutomaticKeeperRunCountsCachedBadCredentialState(t *testing.T) {
 	}
 	if downloadCalls != 0 {
 		t.Fatalf("download calls = %d, want 0", downloadCalls)
+	}
+}
+
+func TestKeeperAuthDetailRequestFailureCountsAsNetworkError(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	usageCalls := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{{"name": "download-fails.json", "type": "codex"}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			http.Error(w, "temporary management failure", http.StatusBadGateway)
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			usageCalls++
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+
+	stats, _, err := app.executeKeeperRunForAccounts(context.Background(), "daemon", nil, func(string) {})
+	if err != nil {
+		t.Fatalf("daemon run: %v", err)
+	}
+	if stats.NetworkError != 1 {
+		t.Fatalf("network_error = %d, want 1", stats.NetworkError)
+	}
+	if stats.Skipped != 0 {
+		t.Fatalf("skipped = %d, want 0", stats.Skipped)
+	}
+	if stats.Healthy != 0 || stats.StatusDisabled != 0 {
+		t.Fatalf("stats = %#v, want only network error", stats)
+	}
+	if usageCalls != 0 {
+		t.Fatalf("usage calls = %d, want 0", usageCalls)
+	}
+	state, err := app.getKeeperState(context.Background(), "download-fails.json")
+	if err != nil {
+		t.Fatalf("get keeper state: %v", err)
+	}
+	if state.LastError == nil || !strings.Contains(*state.LastError, "读取 auth file 详情失败") {
+		t.Fatalf("last_error = %v, want auth detail failure", state.LastError)
 	}
 }
 
@@ -1021,6 +1122,18 @@ func insertKeeperStateForCandidateWithError(t *testing.T, app *App, name string,
 	`, lastError, dbTime(time.Now().In(appTimeLocation)), name)
 	if err != nil {
 		t.Fatalf("mark keeper state %s error: %v", name, err)
+	}
+}
+
+func markKeeperStateDisabled(t *testing.T, app *App, name string) {
+	t.Helper()
+	_, err := app.db.Exec(`
+		UPDATE codex_keeper_auth_states
+		SET disabled = 1, updated_at = ?
+		WHERE auth_name = ?
+	`, dbTime(time.Now().In(appTimeLocation)), name)
+	if err != nil {
+		t.Fatalf("mark keeper state %s disabled: %v", name, err)
 	}
 }
 

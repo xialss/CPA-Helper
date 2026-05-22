@@ -1778,8 +1778,11 @@ func (a *App) conditionalKeeperRefreshCandidates(ctx context.Context, cfg AppCon
 	rows, err = a.db.QueryContext(ctx, `
 		SELECT auth_name
 		FROM codex_keeper_auth_states
-		WHERE (primary_reset_at IS NOT NULL AND primary_reset_at <= ?)
+		WHERE disabled = 0
+		  AND (
+		      (primary_reset_at IS NOT NULL AND primary_reset_at <= ?)
 		   OR (secondary_reset_at IS NOT NULL AND secondary_reset_at <= ?)
+		  )
 		ORDER BY auth_name
 	`, dbTime(time.Now().In(appTimeLocation)), dbTime(time.Now().In(appTimeLocation)))
 	if err != nil {
@@ -1803,7 +1806,8 @@ func (a *App) conditionalKeeperRefreshCandidates(ctx context.Context, cfg AppCon
 	rows, err = a.db.QueryContext(ctx, `
 		SELECT auth_name
 		FROM codex_keeper_auth_states
-		WHERE last_error IS NOT NULL
+		WHERE disabled = 0
+		  AND last_error IS NOT NULL
 		  AND TRIM(last_error) <> ''
 		ORDER BY auth_name
 	`)
@@ -1825,7 +1829,11 @@ func (a *App) conditionalKeeperRefreshCandidates(ctx context.Context, cfg AppCon
 		return nil, err
 	}
 
-	filtered, _, err := a.filterKeeperCachedAuthNames(ctx, names, cfg)
+	enabledNames, err := a.filterKeeperEnabledAuthNames(ctx, names)
+	if err != nil {
+		return nil, err
+	}
+	filtered, _, err := a.filterKeeperCachedAuthNames(ctx, enabledNames, cfg)
 	return filtered, err
 }
 
@@ -1838,6 +1846,7 @@ func (a *App) reconcileKeeperConditionalRemoteAuthStates(ctx context.Context, cf
 		return err
 	}
 	remoteNames := map[string]bool{}
+	refreshableRemoteNames := map[string]bool{}
 	for _, item := range authFiles {
 		if keeperString(item["type"]) != "codex" {
 			continue
@@ -1847,18 +1856,41 @@ func (a *App) reconcileKeeperConditionalRemoteAuthStates(ctx context.Context, cf
 			continue
 		}
 		remoteNames[name] = true
+		if !keeperBool(item["disabled"]) {
+			refreshableRemoteNames[name] = true
+		}
 	}
 	localNames, err := a.keeperAuthStateNameSet(ctx)
 	if err != nil {
 		return err
 	}
-	for name := range remoteNames {
-		if !localNames[name] {
+	for name := range refreshableRemoteNames {
+		if !localNames[name] && !a.keeperRemoteAuthDisabledForConditional(ctx, cfg, name, authFiles) {
 			addName(name)
 		}
 	}
 	_, err = a.pruneKeeperMissingAuthStates(ctx, remoteNames)
 	return err
+}
+
+func (a *App) keeperRemoteAuthDisabledForConditional(ctx context.Context, cfg AppConfig, name string, authFiles []map[string]any) bool {
+	for _, item := range authFiles {
+		if keeperString(item["name"]) != name {
+			continue
+		}
+		if keeperBool(item["disabled"]) {
+			return true
+		}
+		if _, ok := item["disabled"]; ok {
+			return false
+		}
+		detail, err := a.getKeeperRemoteAuthFile(ctx, cfg, name)
+		if err != nil || detail == nil {
+			return false
+		}
+		return keeperBool(mergeKeeperObjects(item, detail)["disabled"])
+	}
+	return false
 }
 
 func (a *App) keeperAuthStateNameSet(ctx context.Context) (map[string]bool, error) {
@@ -1885,6 +1917,7 @@ func (a *App) keeperAuthNameAliases(ctx context.Context) (map[string][]string, e
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT auth_name, email
 		FROM codex_keeper_auth_states
+		WHERE disabled = 0
 		ORDER BY auth_name
 	`)
 	if err != nil {
@@ -1923,6 +1956,9 @@ func (a *App) keeperAuthNamesFromRemoteUsageIdentifiers(ctx context.Context, cfg
 		if keeperString(item["type"]) != "codex" {
 			continue
 		}
+		if keeperBool(item["disabled"]) {
+			continue
+		}
 		codexFiles = append(codexFiles, item)
 		addKeeperAuthObjectAliases(aliases, item)
 	}
@@ -1939,6 +1975,9 @@ func (a *App) keeperAuthNamesFromRemoteUsageIdentifiers(ctx context.Context, cfg
 			continue
 		}
 		merged := mergeKeeperObjects(item, detail)
+		if keeperBool(merged["disabled"]) {
+			continue
+		}
 		addKeeperAuthObjectAliases(aliases, merged)
 		if !keeperHasUnresolvedUsageIdentifiers(identifiers, aliases) {
 			break
@@ -2095,6 +2134,44 @@ func (a *App) filterKeeperCachedAuthNames(ctx context.Context, names []string, c
 	return filtered, skipped, nil
 }
 
+func (a *App) filterKeeperEnabledAuthNames(ctx context.Context, names []string) ([]string, error) {
+	normalized, err := normalizeOptionalKeeperAuthNames(names)
+	if err != nil {
+		return nil, err
+	}
+	if len(normalized) == 0 {
+		return normalized, nil
+	}
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT auth_name
+		FROM codex_keeper_auth_states
+		WHERE disabled = 1
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	disabledNames := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		disabledNames[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	filtered := make([]string, 0, len(normalized))
+	for _, name := range normalized {
+		if disabledNames[name] {
+			continue
+		}
+		filtered = append(filtered, name)
+	}
+	return filtered, nil
+}
+
 func (a *App) addKeeperCachedAuthStats(ctx context.Context, stats *keeperStats, names []string) error {
 	cachedStats, err := a.keeperCachedAuthStats(ctx, names)
 	if err != nil {
@@ -2157,6 +2234,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	detail, err := a.getKeeperRemoteAuthFile(ctx, cfg, name)
 	if err != nil {
 		message := "读取 auth file 详情失败：" + err.Error()
+		result.Result = "network_error"
 		result.LastError = &message
 		result.LatestAction = &message
 		_ = a.upsertKeeperState(ctx, result)
@@ -2165,6 +2243,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	}
 	if detail == nil {
 		message := "读取 auth file 详情失败"
+		result.Result = "network_error"
 		result.LastError = &message
 		result.LatestAction = &message
 		_ = a.upsertKeeperState(ctx, result)
@@ -2462,7 +2541,7 @@ func (stats *keeperStats) mergeCachedState(state keeperAuthState) {
 		stats.PriorityDegraded++
 		return
 	}
-	if state.LastHealthyAt != nil {
+	if state.LastHealthyAt != nil || state.LastCheckedAt != nil {
 		stats.Healthy++
 	}
 }
