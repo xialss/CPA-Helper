@@ -123,6 +123,7 @@ const accountSort = reactive({
 })
 const bulkDeleteDialog = reactive({
   show: false,
+  source: 'selection' as 'selection' | 'disabled401',
 })
 const accountConfirmDialog = reactive({
   show: false,
@@ -476,14 +477,17 @@ function saveAccountStatusPreferences() {
 const selectedDisabledAccountNames = computed(() =>
   selectedDisabledAccountKeys.value.map((key) => String(key)),
 )
-const filteredDisabledAccountNames = computed(() =>
-  filteredDisabledAccounts.value.map((account) => account.name),
+const filteredUnauthorizedDisabledAccounts = computed(() =>
+  filteredDisabledAccounts.value.filter((account) => account.last_status_code === 401),
+)
+const filteredUnauthorizedDisabledAccountNames = computed(() =>
+  filteredUnauthorizedDisabledAccounts.value.map((account) => account.name),
 )
 const selectedDisabledCount = computed(() => selectedDisabledAccountNames.value.length)
 const canBulkDelete = computed(() => selectedDisabledCount.value > 0 && !isBulkDeleting.value)
-const canBulkDeleteFilteredDisabledAccounts = computed(
+const canBulkDeleteFilteredUnauthorizedDisabledAccounts = computed(
   () =>
-    filteredDisabledAccountNames.value.length > 0 &&
+    filteredUnauthorizedDisabledAccountNames.value.length > 0 &&
     !isBulkDeleting.value &&
     !isBulkRefreshing.value &&
     !isLoading.value,
@@ -497,6 +501,16 @@ const canRefreshSelected = computed(
 const bulkDeletePreviewNames = computed(() => selectedDisabledAccountNames.value.slice(0, 5))
 const bulkDeletePreviewOverflow = computed(() =>
   Math.max(0, selectedDisabledCount.value - bulkDeletePreviewNames.value.length),
+)
+const bulkDeleteDialogTitle = computed(() =>
+  bulkDeleteDialog.source === 'disabled401'
+    ? '批量删除 401 已禁用账号'
+    : '批量删除已禁用账号',
+)
+const bulkDeleteWarningText = computed(() =>
+  bulkDeleteDialog.source === 'disabled401'
+    ? `将删除当前筛选下 ${selectedDisabledCount.value} 个 HTTP 401 已禁用账号，并从 CPA 删除 auth file。此操作不可恢复。`
+    : `将删除已选 ${selectedDisabledCount.value} 个已禁用账号，并从 CPA 删除 auth file。此操作不可恢复。`,
 )
 const canSubmitPriority = computed(() => {
   if (priorityDialog.mode === 'default') {
@@ -1181,15 +1195,20 @@ function openBulkDeleteDialog() {
   if (!canBulkDelete.value) {
     return
   }
+  bulkDeleteDialog.source = 'selection'
   bulkDeleteDialog.show = true
 }
 
-function openFilteredDisabledBulkDeleteDialog() {
-  if (!canBulkDeleteFilteredDisabledAccounts.value) {
+function openFilteredUnauthorizedDisabledBulkDeleteDialog() {
+  if (!canBulkDeleteFilteredUnauthorizedDisabledAccounts.value) {
     return
   }
-  selectedDisabledAccountKeys.value = filteredDisabledAccountNames.value
-  openBulkDeleteDialog()
+  selectedDisabledAccountKeys.value = filteredUnauthorizedDisabledAccountNames.value
+  if (!canBulkDelete.value) {
+    return
+  }
+  bulkDeleteDialog.source = 'disabled401'
+  bulkDeleteDialog.show = true
 }
 
 async function submitBulkDelete() {
@@ -2009,19 +2028,19 @@ onBeforeUnmount(() => {
                 {{ cardSectionDisplayText }}
               </p>
             </div>
-            <div v-if="filteredDisabledAccounts.length > 0" class="account-section-actions">
+            <div v-if="filteredUnauthorizedDisabledAccounts.length > 0" class="account-section-actions">
               <NButton
                 secondary
                 type="error"
                 size="small"
-                :disabled="!canBulkDeleteFilteredDisabledAccounts"
+                :disabled="!canBulkDeleteFilteredUnauthorizedDisabledAccounts"
                 :loading="isBulkDeleting"
-                @click="openFilteredDisabledBulkDeleteDialog"
+                @click="openFilteredUnauthorizedDisabledBulkDeleteDialog"
               >
                 <template #icon>
                   <NIcon :component="Trash2" />
                 </template>
-                批量删除已禁用（{{ filteredDisabledAccounts.length }}）
+                批量删除 401 已禁用（{{ filteredUnauthorizedDisabledAccounts.length }}）
               </NButton>
             </div>
           </div>
@@ -2328,12 +2347,12 @@ onBeforeUnmount(() => {
     <NModal
       v-model:show="bulkDeleteDialog.show"
       preset="dialog"
-      title="批量删除已禁用账号"
+      :title="bulkDeleteDialogTitle"
       :style="{ width: 'min(460px, calc(100vw - 32px))' }"
     >
       <div class="bulk-delete-dialog">
         <p class="bulk-delete-warning">
-          将删除已选 {{ selectedDisabledCount }} 个已禁用账号，并从 CPA 删除 auth file。此操作不可恢复。
+          {{ bulkDeleteWarningText }}
         </p>
         <div v-if="bulkDeletePreviewNames.length > 0" class="bulk-delete-preview">
           <span v-for="name in bulkDeletePreviewNames" :key="name">{{ name }}</span>
