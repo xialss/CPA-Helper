@@ -64,7 +64,7 @@ import {
 type FixedPriorityFilter = 'all' | 'high' | 'minusOne' | 'low'
 type PriorityTypeFilter = `type:${string}`
 type PriorityFilter = FixedPriorityFilter | PriorityTypeFilter
-type AccountStatusFilter = 'all' | 'enabled' | 'disabled'
+type AccountStatusFilter = 'all' | 'enabled' | 'disabled' | 'unauthorized' | 'quotaExhausted'
 type AccountDisplaySize = 50 | 100 | 150 | 200 | 'all'
 type AccountListViewMode = 'table' | 'bar' | 'ring'
 type AccountSortKey = 'quotaDay' | 'quotaWeek' | 'accountType' | 'status' | 'priority' | 'lastCheckedAt'
@@ -614,6 +614,12 @@ function matchesStatusFilter(account: CodexKeeperAccount, value: AccountStatusFi
   }
   if (value === 'disabled') {
     return account.disabled
+  }
+  if (value === 'unauthorized') {
+    return account.last_status_code === 401
+  }
+  if (value === 'quotaExhausted') {
+    return accountPriority(account) === -1
   }
   return true
 }
@@ -1828,22 +1834,34 @@ onBeforeUnmount(() => {
         <div class="metric-value">{{ formatInteger(disabledAccountCount) }}</div>
         <div class="metric-footnote">停用账号</div>
       </button>
-      <div class="metric-card is-danger">
+      <button
+        type="button"
+        class="metric-card metric-action is-danger"
+        :class="{ 'is-active': isStatusFilterActive('unauthorized') }"
+        :aria-pressed="isStatusFilterActive('unauthorized')"
+        @click="toggleStatusFilter('unauthorized')"
+      >
         <div class="metric-icon" aria-hidden="true">
           <ShieldAlert :size="20" :stroke-width="2.2" />
         </div>
         <div class="metric-label">401报错</div>
         <div class="metric-value">{{ formatInteger(unauthorizedErrorAccountCount) }}</div>
         <div class="metric-footnote">HTTP 401</div>
-      </div>
-      <div class="metric-card is-purple">
+      </button>
+      <button
+        type="button"
+        class="metric-card metric-action is-purple"
+        :class="{ 'is-active': isStatusFilterActive('quotaExhausted') }"
+        :aria-pressed="isStatusFilterActive('quotaExhausted')"
+        @click="toggleStatusFilter('quotaExhausted')"
+      >
         <div class="metric-icon" aria-hidden="true">
           <Gauge :size="20" :stroke-width="2.2" />
         </div>
         <div class="metric-label">额度耗尽</div>
         <div class="metric-value">{{ formatInteger(quotaExhaustedAccountCount) }}</div>
         <div class="metric-footnote">临时降级</div>
-      </div>
+      </button>
     </div>
 
     <section class="panel account-list-panel">
@@ -2107,7 +2125,7 @@ onBeforeUnmount(() => {
                 'is-disabled': account.disabled,
                 'is-enabled': !account.disabled,
                 'has-error': hasAccountError(account),
-                'is-network-error': !account.disabled && hasAccountError(account),
+                'is-quota-exhausted': accountPriority(account) === -1,
                 'is-select-mode': refreshSelectMode,
                 'is-selected': isRefreshAccountSelected(account),
               }"
@@ -2127,9 +2145,15 @@ onBeforeUnmount(() => {
                 <div class="account-card-status-group">
                   <span
                     class="account-status-pill"
-                    :class="account.disabled ? 'is-warning' : 'is-success'"
+                    :class="
+                      account.disabled
+                        ? 'is-danger'
+                        : accountPriority(account) === -1
+                          ? 'is-quota-exhausted'
+                          : 'is-success'
+                    "
                   >
-                    {{ account.disabled ? '已禁用' : '启用中' }}
+                    {{ account.disabled ? '已禁用' : accountPriority(account) === -1 ? '额度耗尽' : '启用中' }}
                   </span>
                   <span
                     v-if="disabledStatusCodeText(account)"
@@ -2753,6 +2777,17 @@ onBeforeUnmount(() => {
   --account-card-bg: var(--cpa-surface-raised);
   --account-card-border: var(--cpa-border);
   --account-card-hover-border: color-mix(in srgb, var(--cpa-primary) 36%, var(--cpa-border));
+  --account-card-accent: var(--cpa-primary);
+  --account-card-inner-bg: color-mix(
+    in srgb,
+    var(--account-card-bg) 72%,
+    var(--cpa-surface-raised)
+  );
+  --account-card-inner-border: color-mix(
+    in srgb,
+    var(--account-card-border) 70%,
+    var(--cpa-border)
+  );
   display: grid;
   align-content: start;
   gap: 12px;
@@ -2774,18 +2809,21 @@ onBeforeUnmount(() => {
 }
 
 .account-card.is-enabled {
+  --account-card-accent: var(--cpa-success);
   --account-card-bg: color-mix(in srgb, var(--cpa-success-weak) 24%, var(--cpa-surface-raised));
   --account-card-border: color-mix(in srgb, var(--cpa-success) 14%, var(--cpa-border));
   --account-card-hover-border: color-mix(in srgb, var(--cpa-success) 26%, var(--cpa-border));
 }
 
 .account-card.is-disabled {
+  --account-card-accent: var(--cpa-danger);
   --account-card-bg: color-mix(in srgb, var(--cpa-danger-weak) 30%, var(--cpa-surface-raised));
   --account-card-border: color-mix(in srgb, var(--cpa-danger) 18%, var(--cpa-border));
   --account-card-hover-border: color-mix(in srgb, var(--cpa-danger) 32%, var(--cpa-border));
 }
 
-.account-card.is-network-error {
+.account-card.is-quota-exhausted {
+  --account-card-accent: var(--cpa-warning);
   --account-card-bg: color-mix(in srgb, var(--cpa-warning-weak) 34%, var(--cpa-surface-raised));
   --account-card-border: color-mix(in srgb, var(--cpa-warning) 20%, var(--cpa-border));
   --account-card-hover-border: color-mix(in srgb, var(--cpa-warning) 34%, var(--cpa-border));
@@ -2812,11 +2850,6 @@ onBeforeUnmount(() => {
 .account-card:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--cpa-primary) 70%, transparent);
   outline-offset: 2px;
-}
-
-.account-card.has-error:not(.is-network-error) {
-  --account-card-border: color-mix(in srgb, var(--cpa-danger) 42%, var(--cpa-border));
-  --account-card-hover-border: color-mix(in srgb, var(--cpa-danger) 52%, var(--cpa-border));
 }
 
 .account-card-top {
@@ -2884,6 +2917,19 @@ onBeforeUnmount(() => {
   border-color: color-mix(in srgb, var(--cpa-warning) 28%, transparent);
 }
 
+.account-status-pill.is-danger {
+  color: var(--cpa-danger);
+  background: var(--cpa-danger-weak);
+  border-color: color-mix(in srgb, var(--cpa-danger) 28%, transparent);
+}
+
+.account-status-pill.is-quota-exhausted {
+  --quota-exhausted-pill-color: color-mix(in srgb, var(--cpa-warning) 76%, var(--cpa-accent-blue));
+  color: var(--quota-exhausted-pill-color);
+  background: var(--cpa-warning-weak);
+  border-color: color-mix(in srgb, var(--quota-exhausted-pill-color) 30%, transparent);
+}
+
 .account-status-code-badge {
   display: inline-flex;
   align-items: center;
@@ -2913,15 +2959,26 @@ onBeforeUnmount(() => {
   gap: 2px;
   min-width: 0;
   padding: 7px 8px;
-  background: var(--cpa-surface-muted);
-  border: 1px solid color-mix(in srgb, var(--cpa-border) 70%, transparent);
+  background: color-mix(in srgb, var(--account-card-accent) 7%, var(--account-card-inner-bg));
+  border: 1px solid color-mix(in srgb, var(--account-card-accent) 15%, var(--account-card-inner-border));
   border-radius: var(--cpa-radius-sm);
+}
+
+.account-card-meta-item:nth-child(2) {
+  background: color-mix(in srgb, var(--account-card-accent) 9%, var(--account-card-inner-bg));
+  border-color: color-mix(in srgb, var(--account-card-accent) 17%, var(--account-card-inner-border));
+}
+
+.account-card-meta-item:nth-child(3) {
+  background: color-mix(in srgb, var(--account-card-accent) 11%, var(--account-card-inner-bg));
+  border-color: color-mix(in srgb, var(--account-card-accent) 19%, var(--account-card-inner-border));
 }
 
 .account-card-meta-item span {
   overflow: hidden;
   color: var(--cpa-text-muted);
   font-size: 11px;
+  line-height: 1.1;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2929,7 +2986,7 @@ onBeforeUnmount(() => {
 .account-card-meta-item strong {
   min-width: 0;
   overflow: hidden;
-  color: var(--cpa-text);
+  color: color-mix(in srgb, var(--cpa-text) 88%, var(--cpa-text-muted));
   font-size: 12px;
   font-weight: 700;
   text-overflow: ellipsis;
@@ -2980,7 +3037,7 @@ onBeforeUnmount(() => {
   gap: 7px;
   min-width: 0;
   padding-top: 9px;
-  border-top: 1px solid color-mix(in srgb, var(--cpa-border) 70%, transparent);
+  border-top: 1px solid var(--account-card-inner-border);
 }
 
 .card-quota-bar:first-child {
@@ -3023,7 +3080,8 @@ onBeforeUnmount(() => {
   font-size: 11px;
   font-weight: 800;
   line-height: 1.35;
-  background: color-mix(in srgb, var(--cpa-text-muted) 9%, transparent);
+  background: color-mix(in srgb, var(--account-card-accent) 8%, var(--account-card-inner-bg));
+  border: 1px solid color-mix(in srgb, var(--account-card-accent) 12%, transparent);
   border-radius: 999px;
   font-variant-numeric: tabular-nums;
 }
@@ -3040,7 +3098,6 @@ onBeforeUnmount(() => {
 }
 
 .card-quota-usage-tag {
-  --usage-accent: var(--cpa-primary);
   display: grid;
   align-content: space-between;
   gap: 4px;
@@ -3048,23 +3105,19 @@ onBeforeUnmount(() => {
   min-height: 42px;
   overflow: hidden;
   padding: 7px 8px 6px;
-  background:
-    linear-gradient(
-      180deg,
-      color-mix(in srgb, var(--usage-accent) 5%, var(--cpa-surface-raised)),
-      color-mix(in srgb, var(--cpa-surface-muted) 88%, var(--cpa-surface-raised))
-    );
-  border: 1px solid color-mix(in srgb, var(--usage-accent) 18%, var(--cpa-border));
+  background: color-mix(in srgb, var(--account-card-accent) 8%, var(--account-card-inner-bg));
+  border: 1px solid color-mix(in srgb, var(--account-card-accent) 16%, var(--account-card-inner-border));
   border-radius: var(--cpa-radius-sm);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--cpa-surface-raised) 70%, transparent);
 }
 
 .card-quota-usage-tag:nth-child(2) {
-  --usage-accent: var(--cpa-accent-blue);
+  background: color-mix(in srgb, var(--account-card-accent) 10%, var(--account-card-inner-bg));
+  border-color: color-mix(in srgb, var(--account-card-accent) 18%, var(--account-card-inner-border));
 }
 
 .card-quota-usage-tag:nth-child(3) {
-  --usage-accent: var(--cpa-accent-orange);
+  background: color-mix(in srgb, var(--account-card-accent) 12%, var(--account-card-inner-bg));
+  border-color: color-mix(in srgb, var(--account-card-accent) 20%, var(--account-card-inner-border));
 }
 
 .card-quota-usage-tag span,
@@ -3076,14 +3129,13 @@ onBeforeUnmount(() => {
 }
 
 .card-quota-usage-tag span {
-  color: color-mix(in srgb, var(--usage-accent) 62%, var(--cpa-text-muted));
+  color: var(--cpa-text-muted);
   font-size: 10px;
-  font-weight: 700;
   line-height: 1.1;
 }
 
 .card-quota-usage-tag strong {
-  color: var(--cpa-text-strong);
+  color: color-mix(in srgb, var(--cpa-text-strong) 88%, var(--cpa-text-muted));
   font-size: 13px;
   font-weight: 800;
   line-height: 1.1;
