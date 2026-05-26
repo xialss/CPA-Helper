@@ -727,6 +727,164 @@ func TestAutomaticKeeperRunsRespectCacheButManualRefreshBypasses(t *testing.T) {
 	}
 }
 
+func TestKeeperCredentialWebsocketsAppliesToRefreshModes(t *testing.T) {
+	modes := []struct {
+		name      string
+		mode      string
+		authNames []string
+	}{
+		{name: "daemon", mode: "daemon"},
+		{name: "run-once", mode: "once"},
+		{name: "accounts", mode: "accounts", authNames: []string{"accounts-auth.json"}},
+		{name: "conditional", mode: "conditional", authNames: []string{"conditional-auth.json"}},
+	}
+
+	for _, tc := range modes {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+			authName := tc.name + "-auth.json"
+			if len(tc.authNames) > 0 {
+				authName = tc.authNames[0]
+			}
+			websocketPatches := 0
+			priorityPatches := 0
+			authDetail := map[string]any{
+				"name":         authName,
+				"type":         "codex",
+				"email":        "ws@example.com",
+				"account_type": "free",
+				"disabled":     false,
+				"priority":     0,
+				"access_token": "test-token",
+				"websockets":   false,
+			}
+			cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"files": []map[string]any{{"name": authName, "type": "codex", "websockets": false}},
+					})
+				case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+					if r.URL.Query().Get("name") != authName {
+						http.NotFound(w, r)
+						return
+					}
+					_ = json.NewEncoder(w).Encode(authDetail)
+				case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+					_ = json.NewEncoder(w).Encode(keeperWebsocketUsageSuccessPayload(10))
+				case r.Method == http.MethodPatch && r.URL.Path == "/v0/management/auth-files/fields":
+					var payload map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					if payload["name"] != authName {
+						http.Error(w, "unexpected auth name", http.StatusBadRequest)
+						return
+					}
+					if value, ok := payload["websockets"].(bool); ok && value {
+						websocketPatches++
+						authDetail["websockets"] = true
+						_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+						return
+					}
+					if _, ok := payload["priority"]; ok {
+						priorityPatches++
+						_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+						return
+					}
+					http.Error(w, "missing supported field", http.StatusBadRequest)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer cpa.Close()
+
+			app, err := New()
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+			defer app.Close()
+			configureKeeperTestCPA(t, app, cpa.URL, func(cfg *AppConfig) {
+				cfg.CodexKeeper.DryRun = false
+				cfg.CodexKeeper.EnableCredentialWebsockets = true
+				cfg.CodexKeeper.WorkerThreads = 1
+			})
+
+			stats, _, err := app.executeKeeperRunForAccounts(context.Background(), tc.mode, tc.authNames, func(string) {})
+			if err != nil {
+				t.Fatalf("%s run: %v", tc.mode, err)
+			}
+			if websocketPatches != 1 {
+				t.Fatalf("websocket patches = %d, want 1", websocketPatches)
+			}
+			if priorityPatches != 0 {
+				t.Fatalf("priority patches = %d, want 0", priorityPatches)
+			}
+			if stats.Total != 1 || stats.Healthy != 1 || stats.NetworkError != 0 {
+				t.Fatalf("stats = %#v, want one healthy account", stats)
+			}
+		})
+	}
+}
+
+func TestKeeperCredentialWebsocketsRespectsDryRun(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	websocketPatches := 0
+	authName := "dry-run-auth.json"
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{{"name": authName, "type": "codex", "websockets": false}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name":         authName,
+				"type":         "codex",
+				"account_type": "free",
+				"disabled":     false,
+				"priority":     0,
+				"access_token": "test-token",
+				"websockets":   false,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			_ = json.NewEncoder(w).Encode(keeperWebsocketUsageSuccessPayload(10))
+		case r.Method == http.MethodPatch && r.URL.Path == "/v0/management/auth-files/fields":
+			websocketPatches++
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, func(cfg *AppConfig) {
+		cfg.CodexKeeper.DryRun = true
+		cfg.CodexKeeper.EnableCredentialWebsockets = true
+	})
+
+	stats, _, err := app.executeKeeperRunForAccounts(context.Background(), "once", nil, func(string) {})
+	if err != nil {
+		t.Fatalf("once run: %v", err)
+	}
+	if websocketPatches != 0 {
+		t.Fatalf("websocket patches = %d, want 0 in dry run", websocketPatches)
+	}
+	if stats.Total != 1 || stats.Healthy != 1 {
+		t.Fatalf("stats = %#v, want one healthy account", stats)
+	}
+}
+
 func TestAutomaticKeeperRunCountsCachedBadCredentialState(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 
@@ -1875,5 +2033,20 @@ func assertStringSet(t *testing.T, got []string, want []string) {
 		if !gotSet[item] {
 			t.Fatalf("names = %#v, want set %#v", got, want)
 		}
+	}
+}
+
+func keeperWebsocketUsageSuccessPayload(usedPercent int) map[string]any {
+	return map[string]any{
+		"status_code": 200,
+		"body": map[string]any{
+			"plan_type": "free",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{
+					"used_percent":        usedPercent,
+					"reset_after_seconds": 3600,
+				},
+			},
+		},
 	}
 }

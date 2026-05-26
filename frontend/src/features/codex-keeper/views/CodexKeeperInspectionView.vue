@@ -90,6 +90,7 @@ const form = reactive({
   conditional_refresh_interval_seconds: 30,
   account_refresh_cache_minutes: 10,
   dry_run: true,
+  enable_credential_websockets: false,
   auto_start_daemon: false,
 })
 
@@ -173,6 +174,7 @@ function applySettings(nextSettings: Awaited<ReturnType<typeof getCodexKeeperSet
   form.conditional_refresh_interval_seconds = nextSettings.conditional_refresh_interval_seconds
   form.account_refresh_cache_minutes = nextSettings.account_refresh_cache_minutes
   form.dry_run = nextSettings.dry_run
+  form.enable_credential_websockets = nextSettings.enable_credential_websockets
   form.auto_start_daemon = nextSettings.auto_start_daemon
   nextRunTimes.value = nextSettings.next_run_times
   schedulePreviewError.value = ''
@@ -685,6 +687,20 @@ onBeforeUnmount(() => {
                   <NFormItem class="switch-form-item">
                     <div class="switch-setting">
                       <div class="switch-copy">
+                        <span class="switch-title">启用凭证 WebSocket</span>
+                        <p class="switch-help">
+                          刷新时为每个 Codex 凭证写入 websockets=true，用于 Responses API 的 WebSocket 传输。
+                        </p>
+                      </div>
+                      <NSwitch
+                        v-model:value="form.enable_credential_websockets"
+                        class="switch-control"
+                      />
+                    </div>
+                  </NFormItem>
+                  <NFormItem class="switch-form-item">
+                    <div class="switch-setting">
+                      <div class="switch-copy">
                         <span class="switch-title">启动后自动巡检</span>
                         <p class="switch-help">每次 CPA-Helper 启动后，自动按上面的计划检查账号。</p>
                       </div>
@@ -944,7 +960,7 @@ onBeforeUnmount(() => {
 
 .switch-row {
   display: grid;
-  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  grid-template-columns: repeat(3, minmax(220px, 1fr));
   gap: 10px;
   margin-top: 10px;
 }

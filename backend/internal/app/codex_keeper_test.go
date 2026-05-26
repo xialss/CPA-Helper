@@ -26,8 +26,9 @@ type keeperStatusResponse struct {
 }
 
 type keeperSettingsResponse struct {
-	ConditionalRefreshIntervalSeconds int `json:"conditional_refresh_interval_seconds"`
-	AccountRefreshCacheMinutes        int `json:"account_refresh_cache_minutes"`
+	ConditionalRefreshIntervalSeconds int  `json:"conditional_refresh_interval_seconds"`
+	AccountRefreshCacheMinutes        int  `json:"account_refresh_cache_minutes"`
+	EnableCredentialWebsockets        bool `json:"enable_credential_websockets"`
 }
 
 type keeperAccountsResponse struct {
@@ -155,16 +156,23 @@ func TestKeeperSettingsExposeConditionalRefreshConfig(t *testing.T) {
 	if settings.AccountRefreshCacheMinutes != 10 {
 		t.Fatalf("account_refresh_cache_minutes = %d, want 10", settings.AccountRefreshCacheMinutes)
 	}
+	if settings.EnableCredentialWebsockets {
+		t.Fatal("enable_credential_websockets = true, want false by default")
+	}
 
 	requestJSON(t, handler, http.MethodPut, "/api/codex-keeper/settings", map[string]any{
 		"conditional_refresh_interval_seconds": 0,
 		"account_refresh_cache_minutes":        15,
+		"enable_credential_websockets":         true,
 	}, cookies, &settings)
 	if settings.ConditionalRefreshIntervalSeconds != 0 {
 		t.Fatalf("saved conditional_refresh_interval_seconds = %d, want 0", settings.ConditionalRefreshIntervalSeconds)
 	}
 	if settings.AccountRefreshCacheMinutes != 15 {
 		t.Fatalf("saved account_refresh_cache_minutes = %d, want 15", settings.AccountRefreshCacheMinutes)
+	}
+	if !settings.EnableCredentialWebsockets {
+		t.Fatal("saved enable_credential_websockets = false, want true")
 	}
 
 	requestJSONExpectStatus(t, handler, http.MethodPut, "/api/codex-keeper/settings", map[string]any{

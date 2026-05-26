@@ -106,6 +106,7 @@ export interface CodexKeeperSettings {
   conditional_refresh_interval_seconds: number
   account_refresh_cache_minutes: number
   dry_run: boolean
+  enable_credential_websockets: boolean
   auto_start_daemon: boolean
   priority_rules: CodexKeeperPriorityRule[]
 }
@@ -120,6 +121,7 @@ export interface CodexKeeperSettingsUpdatePayload {
   conditional_refresh_interval_seconds?: number
   account_refresh_cache_minutes?: number
   dry_run?: boolean
+  enable_credential_websockets?: boolean
   auto_start_daemon?: boolean
   priority_rules?: CodexKeeperPriorityRule[]
 }

@@ -436,6 +436,7 @@ type KeeperConfig struct {
 	ConditionalRefreshIntervalSeconds int    `json:"conditional_refresh_interval_seconds"`
 	AccountRefreshCacheMinutes        int    `json:"account_refresh_cache_minutes"`
 	DryRun                            bool   `json:"dry_run"`
+	EnableCredentialWebsockets        bool   `json:"enable_credential_websockets"`
 	AutoStartDaemon                   bool   `json:"auto_start_daemon"`
 }
 
@@ -478,6 +479,7 @@ func defaultConfig() (AppConfig, error) {
 			ConditionalRefreshIntervalSeconds: 30,
 			AccountRefreshCacheMinutes:        10,
 			DryRun:                            true,
+			EnableCredentialWebsockets:        false,
 			AutoStartDaemon:                   false,
 		},
 		CodexKeeperPriorityRule: clonePriorityRules(defaultKeeperPriorityRules),

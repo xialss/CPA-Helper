@@ -88,6 +88,7 @@ type keeperSettingsUpdateRequest struct {
 	ConditionalRefreshIntervalSeconds *int                 `json:"conditional_refresh_interval_seconds"`
 	AccountRefreshCacheMinutes        *int                 `json:"account_refresh_cache_minutes"`
 	DryRun                            *bool                `json:"dry_run"`
+	EnableCredentialWebsockets        *bool                `json:"enable_credential_websockets"`
 	AutoStartDaemon                   *bool                `json:"auto_start_daemon"`
 	PriorityRules                     []keeperPriorityRule `json:"priority_rules"`
 }
@@ -1020,6 +1021,7 @@ func keeperSettingsResponse(cfg AppConfig) map[string]any {
 		"conditional_refresh_interval_seconds": cfg.CodexKeeper.ConditionalRefreshIntervalSeconds,
 		"account_refresh_cache_minutes":        cfg.CodexKeeper.AccountRefreshCacheMinutes,
 		"dry_run":                              cfg.CodexKeeper.DryRun,
+		"enable_credential_websockets":         cfg.CodexKeeper.EnableCredentialWebsockets,
 		"auto_start_daemon":                    cfg.CodexKeeper.AutoStartDaemon,
 		"priority_rules":                       sortedPriorityRules(cfg.CodexKeeperPriorityRule),
 	}
@@ -1463,6 +1465,9 @@ func (a *App) updateKeeperSettings(w http.ResponseWriter, r *http.Request) error
 	if payload.DryRun != nil {
 		cfg.CodexKeeper.DryRun = *payload.DryRun
 	}
+	if payload.EnableCredentialWebsockets != nil {
+		cfg.CodexKeeper.EnableCredentialWebsockets = *payload.EnableCredentialWebsockets
+	}
 	if payload.AutoStartDaemon != nil {
 		cfg.CodexKeeper.AutoStartDaemon = *payload.AutoStartDaemon
 	}
@@ -1588,6 +1593,18 @@ func (a *App) executeKeeperRunWithOptions(ctx context.Context, options keeperRun
 		}
 	}
 	stats.Total = len(filtered)
+	if cfg.CodexKeeper.EnableCredentialWebsockets && !cfg.CodexKeeper.DryRun {
+		var websocketFailures []keeperAccountResult
+		filtered, websocketFailures = a.ensureKeeperAuthWebsockets(ctx, cfg, options.Mode, filtered, logFn, options.TryLockAuthName, options.UnlockAuthName)
+		for _, result := range websocketFailures {
+			a.mergeKeeperStats(&stats, result)
+			if runID > 0 {
+				if err := a.recordKeeperRunAccount(ctx, runID, result); err != nil {
+					logFn("写入巡检账号历史失败：" + err.Error())
+				}
+			}
+		}
+	}
 	if options.UseRefreshCache {
 		var skippedNames []string
 		filtered, skippedNames, err = a.filterKeeperCachedAuthItems(ctx, filtered, cfg)
@@ -1606,7 +1623,9 @@ func (a *App) executeKeeperRunWithOptions(ctx context.Context, options keeperRun
 		}
 	}
 	if len(filtered) == 0 {
-		if stats.Total > 0 && options.UseRefreshCache {
+		if stats.NetworkError > 0 {
+			detail = fmt.Sprintf("巡检完成：网络错误 %d", stats.NetworkError)
+		} else if stats.Total > 0 && options.UseRefreshCache {
 			detail = "缓存时间内没有需要自动刷新的 Codex auth file"
 		} else if len(targetSet) > 0 {
 			detail = "未发现指定 Codex auth file"
@@ -2225,6 +2244,68 @@ func (a *App) keeperAuthCheckedSince(ctx context.Context, name string, cutoff ti
 	return checkedAt.After(cutoff) || checkedAt.Equal(cutoff), nil
 }
 
+func (a *App) ensureKeeperAuthWebsockets(
+	ctx context.Context,
+	cfg AppConfig,
+	mode string,
+	items []map[string]any,
+	logFn func(string),
+	tryLock func(string, string) bool,
+	unlock func(string),
+) ([]map[string]any, []keeperAccountResult) {
+	if len(items) == 0 {
+		return items, nil
+	}
+	remaining := make([]map[string]any, 0, len(items))
+	failures := []keeperAccountResult{}
+	now := time.Now().In(appTimeLocation)
+	for _, item := range items {
+		name := keeperString(item["name"])
+		if name == "" || keeperBool(item["websockets"]) {
+			remaining = append(remaining, item)
+			continue
+		}
+		locked := false
+		if tryLock != nil && unlock != nil {
+			if !tryLock(mode, name) {
+				remaining = append(remaining, item)
+				continue
+			}
+			locked = true
+		}
+		unlockIfNeeded := func() {
+			if locked && unlock != nil {
+				unlock(name)
+				locked = false
+			}
+		}
+		if err := a.setKeeperRemoteWebsockets(ctx, cfg, name); err != nil {
+			message := "启用 WebSocket 传输失败：" + err.Error()
+			disabled := keeperBool(item["disabled"])
+			result := keeperAccountResult{
+				Name:         name,
+				AccountType:  keeperStringPtr(item["account_type"], item["accountType"]),
+				Disabled:     &disabled,
+				Priority:     keeperIntPtr(item["priority"]),
+				Result:       "network_error",
+				LastError:    &message,
+				LatestAction: &message,
+				CheckedAt:    now,
+			}
+			_ = a.upsertKeeperState(ctx, result)
+			logFn(name + ": " + message)
+			failures = append(failures, result)
+			unlockIfNeeded()
+			continue
+		}
+		item["websockets"] = true
+		unlockIfNeeded()
+		logFn(name + ": 已启用 WebSocket 传输")
+		remaining = append(remaining, item)
+	}
+	return remaining, failures
+}
+
 func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map[string]any, logFn func(string), manualRefresh bool) keeperAccountResult {
 	now := time.Now().In(appTimeLocation)
 	name := keeperString(authInfo["name"])
@@ -2621,6 +2702,11 @@ func (a *App) setKeeperRemoteDisabled(ctx context.Context, cfg AppConfig, name s
 
 func (a *App) setKeeperRemotePriority(ctx context.Context, cfg AppConfig, name string, priority *int) error {
 	_, _, err := a.keeperRequest(ctx, cfg, http.MethodPatch, "/v0/management/auth-files/fields", nil, map[string]any{"name": name, "priority": priority}, time.Duration(cfg.CodexKeeper.CPATimeoutSeconds)*time.Second)
+	return err
+}
+
+func (a *App) setKeeperRemoteWebsockets(ctx context.Context, cfg AppConfig, name string) error {
+	_, _, err := a.keeperRequest(ctx, cfg, http.MethodPatch, "/v0/management/auth-files/fields", nil, map[string]any{"name": name, "websockets": true}, time.Duration(cfg.CodexKeeper.CPATimeoutSeconds)*time.Second)
 	return err
 }
 
