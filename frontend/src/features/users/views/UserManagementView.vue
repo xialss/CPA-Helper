@@ -27,10 +27,12 @@ import {
   updateUser,
   updateUserQuota,
 } from '@/features/users/api/usersApi'
+import { useI18n } from '@/shared/i18n'
 import type { UserSummary } from '@/shared/types/api'
 import { formatCompact, formatDateTime, formatInteger, formatUsd } from '@/shared/utils/format'
 
 const message = useMessage()
+const { errorText, t } = useI18n()
 const isLoading = ref(false)
 const isSavingUser = ref(false)
 const users = ref<UserSummary[]>([])
@@ -62,33 +64,33 @@ const userMetrics = computed<UserMetricCard[]>(() => {
   return [
     {
       key: 'active',
-      label: '启用用户',
+      label: t('启用用户', 'Active users'),
       value: formatInteger(activeUsers),
-      footnote: `共 ${formatInteger(users.value.length)} 个账号`,
+      footnote: t(`共 ${formatInteger(users.value.length)} 个账号`, `${formatInteger(users.value.length)} accounts total`),
       tone: 'teal',
       icon: UserRound,
     },
     {
       key: 'admins',
-      label: '管理员',
+      label: t('管理员', 'Admins'),
       value: formatInteger(adminUsers),
-      footnote: '拥有管理权限',
+      footnote: t('拥有管理权限', 'Have admin access'),
       tone: 'purple',
       icon: ShieldCheck,
     },
     {
       key: 'keys',
-      label: '绑定 Key',
+      label: t('绑定 Key', 'Bound keys'),
       value: formatInteger(boundKeys),
-      footnote: '当前用户集合',
+      footnote: t('当前用户集合', 'Current users'),
       tone: 'blue',
       icon: KeyRound,
     },
     {
       key: 'cost',
-      label: '今日费用',
+      label: t('今日费用', 'Today cost'),
       value: formatUsd(todayCost),
-      footnote: '按现价估算',
+      footnote: t('按现价估算', 'Estimated at current prices'),
       tone: 'green',
       icon: CircleDollarSign,
     },
@@ -96,12 +98,12 @@ const userMetrics = computed<UserMetricCard[]>(() => {
 })
 
 function userLabel(row: UserSummary): string {
-  return row.nickname.trim() || row.username.trim() || '未知用户'
+  return row.nickname.trim() || row.username.trim() || t('未知用户', 'Unknown user')
 }
 
 function quotaBalanceValue(row: UserSummary, bucket: 'monthly' | 'lifetime'): string {
   if (row.quota.unlimited) {
-    return '无限制'
+    return t('无限制', 'Unlimited')
   }
 
   const value = bucket === 'monthly' ? row.quota.monthly_remaining_usd : row.quota.lifetime_remaining_usd
@@ -120,36 +122,36 @@ function quotaBalanceClass(row: UserSummary): string {
 
 function quotaDetail(row: UserSummary): string | null {
   if (row.quota.paused) {
-    return 'Key 已因余额暂停'
+    return t('Key 已因余额暂停', 'Keys paused due to balance')
   }
   if (row.quota.sync_error) {
-    return '同步异常'
+    return t('同步异常', 'Sync error')
   }
   if (row.quota.unpriced_records > 0) {
-    return `未定价 ${formatInteger(row.quota.unpriced_records)} 条`
+    return t(`未定价 ${formatInteger(row.quota.unpriced_records)} 条`, `${formatInteger(row.quota.unpriced_records)} unpriced`)
   }
   return null
 }
 
 function todayRequestDetail(row: UserSummary): string {
   if (!row.today_records) {
-    return `累计 ${formatInteger(row.records)}`
+    return t(`累计 ${formatInteger(row.records)}`, `${formatInteger(row.records)} total`)
   }
   const failed = row.today_failed_records
-    ? `失败 ${formatInteger(row.today_failed_records)}`
-    : '无失败'
+    ? t(`失败 ${formatInteger(row.today_failed_records)}`, `${formatInteger(row.today_failed_records)} failed`)
+    : t('无失败', 'No failures')
   const rate = Math.round((row.today_success_records / row.today_records) * 100)
   return `${rate}% · ${failed}`
 }
 
 function todayCostDetail(row: UserSummary): string {
   if (!row.today_records) {
-    return '今日无请求'
+    return t('今日无请求', 'No requests today')
   }
   if (row.today_unpriced_records > 0) {
-    return `未计价 ${formatInteger(row.today_unpriced_records)}`
+    return t(`未计价 ${formatInteger(row.today_unpriced_records)}`, `${formatInteger(row.today_unpriced_records)} unpriced`)
   }
-  return '已计价'
+  return t('已计价', 'Priced')
 }
 
 function lastModelLabel(row: UserSummary): string {
@@ -157,7 +159,7 @@ function lastModelLabel(row: UserSummary): string {
 }
 
 function lastProviderLabel(row: UserSummary): string {
-  return row.last_provider ?? '未知服务商'
+  return row.last_provider ?? t('未知服务商', 'Unknown provider')
 }
 
 function setQuotaLifetimeUsd(value: number | null) {
@@ -202,7 +204,7 @@ async function refresh() {
   try {
     users.value = await listUsers()
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载用户列表失败')
+    message.error(errorText(error, '加载用户列表失败', 'Failed to load users'))
   } finally {
     isLoading.value = false
   }
@@ -215,38 +217,38 @@ function isUserDisabled(row: UserSummary): boolean {
 async function disableUserRow(row: UserSummary) {
   try {
     await disableUser(row.id)
-    message.success('用户已禁用')
+    message.success(t('用户已禁用', 'User disabled'))
     await refresh()
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '禁用用户失败')
+    message.error(errorText(error, '禁用用户失败', 'Failed to disable user'))
   }
 }
 
 async function enableUserRow(row: UserSummary) {
   try {
     await enableUser(row.id)
-    message.success('用户已启用')
+    message.success(t('用户已启用', 'User enabled'))
     await refresh()
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '启用用户失败')
+    message.error(errorText(error, '启用用户失败', 'Failed to enable user'))
   }
 }
 
 async function saveUser() {
   const nickname = userNickname.value.trim()
   if (!nickname) {
-    message.error('用户昵称不能为空')
+    message.error(t('用户昵称不能为空', 'User nickname is required'))
     return
   }
   const username = userAccount.value.trim()
   if (!username) {
-    message.error('账号不能为空')
+    message.error(t('账号不能为空', 'Account is required'))
     return
   }
   const isEditing = editingUserId.value !== null
   const password = userPassword.value.trim()
   if (!isEditing && !password) {
-    message.error('密码不能为空')
+    message.error(t('密码不能为空', 'Password is required'))
     return
   }
   isSavingUser.value = true
@@ -265,38 +267,38 @@ async function saveUser() {
       lifetime_quota_usd: quotaUnlimited.value ? null : quotaLifetimeUsd.value,
       monthly_quota_usd: quotaUnlimited.value ? null : quotaMonthlyUsd.value,
     })
-    message.success(isEditing ? '用户已保存' : '用户已创建')
+    message.success(isEditing ? t('用户已保存', 'User saved') : t('用户已创建', 'User created'))
     editorVisible.value = false
     resetEditor()
     await refresh()
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '保存用户失败')
+    message.error(errorText(error, '保存用户失败', 'Failed to save user'))
   } finally {
     isSavingUser.value = false
   }
 }
 
-const columns: DataTableColumns<UserSummary> = [
+const columns = computed<DataTableColumns<UserSummary>>(() => [
   {
-    title: '用户昵称',
+    title: t('用户昵称', 'User nickname'),
     key: 'nickname',
     width: 120,
     render: (row) => userLabel(row),
   },
   {
-    title: '账号',
+    title: t('账号', 'Account'),
     key: 'username',
     width: 130,
     render: (row) => row.username,
   },
   {
-    title: '角色',
+    title: t('角色', 'Role'),
     key: 'is_admin',
     width: 90,
-    render: (row) => (row.is_admin ? '管理员' : '普通用户'),
+    render: (row) => (row.is_admin ? t('管理员', 'Admin') : t('普通用户', 'Standard user')),
   },
   {
-    title: '状态',
+    title: t('状态', 'Status'),
     key: 'disabled_at',
     width: 90,
     render: (row) =>
@@ -307,22 +309,22 @@ const columns: DataTableColumns<UserSummary> = [
           type: isUserDisabled(row) ? 'warning' : 'success',
           bordered: false,
         },
-        { default: () => (isUserDisabled(row) ? '已禁用' : '启用中') },
+        { default: () => (isUserDisabled(row) ? t('已禁用', 'Disabled') : t('启用中', 'Enabled')) },
       ),
   },
   {
-    title: '余额',
+    title: t('余额', 'Balance'),
     key: 'quota',
     width: 210,
     render: (row) => {
       const detail = quotaDetail(row)
       return h('div', { class: ['metric-stack', 'quota-balance-stack'] }, [
         h('div', { class: ['quota-balance-row', 'is-monthly', quotaBalanceClass(row)] }, [
-          h('span', { class: 'quota-balance-label' }, '每月余额：'),
+          h('span', { class: 'quota-balance-label' }, t('每月余额：', 'Monthly: ')),
           h('strong', { class: 'quota-balance-value' }, quotaBalanceValue(row, 'monthly')),
         ]),
         h('div', { class: ['quota-balance-row', 'is-lifetime', quotaBalanceClass(row)] }, [
-          h('span', { class: 'quota-balance-label' }, '不限时余额：'),
+          h('span', { class: 'quota-balance-label' }, t('不限时余额：', 'Lifetime: ')),
           h('strong', { class: 'quota-balance-value' }, quotaBalanceValue(row, 'lifetime')),
         ]),
         ...(detail
@@ -338,13 +340,13 @@ const columns: DataTableColumns<UserSummary> = [
     },
   },
   {
-    title: 'API KEY',
+    title: t('API KEY 数量', 'API keys'),
     key: 'key_count',
     width: 95,
-    render: (row) => `${formatInteger(row.key_count)} 个`,
+    render: (row) => t(`${formatInteger(row.key_count)} 个`, `${formatInteger(row.key_count)} keys`),
   },
   {
-    title: '今日请求',
+    title: t('今日请求', 'Today requests'),
     key: 'today_records',
     width: 140,
     render: (row) =>
@@ -354,31 +356,31 @@ const columns: DataTableColumns<UserSummary> = [
       ]),
   },
   {
-    title: '今日输入',
+    title: t('今日输入', 'Today input'),
     key: 'today_input_tokens',
     width: 120,
     render: (row) => formatCompact(row.today_input_tokens),
   },
   {
-    title: '今日输出',
+    title: t('今日输出', 'Today output'),
     key: 'today_output_tokens',
     width: 120,
     render: (row) => formatCompact(row.today_output_tokens),
   },
   {
-    title: '今日缓存',
+    title: t('今日缓存', 'Today cache'),
     key: 'today_cached_tokens',
     width: 120,
     render: (row) => formatCompact(row.today_cached_tokens),
   },
   {
-    title: '今日总 Token',
+    title: t('今日总 Token', 'Today total tokens'),
     key: 'today_total_tokens',
     width: 145,
     render: (row) => formatCompact(row.today_total_tokens),
   },
   {
-    title: '今日费用',
+    title: t('今日费用', 'Today cost'),
     key: 'today_estimated_cost_usd',
     width: 150,
     render: (row) =>
@@ -392,7 +394,7 @@ const columns: DataTableColumns<UserSummary> = [
       ]),
   },
   {
-    title: '最近模型',
+    title: t('最近模型', 'Recent model'),
     key: 'last_model',
     width: 160,
     render: (row) =>
@@ -402,7 +404,7 @@ const columns: DataTableColumns<UserSummary> = [
       ]),
   },
   {
-    title: '最近使用',
+    title: t('最近使用', 'Last used'),
     key: 'last_seen_at',
     width: 150,
     render: (row) => formatDateTime(row.last_seen_at),
@@ -421,7 +423,7 @@ const columns: DataTableColumns<UserSummary> = [
             h(
               NButton,
               { size: 'small', quaternary: true, onClick: () => editUser(row) },
-              { default: () => '编辑' },
+              { default: () => t('编辑', 'Edit') },
             ),
             row.id === 1
               ? null
@@ -434,9 +436,9 @@ const columns: DataTableColumns<UserSummary> = [
                         h(
                           NButton,
                           { size: 'small', quaternary: true, type: 'primary' },
-                          { default: () => '启用' },
+                          { default: () => t('启用', 'Enable') },
                         ),
-                      default: () => `启用用户 ${userLabel(row)} 并恢复其 API KEY？`,
+                      default: () => t(`启用用户 ${userLabel(row)} 并恢复其 API KEY？`, `Enable user ${userLabel(row)} and restore their API keys?`),
                     },
                   )
                 : h(
@@ -447,16 +449,16 @@ const columns: DataTableColumns<UserSummary> = [
                         h(
                           NButton,
                           { size: 'small', quaternary: true, type: 'warning' },
-                          { default: () => '禁用' },
+                          { default: () => t('禁用', 'Disable') },
                         ),
-                      default: () => `禁用用户 ${userLabel(row)} 并从 CPA 移除其 API KEY？`,
+                      default: () => t(`禁用用户 ${userLabel(row)} 并从 CPA 移除其 API KEY？`, `Disable user ${userLabel(row)} and remove their API keys from CPA?`),
                     },
                   ),
           ],
         },
       ),
   },
-]
+])
 
 onMounted(refresh)
 </script>
@@ -465,12 +467,12 @@ onMounted(refresh)
   <section class="page">
     <div class="page-header">
       <div>
-        <h1 class="page-title">用户管理</h1>
-        <p class="page-subtitle">管理用户昵称、登录账号、密码和角色</p>
+        <h1 class="page-title">{{ t('用户管理', 'User Management') }}</h1>
+        <p class="page-subtitle">{{ t('管理用户昵称、登录账号、密码和角色', 'Manage user nicknames, sign-in accounts, passwords, and roles') }}</p>
       </div>
       <NSpace>
-        <NButton secondary :loading="isLoading" @click="refresh">刷新</NButton>
-        <NButton type="primary" @click="openCreateUser">增加用户</NButton>
+        <NButton secondary :loading="isLoading" @click="refresh">{{ t('刷新', 'Refresh') }}</NButton>
+        <NButton type="primary" @click="openCreateUser">{{ t('增加用户', 'Add user') }}</NButton>
       </NSpace>
     </div>
 
@@ -502,54 +504,54 @@ onMounted(refresh)
       preset="card"
       :mask-closable="false"
       :closable="false"
-      :title="editingUserId ? '编辑用户' : '增加用户'"
+      :title="editingUserId ? t('编辑用户', 'Edit user') : t('增加用户', 'Add user')"
       :style="{ width: 'min(520px, calc(100vw - 32px))' }"
     >
       <NAlert v-if="editingUserId === null" type="warning" :bordered="false" class="user-editor-warning">
-        账号一旦创建，不允许删除，只允许禁用，请谨慎操作。
+        {{ t('账号一旦创建，不允许删除，只允许禁用，请谨慎操作。', 'Accounts cannot be deleted after creation. They can only be disabled, so proceed carefully.') }}
       </NAlert>
 
       <NForm label-placement="top">
-        <NFormItem label="用户昵称" required>
+        <NFormItem :label="t('用户昵称', 'User nickname')" required>
           <NInput
             v-model:value="userNickname"
-            placeholder="例如：研发用户"
+            :placeholder="t('例如：研发用户', 'Example: Engineering user')"
             @keyup.enter="saveUser"
           />
         </NFormItem>
-        <NFormItem label="账号" required>
+        <NFormItem :label="t('账号', 'Account')" required>
           <NInput
             v-model:value="userAccount"
             autocomplete="username"
             :disabled="editingUserId !== null"
-            placeholder="例如：user001"
+            :placeholder="t('例如：user001', 'Example: user001')"
             @keyup.enter="saveUser"
           />
         </NFormItem>
-        <NFormItem label="密码" :required="editingUserId === null">
+        <NFormItem :label="t('密码', 'Password')" :required="editingUserId === null">
           <NInput
             v-model:value="userPassword"
             type="password"
             show-password-on="mousedown"
             autocomplete="new-password"
-            :placeholder="editingUserId ? '留空不修改密码' : '请输入登录密码'"
+            :placeholder="editingUserId ? t('留空不修改密码', 'Leave blank to keep the current password') : t('请输入登录密码', 'Enter a sign-in password')"
             @keyup.enter="saveUser"
           />
         </NFormItem>
-        <NFormItem label="是否设为管理员">
+        <NFormItem :label="t('是否设为管理员', 'Set as admin')">
           <NSwitch v-model:value="isUserAdmin" :disabled="isEditingFirstUser" />
         </NFormItem>
-        <NFormItem label="余额设置">
+        <NFormItem :label="t('余额设置', 'Balance settings')">
           <div class="quota-unlimited-row">
             <div>
-              <div class="quota-unlimited-title">不限制余额</div>
-              <div class="quota-unlimited-desc">开启后不扣余额，也不会因余额暂停 API Key。</div>
+              <div class="quota-unlimited-title">{{ t('不限制余额', 'Unlimited balance') }}</div>
+              <div class="quota-unlimited-desc">{{ t('开启后不扣余额，也不会因余额暂停 API Key。', 'When enabled, balances are not deducted and API keys are not paused due to balance.') }}</div>
             </div>
             <NSwitch v-model:value="quotaUnlimited" />
           </div>
         </NFormItem>
         <div class="form-grid quota-editor-grid">
-          <NFormItem label="不限时余额 USD">
+          <NFormItem :label="t('不限时余额 USD', 'Lifetime balance USD')">
             <NInputNumber
               :value="quotaLifetimeUsd"
               :disabled="quotaUnlimited"
@@ -559,7 +561,7 @@ onMounted(refresh)
               @update:value="setQuotaLifetimeUsd"
             />
           </NFormItem>
-          <NFormItem label="每月余额 USD">
+          <NFormItem :label="t('每月余额 USD', 'Monthly balance USD')">
             <NInputNumber
               :value="quotaMonthlyUsd"
               :disabled="quotaUnlimited"
@@ -571,12 +573,12 @@ onMounted(refresh)
           </NFormItem>
         </div>
         <NAlert type="info" :bordered="false" class="quota-editor-hint">
-          关闭不限制后，扣费顺序：先扣每月余额，不足部分再扣不限时余额；两者都无剩余时暂停该用户的 API Key。
+          {{ t('关闭不限制后，扣费顺序：先扣每月余额，不足部分再扣不限时余额；两者都无剩余时暂停该用户的 API Key。', 'After unlimited balance is disabled, charges are deducted from monthly balance first, then lifetime balance. If neither has remaining balance, the user API keys are paused.') }}
         </NAlert>
         <div class="user-editor-actions">
-          <NButton secondary @click="editorVisible = false">取消</NButton>
+          <NButton secondary @click="editorVisible = false">{{ t('取消', 'Cancel') }}</NButton>
           <NButton type="primary" :loading="isSavingUser" @click="saveUser">
-            {{ editingUserId ? '保存' : '创建' }}
+            {{ editingUserId ? t('保存', 'Save') : t('创建', 'Create') }}
           </NButton>
         </div>
       </NForm>

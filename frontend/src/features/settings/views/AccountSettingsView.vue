@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { NButton, NForm, NFormItem, NInput, NSpace, useMessage } from 'naive-ui'
 import { ShieldCheck, UserRound } from 'lucide-vue-next'
 
 import { changeCredentials, getMe } from '@/features/auth/api/authApi'
 import { setCurrentUser } from '@/features/auth/state/currentUser'
+import { useI18n } from '@/shared/i18n'
 
 const message = useMessage()
+const { errorText, t } = useI18n()
 const isLoading = ref(false)
 const isSaving = ref(false)
 const isAdmin = ref(false)
@@ -16,6 +18,7 @@ const accountForm = reactive({
   password: '',
   current_password: '',
 })
+const roleText = computed(() => (isAdmin.value ? t('管理员', 'Admin') : t('普通账户', 'Standard account')))
 
 async function refresh() {
   isLoading.value = true
@@ -25,7 +28,7 @@ async function refresh() {
     accountForm.username = user.username
     isAdmin.value = user.is_admin
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载账户失败')
+    message.error(errorText(error, '加载账户失败', 'Failed to load account'))
   } finally {
     isLoading.value = false
   }
@@ -43,9 +46,9 @@ async function saveAccount() {
     accountForm.username = user.username
     accountForm.password = ''
     accountForm.current_password = ''
-    message.success('账户已更新')
+    message.success(t('账户已更新', 'Account updated'))
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '账户更新失败')
+    message.error(errorText(error, '账户更新失败', 'Failed to update account'))
   } finally {
     isSaving.value = false
   }
@@ -58,12 +61,12 @@ onMounted(refresh)
   <section class="page">
     <div class="page-header">
       <div>
-        <h1 class="page-title">账户设置</h1>
-        <p class="page-subtitle">查看账号并更新当前登录密码</p>
+        <h1 class="page-title">{{ t('账户设置', 'Account Settings') }}</h1>
+        <p class="page-subtitle">{{ t('查看账号并更新当前登录密码', 'View your account and update the current sign-in password') }}</p>
       </div>
       <NSpace>
-        <NButton secondary :loading="isLoading" @click="refresh">刷新</NButton>
-        <NButton type="primary" :loading="isSaving" @click="saveAccount">保存账户</NButton>
+        <NButton secondary :loading="isLoading" @click="refresh">{{ t('刷新', 'Refresh') }}</NButton>
+        <NButton type="primary" :loading="isSaving" @click="saveAccount">{{ t('保存账户', 'Save account') }}</NButton>
       </NSpace>
     </div>
 
@@ -72,29 +75,29 @@ onMounted(refresh)
         <div class="metric-icon" aria-hidden="true">
           <UserRound :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">当前账号</div>
+        <div class="metric-label">{{ t('当前账号', 'Current account') }}</div>
         <div class="metric-value">{{ accountForm.username || '-' }}</div>
-        <div class="metric-footnote">登录身份</div>
+        <div class="metric-footnote">{{ t('登录身份', 'Sign-in identity') }}</div>
       </div>
       <div class="metric-card is-purple">
         <div class="metric-icon" aria-hidden="true">
           <ShieldCheck :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">权限</div>
-        <div class="metric-value">{{ isAdmin ? '管理员' : '普通账户' }}</div>
-        <div class="metric-footnote">当前会话</div>
+        <div class="metric-label">{{ t('权限', 'Role') }}</div>
+        <div class="metric-value">{{ roleText }}</div>
+        <div class="metric-footnote">{{ t('当前会话', 'Current session') }}</div>
       </div>
     </div>
 
     <section class="panel">
       <div class="panel-inner">
-        <h2 class="section-title">账号与密码</h2>
+        <h2 class="section-title">{{ t('账号与密码', 'Account and Password') }}</h2>
         <NForm :model="accountForm" label-placement="top">
           <div class="form-grid">
-            <NFormItem label="账号">
+            <NFormItem :label="t('账号', 'Account')">
               <NInput v-model:value="accountForm.username" autocomplete="username" disabled />
             </NFormItem>
-            <NFormItem label="当前密码">
+            <NFormItem :label="t('当前密码', 'Current password')">
               <NInput
                 v-model:value="accountForm.current_password"
                 type="password"
@@ -102,7 +105,7 @@ onMounted(refresh)
                 autocomplete="current-password"
               />
             </NFormItem>
-            <NFormItem label="新密码">
+            <NFormItem :label="t('新密码', 'New password')">
               <NInput
                 v-model:value="accountForm.password"
                 type="password"

@@ -5,14 +5,21 @@ import {
   NDialogProvider,
   NGlobalStyle,
   NMessageProvider,
+  dateEnUS,
   dateZhCN,
+  enUS,
   zhCN,
   type GlobalThemeOverrides,
 } from 'naive-ui'
 
 import { useThemePreference } from '@/shared/composables/useThemePreference'
+import { useLanguagePreference } from '@/shared/i18n'
 
 const { naiveTheme, naiveThemeIsDark } = useThemePreference()
+const { language } = useLanguagePreference()
+
+const naiveLocale = computed(() => (language.value === 'zh' ? zhCN : enUS))
+const naiveDateLocale = computed(() => (language.value === 'zh' ? dateZhCN : dateEnUS))
 
 const themeOverrides = computed<GlobalThemeOverrides>(() => ({
   common: {
@@ -52,8 +59,8 @@ const themeOverrides = computed<GlobalThemeOverrides>(() => ({
   <NConfigProvider
     :theme="naiveTheme"
     :theme-overrides="themeOverrides"
-    :locale="zhCN"
-    :date-locale="dateZhCN"
+    :locale="naiveLocale"
+    :date-locale="naiveDateLocale"
   >
     <NDialogProvider>
       <NMessageProvider>

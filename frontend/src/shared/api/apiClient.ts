@@ -1,3 +1,5 @@
+import { localizedApiErrorMessage } from '@/shared/i18n'
+
 interface ApiErrorPayload {
   detail?: {
     code?: string
@@ -16,13 +18,13 @@ function isApiErrorPayload(value: unknown): value is ApiErrorPayload {
 async function parseError(response: Response): Promise<string> {
   try {
     const data: unknown = await response.json()
-    if (isApiErrorPayload(data) && data.detail?.message) {
-      return data.detail.message
+    if (isApiErrorPayload(data)) {
+      return localizedApiErrorMessage(data.detail?.code, data.detail?.message)
     }
   } catch {
-    return response.statusText || '请求失败'
+    return localizedApiErrorMessage(null, null)
   }
-  return response.statusText || '请求失败'
+  return localizedApiErrorMessage(null, null)
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {

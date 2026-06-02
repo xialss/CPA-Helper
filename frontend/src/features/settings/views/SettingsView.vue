@@ -21,10 +21,12 @@ import {
   getSettings,
   updateSettings,
 } from '@/features/settings/api/settingsApi'
+import { useI18n } from '@/shared/i18n'
 import type { CollectorStatus, SettingsUpdatePayload } from '@/shared/types/api'
 import { formatDateTime, formatInteger } from '@/shared/utils/format'
 
 const message = useMessage()
+const { errorText, serverText, t } = useI18n()
 const isLoading = ref(false)
 const isSaving = ref(false)
 const collectorStatus = ref<CollectorStatus | null>(null)
@@ -51,16 +53,16 @@ const remoteStatusType = computed(() => {
 
 const remoteStatusText = computed(() => {
   if (collectorStatus.value?.remote_enabled === true) {
-    return '开启'
+    return t('开启', 'On')
   }
   if (collectorStatus.value?.remote_enabled === false) {
-    return '关闭'
+    return t('关闭', 'Off')
   }
-  return '未知'
+  return t('未知', 'Unknown')
 })
 
-const collectorEnabledText = computed(() => (collectorStatus.value?.enabled ? '开启' : '关闭'))
-const collectorRunningText = computed(() => (collectorStatus.value?.running ? '运行中' : '空闲'))
+const collectorEnabledText = computed(() => (collectorStatus.value?.enabled ? t('开启', 'On') : t('关闭', 'Off')))
+const collectorRunningText = computed(() => (collectorStatus.value?.running ? t('运行中', 'Running') : t('空闲', 'Idle')))
 
 async function refresh() {
   isLoading.value = true
@@ -78,7 +80,7 @@ async function refresh() {
     settingsForm.retry_interval_seconds = settings.retry_interval_seconds
     collectorStatus.value = status
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载设置失败')
+    message.error(errorText(error, '加载设置失败', 'Failed to load settings'))
   } finally {
     isLoading.value = false
   }
@@ -98,10 +100,10 @@ async function saveSettings() {
     }
     const saved = await updateSettings(payload)
     settingsForm.management_key = saved.management_key
-    message.success('设置已保存')
+    message.success(t('设置已保存', 'Settings saved'))
     await refresh()
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '保存设置失败')
+    message.error(errorText(error, '保存设置失败', 'Failed to save settings'))
   } finally {
     isSaving.value = false
   }
@@ -114,12 +116,12 @@ onMounted(refresh)
   <section class="page">
     <div class="page-header">
       <div>
-        <h1 class="page-title">系统设置</h1>
-        <p class="page-subtitle">集中管理采集配置</p>
+        <h1 class="page-title">{{ t('系统设置', 'System Settings') }}</h1>
+        <p class="page-subtitle">{{ t('集中管理采集配置', 'Manage collection settings in one place') }}</p>
       </div>
       <NSpace>
-        <NButton secondary :loading="isLoading" @click="refresh">刷新</NButton>
-        <NButton type="primary" :loading="isSaving" @click="saveSettings">保存设置</NButton>
+        <NButton secondary :loading="isLoading" @click="refresh">{{ t('刷新', 'Refresh') }}</NButton>
+        <NButton type="primary" :loading="isSaving" @click="saveSettings">{{ t('保存设置', 'Save settings') }}</NButton>
       </NSpace>
     </div>
 
@@ -128,23 +130,23 @@ onMounted(refresh)
         <div class="metric-icon" aria-hidden="true">
           <Power :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">本地采集</div>
+        <div class="metric-label">{{ t('本地采集', 'Local collection') }}</div>
         <div class="metric-value">{{ collectorEnabledText }}</div>
-        <div class="metric-footnote">系统开关</div>
+        <div class="metric-footnote">{{ t('系统开关', 'System switch') }}</div>
       </div>
       <div class="metric-card" :class="collectorStatus?.running ? 'is-teal' : 'is-blue'">
         <div class="metric-icon" aria-hidden="true">
           <Activity :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">运行状态</div>
+        <div class="metric-label">{{ t('运行状态', 'Run status') }}</div>
         <div class="metric-value">{{ collectorRunningText }}</div>
-        <div class="metric-footnote">采集进程</div>
+        <div class="metric-footnote">{{ t('采集进程', 'Collector process') }}</div>
       </div>
       <div class="metric-card" :class="remoteStatusType === 'success' ? 'is-green' : 'is-purple'">
         <div class="metric-icon" aria-hidden="true">
           <Server :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">远端开关</div>
+        <div class="metric-label">{{ t('远端开关', 'Remote switch') }}</div>
         <div class="metric-value">{{ remoteStatusText }}</div>
         <div class="metric-footnote">CLIProxyAPI</div>
       </div>
@@ -152,49 +154,49 @@ onMounted(refresh)
         <div class="metric-icon" aria-hidden="true">
           <Database :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">累计写入</div>
+        <div class="metric-label">{{ t('累计写入', 'Records written') }}</div>
         <div class="metric-value">{{ formatInteger(collectorStatus?.records_collected ?? 0) }}</div>
-        <div class="metric-footnote">本地记录</div>
+        <div class="metric-footnote">{{ t('本地记录', 'Local records') }}</div>
       </div>
     </div>
 
     <div class="grid-two">
       <section class="panel">
         <div class="panel-inner">
-          <h2 class="section-title">采集配置</h2>
+          <h2 class="section-title">{{ t('采集配置', 'Collection Settings') }}</h2>
           <NForm :model="settingsForm" label-placement="top">
             <div class="form-grid">
               <div class="field-stack">
-                <div class="field-label">CLIProxyAPI 地址</div>
+                <div class="field-label">{{ t('CLIProxyAPI 地址', 'CLIProxyAPI URL') }}</div>
                 <NInput v-model:value="settingsForm.cliaproxy_url" />
-                <div class="form-help">用于采集队列、API Key 同步和管理接口。</div>
+                <div class="form-help">{{ t('用于采集队列、API Key 同步和管理接口。', 'Used for collection queues, API key sync, and management APIs.') }}</div>
               </div>
               <div class="field-stack">
-                <div class="field-label">模型请求地址（例如：填写CPA外网地址）</div>
+                <div class="field-label">{{ t('模型请求地址（例如：填写CPA外网地址）', 'Model request URL (for example, CPA public URL)') }}</div>
                 <NInput
                   v-model:value="settingsForm.model_request_url"
-                  placeholder="例如：http://192.168.26.50:8317"
+                  :placeholder="t('例如：http://192.168.26.50:8317', 'Example: http://192.168.26.50:8317')"
                 />
-                <div class="form-help">仅用于 API 密钥页「请求测试」生成 URL 和示例。</div>
+                <div class="form-help">{{ t('仅用于 API 密钥页「请求测试」生成 URL 和示例。', 'Only used to generate URLs and examples for request tests on the API keys page.') }}</div>
               </div>
-              <NFormItem label="管理密钥">
+              <NFormItem :label="t('管理密钥', 'Management key')">
                 <NInput
                   v-model:value="settingsForm.management_key"
                   type="password"
                   show-password-on="mousedown"
-                  placeholder="请输入 CLIProxyAPI 管理密钥"
+                  :placeholder="t('请输入 CLIProxyAPI 管理密钥', 'Enter the CLIProxyAPI management key')"
                 />
               </NFormItem>
-              <NFormItem label="开启本地采集">
+              <NFormItem :label="t('开启本地采集', 'Enable local collection')">
                 <NSwitch v-model:value="settingsForm.collector_enabled" />
               </NFormItem>
-              <NFormItem label="批量读取数">
+              <NFormItem :label="t('批量读取数', 'Batch size')">
                 <NInputNumber v-model:value="settingsForm.batch_size" :min="1" :max="1000" />
               </NFormItem>
-              <NFormItem label="轮询间隔（秒）">
+              <NFormItem :label="t('轮询间隔（秒）', 'Poll interval (seconds)')">
                 <NInputNumber v-model:value="settingsForm.poll_interval_seconds" :min="0.2" />
               </NFormItem>
-              <NFormItem label="重试间隔（秒）">
+              <NFormItem :label="t('重试间隔（秒）', 'Retry interval (seconds)')">
                 <NInputNumber v-model:value="settingsForm.retry_interval_seconds" :min="1" />
               </NFormItem>
             </div>
@@ -204,30 +206,30 @@ onMounted(refresh)
 
       <section class="panel">
         <div class="panel-inner">
-          <h2 class="section-title">采集状态</h2>
+          <h2 class="section-title">{{ t('采集状态', 'Collection Status') }}</h2>
           <NDescriptions label-placement="left" :column="1" size="small" bordered>
-            <NDescriptionsItem label="本地采集">
+            <NDescriptionsItem :label="t('本地采集', 'Local collection')">
               <NTag :type="collectorStatus?.enabled ? 'success' : 'default'" size="small">
-                {{ collectorStatus?.enabled ? '开启' : '关闭' }}
+                {{ collectorStatus?.enabled ? t('开启', 'On') : t('关闭', 'Off') }}
               </NTag>
             </NDescriptionsItem>
-            <NDescriptionsItem label="运行状态">
+            <NDescriptionsItem :label="t('运行状态', 'Run status')">
               <NTag :type="collectorStatus?.running ? 'success' : 'default'" size="small">
-                {{ collectorStatus?.running ? '运行中' : '空闲' }}
+                {{ collectorStatus?.running ? t('运行中', 'Running') : t('空闲', 'Idle') }}
               </NTag>
             </NDescriptionsItem>
-            <NDescriptionsItem label="远端开关">
+            <NDescriptionsItem :label="t('远端开关', 'Remote switch')">
               <NTag :type="remoteStatusType" size="small">
                 {{ remoteStatusText }}
               </NTag>
             </NDescriptionsItem>
-            <NDescriptionsItem label="累计写入">
+            <NDescriptionsItem :label="t('累计写入', 'Records written')">
               {{ formatInteger(collectorStatus?.records_collected ?? 0) }}
             </NDescriptionsItem>
-            <NDescriptionsItem label="最后轮询">
+            <NDescriptionsItem :label="t('最后轮询', 'Last poll')">
               {{ formatDateTime(collectorStatus?.last_poll_at ?? null) }}
             </NDescriptionsItem>
-            <NDescriptionsItem label="最后成功">
+            <NDescriptionsItem :label="t('最后成功', 'Last success')">
               {{ formatDateTime(collectorStatus?.last_success_at ?? null) }}
             </NDescriptionsItem>
           </NDescriptions>
@@ -237,7 +239,7 @@ onMounted(refresh)
             :bordered="false"
             class="status-alert"
           >
-            {{ collectorStatus.last_error }}
+            {{ serverText(collectorStatus.last_error, '采集异常', 'Collector error') }}
           </NAlert>
         </div>
       </section>

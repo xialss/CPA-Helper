@@ -34,6 +34,7 @@ import {
   formatLocalDateTimeParam,
   formatUsd,
 } from '@/shared/utils/format'
+import { useI18n } from '@/shared/i18n'
 
 type FailedFilter = 'all' | 'success' | 'failed'
 type QuickRangeKey = 'today' | 'last24h' | 'last3d' | 'last7d' | 'last30d'
@@ -88,14 +89,6 @@ const AUTO_REFRESH_INTERVAL_MS = 5000
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
 const THIRTY_MINUTES_MS = 30 * 60 * 1000
-const quickRangeOptions: Array<{ key: QuickRangeKey; label: string }> = [
-  { key: 'today', label: '今日' },
-  { key: 'last24h', label: '近 24 小时' },
-  { key: 'last3d', label: '近 3 日' },
-  { key: 'last7d', label: '近 7 日' },
-  { key: 'last30d', label: '近 30 日' },
-]
-
 const DISTRIBUTION_CHART_COLORS = [
   { token: '--cpa-chart-1', fallback: '#009aa8' },
   { token: '--cpa-chart-2', fallback: '#1d8dff' },
@@ -108,6 +101,7 @@ const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const props = defineProps<Props>()
+const { currentLanguage, errorText, t } = useI18n()
 const isLoading = ref(false)
 const isAutoRefreshing = ref(false)
 const autoRefreshError = ref<string | null>(null)
@@ -213,7 +207,7 @@ function buildQuickRange(key: QuickRangeKey): [number, number] {
 }
 
 function isQuickRangeKey(value: unknown): value is QuickRangeKey {
-  return typeof value === 'string' && quickRangeOptions.some((option) => option.key === value)
+  return typeof value === 'string' && quickRangeOptions.value.some((option) => option.key === value)
 }
 
 function quickRangeFromQuery(): QuickRangeKey | null {
@@ -268,6 +262,14 @@ function numberFromQuery(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
+const quickRangeOptions = computed<Array<{ key: QuickRangeKey; label: string }>>(() => [
+  { key: 'today', label: t('今日', 'Today') },
+  { key: 'last24h', label: t('近 24 小时', 'Last 24 hours') },
+  { key: 'last3d', label: t('近 3 日', 'Last 3 days') },
+  { key: 'last7d', label: t('近 7 日', 'Last 7 days') },
+  { key: 'last30d', label: t('近 30 日', 'Last 30 days') },
+])
+
 const initialQuickRange = quickRangeFromQuery()
 const initialDateRange = initialRange()
 const inferredQuickRange = initialQuickRange ?? inferQuickRangeFromRange(initialDateRange)
@@ -287,6 +289,12 @@ const filterForm = reactive({
   failed: failedFromQuery(),
 })
 
+const failedFilterOptions = computed(() => [
+  { label: t('全部', 'All'), value: 'all' },
+  { label: t('成功', 'Success'), value: 'success' },
+  { label: t('失败', 'Failed'), value: 'failed' },
+])
+
 function apiKeyFilterLabel(item: UsageOptionsResponse['api_key_descriptions'][number]): string {
   return item.label?.trim() || item.key
 }
@@ -305,35 +313,44 @@ const selectOptions = computed(() => ({
 }))
 
 const isAccountScope = computed(() => props.scope === 'account')
-const pageTitle = computed(() => (isAccountScope.value ? '我的用量' : '历史用量'))
+const pageTitle = computed(() =>
+  isAccountScope.value ? t('我的用量', 'My usage') : t('历史用量', 'Usage history'),
+)
 const pageSubtitle = computed(() =>
   isAccountScope.value
-    ? '仅聚合当前登录账号自己的本地用量记录'
-    : '按本地 SQLite 历史记录实时聚合，费用按当前模型价格估算',
+    ? t('仅聚合当前登录账号自己的本地用量记录', 'Only local usage records for your account are aggregated')
+    : t(
+        '按本地 SQLite 历史记录实时聚合，费用按当前模型价格估算',
+        'Aggregated live from local SQLite history. Costs are estimated using current model prices.',
+      ),
 )
-const rankingTitle = computed(() => (isAccountScope.value ? 'KEY 排行' : '用户排行'))
+const rankingTitle = computed(() =>
+  isAccountScope.value ? t('KEY 排行', 'Key ranking') : t('用户排行', 'User ranking'),
+)
 
 const refreshStatusText = computed(() => {
   const lastRefreshTime = lastRefreshedAt.value
   if (!lastRefreshTime) {
-    return autoRefreshError.value ? '自动刷新异常 · 尚无成功同步' : '每 5 秒自动刷新 · 等待首次同步'
+    return autoRefreshError.value
+      ? t('自动刷新异常 · 尚无成功同步', 'Auto refresh error · no successful sync yet')
+      : t('每 5 秒自动刷新 · 等待首次同步', 'Auto refresh every 5 seconds · waiting for first sync')
   }
-  const lastRefreshText = new Intl.DateTimeFormat('zh-CN', {
+  const lastRefreshText = new Intl.DateTimeFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
   }).format(lastRefreshTime)
   if (autoRefreshError.value) {
-    return `自动刷新异常 · 最近成功 ${lastRefreshText}`
+    return t(`自动刷新异常 · 最近成功 ${lastRefreshText}`, `Auto refresh error · last success ${lastRefreshText}`)
   }
   if (auxiliaryError.value) {
-    return `已同步 ${lastRefreshText} · 辅助指标降级`
+    return t(`已同步 ${lastRefreshText} · 辅助指标降级`, `Synced ${lastRefreshText} · auxiliary metrics degraded`)
   }
-  return `每 5 秒自动刷新 · 最近 ${lastRefreshText}`
+  return t(`每 5 秒自动刷新 · 最近 ${lastRefreshText}`, `Auto refresh every 5 seconds · latest ${lastRefreshText}`)
 })
 
 const dashboardRangeLabel = computed(() => {
-  const activeRange = quickRangeOptions.find((option) => option.key === activeQuickRange.value)
+  const activeRange = quickRangeOptions.value.find((option) => option.key === activeQuickRange.value)
   if (activeRange) {
     return activeRange.label
   }
@@ -346,17 +363,17 @@ const dashboardRangeLabel = computed(() => {
   }
   const range = dateRange.value
   if (!range) {
-    return '当前筛选'
+    return t('当前筛选', 'Current filters')
   }
   return `${formatMetricRangeTime(range[0])} - ${formatMetricRangeTime(range[1])}`
 })
 
 const rateRangeLabel = computed(() =>
-  activeQuickRange.value === 'today' ? '近 30 分钟' : dashboardRangeLabel.value,
+  activeQuickRange.value === 'today' ? t('近 30 分钟', 'Last 30 minutes') : dashboardRangeLabel.value,
 )
 
 function formatMetricRangeTime(value: number): string {
-  return new Intl.DateTimeFormat('zh-CN', {
+  return new Intl.DateTimeFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
     timeZone: BEIJING_TIME_ZONE,
     month: '2-digit',
     day: '2-digit',
@@ -567,7 +584,7 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       failedResult.status === 'rejected' ||
       realtimeResult.status === 'rejected' ||
       quotaResult.status === 'rejected'
-        ? '部分辅助指标加载失败'
+        ? t('部分辅助指标加载失败', 'Some auxiliary metrics failed to load')
         : null
 
     void router.replace({
@@ -581,7 +598,7 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
     autoRefreshError.value = null
     lastRefreshedAt.value = new Date()
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : '加载历史用量失败'
+    const errorMessage = errorText(error, '加载历史用量失败', 'Failed to load usage history')
     if (silent) {
       autoRefreshError.value = errorMessage
     } else {
@@ -661,7 +678,7 @@ function distributionLegendItems(items: DistributionItem[]): DistributionLegendI
 }
 
 function formatPercent(value: number): string {
-  return new Intl.NumberFormat('zh-CN', {
+  return new Intl.NumberFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
     style: 'percent',
     maximumFractionDigits: value > 0 && value < 0.1 ? 1 : 0,
   }).format(value)
@@ -730,31 +747,37 @@ const requestsPerMinute = computed(() => {
 
 function quotaValueText(quota: UserQuotaStatus | null): string {
   if (!quota) {
-    return '加载中'
+    return t('加载中', 'Loading')
   }
   if (quota.unlimited) {
-    return '每月余额 无限制'
+    return t('每月余额 无限制', 'Monthly balance unlimited')
   }
-  return `每月余额 ${formatUsd(quota.monthly_remaining_usd ?? 0)}`
+  return t(
+    `每月余额 ${formatUsd(quota.monthly_remaining_usd ?? 0)}`,
+    `Monthly balance ${formatUsd(quota.monthly_remaining_usd ?? 0)}`,
+  )
 }
 
 function quotaFootnote(quota: UserQuotaStatus | null): string {
   if (!quota) {
-    return '额度加载中'
+    return t('额度加载中', 'Quota loading')
   }
   if (quota.unlimited) {
-    return '不限时余额 无限制'
+    return t('不限时余额 无限制', 'Lifetime balance unlimited')
   }
-  const lifetimeText = `不限时余额 ${formatUsd(quota.lifetime_remaining_usd ?? 0)}`
+  const lifetimeText = t(
+    `不限时余额 ${formatUsd(quota.lifetime_remaining_usd ?? 0)}`,
+    `Lifetime balance ${formatUsd(quota.lifetime_remaining_usd ?? 0)}`,
+  )
   const notes: string[] = []
   if (quota.sync_error) {
-    notes.push('Key 同步异常')
+    notes.push(t('Key 同步异常', 'Key sync error'))
   }
   if (quota.unpriced_records > 0) {
-    notes.push(`未定价 ${formatInteger(quota.unpriced_records)} 条`)
+    notes.push(t(`未定价 ${formatInteger(quota.unpriced_records)} 条`, `${formatInteger(quota.unpriced_records)} unpriced records`))
   }
   if (quota.paused) {
-    notes.push('Key 已因余额暂停')
+    notes.push(t('Key 已因余额暂停', 'Key paused due to balance'))
   }
   return notes.length > 0 ? `${lifetimeText} · ${notes.join(' · ')}` : lifetimeText
 }
@@ -764,7 +787,7 @@ const metricCards = computed<MetricCardConfig[]>(() => {
   return [
     {
       key: 'requests',
-      label: '请求数',
+      label: t('请求数', 'Requests'),
       value: formatInteger(currentSummary?.total_records ?? 0),
       icon: ClipboardList,
       tone: 'blue',
@@ -772,23 +795,33 @@ const metricCards = computed<MetricCardConfig[]>(() => {
     },
     {
       key: 'success',
-      label: '成功率',
+      label: t('成功率', 'Success rate'),
       value: formatPercent(successRate.value),
       icon: ShieldCheck,
       tone: 'green',
-      footnote: `${formatInteger(currentSummary?.success_records ?? 0)} 成功 / ${formatInteger(
-        currentSummary?.total_records ?? 0,
-      )} 请求`,
+      footnote: t(
+        `${formatInteger(currentSummary?.success_records ?? 0)} 成功 / ${formatInteger(
+          currentSummary?.total_records ?? 0,
+        )} 请求`,
+        `${formatInteger(currentSummary?.success_records ?? 0)} succeeded / ${formatInteger(
+          currentSummary?.total_records ?? 0,
+        )} requests`,
+      ),
     },
     {
       key: 'total_tokens',
-      label: '总 Token',
+      label: t('总 Token', 'Total tokens'),
       value: formatCompact(currentSummary?.total_tokens ?? 0),
       icon: Layers3,
       tone: 'purple',
-      footnote: `输入 ${formatCompact(currentSummary?.input_tokens ?? 0)} / 输出 ${formatCompact(
-        currentSummary?.output_tokens ?? 0,
-      )}`,
+      footnote: t(
+        `输入 ${formatCompact(currentSummary?.input_tokens ?? 0)} / 输出 ${formatCompact(
+          currentSummary?.output_tokens ?? 0,
+        )}`,
+        `Input ${formatCompact(currentSummary?.input_tokens ?? 0)} / output ${formatCompact(
+          currentSummary?.output_tokens ?? 0,
+        )}`,
+      ),
     },
     {
       key: 'rpm',
@@ -800,7 +833,7 @@ const metricCards = computed<MetricCardConfig[]>(() => {
     },
     {
       key: 'average_ttft',
-      label: '平均首字耗时',
+      label: t('平均首字耗时', 'Avg TTFT'),
       value: formatLatency(currentSummary?.average_ttft_ms ?? null),
       icon: Timer,
       tone: 'teal',
@@ -808,14 +841,17 @@ const metricCards = computed<MetricCardConfig[]>(() => {
     },
     {
       key: 'cost',
-      label: '估算费用',
+      label: t('估算费用', 'Estimated cost'),
       value: formatUsd(currentSummary?.estimated_cost_usd ?? 0),
       icon: CircleDollarSign,
       tone: 'green',
       footnote:
         (currentSummary?.unpriced_records ?? 0) > 0
-          ? `未计价 ${formatInteger(currentSummary?.unpriced_records ?? 0)} 条`
-          : '按当前价格估算',
+          ? t(
+              `未计价 ${formatInteger(currentSummary?.unpriced_records ?? 0)} 条`,
+              `${formatInteger(currentSummary?.unpriced_records ?? 0)} unpriced records`,
+            )
+          : t('按当前价格估算', 'Estimated at current prices'),
     },
   ]
 })
@@ -841,7 +877,7 @@ const trendOption = computed<ChartOption>(() => {
       itemGap: 14,
       itemWidth: 10,
       itemHeight: 10,
-      data: ['请求数', 'Token', '失败请求'],
+      data: [t('请求数', 'Requests'), 'Token', t('失败请求', 'Failed requests')],
     },
     grid: { left: 42, right: 58, top: 44, bottom: 34 },
     xAxis: {
@@ -858,7 +894,7 @@ const trendOption = computed<ChartOption>(() => {
     yAxis: [
       {
         type: 'value',
-        name: '请求',
+        name: t('请求', 'Requests'),
         nameTextStyle: { color: mutedColor },
         axisLabel: { color: mutedColor, formatter: (value: number) => formatCompact(value) },
         splitLine: { lineStyle: { color: gridColor } },
@@ -873,7 +909,7 @@ const trendOption = computed<ChartOption>(() => {
     ],
     series: [
       {
-        name: '请求数',
+        name: t('请求数', 'Requests'),
         type: 'bar',
         data: trends.value.map((item) => item.records),
         barMaxWidth: 18,
@@ -890,7 +926,7 @@ const trendOption = computed<ChartOption>(() => {
         itemStyle: { color: tokenColor },
       },
       {
-        name: '失败请求',
+        name: t('失败请求', 'Failed requests'),
         type: 'line',
         data: trends.value.map((item) => item.failed_records),
         showSymbol: true,
@@ -905,10 +941,10 @@ const trendOption = computed<ChartOption>(() => {
 const tokenBreakdownItems = computed<TokenBreakdownItem[]>(() => {
   const currentSummary = summary.value
   const values = [
-    { key: 'input', label: '输入 Token', value: currentSummary?.input_tokens ?? 0 },
-    { key: 'output', label: '输出 Token', value: currentSummary?.output_tokens ?? 0 },
-    { key: 'cached', label: '缓存 Token', value: currentSummary?.cached_tokens ?? 0 },
-    { key: 'reasoning', label: '推理 Token', value: currentSummary?.reasoning_tokens ?? 0 },
+    { key: 'input', label: t('输入 Token', 'Input tokens'), value: currentSummary?.input_tokens ?? 0 },
+    { key: 'output', label: t('输出 Token', 'Output tokens'), value: currentSummary?.output_tokens ?? 0 },
+    { key: 'cached', label: t('缓存 Token', 'Cached tokens'), value: currentSummary?.cached_tokens ?? 0 },
+    { key: 'reasoning', label: t('推理 Token', 'Reasoning tokens'), value: currentSummary?.reasoning_tokens ?? 0 },
   ]
   const total = values.reduce((sum, item) => sum + item.value, 0)
   return values.map((item, index) => ({
@@ -1052,7 +1088,10 @@ const hourActivityItems = computed<HourActivityItem[]>(() => {
       label: hourLabel,
       records: value.records,
       tokens: value.tokens,
-      recordTitle: `${hourLabel}:00 · ${formatInteger(value.records)} 次请求`,
+      recordTitle: t(
+        `${hourLabel}:00 · ${formatInteger(value.records)} 次请求`,
+        `${hourLabel}:00 · ${formatInteger(value.records)} requests`,
+      ),
       tokenTitle: `${hourLabel}:00 · ${formatCompact(value.tokens)} Token`,
       recordStyle: { '--heat-intensity': recordIntensity.toFixed(3) },
       tokenStyle: { '--heat-intensity': tokenIntensity.toFixed(3) },
@@ -1092,19 +1131,19 @@ const recentFailedRows = computed(() =>
 const anomalyStats = computed(() => [
   {
     key: 'failed_rate',
-    label: '失败率',
+    label: t('失败率', 'Failure rate'),
     value: formatPercent(failedRate.value),
     tone: failedRate.value > 0 ? 'danger' : 'success',
   },
   {
     key: 'failed_records',
-    label: '失败请求',
+    label: t('失败请求', 'Failed requests'),
     value: formatInteger(summary.value?.failed_records ?? failedSummary.value?.total_records ?? 0),
     tone: 'danger',
   },
   {
     key: 'unpriced',
-    label: '未计价',
+    label: t('未计价', 'Unpriced'),
     value: formatInteger(summary.value?.unpriced_records ?? 0),
     tone: (summary.value?.unpriced_records ?? 0) > 0 ? 'warning' : 'success',
   },
@@ -1118,10 +1157,10 @@ const endpointDistributionLegend = computed(() =>
 )
 
 const providerDistributionOption = computed<ChartOption>(() =>
-  distributionPieOption(distributions.value.providers, '服务商'),
+  distributionPieOption(distributions.value.providers, t('服务商', 'Providers')),
 )
 const endpointDistributionOption = computed<ChartOption>(() =>
-  distributionPieOption(distributions.value.endpoints, '接口'),
+  distributionPieOption(distributions.value.endpoints, t('接口', 'Endpoints')),
 )
 
 let autoRefreshTimer: number | undefined
@@ -1164,23 +1203,23 @@ onBeforeUnmount(() => {
         <span class="refresh-status" :class="{ 'is-error': autoRefreshError }">
           {{ refreshStatusText }}
         </span>
-        <NButton secondary @click="goRecords()">明细</NButton>
+        <NButton secondary @click="goRecords()">{{ t('明细', 'Records') }}</NButton>
       </div>
     </div>
 
     <section class="panel filter-panel" :class="{ 'is-expanded': filtersExpanded }">
       <div class="filter-summary">
         <div>
-          <strong>筛选</strong>
+          <strong>{{ t('筛选', 'Filters') }}</strong>
           <span>{{ dashboardRangeLabel }}</span>
         </div>
         <NButton class="filter-toggle" secondary size="small" @click="filtersExpanded = !filtersExpanded">
-          {{ filtersExpanded ? '收起' : '展开' }}
+          {{ filtersExpanded ? t('收起', 'Collapse') : t('展开', 'Expand') }}
         </NButton>
       </div>
       <div class="panel-inner filter-toolbar">
         <div class="time-row">
-          <div class="quick-ranges" role="group" aria-label="快捷时间范围">
+          <div class="quick-ranges" role="group" :aria-label="t('快捷时间范围', 'Quick time ranges')">
             <NButton
               v-for="option in quickRangeOptions"
               :key="option.key"
@@ -1208,7 +1247,7 @@ onBeforeUnmount(() => {
             :options="selectOptions.users"
             clearable
             filterable
-            placeholder="用户昵称"
+            :placeholder="t('用户昵称', 'User nickname')"
             @update:value="handleUserChange"
           />
           <NSelect
@@ -1216,7 +1255,7 @@ onBeforeUnmount(() => {
             :options="selectOptions.apiKeyDescriptions"
             clearable
             filterable
-            placeholder="KEY 描述"
+            :placeholder="t('KEY 描述', 'Key description')"
             @update:value="handleApiKeyChange"
           />
           <NSelect
@@ -1224,7 +1263,7 @@ onBeforeUnmount(() => {
             :options="selectOptions.providers"
             clearable
             filterable
-            placeholder="服务商"
+            :placeholder="t('服务商', 'Provider')"
             @update:value="handleProviderChange"
           />
           <NSelect
@@ -1232,7 +1271,7 @@ onBeforeUnmount(() => {
             :options="selectOptions.models"
             clearable
             filterable
-            placeholder="模型"
+            :placeholder="t('模型', 'Model')"
             @update:value="handleModelChange"
           />
           <NSelect
@@ -1240,21 +1279,17 @@ onBeforeUnmount(() => {
             :options="selectOptions.endpoints"
             clearable
             filterable
-            placeholder="接口"
+            :placeholder="t('接口', 'Endpoint')"
             @update:value="handleEndpointChange"
           />
           <div class="status-actions">
             <NSelect
               :value="filterForm.failed"
               class="status-select"
-              :options="[
-                { label: '全部', value: 'all' },
-                { label: '成功', value: 'success' },
-                { label: '失败', value: 'failed' },
-              ]"
+              :options="failedFilterOptions"
               @update:value="handleFailedChange"
             />
-            <NButton secondary :loading="isLoading" @click="refresh()">筛选</NButton>
+            <NButton secondary :loading="isLoading" @click="refresh()">{{ t('筛选', 'Filter') }}</NButton>
           </div>
         </div>
       </div>
@@ -1283,7 +1318,7 @@ onBeforeUnmount(() => {
         <div class="dashboard-top-grid">
           <ChartPanel
             class="usage-trend-panel area-trend"
-            title="用量趋势"
+            :title="t('用量趋势', 'Usage trend')"
             :option="trendOption"
             :empty="trends.length === 0"
             :loading="isLoading"
@@ -1291,13 +1326,13 @@ onBeforeUnmount(() => {
 
           <ChartPanel
             class="token-panel area-token"
-            title="Token 构成"
+            :title="t('Token 构成', 'Token breakdown')"
             :option="tokenBreakdownOption"
             :empty="tokenBreakdownTotal === 0"
             :loading="isLoading"
             :compact-footer="tokenBreakdownItems.length <= 1"
           >
-            <ol class="distribution-legend token-legend" aria-label="Token 构成图例">
+            <ol class="distribution-legend token-legend" :aria-label="t('Token 构成图例', 'Token breakdown legend')">
               <li
                 v-for="item in tokenBreakdownItems"
                 :key="item.key"
@@ -1321,18 +1356,18 @@ onBeforeUnmount(() => {
             <section class="panel heatmap-panel area-heatmap">
               <div class="panel-inner compact-panel-inner">
                 <div class="panel-heading-row">
-                  <h2 class="section-title">小时活跃（今日）</h2>
+                  <h2 class="section-title">{{ t('小时活跃（今日）', 'Hourly activity (today)') }}</h2>
                   <span class="panel-subtle-text">
-                    {{ auxiliaryError ? '辅助数据降级' : '请求数 / Token' }}
+                    {{ auxiliaryError ? t('辅助数据降级', 'Auxiliary data degraded') : t('请求数 / Token', 'Requests / tokens') }}
                   </span>
                 </div>
                 <div class="heatmap-groups">
                   <div class="heatmap-group is-records">
                     <div class="heatmap-group-heading">
-                      <span>请求数</span>
-                      <strong>{{ formatInteger(todayRecordTotal) }} 次</strong>
+                      <span>{{ t('请求数', 'Requests') }}</span>
+                      <strong>{{ t(`${formatInteger(todayRecordTotal)} 次`, `${formatInteger(todayRecordTotal)} requests`) }}</strong>
                     </div>
-                    <div class="hour-heatmap is-records" aria-label="今日请求数小时活跃热力图">
+                    <div class="hour-heatmap is-records" :aria-label="t('今日请求数小时活跃热力图', 'Today hourly request heatmap')">
                       <div
                         v-for="item in hourActivityItems"
                         :key="`records-${item.hour}`"
@@ -1350,7 +1385,7 @@ onBeforeUnmount(() => {
                       <span>Token</span>
                       <strong>{{ formatCompact(todayTokenTotal) }}</strong>
                     </div>
-                    <div class="hour-heatmap is-tokens" aria-label="今日 Token 小时活跃热力图">
+                    <div class="hour-heatmap is-tokens" :aria-label="t('今日 Token 小时活跃热力图', 'Today hourly token heatmap')">
                       <div
                         v-for="item in hourActivityItems"
                         :key="`tokens-${item.hour}`"
@@ -1365,19 +1400,19 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
                 <div class="heatmap-scale">
-                  <span>低</span>
+                  <span>{{ t('低', 'Low') }}</span>
                   <div class="heatmap-scale-bars" aria-hidden="true">
                     <i class="is-records" />
                     <i class="is-tokens" />
                   </div>
-                  <span>高</span>
+                  <span>{{ t('高', 'High') }}</span>
                 </div>
               </div>
             </section>
 
             <ChartPanel
               class="distribution-panel area-provider"
-              title="服务商分布"
+              :title="t('服务商分布', 'Provider distribution')"
               :option="providerDistributionOption"
               :empty="distributions.providers.length === 0"
               :loading="isLoading"
@@ -1386,7 +1421,7 @@ onBeforeUnmount(() => {
               <ol
                 class="distribution-legend"
                 :class="{ 'is-single': providerDistributionLegend.length === 1 }"
-                aria-label="服务商分布图例"
+                :aria-label="t('服务商分布图例', 'Provider distribution legend')"
               >
                 <li
                   v-for="item in providerDistributionLegend"
@@ -1410,8 +1445,8 @@ onBeforeUnmount(() => {
             <section class="panel anomaly-panel area-anomaly">
               <div class="panel-inner compact-panel-inner">
                 <div class="panel-heading-row">
-                  <h2 class="section-title">异常概览</h2>
-                  <NButton size="small" quaternary @click="goRecords({ failed: true })">更多</NButton>
+                  <h2 class="section-title">{{ t('异常概览', 'Anomaly overview') }}</h2>
+                  <NButton size="small" quaternary @click="goRecords({ failed: true })">{{ t('更多', 'More') }}</NButton>
                 </div>
                 <div class="anomaly-stat-grid">
                   <div
@@ -1425,14 +1460,14 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
                 <div class="top-failed-endpoint">
-                  <span>Top 失败接口</span>
-                  <strong :title="topFailedEndpoint?.label ?? '暂无失败接口'">
-                    {{ topFailedEndpoint?.label ?? '暂无失败接口' }}
+                  <span>{{ t('Top 失败接口', 'Top failed endpoint') }}</span>
+                  <strong :title="topFailedEndpoint?.label ?? t('暂无失败接口', 'No failed endpoints')">
+                    {{ topFailedEndpoint?.label ?? t('暂无失败接口', 'No failed endpoints') }}
                   </strong>
                 </div>
                 <div class="recent-failed-list">
                   <div v-if="recentFailedRows.length === 0" class="empty-inline">
-                    当前范围暂无失败请求
+                    {{ t('当前范围暂无失败请求', 'No failed requests in the current range') }}
                   </div>
                   <button
                     v-for="item in recentFailedRows"
@@ -1443,7 +1478,7 @@ onBeforeUnmount(() => {
                     @click="goRecords({ failed: true })"
                   >
                     <span>{{ formatTrendBucket(item.bucket) }}</span>
-                    <strong>{{ formatInteger(item.records) }} 次</strong>
+                    <strong>{{ t(`${formatInteger(item.records)} 次`, `${formatInteger(item.records)} requests`) }}</strong>
                     <em>{{ formatCompact(item.total_tokens) }} Token</em>
                   </button>
                 </div>
@@ -1452,7 +1487,7 @@ onBeforeUnmount(() => {
 
             <ChartPanel
               class="distribution-panel area-endpoint"
-              title="接口分布"
+              :title="t('接口分布', 'Endpoint distribution')"
               :option="endpointDistributionOption"
               :empty="distributions.endpoints.length === 0"
               :loading="isLoading"
@@ -1461,7 +1496,7 @@ onBeforeUnmount(() => {
               <ol
                 class="distribution-legend"
                 :class="{ 'is-single': endpointDistributionLegend.length === 1 }"
-                aria-label="接口分布图例"
+                :aria-label="t('接口分布图例', 'Endpoint distribution legend')"
               >
                 <li
                   v-for="item in endpointDistributionLegend"
@@ -1486,10 +1521,10 @@ onBeforeUnmount(() => {
               <div class="panel-inner compact-panel-inner">
                 <div class="panel-heading-row">
                   <h2 class="section-title">{{ rankingTitle }}</h2>
-                  <span class="panel-subtle-text">按 Token 排序</span>
+                  <span class="panel-subtle-text">{{ t('按 Token 排序', 'Sorted by tokens') }}</span>
                 </div>
                 <div class="ranking-list">
-                  <div v-if="primaryRankingRows.length === 0" class="empty-inline">暂无排行数据</div>
+                  <div v-if="primaryRankingRows.length === 0" class="empty-inline">{{ t('暂无排行数据', 'No ranking data') }}</div>
                   <div
                     v-for="(row, index) in primaryRankingRows"
                     v-else
@@ -1507,10 +1542,10 @@ onBeforeUnmount(() => {
                     </div>
                     <div class="ranking-values">
                       <strong>{{ formatCompact(row.total_tokens) }}</strong>
-                      <span>{{ formatInteger(row.records) }} 次</span>
+                      <span>{{ t(`${formatInteger(row.records)} 次`, `${formatInteger(row.records)} requests`) }}</span>
                     </div>
                     <NButton size="tiny" quaternary @click="goRecords(rankingFilters(row))">
-                      明细
+                      {{ t('明细', 'Records') }}
                     </NButton>
                   </div>
                 </div>
@@ -1520,11 +1555,11 @@ onBeforeUnmount(() => {
             <section class="panel ranking-panel area-model-ranking">
               <div class="panel-inner compact-panel-inner">
                 <div class="panel-heading-row">
-                  <h2 class="section-title">模型排行</h2>
-                  <span class="panel-subtle-text">按 Token 排序</span>
+                  <h2 class="section-title">{{ t('模型排行', 'Model ranking') }}</h2>
+                  <span class="panel-subtle-text">{{ t('按 Token 排序', 'Sorted by tokens') }}</span>
                 </div>
                 <div class="ranking-list">
-                  <div v-if="modelRankingRows.length === 0" class="empty-inline">暂无模型数据</div>
+                  <div v-if="modelRankingRows.length === 0" class="empty-inline">{{ t('暂无模型数据', 'No model data') }}</div>
                   <div
                     v-for="(row, index) in modelRankingRows"
                     v-else
@@ -1542,10 +1577,10 @@ onBeforeUnmount(() => {
                     </div>
                     <div class="ranking-values">
                       <strong>{{ formatCompact(row.total_tokens) }}</strong>
-                      <span>{{ formatInteger(row.records) }} 次</span>
+                      <span>{{ t(`${formatInteger(row.records)} 次`, `${formatInteger(row.records)} requests`) }}</span>
                     </div>
                     <NButton size="tiny" quaternary @click="goRecords(modelFilters(row))">
-                      明细
+                      {{ t('明细', 'Records') }}
                     </NButton>
                   </div>
                 </div>

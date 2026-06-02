@@ -1,3 +1,5 @@
+import { localize } from '@/shared/i18n'
+
 function copyWithSelection(text: string): boolean {
   const textArea = document.createElement('textarea')
   const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null
@@ -35,7 +37,7 @@ function copyWithSelection(text: string): boolean {
 
 export async function copyToClipboard(text: string): Promise<void> {
   if (!text) {
-    throw new Error('没有可复制的内容')
+    throw new Error(localize('没有可复制的内容', 'Nothing to copy'))
   }
 
   try {
@@ -51,5 +53,7 @@ export async function copyToClipboard(text: string): Promise<void> {
     return
   }
 
-  throw new Error('复制失败，请手动选中后复制')
+  throw new Error(
+    localize('复制失败，请手动选中后复制', 'Copy failed. Select the text and copy it manually.'),
+  )
 }

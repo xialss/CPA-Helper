@@ -38,6 +38,7 @@ import type {
   ModelPricePayload,
 } from '@/shared/types/api'
 import { formatDateTime, formatInteger } from '@/shared/utils/format'
+import { useI18n } from '@/shared/i18n'
 
 type PriceTableLayoutProps =
   | { flexHeight: true }
@@ -73,11 +74,10 @@ const priceModalStyle: CSSProperties = { width: 'min(640px, calc(100vw - 32px))'
 const proxyModalStyle: CSSProperties = { width: 'min(460px, calc(100vw - 32px))' }
 const proxyModalContentStyle: CSSProperties = { padding: '16px 22px 4px' }
 const proxyModalFooterStyle: CSSProperties = { padding: '12px 22px 18px' }
-const liteLLMProxyHint =
-  'LiteLLM 价格数据从 GitHub 下载；如果当前网络无法访问 GitHub，可以启用代理后再同步。'
 const desktopPriceLayoutQuery = window.matchMedia('(min-width: 861px)')
 const message = useMessage()
 const dialog = useDialog()
+const { errorText, serverText, t } = useI18n()
 const isLoading = ref(false)
 const isSyncing = ref(false)
 const modalOpen = ref(false)
@@ -160,13 +160,20 @@ const providerOptions = computed(() =>
     .map((provider) => ({ label: provider, value: provider })),
 )
 
-const statusOptions: Array<{ label: string; value: PriceStatusFilter }> = [
-  { label: 'CPA 可用模型', value: 'cpa' },
-  { label: '未定价', value: 'missing' },
+const liteLLMProxyHint = computed(() =>
+  t(
+    'LiteLLM 价格数据从 GitHub 下载；如果当前网络无法访问 GitHub，可以启用代理后再同步。',
+    'LiteLLM price data is downloaded from GitHub. If GitHub is not reachable from this network, enable a proxy and sync again.',
+  ),
+)
+
+const statusOptions = computed<Array<{ label: string; value: PriceStatusFilter }>>(() => [
+  { label: t('CPA 可用模型', 'CPA available models'), value: 'cpa' },
+  { label: t('未定价', 'Unpriced'), value: 'missing' },
   { label: 'LiteLLM', value: 'litellm' },
-  { label: '手动', value: 'manual' },
-  { label: '仅有价格', value: 'library' },
-]
+  { label: t('手动', 'Manual'), value: 'manual' },
+  { label: t('仅有价格', 'Prices only'), value: 'library' },
+])
 
 const filteredPrices = computed(() => {
   return priceRows.value.filter((row) => {
@@ -254,17 +261,25 @@ const catalogNotice = computed(() => {
     return ''
   }
   if (!current.has_api_keys) {
-    return '还没有本地绑定的 API Key，当前只显示已有价格库条目。'
+    return t('还没有本地绑定的 API Key，当前只显示已有价格库条目。', 'No local API keys are bound yet. Only existing price library entries are shown.')
   }
   if (current.queryable_api_key_count === 0) {
-    return '本地 API Key 没有保存明文 Key，暂时无法查询 CPA 当前模型，只显示已有价格库条目。'
+    return t(
+      '本地 API Key 没有保存明文 Key，暂时无法查询 CPA 当前模型，只显示已有价格库条目。',
+      'Local API keys do not store plaintext keys, so CPA models cannot be queried for now. Only existing price library entries are shown.',
+    )
   }
   if (current.errors.length > 0) {
     const details = current.errors
       .slice(0, 3)
-      .map((item) => `${item.description}：${item.message}`)
-      .join('；')
-    return `部分 Key 查询 CPA 模型失败：${details}`
+      .map((item) =>
+        t(
+          `${item.description}：${serverText(item.message, '查询失败', 'Query failed')}`,
+          `${item.description}: ${serverText(item.message, '查询失败', 'Query failed')}`,
+        ),
+      )
+      .join(t('；', '; '))
+    return t(`部分 Key 查询 CPA 模型失败：${details}`, `Some keys failed to query CPA models: ${details}`)
   }
   return ''
 })
@@ -276,8 +291,14 @@ const priceTableLayoutProps = computed<PriceTableLayoutProps>(() =>
 const isRequestPriceForm = computed(() => billingUnitForModel(form.model) === 'request')
 const priceSaveHint = computed(() =>
   isRequestPriceForm.value
-    ? 'image 模型按每次成功调用固定金额计费，保存后会作为手动价格优先保留。'
-    : '保存后会作为手动价格，后续 LiteLLM 同步会优先保留。',
+    ? t(
+        'image 模型按每次成功调用固定金额计费，保存后会作为手动价格优先保留。',
+        'Image models are charged a fixed amount per successful call. Saved values are kept as manual prices with priority.',
+      )
+    : t(
+        '保存后会作为手动价格，后续 LiteLLM 同步会优先保留。',
+        'Saved values are kept as manual prices and preserved by later LiteLLM syncs.',
+      ),
 )
 
 interface PriceMetricCard {
@@ -292,35 +313,41 @@ interface PriceMetricCard {
 const priceMetrics = computed<PriceMetricCard[]>(() => [
   {
     key: 'models',
-    label: 'CPA 模型',
+    label: t('CPA 模型', 'CPA models'),
     value: formatInteger(cpaModelCount.value),
     footnote: catalog.value
-      ? `可查询 Key ${formatInteger(catalog.value.queryable_api_key_count)} / ${formatInteger(catalog.value.api_key_count)}`
-      : '等待刷新',
+      ? t(
+          `可查询 Key ${formatInteger(catalog.value.queryable_api_key_count)} / ${formatInteger(catalog.value.api_key_count)}`,
+          `Queryable keys ${formatInteger(catalog.value.queryable_api_key_count)} / ${formatInteger(catalog.value.api_key_count)}`,
+        )
+      : t('等待刷新', 'Waiting for refresh'),
     tone: 'teal',
     icon: Layers3,
   },
   {
     key: 'unpriced',
-    label: '未定价',
+    label: t('未定价', 'Unpriced'),
     value: formatInteger(unpricedModelCount.value),
-    footnote: `筛选后 ${formatInteger(filteredPriceCount.value)} / ${formatInteger(totalPriceCount.value)}`,
+    footnote: t(
+      `筛选后 ${formatInteger(filteredPriceCount.value)} / ${formatInteger(totalPriceCount.value)}`,
+      `Filtered ${formatInteger(filteredPriceCount.value)} / ${formatInteger(totalPriceCount.value)}`,
+    ),
     tone: 'blue',
     icon: Server,
   },
   {
     key: 'synced',
-    label: 'LiteLLM 同步',
+    label: t('LiteLLM 同步', 'LiteLLM sync'),
     value: formatInteger(syncedPriceCount.value),
-    footnote: '自动维护',
+    footnote: t('自动维护', 'Auto maintained'),
     tone: 'purple',
     icon: RefreshCw,
   },
   {
     key: 'manual',
-    label: '手动价格',
+    label: t('手动价格', 'Manual prices'),
     value: formatInteger(manualPriceCount.value),
-    footnote: '优先保留',
+    footnote: t('优先保留', 'Preserved first'),
     tone: 'orange',
     icon: Database,
   },
@@ -358,7 +385,7 @@ async function refresh() {
     prices.value = nextPrices
     catalog.value = nextCatalog
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载模型价格失败')
+    message.error(errorText(error, '加载模型价格失败', 'Failed to load model prices'))
   } finally {
     isLoading.value = false
   }
@@ -408,25 +435,25 @@ async function savePrice() {
     request_usd: requestUSD,
   }
   if (!payload.provider || !payload.model) {
-    message.error('服务商和模型不能为空')
+    message.error(t('服务商和模型不能为空', 'Provider and model are required'))
     return
   }
   if (requestPriceMode && requestUSD === null) {
-    message.error('image 模型需要填写每次调用价格')
+    message.error(t('image 模型需要填写每次调用价格', 'Image models require a per-call price'))
     return
   }
   try {
     if (editingId.value === null) {
       await createModelPrice(payload)
-      message.success('模型价格已创建')
+      message.success(t('模型价格已创建', 'Model price created'))
     } else {
       await updateModelPrice(editingId.value, payload)
-      message.success('模型价格已更新')
+      message.success(t('模型价格已更新', 'Model price updated'))
     }
     modalOpen.value = false
     await refresh()
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '保存模型价格失败')
+    message.error(errorText(error, '保存模型价格失败', 'Failed to save model price'))
   }
 }
 
@@ -435,12 +462,15 @@ async function syncPrices() {
   try {
     const result = await syncLitellmModelPrices()
     message.success(
-      `同步完成：LiteLLM 价格 ${result.imported} 条，手动价格保留 ${result.skipped_manual} 条`,
+      t(
+        `同步完成：LiteLLM 价格 ${result.imported} 条，手动价格保留 ${result.skipped_manual} 条`,
+        `Sync complete: ${result.imported} LiteLLM prices imported, ${result.skipped_manual} manual prices preserved`,
+      ),
     )
     await refresh()
   } catch (error) {
-    const detail = error instanceof Error ? error.message : '同步模型价格失败'
-    message.error(`${detail}。${liteLLMProxyHint}`)
+    const detail = errorText(error, '同步模型价格失败', 'Failed to sync model prices')
+    message.error(t(`${detail}。${liteLLMProxyHint.value}`, `${detail}. ${liteLLMProxyHint.value}`))
   } finally {
     isSyncing.value = false
   }
@@ -454,7 +484,7 @@ async function openProxySettings() {
     proxyForm.enabled = settings.enabled
     proxyForm.proxy_url = settings.proxy_url
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载代理配置失败')
+    message.error(errorText(error, '加载代理配置失败', 'Failed to load proxy settings'))
   } finally {
     isProxyLoading.value = false
   }
@@ -466,7 +496,7 @@ async function saveProxySettings() {
     proxy_url: proxyForm.proxy_url.trim(),
   }
   if (payload.enabled && !payload.proxy_url) {
-    message.error('启用代理时必须填写代理地址')
+    message.error(t('启用代理时必须填写代理地址', 'Proxy URL is required when proxy is enabled'))
     return
   }
   isProxySaving.value = true
@@ -475,9 +505,9 @@ async function saveProxySettings() {
     proxyForm.enabled = saved.enabled
     proxyForm.proxy_url = saved.proxy_url
     proxyModalOpen.value = false
-    message.success('代理配置已保存')
+    message.success(t('代理配置已保存', 'Proxy settings saved'))
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '保存代理配置失败')
+    message.error(errorText(error, '保存代理配置失败', 'Failed to save proxy settings'))
   } finally {
     isProxySaving.value = false
   }
@@ -485,13 +515,13 @@ async function saveProxySettings() {
 
 function confirmDelete(row: ModelPrice) {
   dialog.warning({
-    title: '删除价格',
+    title: t('删除价格', 'Delete price'),
     content: `${row.provider} / ${row.model}`,
-    positiveText: '删除',
-    negativeText: '取消',
+    positiveText: t('删除', 'Delete'),
+    negativeText: t('取消', 'Cancel'),
     onPositiveClick: async () => {
       await deleteModelPrice(row.id)
-      message.success('模型价格已删除')
+      message.success(t('模型价格已删除', 'Model price deleted'))
       await refresh()
     },
   })
@@ -527,7 +557,7 @@ function renderBillingUnitCell(row: PriceDisplayRow) {
         lineHeight: '1.2',
       },
     },
-    isRequest ? '按次' : '按 Token',
+    isRequest ? t('按次', 'Per call') : t('按 Token', 'Per token'),
   )
 }
 
@@ -543,7 +573,7 @@ function renderRequestPriceValue(row: PriceDisplayRow) {
     return h('span', { class: 'price-muted' }, '-')
   }
   if (row.price?.request_usd === null || row.price?.request_usd === undefined) {
-    return h('span', { class: 'price-muted' }, '未定价')
+    return h('span', { class: 'price-muted' }, t('未定价', 'Unpriced'))
   }
   return formatPriceValue(row.price.request_usd)
 }
@@ -562,7 +592,7 @@ function renderModelCell(row: PriceDisplayRow) {
               bordered: false,
               style: { marginLeft: '16px' },
             },
-            { default: () => 'CPA 可用模型' },
+            { default: () => t('CPA 可用模型', 'CPA available model') },
           )
         : null,
     ]),
@@ -573,12 +603,14 @@ function renderModelCell(row: PriceDisplayRow) {
 function renderProviderCell(row: PriceDisplayRow) {
   return h('div', { class: 'provider-cell' }, [
     h('div', { class: 'provider-main' }, row.provider || '-'),
-    row.owner && row.owner !== row.provider ? h('div', { class: 'model-sub' }, `Owner: ${row.owner}`) : null,
+    row.owner && row.owner !== row.provider
+      ? h('div', { class: 'model-sub' }, t('所有者', 'Owner') + `: ${row.owner}`)
+      : null,
   ])
 }
 
 function renderStatusCell(row: PriceDisplayRow) {
-  const label = row.status === 'missing' ? '未定价' : row.status === 'litellm' ? 'LiteLLM' : '手动'
+  const label = row.status === 'missing' ? t('未定价', 'Unpriced') : row.status === 'litellm' ? 'LiteLLM' : t('手动', 'Manual')
   const type = row.status === 'missing' ? 'warning' : row.status === 'litellm' ? 'info' : 'default'
   return h(
     NTag,
@@ -587,65 +619,65 @@ function renderStatusCell(row: PriceDisplayRow) {
   )
 }
 
-const columns: DataTableColumns<PriceDisplayRow> = [
+const columns = computed<DataTableColumns<PriceDisplayRow>>(() => [
   {
-    title: '模型',
+    title: t('模型', 'Model'),
     key: 'id',
     width: 380,
     ellipsis: { tooltip: true },
     render: renderModelCell,
   },
   {
-    title: '服务商',
+    title: t('服务商', 'Provider'),
     key: 'provider',
     width: 160,
     ellipsis: { tooltip: true },
     render: renderProviderCell,
   },
   {
-    title: '定价',
+    title: t('定价', 'Pricing'),
     key: 'status',
     width: 96,
     render: renderStatusCell,
   },
   {
-    title: '计费方式',
+    title: t('计费方式', 'Billing'),
     key: 'billing_unit',
     width: 100,
     render: renderBillingUnitCell,
   },
   {
-    title: '每次 ($)',
+    title: t('每次 ($)', 'Per call ($)'),
     key: 'request_usd',
     width: 110,
     render: renderRequestPriceValue,
   },
   {
-    title: '输入 ($/MTok)',
+    title: t('输入 ($/MTok)', 'Input ($/MTok)'),
     key: 'input_usd_per_million',
     width: 125,
     render: (row) => renderTokenPriceValue(row, 'input_usd_per_million'),
   },
   {
-    title: '输出 ($/MTok)',
+    title: t('输出 ($/MTok)', 'Output ($/MTok)'),
     key: 'output_usd_per_million',
     width: 125,
     render: (row) => renderTokenPriceValue(row, 'output_usd_per_million'),
   },
   {
-    title: '缓存读 ($/MTok)',
+    title: t('缓存读 ($/MTok)', 'Cache read ($/MTok)'),
     key: 'cache_read_usd_per_million',
     width: 125,
     render: (row) => renderTokenPriceValue(row, 'cache_read_usd_per_million'),
   },
   {
-    title: '缓存写 ($/MTok)',
+    title: t('缓存写 ($/MTok)', 'Cache write ($/MTok)'),
     key: 'cache_creation_usd_per_million',
     width: 125,
     render: (row) => renderTokenPriceValue(row, 'cache_creation_usd_per_million'),
   },
   {
-    title: '更新',
+    title: t('更新', 'Updated'),
     key: 'updated_at',
     width: 140,
     render: (row) => (row.price ? formatDateTime(row.price.updated_at) : '-'),
@@ -665,25 +697,25 @@ const columns: DataTableColumns<PriceDisplayRow> = [
               ? h(
                   NButton,
                   { size: 'small', quaternary: true, onClick: () => openEdit(row.price as ModelPrice) },
-                  { default: () => '改价' },
+                  { default: () => t('改价', 'Edit') },
                 )
               : h(
                   NButton,
                   { size: 'small', type: 'primary', secondary: true, onClick: () => openCreateForRow(row) },
-                  { default: () => '设价' },
+                  { default: () => t('设价', 'Set price') },
                 ),
             row.price
               ? h(
                   NButton,
                   { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDelete(row.price as ModelPrice) },
-                  { default: () => '删除' },
+                  { default: () => t('删除', 'Delete') },
                 )
               : null,
           ],
         },
       ),
   },
-]
+])
 
 onMounted(() => {
   desktopPriceLayoutQuery.addEventListener('change', handleDesktopPriceLayoutChange)
@@ -699,23 +731,25 @@ onBeforeUnmount(() => {
   <section class="page price-page">
     <div class="page-header">
       <div>
-        <h1 class="page-title">模型价格</h1>
-        <p class="page-subtitle">Token 模型按 USD / 百万 Token 计费，image 模型按每次成功调用计费</p>
+        <h1 class="page-title">{{ t('模型价格', 'Model prices') }}</h1>
+        <p class="page-subtitle">
+          {{ t('Token 模型按 USD / 百万 Token 计费，image 模型按每次成功调用计费', 'Token models are charged in USD per million tokens. Image models are charged per successful call.') }}
+        </p>
       </div>
       <NSpace>
         <NButton secondary :loading="isSyncing" @click="syncPrices">
           <template #icon>
             <NIcon :component="RefreshCw" />
           </template>
-          同步 LiteLLM
+          {{ t('同步 LiteLLM', 'Sync LiteLLM') }}
         </NButton>
         <NButton secondary :disabled="isSyncing" @click="openProxySettings">
           <template #icon>
             <NIcon :component="Settings2" />
           </template>
-          代理配置
+          {{ t('代理配置', 'Proxy settings') }}
         </NButton>
-        <NButton type="primary" @click="() => openCreate()">新增价格</NButton>
+        <NButton type="primary" @click="() => openCreate()">{{ t('新增价格', 'Add price') }}</NButton>
       </NSpace>
     </div>
 
@@ -738,31 +772,33 @@ onBeforeUnmount(() => {
         <div class="table-toolbar">
           <NSpace class="price-toolbar-layout" justify="space-between" align="center">
             <NSpace class="price-filters" align="center" :size="8">
-              <span class="filter-label">服务商</span>
+              <span class="filter-label">{{ t('服务商', 'Provider') }}</span>
               <NSelect
                 v-model:value="selectedProvider"
                 class="provider-filter"
                 :options="providerOptions"
                 clearable
                 filterable
-                placeholder="全部服务商"
+                :placeholder="t('全部服务商', 'All providers')"
               />
               <NSelect
                 v-model:value="selectedStatus"
                 class="status-filter"
                 :options="statusOptions"
                 clearable
-                placeholder="全部状态"
+                :placeholder="t('全部状态', 'All statuses')"
               />
               <NInput
                 v-model:value="searchQuery"
                 class="price-search"
                 clearable
-                placeholder="搜索模型或服务商"
+                :placeholder="t('搜索模型或服务商', 'Search models or providers')"
                 :render-prefix="renderSearchIcon"
               />
             </NSpace>
-            <span class="result-count">共 {{ filteredPriceCount }} / {{ totalPriceCount }} 条</span>
+            <span class="result-count">
+              {{ t(`共 ${filteredPriceCount} / ${totalPriceCount} 条`, `${filteredPriceCount} / ${totalPriceCount} items`) }}
+            </span>
           </NSpace>
         </div>
       </div>
@@ -782,32 +818,32 @@ onBeforeUnmount(() => {
     <NModal
       v-model:show="modalOpen"
       preset="card"
-      :title="editingId === null ? '新增价格' : '编辑价格'"
+      :title="editingId === null ? t('新增价格', 'Add price') : t('编辑价格', 'Edit price')"
       :style="priceModalStyle"
       class="price-modal"
     >
       <NForm :model="form" label-placement="top">
         <div class="form-grid">
-          <NFormItem label="服务商">
+          <NFormItem :label="t('服务商', 'Provider')">
             <NInput v-model:value="form.provider" />
           </NFormItem>
-          <NFormItem label="模型">
+          <NFormItem :label="t('模型', 'Model')">
             <NInput v-model:value="form.model" />
           </NFormItem>
-          <NFormItem v-if="isRequestPriceForm" label="每次调用价格 USD" class="wide-form-item">
-            <NInputNumber v-model:value="form.request_usd" :min="0" placeholder="例如：0.04" />
+          <NFormItem v-if="isRequestPriceForm" :label="t('每次调用价格 USD', 'Per-call price USD')" class="wide-form-item">
+            <NInputNumber v-model:value="form.request_usd" :min="0" :placeholder="t('例如：0.04', 'Example: 0.04')" />
           </NFormItem>
           <template v-else>
-            <NFormItem label="输入价格">
+            <NFormItem :label="t('输入价格', 'Input price')">
               <NInputNumber v-model:value="form.input_usd_per_million" :min="0" />
             </NFormItem>
-            <NFormItem label="输出价格">
+            <NFormItem :label="t('输出价格', 'Output price')">
               <NInputNumber v-model:value="form.output_usd_per_million" :min="0" />
             </NFormItem>
-            <NFormItem label="缓存读价格">
+            <NFormItem :label="t('缓存读价格', 'Cache read price')">
               <NInputNumber v-model:value="form.cache_read_usd_per_million" :min="0" />
             </NFormItem>
-            <NFormItem label="缓存写价格">
+            <NFormItem :label="t('缓存写价格', 'Cache write price')">
               <NInputNumber v-model:value="form.cache_creation_usd_per_million" :min="0" />
             </NFormItem>
           </template>
@@ -816,8 +852,8 @@ onBeforeUnmount(() => {
       <p class="price-save-hint">{{ priceSaveHint }}</p>
       <template #footer>
         <NSpace justify="end">
-          <NButton @click="modalOpen = false">取消</NButton>
-          <NButton type="primary" @click="savePrice">保存</NButton>
+          <NButton @click="modalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
+          <NButton type="primary" @click="savePrice">{{ t('保存', 'Save') }}</NButton>
         </NSpace>
       </template>
     </NModal>
@@ -825,7 +861,7 @@ onBeforeUnmount(() => {
     <NModal
       v-model:show="proxyModalOpen"
       preset="card"
-      title="LiteLLM 代理配置"
+      :title="t('LiteLLM 代理配置', 'LiteLLM proxy settings')"
       :style="proxyModalStyle"
       :content-style="proxyModalContentStyle"
       :footer-style="proxyModalFooterStyle"
@@ -835,26 +871,26 @@ onBeforeUnmount(() => {
         <div class="proxy-form">
           <p class="proxy-hint">{{ liteLLMProxyHint }}</p>
           <div class="proxy-switch-row">
-            <span class="proxy-switch-label">使用代理</span>
+            <span class="proxy-switch-label">{{ t('使用代理', 'Use proxy') }}</span>
             <NSwitch
               v-model:value="proxyForm.enabled"
               :disabled="isProxyLoading || isProxySaving"
-              aria-label="使用代理"
+              :aria-label="t('使用代理', 'Use proxy')"
             />
           </div>
-          <NFormItem label="代理地址">
+          <NFormItem :label="t('代理地址', 'Proxy URL')">
             <NInput
               v-model:value="proxyForm.proxy_url"
               :disabled="!proxyForm.enabled || isProxyLoading || isProxySaving"
-              placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+              :placeholder="t('http://127.0.0.1:7890 或 socks5://127.0.0.1:1080', 'http://127.0.0.1:7890 or socks5://127.0.0.1:1080')"
             />
           </NFormItem>
         </div>
       </NForm>
       <template #footer>
         <NSpace justify="end">
-          <NButton :disabled="isProxySaving" @click="proxyModalOpen = false">取消</NButton>
-          <NButton type="primary" :loading="isProxySaving" @click="saveProxySettings">保存</NButton>
+          <NButton :disabled="isProxySaving" @click="proxyModalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
+          <NButton type="primary" :loading="isProxySaving" @click="saveProxySettings">{{ t('保存', 'Save') }}</NButton>
         </NSpace>
       </template>
     </NModal>

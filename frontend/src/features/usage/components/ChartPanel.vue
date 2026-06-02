@@ -19,6 +19,7 @@ import type { BarSeriesOption, LineSeriesOption, PieSeriesOption } from 'echarts
 import type { ComposeOption, ECharts } from 'echarts/core'
 
 import { useThemePreference } from '@/shared/composables/useThemePreference'
+import { useI18n } from '@/shared/i18n'
 
 echarts.use([
   BarChart,
@@ -53,6 +54,7 @@ const props = defineProps<{
 const chartEl = ref<HTMLDivElement | null>(null)
 const chart = ref<ECharts | null>(null)
 const { isDark } = useThemePreference()
+const { t } = useI18n()
 
 let chartThemeFrame: number | undefined
 
@@ -153,7 +155,7 @@ onBeforeUnmount(() => {
       <div class="chart-body">
         <div ref="chartEl" class="chart-surface" :class="{ 'is-empty': empty }" />
         <div v-if="empty" class="chart-empty">
-          <NEmpty description="暂无数据" />
+          <NEmpty :description="t('暂无数据', 'No data')" />
         </div>
       </div>
       <div v-if="$slots.default" class="chart-footer">

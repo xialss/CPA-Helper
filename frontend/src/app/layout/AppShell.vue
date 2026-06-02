@@ -23,6 +23,7 @@ import {
   DollarSign,
   Github,
   KeyRound,
+  Languages,
   List,
   ListChecks,
   LogOut,
@@ -39,6 +40,7 @@ import {
 import { getMe, isAuthUser, logout } from '@/features/auth/api/authApi'
 import { useCurrentUser } from '@/features/auth/state/currentUser'
 import { useThemePreference } from '@/shared/composables/useThemePreference'
+import { useI18n } from '@/shared/i18n'
 import { logoUrl } from '@/shared/utils/assets'
 
 const route = useRoute()
@@ -53,6 +55,7 @@ const isRouteTransitioning = ref(false)
 const { currentUser, setCurrentUser } = useCurrentUser()
 const hasLoadedUser = ref(currentUser.value !== null)
 const { isDark, preference, setThemePreference, toggleTheme } = useThemePreference()
+const { language, t, toggleLanguage } = useI18n()
 let navigationFeedbackTimer: number | undefined
 let routeTransitionReleaseTimer: number | undefined
 
@@ -114,26 +117,30 @@ function renderIcon(icon: Component) {
     )
 }
 
-const adminMenuItems: MenuOption[] = [
-  { label: '历史用量', key: '/admin/usage', icon: renderIcon(BarChart3) },
-  { label: '请求明细', key: '/admin/records', icon: renderIcon(List) },
-  { label: '用户管理', key: '/admin/users', icon: renderIcon(Users) },
-  { label: '模型价格', key: '/admin/pricing', icon: renderIcon(DollarSign) },
-  { label: '系统设置', key: '/admin/settings', icon: renderIcon(Settings) },
-]
+const adminMenuItems = computed<MenuOption[]>(() => [
+  { label: t('历史用量', 'Usage History'), key: '/admin/usage', icon: renderIcon(BarChart3) },
+  { label: t('请求明细', 'Request Records'), key: '/admin/records', icon: renderIcon(List) },
+  { label: t('用户管理', 'Users'), key: '/admin/users', icon: renderIcon(Users) },
+  { label: t('模型价格', 'Model Prices'), key: '/admin/pricing', icon: renderIcon(DollarSign) },
+  { label: t('系统设置', 'System Settings'), key: '/admin/settings', icon: renderIcon(Settings) },
+])
 
-const accountInspectionMenuItems: MenuOption[] = [
-  { label: '巡检设置', key: '/admin/account-inspection', icon: renderIcon(Activity) },
-  { label: '账号状态', key: '/admin/account-status', icon: renderIcon(ListChecks) },
-]
+const accountInspectionMenuItems = computed<MenuOption[]>(() => [
+  {
+    label: t('巡检设置', 'Inspection Settings'),
+    key: '/admin/account-inspection',
+    icon: renderIcon(Activity),
+  },
+  { label: t('账号状态', 'Account Status'), key: '/admin/account-status', icon: renderIcon(ListChecks) },
+])
 
-const accountMenuItems: MenuOption[] = [
-  { label: '我的用量', key: '/account/usage', icon: renderIcon(BarChart3) },
-  { label: '我的明细', key: '/account/records', icon: renderIcon(List) },
-  { label: 'API 密钥', key: '/account/keys', icon: renderIcon(KeyRound) },
-  { label: '可用模型', key: '/account/models', icon: renderIcon(Cpu) },
-  { label: '账户设置', key: '/account/settings', icon: renderIcon(UserRound) },
-]
+const accountMenuItems = computed<MenuOption[]>(() => [
+  { label: t('我的用量', 'My Usage'), key: '/account/usage', icon: renderIcon(BarChart3) },
+  { label: t('我的明细', 'My Records'), key: '/account/records', icon: renderIcon(List) },
+  { label: t('API 密钥', 'API Keys'), key: '/account/keys', icon: renderIcon(KeyRound) },
+  { label: t('可用模型', 'Available Models'), key: '/account/models', icon: renderIcon(Cpu) },
+  { label: t('账户设置', 'Account Settings'), key: '/account/settings', icon: renderIcon(UserRound) },
+])
 
 const isAdmin = computed(() => {
   if (currentUser.value) {
@@ -144,8 +151,8 @@ const isAdmin = computed(() => {
   }
   return false
 })
-const roleText = computed(() => (isAdmin.value ? '管理员' : '普通用户'))
-const accountText = computed(() => currentUser.value?.username || '当前账号')
+const roleText = computed(() => (isAdmin.value ? t('管理员', 'Admin') : t('普通用户', 'User')))
+const accountText = computed(() => currentUser.value?.username || t('当前账号', 'Current account'))
 
 function formatAppVersion(value: string | undefined): string {
   const version = value?.trim()
@@ -165,33 +172,33 @@ const menuOptions = computed<MenuOption[]>(() => {
   if (isAdmin.value) {
     groups.push({
       type: 'group',
-      label: '统计中心',
+      label: t('统计中心', 'Analytics'),
       key: 'admin-group',
       icon: renderIcon(Shield),
-      children: adminMenuItems,
+      children: adminMenuItems.value,
     })
     groups.push({
       type: 'group',
-      label: '账号巡检',
+      label: t('账号巡检', 'Account Inspection'),
       key: 'account-inspection-group',
       icon: renderIcon(Activity),
-      children: accountInspectionMenuItems,
+      children: accountInspectionMenuItems.value,
     })
   }
   groups.push({
     type: 'group',
-    label: '我的账户',
+    label: t('我的账户', 'My Account'),
     key: 'account-group',
     icon: renderIcon(UserRound),
-    children: accountMenuItems,
+    children: accountMenuItems.value,
   })
   return groups
 })
 
 const leafMenuOptions = computed(() =>
   isAdmin.value
-    ? [...adminMenuItems, ...accountInspectionMenuItems, ...accountMenuItems]
-    : accountMenuItems,
+    ? [...adminMenuItems.value, ...accountInspectionMenuItems.value, ...accountMenuItems.value]
+    : accountMenuItems.value,
 )
 
 const selectedKey = computed(() => {
@@ -260,7 +267,7 @@ async function handleLogout() {
   await logout()
   setCurrentUser(null)
   hasLoadedUser.value = true
-  message.success('已退出登录')
+  message.success(t('已退出登录', 'Signed out'))
   await router.push('/login')
 }
 
@@ -282,6 +289,11 @@ const themeIcon = computed(() => {
   }
   return isDark.value ? Moon : Sun
 })
+
+const languageLabel = computed(() => (language.value === 'zh' ? 'EN' : 'CN'))
+const languageAriaLabel = computed(() => t('切换语言', 'Switch language'))
+const themeAriaLabel = computed(() => t('切换主题', 'Switch theme'))
+const logoutAriaLabel = computed(() => t('退出登录', 'Sign out'))
 </script>
 
 <template>
@@ -316,7 +328,7 @@ const themeIcon = computed(() => {
           :href="repositoryUrl"
           target="_blank"
           rel="noreferrer"
-          aria-label="在 GitHub 查看 CPA-Helper"
+          :aria-label="t('在 GitHub 查看 CPA-Helper', 'View CPA-Helper on GitHub')"
         >
           <NIcon :component="Github" :size="20" />
           <span class="sider-version-text">{{ appVersion }}</span>
@@ -324,23 +336,34 @@ const themeIcon = computed(() => {
         <div class="sider-actions">
           <NTooltip trigger="hover">
             <template #trigger>
-              <NButton quaternary circle :aria-label="'切换主题'" @click="cycleTheme">
+              <NButton quaternary circle :aria-label="languageAriaLabel" @click="toggleLanguage">
+                <template #icon>
+                  <NIcon :component="Languages" />
+                </template>
+                <span class="sr-only">{{ languageLabel }}</span>
+              </NButton>
+            </template>
+            {{ language === 'zh' ? 'English' : '中文' }}
+          </NTooltip>
+          <NTooltip trigger="hover">
+            <template #trigger>
+              <NButton quaternary circle :aria-label="themeAriaLabel" @click="cycleTheme">
                 <template #icon>
                   <NIcon :component="themeIcon" />
                 </template>
               </NButton>
             </template>
-            主题
+            {{ t('主题', 'Theme') }}
           </NTooltip>
           <NTooltip trigger="hover">
             <template #trigger>
-              <NButton quaternary circle :aria-label="'退出登录'" @click="handleLogout">
+              <NButton quaternary circle :aria-label="logoutAriaLabel" @click="handleLogout">
                 <template #icon>
                   <NIcon :component="LogOut" />
                 </template>
               </NButton>
             </template>
-            退出
+            {{ t('退出', 'Sign out') }}
           </NTooltip>
         </div>
       </div>
@@ -348,12 +371,12 @@ const themeIcon = computed(() => {
 
     <NLayout class="app-main">
       <NLayoutHeader class="mobile-header" bordered>
-        <NButton quaternary circle :aria-label="'打开导航'" @click="drawerOpen = true">
+        <NButton quaternary circle :aria-label="t('打开导航', 'Open navigation')" @click="drawerOpen = true">
           <template #icon>
             <NIcon :component="Menu" />
           </template>
         </NButton>
-        <div class="mobile-brand" aria-label="CPA-Helper 账号信息">
+        <div class="mobile-brand" :aria-label="t('CPA-Helper 账号信息', 'CPA-Helper account info')">
           <img class="mobile-brand-logo" :src="logoUrl" alt="" aria-hidden="true">
           <div class="mobile-brand-copy">
             <div class="mobile-title-row">
@@ -363,11 +386,19 @@ const themeIcon = computed(() => {
             <span>{{ accountText }} · {{ roleText }}</span>
           </div>
         </div>
-        <NButton quaternary circle :aria-label="'切换主题'" @click="toggleTheme">
-          <template #icon>
-            <NIcon :component="themeIcon" />
-          </template>
-        </NButton>
+        <div class="mobile-actions">
+          <NButton quaternary circle :aria-label="languageAriaLabel" @click="toggleLanguage">
+            <template #icon>
+              <NIcon :component="Languages" />
+            </template>
+            <span class="sr-only">{{ languageLabel }}</span>
+          </NButton>
+          <NButton quaternary circle :aria-label="themeAriaLabel" @click="toggleTheme">
+            <template #icon>
+              <NIcon :component="themeIcon" />
+            </template>
+          </NButton>
+        </div>
       </NLayoutHeader>
       <NLayoutContent
         class="content"
@@ -400,17 +431,23 @@ const themeIcon = computed(() => {
       <NDrawerContent :title="`CPA-Helper · ${appVersion}`" body-content-style="padding: 0;">
         <NMenu :value="selectedKey" :options="menuOptions" @update:value="handleMenuUpdate" />
         <div class="drawer-actions">
+          <NButton secondary @click="toggleLanguage">
+            <template #icon>
+              <NIcon :component="Languages" />
+            </template>
+            {{ language === 'zh' ? 'English' : '中文' }}
+          </NButton>
           <NButton secondary @click="cycleTheme">
             <template #icon>
               <NIcon :component="themeIcon" />
             </template>
-            主题
+            {{ t('主题', 'Theme') }}
           </NButton>
           <NButton secondary @click="handleLogout">
             <template #icon>
               <NIcon :component="LogOut" />
             </template>
-            退出
+            {{ t('退出', 'Sign out') }}
           </NButton>
         </div>
       </NDrawerContent>
@@ -676,6 +713,18 @@ const themeIcon = computed(() => {
   box-shadow: var(--cpa-shadow-card), var(--cpa-shadow-hairline);
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
 .app-main {
   display: flex;
   flex-direction: column;
@@ -849,7 +898,7 @@ const themeIcon = computed(() => {
 .mobile-header {
   display: none;
   align-items: center;
-  grid-template-columns: 42px minmax(0, 1fr) 42px;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
   gap: 8px;
   height: 56px;
   padding: 0 10px;
@@ -861,6 +910,12 @@ const themeIcon = computed(() => {
 .mobile-header :deep(.n-button) {
   width: 38px;
   height: 38px;
+}
+
+.mobile-actions {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
 }
 
 .mobile-brand {
@@ -921,7 +976,7 @@ const themeIcon = computed(() => {
 
 .drawer-actions {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   padding: 14px;
 }

@@ -1,4 +1,5 @@
 import { apiClient } from '@/shared/api/apiClient'
+import { localize } from '@/shared/i18n'
 import type {
   AuthUser,
   ChangeCredentialsPayload,
@@ -22,7 +23,7 @@ export function isAuthUser(value: unknown): value is AuthUser {
 
 function toAuthUser(value: unknown): AuthUser {
   if (!isAuthUser(value)) {
-    throw new Error('登录状态缺少角色信息，请重启后端服务后重新登录')
+    throw new Error(localize('登录状态缺少角色信息，请重启后端服务后重新登录', 'Your session is missing role information. Restart the backend and sign in again.'))
   }
   return value
 }

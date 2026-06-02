@@ -5,10 +5,12 @@ import { NAlert, NButton, NCard, NForm, NFormItem, NInput, useMessage } from 'na
 
 import { changeCredentials, getMe } from '@/features/auth/api/authApi'
 import { setCurrentUser } from '@/features/auth/state/currentUser'
+import { useI18n } from '@/shared/i18n'
 import { logoUrl } from '@/shared/utils/assets'
 
 const router = useRouter()
 const message = useMessage()
+const { errorText, t } = useI18n()
 const isLoading = ref(false)
 const errorMessage = ref<string | null>(null)
 const form = reactive({
@@ -35,10 +37,10 @@ async function handleSubmit() {
       current_password: form.current_password || undefined,
     })
     setCurrentUser(user)
-    message.success('密码已更新')
+    message.success(t('密码已更新', 'Password updated'))
     await router.push(user.is_admin ? '/admin/usage' : '/account/usage')
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '更新失败'
+    errorMessage.value = errorText(error, '更新失败', 'Update failed')
   } finally {
     isLoading.value = false
   }
@@ -54,15 +56,15 @@ async function handleSubmit() {
       </div>
     </section>
 
-    <section class="auth-content" aria-label="修改密码区域">
+    <section class="auth-content" :aria-label="t('修改密码区域', 'Change password area')">
       <div class="brand-mark">
         <img :src="logoUrl" alt="">
       </div>
 
       <NCard class="auth-card" :bordered="true">
         <div class="auth-heading">
-          <h1>修改密码</h1>
-          <p>首次登录后需要完成密码更新</p>
+          <h1>{{ t('修改密码', 'Change password') }}</h1>
+          <p>{{ t('首次登录后需要完成密码更新', 'Update your password after first sign-in') }}</p>
         </div>
 
         <NAlert v-if="errorMessage" type="error" :bordered="false" class="auth-alert">
@@ -70,10 +72,10 @@ async function handleSubmit() {
         </NAlert>
 
         <NForm :model="form" label-placement="top" @submit.prevent="handleSubmit">
-          <NFormItem label="账号" path="username">
+          <NFormItem :label="t('账号', 'Account')" path="username">
             <NInput v-model:value="form.username" autocomplete="username" disabled />
           </NFormItem>
-          <NFormItem label="新密码" path="password">
+          <NFormItem :label="t('新密码', 'New password')" path="password">
             <NInput
               v-model:value="form.password"
               type="password"
@@ -81,7 +83,7 @@ async function handleSubmit() {
               autocomplete="new-password"
             />
           </NFormItem>
-          <NFormItem label="当前密码" path="current_password">
+          <NFormItem :label="t('当前密码', 'Current password')" path="current_password">
             <NInput
               v-model:value="form.current_password"
               type="password"
@@ -91,7 +93,7 @@ async function handleSubmit() {
             />
           </NFormItem>
           <NButton type="primary" block attr-type="submit" :loading="isLoading">
-            保存
+            {{ t('保存', 'Save') }}
           </NButton>
         </NForm>
       </NCard>

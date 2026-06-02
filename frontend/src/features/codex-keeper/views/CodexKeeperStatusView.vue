@@ -53,6 +53,7 @@ import type {
   CodexKeeperQuotaWindowUsage,
   CodexKeeperStatus,
 } from '@/shared/types/api'
+import { useI18n } from '@/shared/i18n'
 import {
   BEIJING_TIME_ZONE,
   formatCompact,
@@ -100,6 +101,7 @@ const normalTableScrollX = 1816
 const KEEPER_STATUS_POLL_INTERVAL_MS = 3000
 const REFRESH_STATUS_POLL_INTERVAL_MS = 1500
 const message = useMessage()
+const { currentLanguage, errorText, keeperStatusText, serverText, t } = useI18n()
 const isLoading = ref(false)
 const isBulkDeleting = ref(false)
 const isBulkRefreshing = ref(false)
@@ -153,8 +155,8 @@ const priorityRuleMap = computed(() =>
   Object.fromEntries(priorityRules.value.map((rule) => [rule.account_type, rule.priority])),
 )
 const priorityFilterOptions = computed<Array<{ label: string; value: PriorityFilter }>>(() => [
-  { label: '全部优先级', value: 'all' },
-  { label: '手动优先 >20', value: 'high' },
+  { label: t('全部优先级', 'All Priorities'), value: 'all' },
+  { label: t('手动优先 >20', 'Manual Priority >20'), value: 'high' },
   ...[...priorityRules.value]
     .filter((rule) => rule.priority >= 0 && rule.priority <= 20)
     .sort((left, right) => {
@@ -167,25 +169,25 @@ const priorityFilterOptions = computed<Array<{ label: string; value: PriorityFil
       label: `${formatInteger(rule.priority)} (${rule.account_type})`,
       value: priorityTypeFilter(rule.account_type),
     })),
-  { label: '临时降级', value: 'minusOne' },
-  { label: '手动低优先 <-1', value: 'low' },
+  { label: t('临时降级', 'Temporary Downgrade'), value: 'minusOne' },
+  { label: t('手动低优先 <-1', 'Manual Low Priority <-1'), value: 'low' },
 ])
-const accountDisplaySizeOptions: Array<{ label: string; value: AccountDisplaySize }> = [
+const accountDisplaySizeOptions = computed<Array<{ label: string; value: AccountDisplaySize }>>(() => [
   { label: '50', value: 50 },
   { label: '100', value: 100 },
   { label: '150', value: 150 },
   { label: '200', value: 200 },
-  { label: '全部', value: 'all' },
-]
-const accountListViewOptions = [
-  { label: '表格', key: 'table', icon: () => h(NIcon, null, { default: () => h(Table2) }) },
-  { label: '进度条卡片', key: 'bar', icon: () => h(NIcon, null, { default: () => h(BarChart3) }) },
-  { label: '圆环卡片', key: 'ring', icon: () => h(NIcon, null, { default: () => h(CircleDot) }) },
-]
-const quotaSortOptions = [
-  { label: '天', key: 'quotaDay' },
-  { label: '月/周', key: 'quotaWeek' },
-]
+  { label: t('全部', 'All'), value: 'all' },
+])
+const accountListViewOptions = computed(() => [
+  { label: t('表格', 'Table'), key: 'table', icon: () => h(NIcon, null, { default: () => h(Table2) }) },
+  { label: t('进度条卡片', 'Progress Cards'), key: 'bar', icon: () => h(NIcon, null, { default: () => h(BarChart3) }) },
+  { label: t('圆环卡片', 'Ring Cards'), key: 'ring', icon: () => h(NIcon, null, { default: () => h(CircleDot) }) },
+])
+const quotaSortOptions = computed(() => [
+  { label: t('天', 'Day'), key: 'quotaDay' },
+  { label: t('月/周', 'Month/Week'), key: 'quotaWeek' },
+])
 
 const accountTypeOptions = computed(() =>
   [...new Set(accounts.value.map((item) => item.account_type).filter(Boolean))]
@@ -248,19 +250,15 @@ const keeperStateType = computed(() => {
 const keeperStatusDetailText = computed(() => {
   const detail = keeperStatus.value?.detail
   if (isKeeperDaemonRunning.value && !isKeeperRunning.value) {
-    return '自动巡检已开启'
+    return t('自动巡检已开启', 'Automatic inspection is enabled')
   }
   if (!detail) {
-    return '未运行'
+    return t('未运行', 'Not running')
   }
-  return detail
-    .replace(/守护运行中/g, '自动巡检运行中')
-    .replace(/守护进程/g, '后台自动巡检')
-    .replace(/守护任务/g, '自动巡检任务')
-    .replace(/守护已启动/g, '已开始自动巡检')
+  return keeperStatusText(detail)
 })
 const keeperStatusFootnoteText = computed(() =>
-  isKeeperDaemonRunning.value ? '等待 Cron 调度' : '后台自动巡检',
+  isKeeperDaemonRunning.value ? t('等待 Cron 调度', 'Waiting for Cron schedule') : t('后台自动巡检', 'Background automatic inspection'),
 )
 const unauthorizedErrorAccountCount = computed(
   () => accounts.value.filter((account) => account.last_status_code === 401).length,
@@ -279,12 +277,12 @@ const isTableView = computed(() => accountListViewMode.value === 'table')
 const isBarCardView = computed(() => accountListViewMode.value === 'bar')
 const accountListViewLabel = computed(() => {
   if (accountListViewMode.value === 'bar') {
-    return '进度条卡片'
+    return t('进度条卡片', 'Progress Cards')
   }
   if (accountListViewMode.value === 'ring') {
-    return '圆环卡片'
+    return t('圆环卡片', 'Ring Cards')
   }
-  return '表格'
+  return t('表格', 'Table')
 })
 const sortedCardAccounts = computed(() => [
   ...filteredDisabledAccounts.value,
@@ -349,18 +347,18 @@ const showCardLoadingState = computed(() => isLoading.value && accounts.value.le
 const displaySizeHelpText = computed(() =>
   isTableView.value
     ? isDisplayAllAccounts.value
-      ? '当前筛选结果全部展示，账号较多时自动使用虚拟滚动。'
-      : `每个分组每页显示 ${accountDisplaySize.value} 个账号。`
+      ? t('当前筛选结果全部展示，账号较多时自动使用虚拟滚动。', 'All filtered results are shown. Virtual scrolling is used automatically for large account sets.')
+      : t(`每个分组每页显示 ${accountDisplaySize.value} 个账号。`, `${accountDisplaySize.value} accounts per group per page.`)
     : isDisplayAllAccounts.value
-      ? '当前筛选结果全部以卡片展示，账号较多时使用轻量渲染优化。'
-      : `统一列表每页显示 ${accountDisplaySize.value} 个账号。`,
+      ? t('当前筛选结果全部以卡片展示，账号较多时使用轻量渲染优化。', 'All filtered results are shown as cards. Lightweight rendering is used for large account sets.')
+      : t(`统一列表每页显示 ${accountDisplaySize.value} 个账号。`, `${accountDisplaySize.value} accounts per page in the unified list.`),
 )
 const activeQuotaSortLabel = computed(() => {
   if (accountSort.key === 'quotaDay') {
-    return '天'
+    return t('天', 'Day')
   }
   if (accountSort.key === 'quotaWeek') {
-    return '月/周'
+    return t('月/周', 'Month/Week')
   }
   return ''
 })
@@ -405,9 +403,12 @@ function accountDisplayText(
   pageCount: number,
 ): string {
   if (isDisplayAllAccounts.value) {
-    return `显示 ${visibleCount} / ${totalCount} 个账号`
+    return t(`显示 ${visibleCount} / ${totalCount} 个账号`, `Showing ${visibleCount} / ${totalCount} accounts`)
   }
-  return `第 ${clampPage(page, pageCount)} / ${pageCount} 页，显示 ${visibleCount} / ${totalCount} 个账号`
+  return t(
+    `第 ${clampPage(page, pageCount)} / ${pageCount} 页，显示 ${visibleCount} / ${totalCount} 个账号`,
+    `Page ${clampPage(page, pageCount)} / ${pageCount}, showing ${visibleCount} / ${totalCount} accounts`,
+  )
 }
 
 function clampPage(page: number, pageCount: number): number {
@@ -508,7 +509,7 @@ function saveAccountStatusPreferences() {
       }),
     )
   } catch {
-    // 本地存储不可用时不影响页面继续使用。
+    // Keep the page usable when local storage is unavailable.
   }
 }
 const selectedDisabledAccountNames = computed(() =>
@@ -541,13 +542,19 @@ const bulkDeletePreviewOverflow = computed(() =>
 )
 const bulkDeleteDialogTitle = computed(() =>
   bulkDeleteDialog.source === 'disabled401'
-    ? '批量删除 401 已禁用账号'
-    : '批量删除已禁用账号',
+    ? t('批量删除 401 已禁用账号', 'Bulk Delete 401 Disabled Accounts')
+    : t('批量删除已禁用账号', 'Bulk Delete Disabled Accounts'),
 )
 const bulkDeleteWarningText = computed(() =>
   bulkDeleteDialog.source === 'disabled401'
-    ? `将删除当前筛选下 ${selectedDisabledCount.value} 个 HTTP 401 已禁用账号，并从 CPA 删除 auth file。此操作不可恢复。`
-    : `将删除已选 ${selectedDisabledCount.value} 个已禁用账号，并从 CPA 删除 auth file。此操作不可恢复。`,
+    ? t(
+        `将删除当前筛选下 ${selectedDisabledCount.value} 个 HTTP 401 已禁用账号，并从 CPA 删除 auth file。此操作不可恢复。`,
+        `This will delete ${selectedDisabledCount.value} HTTP 401 disabled accounts in the current filter and remove their auth files from CPA. This cannot be undone.`,
+      )
+    : t(
+        `将删除已选 ${selectedDisabledCount.value} 个已禁用账号，并从 CPA 删除 auth file。此操作不可恢复。`,
+        `This will delete ${selectedDisabledCount.value} selected disabled accounts and remove their auth files from CPA. This cannot be undone.`,
+      ),
 )
 const canSubmitPriority = computed(() => {
   if (priorityDialog.mode === 'default') {
@@ -559,19 +566,19 @@ const canSubmitPriority = computed(() => {
   }
   return priorityDialog.mode === 'low' ? value < -1 : value > 20
 })
-const priorityDialogTitle = computed(() => '修改优先级')
+const priorityDialogTitle = computed(() => t('修改优先级', 'Change Priority'))
 const priorityDialogHint = computed(() => {
   if (priorityDialog.mode === 'low') {
-    return '手动低优先级必须小于 -1，巡检永远不会自动调整。'
+    return t('手动低优先级必须小于 -1，巡检永远不会自动调整。', 'Manual low priority must be less than -1. Inspection will never adjust it automatically.')
   }
   if (priorityDialog.mode === 'high') {
-    return '手动优先必须大于 20，额度耗尽时会临时降为 -1，恢复后回到该值。'
+    return t('手动优先必须大于 20，额度耗尽时会临时降为 -1，恢复后回到该值。', 'Manual priority must be greater than 20. When quota is exhausted it is temporarily lowered to -1 and restored to this value after recovery.')
   }
   const account = priorityDialog.account
   const value = account ? defaultPriority(account) : null
   return value === null
-    ? '该账号类型没有配置默认优先级，不能使用类型默认值。'
-    : `将优先级设置为当前账号类型默认值 ${value}。`
+    ? t('该账号类型没有配置默认优先级，不能使用类型默认值。', 'This account type has no default priority, so the type default cannot be used.')
+    : t(`将优先级设置为当前账号类型默认值 ${value}。`, `Set the priority to the current account type default: ${value}.`)
 })
 const priorityDialogBounds = computed(() => {
   if (priorityDialog.mode === 'low') {
@@ -585,10 +592,12 @@ const priorityDialogBounds = computed(() => {
 const priorityModeOptions = computed(() => {
   const defaultValue = priorityDialog.account ? defaultPriority(priorityDialog.account) : null
   return [
-    { label: '手动低优先 (< -1)', value: 'low' },
-    { label: '手动优先 (> 20)', value: 'high' },
+    { label: t('手动低优先 (< -1)', 'Manual Low Priority (< -1)'), value: 'low' },
+    { label: t('手动优先 (> 20)', 'Manual Priority (> 20)'), value: 'high' },
     {
-      label: defaultValue === null ? '类型默认优先级（不可用）' : `类型默认优先级 (${defaultValue})`,
+      label: defaultValue === null
+        ? t('类型默认优先级（不可用）', 'Type Default Priority (unavailable)')
+        : t(`类型默认优先级 (${defaultValue})`, `Type Default Priority (${defaultValue})`),
       value: 'default',
       disabled: defaultValue === null,
     },
@@ -843,12 +852,12 @@ function isFreeQuotaWindow(account: CodexKeeperAccount): boolean {
 
 function quotaWindowLabels(account: CodexKeeperAccount): { primary: string; secondary: string } {
   if (isFreeQuotaWindow(account)) {
-    return { primary: '月限额', secondary: '次限额' }
+    return { primary: t('月限额', 'Monthly Limit'), secondary: t('次限额', 'Secondary Limit') }
   }
   if (isPaidQuotaWindow(account)) {
-    return { primary: '5小时限额', secondary: '周限额' }
+    return { primary: t('5小时限额', '5-Hour Limit'), secondary: t('周限额', 'Weekly Limit') }
   }
-  return { primary: '主', secondary: '次' }
+  return { primary: t('主', 'Primary'), secondary: t('次', 'Secondary') }
 }
 
 function shouldShowQuotaWindow(account: CodexKeeperAccount): boolean {
@@ -926,7 +935,7 @@ function formatQuotaResetTime(value: string | null): string | null {
   if (Number.isNaN(date.getTime())) {
     return null
   }
-  return new Intl.DateTimeFormat('zh-CN', {
+  return new Intl.DateTimeFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
     timeZone: BEIJING_TIME_ZONE,
     month: '2-digit',
     day: '2-digit',
@@ -946,50 +955,64 @@ function quotaText(account: CodexKeeperAccount): string {
       const resetTime = formatQuotaResetTime(item.resetAt)
       const usageText = quotaWindowUsageText(item)
       return resetTime
-        ? `${item.label}剩余 ${item.remainingPercent}%，刷新 ${resetTime}，${usageText}`
-        : `${item.label}剩余 ${item.remainingPercent}%，${usageText}`
+        ? t(
+            `${item.label}剩余 ${item.remainingPercent}%，刷新 ${resetTime}，${usageText}`,
+            `${item.label} ${item.remainingPercent}% remaining, refreshes ${resetTime}, ${usageText}`,
+          )
+        : t(
+            `${item.label}剩余 ${item.remainingPercent}%，${usageText}`,
+            `${item.label} ${item.remainingPercent}% remaining, ${usageText}`,
+          )
     })
     .join(' / ')
 }
 
 function quotaWindowUsageText(item: QuotaWindowItem): string {
   if (!item.resetAt || item.usage?.stale === true) {
-    return '额度数据需刷新'
+    return t('额度数据需刷新', 'Quota data needs refresh')
   }
   if (!item.usage) {
-    return '本窗口暂无用量'
+    return t('本窗口暂无用量', 'No usage in this window')
   }
-  return `${formatInteger(item.usage.records)} 次 / ${formatCompact(item.usage.total_tokens)} Tokens / ${formatUsd(item.usage.estimated_cost_usd)}`
+  return t(
+    `${formatInteger(item.usage.records)} 次 / ${formatCompact(item.usage.total_tokens)} Tokens / ${formatUsd(item.usage.estimated_cost_usd)}`,
+    `${formatInteger(item.usage.records)} requests / ${formatCompact(item.usage.total_tokens)} Tokens / ${formatUsd(item.usage.estimated_cost_usd)}`,
+  )
 }
 
 function quotaWindowUsageTags(item: QuotaWindowItem): QuotaUsageTag[] {
   if (!item.resetAt || item.usage?.stale === true) {
-    return [{ label: '状态', value: '需刷新', tone: 'stale' }]
+    return [{ label: t('状态', 'Status'), value: t('需刷新', 'Needs refresh'), tone: 'stale' }]
   }
   const usage = item.usage
   return [
-    { label: '请求', value: formatInteger(usage?.records ?? 0) },
+    { label: t('请求', 'Requests'), value: formatInteger(usage?.records ?? 0) },
     { label: 'Tokens', value: formatCompact(usage?.total_tokens ?? 0) },
-    { label: '费用', value: formatUsd(usage?.estimated_cost_usd ?? 0) },
+    { label: t('费用', 'Cost'), value: formatUsd(usage?.estimated_cost_usd ?? 0) },
   ]
 }
 
 function quotaWindowResetText(item: QuotaWindowItem): string {
   const resetTime = formatQuotaResetTime(item.resetAt)
-  return resetTime ? `刷新 ${resetTime}` : '未记录刷新时间'
+  return resetTime ? t(`刷新 ${resetTime}`, `Refreshes ${resetTime}`) : t('未记录刷新时间', 'No refresh time recorded')
 }
 
 function quotaWindowUsageTitle(item: QuotaWindowItem): string {
   const usage = item.usage
   if (!item.resetAt || usage?.stale === true) {
-    return `${item.label} 额度数据需刷新`
+    return t(`${item.label} 额度数据需刷新`, `${item.label} quota data needs refresh`)
   }
   if (!usage) {
-    return `${item.label} 本窗口暂无用量`
+    return t(`${item.label} 本窗口暂无用量`, `${item.label} has no usage in this window`)
   }
   const unpriced =
-    usage.unpriced_records > 0 ? `，未计价 ${formatInteger(usage.unpriced_records)} 条` : ''
-  return `${item.label} 当前窗口：${formatInteger(usage.records)} 次请求，${formatCompact(usage.total_tokens)} Tokens，${formatUsd(usage.estimated_cost_usd)}${unpriced}`
+    usage.unpriced_records > 0
+      ? t(`，未计价 ${formatInteger(usage.unpriced_records)} 条`, `, ${formatInteger(usage.unpriced_records)} unpriced records`)
+      : ''
+  return t(
+    `${item.label} 当前窗口：${formatInteger(usage.records)} 次请求，${formatCompact(usage.total_tokens)} Tokens，${formatUsd(usage.estimated_cost_usd)}${unpriced}`,
+    `${item.label} current window: ${formatInteger(usage.records)} requests, ${formatCompact(usage.total_tokens)} Tokens, ${formatUsd(usage.estimated_cost_usd)}${unpriced}`,
+  )
 }
 
 function quotaWindowUsageTone(item: QuotaWindowItem): string {
@@ -997,19 +1020,19 @@ function quotaWindowUsageTone(item: QuotaWindowItem): string {
 }
 
 function latestActionText(account: CodexKeeperAccount): string {
-  return account.last_error?.trim() || account.latest_action?.trim() || '-'
+  const text = account.last_error?.trim() || account.latest_action?.trim()
+  return text ? serverText(text, '账号状态', 'Account status') : '-'
 }
 
 function disabledCardErrorText(account: CodexKeeperAccount): string {
   if (!account.disabled) {
     return ''
   }
-  return (
+  const text =
     account.last_error?.trim() ||
     account.latest_action?.trim() ||
-    disabledStatusCodeTitle(account) ||
-    '暂无报错信息'
-  )
+    disabledStatusCodeTitle(account)
+  return text ? serverText(text, '报错信息', 'Error details') : t('暂无报错信息', 'No error details')
 }
 
 function disabledStatusCodeText(account: CodexKeeperAccount): string | null {
@@ -1039,8 +1062,14 @@ function renderQuotaCell(account: CodexKeeperAccount) {
         {
           class: 'quota-window-item',
           title: resetTime
-            ? `${item.label}剩余 ${item.remainingPercent}%，刷新 ${resetTime}；${quotaWindowUsageTitle(item)}`
-            : `${item.label}剩余 ${item.remainingPercent}%；${quotaWindowUsageTitle(item)}`,
+            ? t(
+                `${item.label}剩余 ${item.remainingPercent}%，刷新 ${resetTime}；${quotaWindowUsageTitle(item)}`,
+                `${item.label} ${item.remainingPercent}% remaining, refreshes ${resetTime}; ${quotaWindowUsageTitle(item)}`,
+              )
+            : t(
+                `${item.label}剩余 ${item.remainingPercent}%；${quotaWindowUsageTitle(item)}`,
+                `${item.label} ${item.remainingPercent}% remaining; ${quotaWindowUsageTitle(item)}`,
+              ),
         },
         [
           h('div', { class: 'quota-window-head' }, [
@@ -1095,12 +1124,12 @@ function renderQuotaUsageCell(account: CodexKeeperAccount) {
 function renderAccountIdentityCell(account: CodexKeeperAccount) {
   const primary = account.email ?? account.name
   const statusCode = disabledStatusCodeText(account)
-  const statusLabel = `${account.disabled ? '已禁用' : '启用中'}${statusCode ? ` ${statusCode}` : ''}`
+  const statusLabel = `${account.disabled ? t('已禁用', 'Disabled') : t('启用中', 'Enabled')}${statusCode ? ` ${statusCode}` : ''}`
   return h(
     'div',
     {
       class: 'account-table-identity',
-      title: `${primary}\n${account.name}\n状态 ${statusLabel}`,
+      title: `${primary}\n${account.name}\n${t('状态', 'Status')} ${statusLabel}`,
     },
     [
       h('span', { class: 'account-table-email' }, primary),
@@ -1117,7 +1146,7 @@ function renderAccountIdentityCell(account: CodexKeeperAccount) {
 }
 
 function renderAccountTypeCell(account: CodexKeeperAccount) {
-  const typeLabel = account.account_type ?? '未知'
+  const typeLabel = account.account_type ?? t('未知', 'Unknown')
   return h(
     'span',
     { class: ['account-table-chip', 'is-type'], title: typeLabel },
@@ -1129,7 +1158,7 @@ function renderAccountPriorityCell(account: CodexKeeperAccount) {
   const priorityLabel = formatInteger(accountPriority(account))
   return h(
     'span',
-    { class: ['account-table-chip', 'is-priority'], title: `优先级 ${priorityLabel}` },
+    { class: ['account-table-chip', 'is-priority'], title: t(`优先级 ${priorityLabel}`, `Priority ${priorityLabel}`) },
     priorityLabel,
   )
 }
@@ -1170,7 +1199,7 @@ async function loadAccounts() {
     priorityRules.value = settings.priority_rules
     keeperStatus.value = nextStatus
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载账号状态失败')
+    message.error(errorText(error, '加载账号状态失败', 'Failed to load account status'))
   } finally {
     isLoading.value = false
   }
@@ -1300,16 +1329,16 @@ async function submitBulkDelete() {
       (key) => !deletedNames.has(String(key)),
     )
     if (result.failed.length > 0 && result.deleted.length > 0) {
-      message.warning(`批量删除完成：成功 ${result.deleted.length} 个，失败 ${result.failed.length} 个`)
+      message.warning(t(`批量删除完成：成功 ${result.deleted.length} 个，失败 ${result.failed.length} 个`, `Bulk delete complete: ${result.deleted.length} succeeded, ${result.failed.length} failed`))
     } else if (result.failed.length > 0) {
-      message.error(`批量删除失败：失败 ${result.failed.length} 个`)
+      message.error(t(`批量删除失败：失败 ${result.failed.length} 个`, `Bulk delete failed: ${result.failed.length} failed`))
     } else {
-      message.success(`已删除 ${result.deleted.length} 个已禁用账号`)
+      message.success(t(`已删除 ${result.deleted.length} 个已禁用账号`, `Deleted ${result.deleted.length} disabled accounts`))
     }
     bulkDeleteDialog.show = false
     await loadAccounts()
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '批量删除失败')
+    message.error(errorText(error, '批量删除失败', 'Bulk delete failed'))
   } finally {
     isBulkDeleting.value = false
   }
@@ -1368,7 +1397,7 @@ async function submitPriorityDialog() {
     priorityDialog.account,
     'priority',
     () => updateCodexKeeperPriority(priorityDialog.account!.name, value),
-    '优先级已更新',
+    t('优先级已更新', 'Priority updated'),
   )
   priorityDialog.show = false
 }
@@ -1403,9 +1432,9 @@ async function submitAccountConfirm() {
 
 function confirmEnableAccount(account: CodexKeeperAccount) {
   openAccountConfirm(
-    '启用账号',
-    `启用 ${account.name}？`,
-    '确认启用',
+    t('启用账号', 'Enable Account'),
+    t(`启用 ${account.name}？`, `Enable ${account.name}?`),
+    t('确认启用', 'Confirm Enable'),
     'primary',
     () => enableAccount(account),
   )
@@ -1413,9 +1442,9 @@ function confirmEnableAccount(account: CodexKeeperAccount) {
 
 function confirmDisableAccount(account: CodexKeeperAccount) {
   openAccountConfirm(
-    '禁用账号',
-    `禁用 ${account.name}？`,
-    '确认禁用',
+    t('禁用账号', 'Disable Account'),
+    t(`禁用 ${account.name}？`, `Disable ${account.name}?`),
+    t('确认禁用', 'Confirm Disable'),
     'warning',
     () => disableAccount(account),
   )
@@ -1423,9 +1452,9 @@ function confirmDisableAccount(account: CodexKeeperAccount) {
 
 function confirmDeleteAccount(account: CodexKeeperAccount) {
   openAccountConfirm(
-    '删除账号',
-    `删除 ${account.name}？此操作会从 CPA 删除 auth file。`,
-    '确认删除',
+    t('删除账号', 'Delete Account'),
+    t(`删除 ${account.name}？此操作会从 CPA 删除 auth file。`, `Delete ${account.name}? This will remove the auth file from CPA.`),
+    t('确认删除', 'Confirm Delete'),
     'error',
     () => deleteAccount(account),
   )
@@ -1436,7 +1465,7 @@ function enableAccount(account: CodexKeeperAccount) {
     account,
     'toggle',
     () => enableCodexKeeperAccount(account.name),
-    '账号已启用',
+    t('账号已启用', 'Account enabled'),
   )
 }
 
@@ -1445,7 +1474,7 @@ function disableAccount(account: CodexKeeperAccount) {
     account,
     'toggle',
     () => disableCodexKeeperAccount(account.name),
-    '账号已禁用',
+    t('账号已禁用', 'Account disabled'),
   )
 }
 
@@ -1454,7 +1483,7 @@ function deleteAccount(account: CodexKeeperAccount) {
     account,
     'delete',
     () => deleteCodexKeeperAccount(account.name),
-    '账号已删除',
+    t('账号已删除', 'Account deleted'),
   )
 }
 
@@ -1521,7 +1550,9 @@ async function refreshAccounts(
   }
   try {
     await refreshCodexKeeperAccounts({ auth_names: authNames })
-    message.success(authNames.length === 1 ? '已开始刷新账号' : `已开始刷新 ${authNames.length} 个账号`)
+    message.success(authNames.length === 1
+      ? t('已开始刷新账号', 'Started refreshing account')
+      : t(`已开始刷新 ${authNames.length} 个账号`, `Started refreshing ${authNames.length} accounts`))
     if (options.closeDetail) {
       detailOpen.value = false
     }
@@ -1530,7 +1561,7 @@ async function refreshAccounts(
     }
     void pollRefreshUntilIdle()
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '刷新账号失败')
+    message.error(errorText(error, '刷新账号失败', 'Failed to refresh accounts'))
   } finally {
     const restActions = new Set(actingActions.value)
     refreshKeys.forEach((key) => restActions.delete(key))
@@ -1574,7 +1605,7 @@ async function runAccountAction(
       detailOpen.value = freshAccount !== null
     }
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '账号操作失败')
+    message.error(errorText(error, '账号操作失败', 'Account operation failed'))
   } finally {
     const nextActions = new Set(actingActions.value)
     nextActions.delete(key)
@@ -1582,56 +1613,58 @@ async function runAccountAction(
   }
 }
 
-const baseColumns: DataTableColumns<CodexKeeperAccount> = [
+const baseColumns = computed<DataTableColumns<CodexKeeperAccount>>(() => [
   {
-    title: '账号',
+    title: t('账号', 'Account'),
     key: 'identity',
     width: 360,
     render: (row) => renderAccountIdentityCell(row),
   },
   {
-    title: '类型',
+    title: t('类型', 'Type'),
     key: 'account_type',
     width: 96,
     render: (row) => renderAccountTypeCell(row),
   },
   {
-    title: '优先级',
+    title: t('优先级', 'Priority'),
     key: 'priority',
     width: 88,
     render: (row) => renderAccountPriorityCell(row),
   },
   {
-    title: '额度窗口',
+    title: t('额度窗口', 'Quota Window'),
     key: 'quota',
     width: 260,
     render: (row) => renderQuotaCell(row),
   },
   {
-    title: '窗口用量',
+    title: t('窗口用量', 'Window Usage'),
     key: 'quota_usage',
     width: 280,
     render: (row) => renderQuotaUsageCell(row),
   },
   {
-    title: '最近巡检',
+    title: t('最近巡检', 'Last Inspection'),
     key: 'last_checked_at',
     width: 150,
     render: (row) => renderLastCheckedCell(row),
   },
   {
-    title: '最近操作',
+    title: t('最近操作', 'Latest Action'),
     key: 'latest_action',
     width: 340,
     render: (row) => renderLatestActionCell(row),
   },
-]
+])
 
-const disabledBaseColumns: DataTableColumns<CodexKeeperAccount> = baseColumns.filter(
-  (column) => !('key' in column) || (column.key !== 'quota' && column.key !== 'quota_usage'),
+const disabledBaseColumns = computed<DataTableColumns<CodexKeeperAccount>>(
+  () => baseColumns.value.filter(
+    (column) => !('key' in column) || (column.key !== 'quota' && column.key !== 'quota_usage'),
+  ),
 )
 
-const disabledActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
+const disabledActionColumn = computed<DataTableColumns<CodexKeeperAccount>[number]>(() => ({
   title: '',
   key: 'actions',
   width: 224,
@@ -1645,7 +1678,7 @@ const disabledActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
           h(
             NButton,
             { size: 'small', quaternary: true, onClick: () => openDetail(row) },
-            { default: () => '详情' },
+            { default: () => t('详情', 'Details') },
           ),
           h(
             NButton,
@@ -1657,7 +1690,7 @@ const disabledActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
               loading: isActionLoading(row, 'toggle'),
               onClick: () => confirmEnableAccount(row),
             },
-            { default: () => '启用' },
+            { default: () => t('启用', 'Enable') },
           ),
           h(
             NButton,
@@ -1669,7 +1702,7 @@ const disabledActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
               loading: isActionLoading(row, 'delete'),
               onClick: () => confirmDeleteAccount(row),
             },
-            { default: () => '删除' },
+            { default: () => t('删除', 'Delete') },
           ),
           h(
             NButton,
@@ -1681,15 +1714,15 @@ const disabledActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
               loading: isActionLoading(row, 'refresh'),
               onClick: () => refreshAccount(row),
             },
-            { default: () => '刷新' },
+            { default: () => t('刷新', 'Refresh') },
           ),
         ],
       },
     )
   },
-}
+}))
 
-const normalActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
+const normalActionColumn = computed<DataTableColumns<CodexKeeperAccount>[number]>(() => ({
   title: '',
   key: 'actions',
   width: 232,
@@ -1703,7 +1736,7 @@ const normalActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
           h(
             NButton,
             { size: 'small', quaternary: true, onClick: () => openDetail(row) },
-            { default: () => '详情' },
+            { default: () => t('详情', 'Details') },
           ),
           h(
             NButton,
@@ -1715,7 +1748,7 @@ const normalActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
               loading: isActionLoading(row, 'toggle'),
               onClick: () => confirmDisableAccount(row),
             },
-            { default: () => '禁用' },
+            { default: () => t('禁用', 'Disable') },
           ),
           h(
             NButton,
@@ -1725,7 +1758,7 @@ const normalActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
               disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
               onClick: () => openPriorityDialog(row),
             },
-            { default: () => '优先级' },
+            { default: () => t('优先级', 'Priority') },
           ),
           h(
             NButton,
@@ -1737,13 +1770,13 @@ const normalActionColumn: DataTableColumns<CodexKeeperAccount>[number] = {
               loading: isActionLoading(row, 'refresh'),
               onClick: () => refreshAccount(row),
             },
-            { default: () => '刷新' },
+            { default: () => t('刷新', 'Refresh') },
           ),
         ],
       },
     )
   },
-}
+}))
 
 const disabledColumns = computed<DataTableColumns<CodexKeeperAccount>>(() => [
   {
@@ -1751,13 +1784,13 @@ const disabledColumns = computed<DataTableColumns<CodexKeeperAccount>>(() => [
     width: 44,
     disabled: (row: CodexKeeperAccount) => isRowActing(row) || isBulkDeleting.value,
   },
-  ...disabledBaseColumns,
-  disabledActionColumn,
+  ...disabledBaseColumns.value,
+  disabledActionColumn.value,
 ])
 
 const normalColumns = computed<DataTableColumns<CodexKeeperAccount>>(() => [
-  ...baseColumns,
-  normalActionColumn,
+  ...baseColumns.value,
+  normalActionColumn.value,
 ])
 
 restoreAccountStatusPreferences()
@@ -1806,17 +1839,17 @@ onBeforeUnmount(() => {
     <div class="page-header account-page-header">
       <div class="account-header-copy">
         <div class="account-header-title-row">
-          <h1 class="page-title">账号状态</h1>
+          <h1 class="page-title">{{ t('账号状态', 'Account Status') }}</h1>
           <div class="header-actions">
             <NButton secondary :loading="isLoading" @click="loadAccounts">
               <template #icon>
                 <NIcon :component="RefreshCw" />
               </template>
-              重新加载
+              {{ t('重新加载', 'Reload') }}
             </NButton>
           </div>
         </div>
-        <p class="page-subtitle">查看 Codex auth file 的健康、额度和优先级维护结果</p>
+        <p class="page-subtitle">{{ t('查看 Codex auth file 的健康、额度和优先级维护结果', 'View Codex auth file health, quota, and priority maintenance results') }}</p>
       </div>
     </div>
 
@@ -1825,7 +1858,7 @@ onBeforeUnmount(() => {
         <div class="metric-icon" aria-hidden="true">
           <Activity :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">运行状态</div>
+        <div class="metric-label">{{ t('运行状态', 'Run Status') }}</div>
         <div class="metric-value inspection-status-value" :title="keeperStatusDetailText">
           <NTag class="inspection-status-tag" :type="keeperStateType" size="small" :bordered="false">
             {{ keeperStatusDetailText }}
@@ -1837,9 +1870,9 @@ onBeforeUnmount(() => {
         <div class="metric-icon" aria-hidden="true">
           <Users :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">账号总数</div>
+        <div class="metric-label">{{ t('账号总数', 'Total Accounts') }}</div>
         <div class="metric-value">{{ formatInteger(accounts.length) }}</div>
-        <div class="metric-footnote">全部 auth file</div>
+        <div class="metric-footnote">{{ t('全部 auth file', 'All auth files') }}</div>
       </div>
       <button
         type="button"
@@ -1851,9 +1884,9 @@ onBeforeUnmount(() => {
         <div class="metric-icon" aria-hidden="true">
           <ShieldCheck :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">启用中</div>
+        <div class="metric-label">{{ t('启用中', 'Enabled') }}</div>
         <div class="metric-value">{{ formatInteger(enabledAccountCount) }}</div>
-        <div class="metric-footnote">可参与调度</div>
+        <div class="metric-footnote">{{ t('可参与调度', 'Available for scheduling') }}</div>
       </button>
       <button
         type="button"
@@ -1865,9 +1898,9 @@ onBeforeUnmount(() => {
         <div class="metric-icon" aria-hidden="true">
           <PauseCircle :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">已禁用</div>
+        <div class="metric-label">{{ t('已禁用', 'Disabled') }}</div>
         <div class="metric-value">{{ formatInteger(disabledAccountCount) }}</div>
-        <div class="metric-footnote">停用账号</div>
+        <div class="metric-footnote">{{ t('停用账号', 'Inactive accounts') }}</div>
       </button>
       <button
         type="button"
@@ -1879,7 +1912,7 @@ onBeforeUnmount(() => {
         <div class="metric-icon" aria-hidden="true">
           <ShieldAlert :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">401报错</div>
+        <div class="metric-label">{{ t('401报错', '401 Errors') }}</div>
         <div class="metric-value">{{ formatInteger(unauthorizedErrorAccountCount) }}</div>
         <div class="metric-footnote">HTTP 401</div>
       </button>
@@ -1893,9 +1926,9 @@ onBeforeUnmount(() => {
         <div class="metric-icon" aria-hidden="true">
           <Gauge :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">额度耗尽</div>
+        <div class="metric-label">{{ t('额度耗尽', 'Quota Exhausted') }}</div>
         <div class="metric-value">{{ formatInteger(quotaExhaustedAccountCount) }}</div>
-        <div class="metric-footnote">临时降级</div>
+        <div class="metric-footnote">{{ t('临时降级', 'Temporary downgrade') }}</div>
       </button>
     </div>
 
@@ -1903,26 +1936,26 @@ onBeforeUnmount(() => {
       <div class="status-toolbar">
         <div class="toolbar-heading">
           <div>
-            <h2 class="toolbar-title">账号列表</h2>
+            <h2 class="toolbar-title">{{ t('账号列表', 'Account List') }}</h2>
             <p class="toolbar-subtitle">
-              正常 {{ filteredNormalAccounts.length }} / {{ enabledAccountCount }} 个账号
+              {{ t(`正常 ${filteredNormalAccounts.length} / ${enabledAccountCount} 个账号`, `Normal ${filteredNormalAccounts.length} / ${enabledAccountCount} accounts`) }}
               <template v-if="hasDisabledAccounts">
-                ，已禁用 {{ filteredDisabledAccounts.length }} / {{ disabledAccountCount }} 个账号
+                {{ t(`，已禁用 ${filteredDisabledAccounts.length} / ${disabledAccountCount} 个账号`, `, disabled ${filteredDisabledAccounts.length} / ${disabledAccountCount} accounts`) }}
               </template>
             </p>
           </div>
           <NTag v-if="activeFilterCount > 0" size="small" type="info" :bordered="false">
-            已筛选 {{ activeFilterCount }} 项
+            {{ t(`已筛选 ${activeFilterCount} 项`, `${activeFilterCount} filters active`) }}
           </NTag>
         </div>
         <div class="filter-grid">
-          <NInput v-model:value="filters.keyword" clearable placeholder="搜索账号或邮箱" />
+          <NInput v-model:value="filters.keyword" clearable :placeholder="t('搜索账号或邮箱', 'Search account or email')" />
           <NSelect
             v-model:value="filters.accountType"
             :options="accountTypeOptions"
             clearable
             filterable
-            placeholder="账号类型"
+            :placeholder="t('账号类型', 'Account Type')"
           />
           <NSelect
             v-model:value="filters.priority"
@@ -1940,7 +1973,7 @@ onBeforeUnmount(() => {
                 <template #icon>
                   <NIcon :component="ChevronDown" />
                 </template>
-                切换样式：{{ accountListViewLabel }}
+                {{ t(`切换样式：${accountListViewLabel}`, `Switch View: ${accountListViewLabel}`) }}
               </NButton>
             </NDropdown>
             <NButton
@@ -1949,11 +1982,11 @@ onBeforeUnmount(() => {
               :type="refreshSelectMode ? 'primary' : 'default'"
               @click="toggleRefreshSelectMode"
             >
-              多选刷新
+              {{ t('多选刷新', 'Multi-select Refresh') }}
             </NButton>
             <template v-if="refreshSelectMode">
               <NTag size="small" type="info" :bordered="false">
-                {{ selectedRefreshCount }} 已选
+                {{ t(`${selectedRefreshCount} 已选`, `${selectedRefreshCount} selected`) }}
               </NTag>
               <NButton
                 secondary
@@ -1961,7 +1994,7 @@ onBeforeUnmount(() => {
                 :disabled="filteredAccountNames.length === 0 || isBulkRefreshing"
                 @click="selectAllFilteredRefreshAccounts"
               >
-                全选当前筛选
+                {{ t('全选当前筛选', 'Select Current Filter') }}
               </NButton>
               <NButton
                 secondary
@@ -1971,22 +2004,22 @@ onBeforeUnmount(() => {
                 :loading="isBulkRefreshing"
                 @click="refreshSelectedAccounts"
               >
-                刷新已选
+                {{ t('刷新已选', 'Refresh Selected') }}
               </NButton>
               <NButton secondary size="small" :disabled="isBulkRefreshing" @click="exitRefreshSelectMode">
-                退出选择
+                {{ t('退出选择', 'Exit Selection') }}
               </NButton>
             </template>
           </div>
-          <div class="sort-control-row" aria-label="账号排序">
-            <span class="sort-control-label">排序</span>
+          <div class="sort-control-row" :aria-label="t('账号排序', 'Account Sorting')">
+            <span class="sort-control-label">{{ t('排序', 'Sort') }}</span>
             <NDropdown trigger="click" :options="quotaSortOptions" @select="handleQuotaSortSelect">
               <NButton
                 secondary
                 size="small"
                 :type="accountSort.key === 'quotaDay' || accountSort.key === 'quotaWeek' ? 'primary' : 'default'"
               >
-                额度窗口{{ activeQuotaSortLabel ? `：${activeQuotaSortLabel} ${sortDirectionMark}` : '' }}
+                {{ activeQuotaSortLabel ? t(`额度窗口：${activeQuotaSortLabel} ${sortDirectionMark}`, `Quota Window: ${activeQuotaSortLabel} ${sortDirectionMark}`) : t('额度窗口', 'Quota Window') }}
               </NButton>
             </NDropdown>
             <NButton
@@ -1995,7 +2028,7 @@ onBeforeUnmount(() => {
               :type="isAccountSortActive('accountType') ? 'primary' : 'default'"
               @click="toggleAccountSort('accountType')"
             >
-              类型 {{ accountSortMark('accountType') }}
+              {{ t('类型', 'Type') }} {{ accountSortMark('accountType') }}
             </NButton>
             <NButton
               secondary
@@ -2003,7 +2036,7 @@ onBeforeUnmount(() => {
               :type="isAccountSortActive('status') ? 'primary' : 'default'"
               @click="toggleAccountSort('status')"
             >
-              状态 {{ accountSortMark('status') }}
+              {{ t('状态', 'Status') }} {{ accountSortMark('status') }}
             </NButton>
             <NButton
               secondary
@@ -2011,7 +2044,7 @@ onBeforeUnmount(() => {
               :type="isAccountSortActive('priority') ? 'primary' : 'default'"
               @click="toggleAccountSort('priority')"
             >
-              优先级 {{ accountSortMark('priority') }}
+              {{ t('优先级', 'Priority') }} {{ accountSortMark('priority') }}
             </NButton>
             <NButton
               secondary
@@ -2019,19 +2052,19 @@ onBeforeUnmount(() => {
               :type="isAccountSortActive('lastCheckedAt') ? 'primary' : 'default'"
               @click="toggleAccountSort('lastCheckedAt')"
             >
-              最近巡检 {{ accountSortMark('lastCheckedAt') }}
+              {{ t('最近巡检', 'Last Inspection') }} {{ accountSortMark('lastCheckedAt') }}
             </NButton>
           </div>
         </div>
       </div>
 
       <div v-if="isTableView" class="account-sections">
-        <div v-if="showTableLoadingState" class="empty-state">账号加载中...</div>
-        <div v-else-if="showEmptyTableState" class="empty-state">当前筛选下暂无账号</div>
+        <div v-if="showTableLoadingState" class="empty-state">{{ t('账号加载中...', 'Loading accounts...') }}</div>
+        <div v-else-if="showEmptyTableState" class="empty-state">{{ t('当前筛选下暂无账号', 'No accounts match the current filter') }}</div>
         <section v-if="showDisabledSection" class="account-section">
           <div class="account-section-header">
             <div class="account-section-title-group">
-              <h3 class="account-section-title">已禁用账号</h3>
+              <h3 class="account-section-title">{{ t('已禁用账号', 'Disabled Accounts') }}</h3>
               <p class="account-section-subtitle">
                 {{ disabledSectionDisplayText }}
               </p>
@@ -2047,7 +2080,7 @@ onBeforeUnmount(() => {
                 <template #icon>
                   <NIcon :component="Trash2" />
                 </template>
-                批量删除（{{ selectedDisabledCount }}）
+                {{ t(`批量删除（${selectedDisabledCount}）`, `Bulk Delete (${selectedDisabledCount})`) }}
               </NButton>
             </div>
           </div>
@@ -2067,7 +2100,7 @@ onBeforeUnmount(() => {
             @update:checked-row-keys="handleDisabledSelectionUpdate"
           >
             <template #empty>
-              <div class="empty-state">当前筛选下暂无已禁用账号</div>
+              <div class="empty-state">{{ t('当前筛选下暂无已禁用账号', 'No disabled accounts match the current filter') }}</div>
             </template>
           </NDataTable>
           <div v-if="showDisabledPagination" class="account-pagination-row">
@@ -2083,7 +2116,7 @@ onBeforeUnmount(() => {
         <section v-if="showNormalSection" class="account-section">
           <div class="account-section-header">
             <div class="account-section-title-group">
-              <h3 class="account-section-title">正常账号</h3>
+              <h3 class="account-section-title">{{ t('正常账号', 'Normal Accounts') }}</h3>
               <p class="account-section-subtitle">
                 {{ normalSectionDisplayText }}
               </p>
@@ -2103,7 +2136,7 @@ onBeforeUnmount(() => {
             :scroll-x="normalTableScrollX"
           >
             <template #empty>
-              <div class="empty-state">当前筛选下暂无正常账号</div>
+              <div class="empty-state">{{ t('当前筛选下暂无正常账号', 'No normal accounts match the current filter') }}</div>
             </template>
           </NDataTable>
           <div v-if="showNormalPagination" class="account-pagination-row">
@@ -2137,13 +2170,13 @@ onBeforeUnmount(() => {
                 <template #icon>
                   <NIcon :component="Trash2" />
                 </template>
-                批量删除 401 已禁用（{{ filteredUnauthorizedDisabledAccounts.length }}）
+                {{ t(`批量删除 401 已禁用（${filteredUnauthorizedDisabledAccounts.length}）`, `Bulk Delete 401 Disabled (${filteredUnauthorizedDisabledAccounts.length})`) }}
               </NButton>
             </div>
           </div>
-          <div v-if="showCardLoadingState" class="empty-state">账号加载中...</div>
+          <div v-if="showCardLoadingState" class="empty-state">{{ t('账号加载中...', 'Loading accounts...') }}</div>
           <div v-else-if="visibleCardAccounts.length === 0" class="empty-state">
-            当前筛选下暂无账号
+            {{ t('当前筛选下暂无账号', 'No accounts match the current filter') }}
           </div>
           <div
             v-else
@@ -2168,8 +2201,8 @@ onBeforeUnmount(() => {
               }"
               :aria-label="
                 refreshSelectMode
-                  ? `选择 ${account.email ?? account.name}`
-                  : `查看 ${account.email ?? account.name} 详情`
+                  ? t(`选择 ${account.email ?? account.name}`, `Select ${account.email ?? account.name}`)
+                  : t(`查看 ${account.email ?? account.name} 详情`, `View details for ${account.email ?? account.name}`)
               "
               :aria-pressed="refreshSelectMode ? isRefreshAccountSelected(account) : undefined"
               @click="handleAccountCardClick(account)"
@@ -2190,7 +2223,7 @@ onBeforeUnmount(() => {
                           : 'is-success'
                     "
                   >
-                    {{ account.disabled ? '已禁用' : isQuotaExhaustedAccount(account) ? '额度耗尽' : '启用中' }}
+                    {{ account.disabled ? t('已禁用', 'Disabled') : isQuotaExhaustedAccount(account) ? t('额度耗尽', 'Quota Exhausted') : t('启用中', 'Enabled') }}
                   </span>
                   <span
                     v-if="disabledStatusCodeText(account)"
@@ -2203,15 +2236,15 @@ onBeforeUnmount(() => {
               </div>
               <div class="account-card-meta-grid">
                 <div class="account-card-meta-item">
-                  <span>类型</span>
-                  <strong>{{ account.account_type ?? '未知' }}</strong>
+                  <span>{{ t('类型', 'Type') }}</span>
+                  <strong>{{ account.account_type ?? t('未知', 'Unknown') }}</strong>
                 </div>
                 <div class="account-card-meta-item">
-                  <span>优先级</span>
+                  <span>{{ t('优先级', 'Priority') }}</span>
                   <strong>{{ formatInteger(accountPriority(account)) }}</strong>
                 </div>
                 <div class="account-card-meta-item">
-                  <span>最近巡检</span>
+                  <span>{{ t('最近巡检', 'Last Inspection') }}</span>
                   <strong :title="formatDateTime(account.last_checked_at)">
                     {{ formatDateTime(account.last_checked_at, { includeSecond: false }) }}
                   </strong>
@@ -2222,7 +2255,7 @@ onBeforeUnmount(() => {
                 class="account-card-error"
                 :title="disabledCardErrorText(account)"
               >
-                <span>报错信息</span>
+                <span>{{ t('报错信息', 'Error Details') }}</span>
                 <strong>{{ disabledCardErrorText(account) }}</strong>
               </div>
               <div v-else-if="shouldShowQuotaWindow(account)" class="account-card-quota">
@@ -2235,7 +2268,7 @@ onBeforeUnmount(() => {
                     >
                       <div class="card-quota-head">
                         <span>{{ item.label }}</span>
-                        <strong>剩余 {{ item.remainingPercent }}%</strong>
+                        <strong>{{ t(`剩余 ${item.remainingPercent}%`, `${item.remainingPercent}% remaining`) }}</strong>
                       </div>
                       <div class="card-quota-track">
                         <div
@@ -2293,7 +2326,7 @@ onBeforeUnmount(() => {
                     </div>
                   </div>
                 </template>
-                <div v-else class="card-quota-empty">暂无额度窗口</div>
+                <div v-else class="card-quota-empty">{{ t('暂无额度窗口', 'No quota windows') }}</div>
               </div>
             </button>
           </div>
@@ -2310,7 +2343,7 @@ onBeforeUnmount(() => {
 
       <div class="display-control-row">
         <div class="display-control-copy">
-          <span class="display-control-label">每页数量</span>
+          <span class="display-control-label">{{ t('每页数量', 'Items Per Page') }}</span>
           <span class="display-control-help">{{ displaySizeHelpText }}</span>
         </div>
         <NSelect
@@ -2330,39 +2363,39 @@ onBeforeUnmount(() => {
               <template #icon>
                 <NIcon :component="ArrowLeft" />
               </template>
-              返回
+              {{ t('返回', 'Back') }}
             </NButton>
-            <span class="detail-drawer-title">账号详情</span>
+            <span class="detail-drawer-title">{{ t('账号详情', 'Account Details') }}</span>
           </div>
         </template>
         <NDescriptions v-if="selectedAccount" label-placement="left" :column="1" size="small" bordered>
-          <NDescriptionsItem label="账号">{{ selectedAccount.name }}</NDescriptionsItem>
-          <NDescriptionsItem label="邮箱">{{ selectedAccount.email ?? '-' }}</NDescriptionsItem>
-          <NDescriptionsItem label="账号类型">
-            {{ selectedAccount.account_type ?? '未知' }}
+          <NDescriptionsItem :label="t('账号', 'Account')">{{ selectedAccount.name }}</NDescriptionsItem>
+          <NDescriptionsItem :label="t('邮箱', 'Email')">{{ selectedAccount.email ?? '-' }}</NDescriptionsItem>
+          <NDescriptionsItem :label="t('账号类型', 'Account Type')">
+            {{ selectedAccount.account_type ?? t('未知', 'Unknown') }}
           </NDescriptionsItem>
-          <NDescriptionsItem label="启用状态">
-            {{ selectedAccount.disabled ? '已禁用' : '启用中' }}
+          <NDescriptionsItem :label="t('启用状态', 'Enabled Status')">
+            {{ selectedAccount.disabled ? t('已禁用', 'Disabled') : t('启用中', 'Enabled') }}
           </NDescriptionsItem>
-          <NDescriptionsItem label="当前优先级">
+          <NDescriptionsItem :label="t('当前优先级', 'Current Priority')">
             {{ accountPriority(selectedAccount) }}
           </NDescriptionsItem>
-          <NDescriptionsItem label="类型默认优先级">
+          <NDescriptionsItem :label="t('类型默认优先级', 'Type Default Priority')">
             {{ defaultPriority(selectedAccount) ?? '-' }}
           </NDescriptionsItem>
-          <NDescriptionsItem v-if="shouldShowQuotaWindow(selectedAccount)" label="额度窗口">
+          <NDescriptionsItem v-if="shouldShowQuotaWindow(selectedAccount)" :label="t('额度窗口', 'Quota Window')">
             {{ quotaText(selectedAccount) }}
           </NDescriptionsItem>
-          <NDescriptionsItem label="状态码">
+          <NDescriptionsItem :label="t('状态码', 'Status Code')">
             {{ selectedAccount.last_status_code ?? '-' }}
           </NDescriptionsItem>
-          <NDescriptionsItem label="最近健康">
+          <NDescriptionsItem :label="t('最近健康', 'Last Healthy')">
             {{ formatDateTime(selectedAccount.last_healthy_at) }}
           </NDescriptionsItem>
-          <NDescriptionsItem label="最近巡检">
+          <NDescriptionsItem :label="t('最近巡检', 'Last Inspection')">
             {{ formatDateTime(selectedAccount.last_checked_at) }}
           </NDescriptionsItem>
-          <NDescriptionsItem label="最近操作">
+          <NDescriptionsItem :label="t('最近操作', 'Latest Action')">
             {{ latestActionText(selectedAccount) }}
           </NDescriptionsItem>
         </NDescriptions>
@@ -2376,7 +2409,7 @@ onBeforeUnmount(() => {
               :loading="isActionLoading(selectedAccount, 'refresh')"
               @click="refreshAccount(selectedAccount, { closeDetail: true })"
             >
-              刷新
+              {{ t('刷新', 'Refresh') }}
             </NButton>
             <NButton
               v-if="selectedAccount.disabled"
@@ -2387,7 +2420,7 @@ onBeforeUnmount(() => {
               :loading="isActionLoading(selectedAccount, 'toggle')"
               @click="confirmEnableAccount(selectedAccount)"
             >
-              启用
+              {{ t('启用', 'Enable') }}
             </NButton>
             <NButton
               v-else
@@ -2398,7 +2431,7 @@ onBeforeUnmount(() => {
               :loading="isActionLoading(selectedAccount, 'toggle')"
               @click="confirmDisableAccount(selectedAccount)"
             >
-              禁用
+              {{ t('禁用', 'Disable') }}
             </NButton>
             <NButton
               size="small"
@@ -2407,7 +2440,7 @@ onBeforeUnmount(() => {
               :loading="isActionLoading(selectedAccount, 'priority')"
               @click="openPriorityDialog(selectedAccount)"
             >
-              修改优先级
+              {{ t('修改优先级', 'Change Priority') }}
             </NButton>
             <NButton
               v-if="selectedAccount.disabled"
@@ -2418,7 +2451,7 @@ onBeforeUnmount(() => {
               :loading="isActionLoading(selectedAccount, 'delete')"
               @click="confirmDeleteAccount(selectedAccount)"
             >
-              删除
+              {{ t('删除', 'Delete') }}
             </NButton>
           </NSpace>
         </div>
@@ -2435,7 +2468,7 @@ onBeforeUnmount(() => {
       <template #action>
         <NSpace justify="end">
           <NButton :disabled="isAccountConfirmSubmitting" @click="accountConfirmDialog.show = false">
-            取消
+            {{ t('取消', 'Cancel') }}
           </NButton>
           <NButton
             :type="accountConfirmDialog.type"
@@ -2460,19 +2493,19 @@ onBeforeUnmount(() => {
         </p>
         <div v-if="bulkDeletePreviewNames.length > 0" class="bulk-delete-preview">
           <span v-for="name in bulkDeletePreviewNames" :key="name">{{ name }}</span>
-          <span v-if="bulkDeletePreviewOverflow > 0">另 {{ bulkDeletePreviewOverflow }} 个...</span>
+          <span v-if="bulkDeletePreviewOverflow > 0">{{ t(`另 ${bulkDeletePreviewOverflow} 个...`, `${bulkDeletePreviewOverflow} more...`) }}</span>
         </div>
       </div>
       <template #action>
         <NSpace justify="end">
-          <NButton :disabled="isBulkDeleting" @click="bulkDeleteDialog.show = false">取消</NButton>
+          <NButton :disabled="isBulkDeleting" @click="bulkDeleteDialog.show = false">{{ t('取消', 'Cancel') }}</NButton>
           <NButton
             type="error"
             :disabled="selectedDisabledCount === 0"
             :loading="isBulkDeleting"
             @click="submitBulkDelete"
           >
-            确认删除
+            {{ t('确认删除', 'Confirm Delete') }}
           </NButton>
         </NSpace>
       </template>
@@ -2500,7 +2533,7 @@ onBeforeUnmount(() => {
       </div>
       <template #action>
         <NSpace justify="end">
-          <NButton @click="priorityDialog.show = false">取消</NButton>
+          <NButton @click="priorityDialog.show = false">{{ t('取消', 'Cancel') }}</NButton>
           <NButton
             type="primary"
             :disabled="!canSubmitPriority"
@@ -2511,7 +2544,7 @@ onBeforeUnmount(() => {
             "
             @click="submitPriorityDialog"
           >
-            确认
+            {{ t('确认', 'Confirm') }}
           </NButton>
         </NSpace>
       </template>

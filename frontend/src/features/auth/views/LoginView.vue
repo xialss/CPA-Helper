@@ -5,11 +5,13 @@ import { NAlert, NButton, NCard, NForm, NFormItem, NInput, useMessage } from 'na
 
 import { getSetupState, login, setupFirstAdmin } from '@/features/auth/api/authApi'
 import { setCurrentUser } from '@/features/auth/state/currentUser'
+import { useI18n } from '@/shared/i18n'
 import { logoUrl } from '@/shared/utils/assets'
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
+const { errorText, t } = useI18n()
 const isLoading = ref(false)
 const isSetupLoading = ref(true)
 const setupRequired = ref(false)
@@ -19,18 +21,18 @@ const form = reactive({
   password: '',
   nickname: '',
 })
-const headingTitle = computed(() => (setupRequired.value ? '创建首个管理员账号' : 'CPA-Helper'))
+const headingTitle = computed(() => (setupRequired.value ? t('创建首个管理员账号', 'Create first admin account') : 'CPA-Helper'))
 const headingSubtitle = computed(() =>
-  setupRequired.value ? '首次使用前需要先录入管理员账号' : '本地 AI 用量管理控制台',
+  setupRequired.value ? t('首次使用前需要先录入管理员账号', 'Create an admin account before first use') : t('本地 AI 用量管理控制台', 'Local AI usage management console'),
 )
-const submitText = computed(() => (setupRequired.value ? '创建并登录' : '登录'))
+const submitText = computed(() => (setupRequired.value ? t('创建并登录', 'Create and sign in') : t('登录', 'Sign in')))
 
 onMounted(async () => {
   try {
     const state = await getSetupState()
     setupRequired.value = state.setup_required
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '初始化状态加载失败'
+    errorMessage.value = errorText(error, '初始化状态加载失败', 'Failed to load setup state')
   } finally {
     isSetupLoading.value = false
   }
@@ -38,7 +40,7 @@ onMounted(async () => {
 
 async function handleSubmit() {
   if (setupRequired.value && !form.nickname.trim()) {
-    message.error('用户昵称不能为空')
+    message.error(t('用户昵称不能为空', 'User nickname is required'))
     return
   }
   isLoading.value = true
@@ -53,17 +55,17 @@ async function handleSubmit() {
       })
       setCurrentUser(user)
       homePath = user.is_admin ? '/admin/usage' : '/account/usage'
-      message.success('管理员账号已创建')
+      message.success(t('管理员账号已创建', 'Admin account created'))
     } else {
       const user = await login({ username: form.username, password: form.password })
       setCurrentUser(user)
       homePath = user.is_admin ? '/admin/usage' : '/account/usage'
-      message.success('登录成功')
+      message.success(t('登录成功', 'Signed in'))
     }
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : homePath
     await router.push(redirect)
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '登录失败'
+    errorMessage.value = errorText(error, '登录失败', 'Sign in failed')
   } finally {
     isLoading.value = false
   }
@@ -79,7 +81,7 @@ async function handleSubmit() {
       </div>
     </section>
 
-    <section class="auth-content" aria-label="登录区域">
+    <section class="auth-content" :aria-label="t('登录区域', 'Sign-in area')">
       <div class="brand-mark">
         <img :src="logoUrl" alt="">
       </div>
@@ -95,14 +97,14 @@ async function handleSubmit() {
         </NAlert>
 
         <NAlert v-if="setupRequired" type="warning" :bordered="false" class="auth-alert">
-          账号一旦创建，不允许删除，只允许禁用，请谨慎操作。
+          {{ t('账号一旦创建，不允许删除，只允许禁用，请谨慎操作。', 'Accounts cannot be deleted after creation. They can only be disabled, so proceed carefully.') }}
         </NAlert>
 
         <NForm :model="form" label-placement="top" @submit.prevent="handleSubmit">
-          <NFormItem label="账号" path="username">
+          <NFormItem :label="t('账号', 'Account')" path="username">
             <NInput v-model:value="form.username" autocomplete="username" />
           </NFormItem>
-          <NFormItem label="密码" path="password">
+          <NFormItem :label="t('密码', 'Password')" path="password">
             <NInput
               v-model:value="form.password"
               type="password"
@@ -111,8 +113,8 @@ async function handleSubmit() {
               @keyup.enter="handleSubmit"
             />
           </NFormItem>
-          <NFormItem v-if="setupRequired" label="用户昵称" path="nickname" required>
-            <NInput v-model:value="form.nickname" placeholder="例如：研发用户" />
+          <NFormItem v-if="setupRequired" :label="t('用户昵称', 'User nickname')" path="nickname" required>
+            <NInput v-model:value="form.nickname" :placeholder="t('例如：研发用户', 'Example: Engineering user')" />
           </NFormItem>
           <NButton type="primary" block attr-type="submit" :loading="isLoading || isSetupLoading">
             {{ submitText }}

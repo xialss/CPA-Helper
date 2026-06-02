@@ -15,6 +15,7 @@ import {
 import { Cpu, KeyRound, RefreshCw, ShieldCheck } from 'lucide-vue-next'
 
 import { listAvailableModels } from '@/features/models/api/availableModelsApi'
+import { useI18n } from '@/shared/i18n'
 import type { AvailableModel, AvailableModelPrice, AvailableModelsResponse } from '@/shared/types/api'
 
 type PriceField = keyof Pick<
@@ -27,6 +28,7 @@ type PriceField = keyof Pick<
 type BillingUnit = 'token' | 'request'
 
 const router = useRouter()
+const { currentLanguage, errorText, serverText, t } = useI18n()
 const isLoading = ref(false)
 const errorMessage = ref<string | null>(null)
 const response = ref<AvailableModelsResponse | null>(null)
@@ -43,12 +45,12 @@ const queryStatus = computed(() => {
     return '-'
   }
   if (response.value.errors.length > 0) {
-    return `部分失败 ${response.value.errors.length}`
+    return t(`部分失败 ${response.value.errors.length}`, `${response.value.errors.length} failed`)
   }
   if (response.value.queryable_api_key_count === 0) {
-    return response.value.has_api_keys ? '不可查询' : '无 Key'
+    return response.value.has_api_keys ? t('不可查询', 'Unavailable') : t('无 Key', 'No keys')
   }
-  return response.value.has_api_keys ? '正常' : '无 Key'
+  return response.value.has_api_keys ? t('正常', 'Normal') : t('无 Key', 'No keys')
 })
 
 function displayText(value: string | null | undefined): string {
@@ -56,7 +58,7 @@ function displayText(value: string | null | undefined): string {
 }
 
 function formatUsdPerMtok(value: number): string {
-  return value.toLocaleString('en-US', {
+  return value.toLocaleString(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
     maximumFractionDigits: 6,
   })
 }
@@ -94,7 +96,7 @@ function renderBillingUnit(row: AvailableModel) {
         lineHeight: '1.2',
       },
     },
-    isRequest ? '按次' : '按 Token',
+    isRequest ? t('按次', 'Per request') : t('按 Token', 'Per token'),
   )
 }
 
@@ -103,7 +105,7 @@ function renderRequestPrice(row: AvailableModel) {
     return h('span', { class: 'model-price-muted' }, '-')
   }
   if (row.price?.request_usd === null || row.price?.request_usd === undefined) {
-    return h('span', { class: 'model-price-muted' }, '未定价')
+    return h('span', { class: 'model-price-muted' }, t('未定价', 'Unpriced'))
   }
   return formatUsdPerMtok(row.price.request_usd)
 }
@@ -129,35 +131,35 @@ async function refresh() {
     response.value = await listAvailableModels()
   } catch (error) {
     response.value = null
-    errorMessage.value = error instanceof Error ? error.message : '加载可用模型失败'
+    errorMessage.value = errorText(error, '加载可用模型失败', 'Failed to load available models')
   } finally {
     isLoading.value = false
   }
 }
 
-const columns: DataTableColumns<AvailableModel> = [
+const columns = computed<DataTableColumns<AvailableModel>>(() => [
   {
-    title: '模型 ID',
+    title: t('模型 ID', 'Model ID'),
     key: 'id',
     width: 270,
     ellipsis: { tooltip: true },
     render: (row) => h('span', { class: 'model-id' }, row.id),
   },
   {
-    title: '名称',
+    title: t('名称', 'Name'),
     key: 'name',
     width: 220,
     ellipsis: { tooltip: true },
     render: (row) => displayText(row.name),
   },
   {
-    title: 'Owner',
+    title: t('所有者', 'Owner'),
     key: 'owner',
     width: 150,
     render: (row) => displayText(row.owner),
   },
   {
-    title: '来源 Key',
+    title: t('来源 Key', 'Source Key'),
     key: 'sources',
     width: 220,
     render: (row) =>
@@ -177,42 +179,42 @@ const columns: DataTableColumns<AvailableModel> = [
       ),
   },
   {
-    title: '计费方式',
+    title: t('计费方式', 'Billing'),
     key: 'billing_unit',
     width: 110,
     render: renderBillingUnit,
   },
   {
-    title: '每次 ($)',
+    title: t('每次 ($)', 'Per request ($)'),
     key: 'request_usd',
     width: 110,
     render: renderRequestPrice,
   },
   {
-    title: '输入 ($/MTok)',
+    title: t('输入 ($/MTok)', 'Input ($/MTok)'),
     key: 'input_usd_per_million',
     width: 145,
     render: (row) => renderPriceValue(row, 'input_usd_per_million'),
   },
   {
-    title: '输出 ($/MTok)',
+    title: t('输出 ($/MTok)', 'Output ($/MTok)'),
     key: 'output_usd_per_million',
     width: 145,
     render: (row) => renderPriceValue(row, 'output_usd_per_million'),
   },
   {
-    title: '缓存读 ($/MTok)',
+    title: t('缓存读 ($/MTok)', 'Cache read ($/MTok)'),
     key: 'cache_read_usd_per_million',
     width: 145,
     render: (row) => renderPriceValue(row, 'cache_read_usd_per_million'),
   },
   {
-    title: '缓存写 ($/MTok)',
+    title: t('缓存写 ($/MTok)', 'Cache write ($/MTok)'),
     key: 'cache_creation_usd_per_million',
     width: 145,
     render: (row) => renderPriceValue(row, 'cache_creation_usd_per_million'),
   },
-]
+])
 
 onMounted(refresh)
 </script>
@@ -221,15 +223,15 @@ onMounted(refresh)
   <section class="page models-page" :aria-busy="isLoading">
     <div class="page-header">
       <div>
-        <h1 class="page-title">可用模型</h1>
-        <p class="page-subtitle">通过当前账号绑定的 CPA API Key 查询并聚合</p>
+        <h1 class="page-title">{{ t('可用模型', 'Available Models') }}</h1>
+        <p class="page-subtitle">{{ t('通过当前账号绑定的 CPA API Key 查询并聚合', 'Query and aggregate models from CPA API keys bound to the current account') }}</p>
       </div>
       <NSpace>
         <NButton secondary :loading="isLoading" @click="refresh">
           <template #icon>
             <NIcon :component="RefreshCw" />
           </template>
-          刷新
+          {{ t('刷新', 'Refresh') }}
         </NButton>
       </NSpace>
     </div>
@@ -239,7 +241,7 @@ onMounted(refresh)
         <NAlert v-if="errorMessage" type="error" :bordered="false">
           <div class="alert-row">
             <span>{{ errorMessage }}</span>
-            <NButton size="small" secondary :loading="isLoading" @click="refresh">重试</NButton>
+            <NButton size="small" secondary :loading="isLoading" @click="refresh">{{ t('重试', 'Retry') }}</NButton>
           </div>
         </NAlert>
 
@@ -248,11 +250,16 @@ onMounted(refresh)
             v-if="response?.errors.length"
             type="warning"
             :bordered="false"
-            title="部分 API Key 查询失败"
+            :title="t('部分 API Key 查询失败', 'Some API key queries failed')"
           >
             <div class="key-errors">
               <div v-for="error in response.errors" :key="error.api_key_hash">
-                {{ error.description }}（{{ error.api_key_preview }}）：{{ error.message }}
+                {{
+                  t(
+                    `${error.description}（${error.api_key_preview}）：${serverText(error.message, '查询失败', 'Query failed')}`,
+                    `${error.description} (${error.api_key_preview}): ${serverText(error.message, '查询失败', 'Query failed')}`,
+                  )
+                }}
               </div>
             </div>
           </NAlert>
@@ -262,37 +269,37 @@ onMounted(refresh)
               <div class="metric-icon" aria-hidden="true">
                 <Cpu :size="20" :stroke-width="2.2" />
               </div>
-              <div class="metric-label">可用模型</div>
+              <div class="metric-label">{{ t('可用模型', 'Available models') }}</div>
               <div class="metric-value">{{ modelCount }}</div>
-              <div class="metric-footnote">CPA 返回</div>
+              <div class="metric-footnote">{{ t('CPA 返回', 'Returned by CPA') }}</div>
             </div>
             <div class="metric-card is-blue">
               <div class="metric-icon" aria-hidden="true">
                 <KeyRound :size="20" :stroke-width="2.2" />
               </div>
-              <div class="metric-label">可查询 Key</div>
+              <div class="metric-label">{{ t('可查询 Key', 'Queryable keys') }}</div>
               <div class="metric-value">{{ keySummary }}</div>
-              <div class="metric-footnote">完整密钥</div>
+              <div class="metric-footnote">{{ t('完整密钥', 'Complete keys') }}</div>
             </div>
             <div class="metric-card is-green">
               <div class="metric-icon" aria-hidden="true">
                 <ShieldCheck :size="20" :stroke-width="2.2" />
               </div>
-              <div class="metric-label">查询状态</div>
+              <div class="metric-label">{{ t('查询状态', 'Query status') }}</div>
               <div class="metric-value">{{ queryStatus }}</div>
-              <div class="metric-footnote">当前账号</div>
+              <div class="metric-footnote">{{ t('当前账号', 'Current account') }}</div>
             </div>
           </div>
 
           <div v-if="isLoading && !response" class="loading-state">
             <NSpin size="small" />
-            <span>正在向 CPA 查询模型</span>
+            <span>{{ t('正在向 CPA 查询模型', 'Querying CPA for models') }}</span>
           </div>
 
           <div v-else-if="response && !response.has_api_keys" class="empty-state">
-            <NEmpty description="还没有可用于查询模型的 API 密钥">
+            <NEmpty :description="t('还没有可用于查询模型的 API 密钥', 'No API keys are available for model queries yet')">
               <template #extra>
-                <NButton type="primary" @click="goToApiKeys">去创建 API 密钥</NButton>
+                <NButton type="primary" @click="goToApiKeys">{{ t('去创建 API 密钥', 'Create API key') }}</NButton>
               </template>
             </NEmpty>
           </div>
@@ -301,17 +308,17 @@ onMounted(refresh)
             v-else-if="response && response.has_api_keys && response.queryable_api_key_count === 0"
             class="empty-state"
           >
-            <NEmpty description="绑定的 API 密钥缺少完整密钥，无法查询模型">
+            <NEmpty :description="t('绑定的 API 密钥缺少完整密钥，无法查询模型', 'Bound API keys are missing complete keys and cannot query models')">
               <template #extra>
-                <NButton type="primary" @click="goToApiKeys">去 API 密钥页检查</NButton>
+                <NButton type="primary" @click="goToApiKeys">{{ t('去 API 密钥页检查', 'Check API keys') }}</NButton>
               </template>
             </NEmpty>
           </div>
 
           <div v-else-if="response && response.models.length === 0" class="empty-state">
-            <NEmpty description="CPA 未返回可用模型">
+            <NEmpty :description="t('CPA 未返回可用模型', 'CPA returned no available models')">
               <template #extra>
-                <NButton secondary :loading="isLoading" @click="refresh">重新查询</NButton>
+                <NButton secondary :loading="isLoading" @click="refresh">{{ t('重新查询', 'Query again') }}</NButton>
               </template>
             </NEmpty>
           </div>

@@ -1,9 +1,13 @@
+import { currentLanguage } from '@/shared/i18n'
+
 export function formatInteger(value: number): string {
-  return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 0 }).format(value)
+  return new Intl.NumberFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
+    maximumFractionDigits: 0,
+  }).format(value)
 }
 
 export function formatCompact(value: number): string {
-  return new Intl.NumberFormat('en-US', {
+  return new Intl.NumberFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
     notation: 'compact',
     compactDisplay: 'short',
     maximumFractionDigits: 1,
@@ -63,7 +67,10 @@ export function formatDateTime(
   if (options.includeSecond !== false) {
     formatOptions.second = '2-digit'
   }
-  return new Intl.DateTimeFormat('zh-CN', formatOptions).format(date)
+  return new Intl.DateTimeFormat(
+    currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US',
+    formatOptions,
+  ).format(date)
 }
 
 export function formatLocalDateTimeParam(value: number): string {

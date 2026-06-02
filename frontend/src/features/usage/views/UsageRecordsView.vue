@@ -29,6 +29,7 @@ import {
   formatUsd,
   jsonPretty,
 } from '@/shared/utils/format'
+import { useI18n } from '@/shared/i18n'
 
 type FailedFilter = 'all' | 'success' | 'failed'
 type QuickRangeKey = 'today' | 'last24h' | 'last3d' | 'last7d' | 'all'
@@ -81,19 +82,13 @@ const ACCOUNT_RECORDS_TABLE_SCROLL_X =
   RECORDS_TABLE_COLUMN_WIDTHS.user -
   RECORDS_TABLE_COLUMN_WIDTHS.source
 const RECORDS_TABLE_FALLBACK_MAX_HEIGHT = 'max(320px, calc(100dvh - 318px))'
-const quickRangeOptions: Array<{ key: QuickRangeKey; label: string }> = [
-  { key: 'today', label: '今日' },
-  { key: 'last24h', label: '近24小时' },
-  { key: 'last3d', label: '近3日' },
-  { key: 'last7d', label: '近7日' },
-  { key: 'all', label: '全部' },
-]
 const desktopRecordsLayoutQuery = window.matchMedia('(min-width: 861px)')
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const props = defineProps<Props>()
+const { currentLanguage, errorText, t } = useI18n()
 const isLoading = ref(false)
 const isAutoRefreshing = ref(false)
 const autoRefreshError = ref<string | null>(null)
@@ -177,6 +172,20 @@ const filterForm = reactive({
   endpoint: typeof route.query.endpoint === 'string' ? route.query.endpoint : null,
   failed: failedFromQuery(),
 })
+
+const quickRangeOptions = computed<Array<{ key: QuickRangeKey; label: string }>>(() => [
+  { key: 'today', label: t('今日', 'Today') },
+  { key: 'last24h', label: t('近24小时', 'Last 24 hours') },
+  { key: 'last3d', label: t('近3日', 'Last 3 days') },
+  { key: 'last7d', label: t('近7日', 'Last 7 days') },
+  { key: 'all', label: t('全部', 'All') },
+])
+
+const failedFilterOptions = computed(() => [
+  { label: t('全部', 'All'), value: 'all' },
+  { label: t('成功', 'Success'), value: 'success' },
+  { label: t('失败', 'Failed'), value: 'failed' },
+])
 
 function apiKeyFilterLabel(item: UsageOptionsResponse['api_key_descriptions'][number]): string {
   return item.label?.trim() || item.key
@@ -274,11 +283,16 @@ const selectOptions = computed(() => ({
 }))
 
 const isAccountScope = computed(() => props.scope === 'account')
-const pageTitle = computed(() => (isAccountScope.value ? '我的明细' : '请求明细'))
+const pageTitle = computed(() =>
+  isAccountScope.value ? t('我的明细', 'My records') : t('请求明细', 'Request records'),
+)
 const pageSubtitle = computed(() =>
   isAccountScope.value
-    ? '仅查询当前登录账号自己的本地用量记录'
-    : '分页查询本地用量记录，单条原始数据已在接口层脱敏',
+    ? t('仅查询当前登录账号自己的本地用量记录', 'Only local usage records for your account are shown')
+    : t(
+        '分页查询本地用量记录，单条原始数据已在接口层脱敏',
+        'Browse local usage records by page. Raw record data is masked by the API.',
+      ),
 )
 const recordsTableScrollX = computed(() =>
   isAccountScope.value ? ACCOUNT_RECORDS_TABLE_SCROLL_X : ADMIN_RECORDS_TABLE_SCROLL_X,
@@ -292,17 +306,19 @@ const recordsTableLayoutProps = computed<RecordsTableLayoutProps>(() =>
 const refreshStatusText = computed(() => {
   const lastRefreshTime = lastRefreshedAt.value
   if (!lastRefreshTime) {
-    return autoRefreshError.value ? '自动刷新异常 · 尚无成功同步' : '每 5 秒自动刷新 · 等待首次同步'
+    return autoRefreshError.value
+      ? t('自动刷新异常 · 尚无成功同步', 'Auto refresh error · no successful sync yet')
+      : t('每 5 秒自动刷新 · 等待首次同步', 'Auto refresh every 5 seconds · waiting for first sync')
   }
-  const lastRefreshText = new Intl.DateTimeFormat('zh-CN', {
+  const lastRefreshText = new Intl.DateTimeFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
   }).format(lastRefreshTime)
   if (autoRefreshError.value) {
-    return `自动刷新异常 · 最近成功 ${lastRefreshText}`
+    return t(`自动刷新异常 · 最近成功 ${lastRefreshText}`, `Auto refresh error · last success ${lastRefreshText}`)
   }
-  return `每 5 秒自动刷新 · 最近 ${lastRefreshText}`
+  return t(`每 5 秒自动刷新 · 最近 ${lastRefreshText}`, `Auto refresh every 5 seconds · latest ${lastRefreshText}`)
 })
 
 function buildFilters(): UsageFilters {
@@ -502,7 +518,7 @@ async function refresh({ resetPage = false, silent = false }: RefreshOptions = {
     autoRefreshError.value = null
     lastRefreshedAt.value = new Date()
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : '加载明细失败'
+    const errorMessage = errorText(error, '加载明细失败', 'Failed to load records')
     if (silent) {
       autoRefreshError.value = errorMessage
     } else {
@@ -527,7 +543,7 @@ async function openRecord(record: UsageRecordListItem) {
     selectedRecord.value = await getUsageRecord(record.id, props.scope)
     drawerOpen.value = true
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载原始数据失败')
+    message.error(errorText(error, '加载原始数据失败', 'Failed to load raw data'))
   }
 }
 
@@ -539,7 +555,7 @@ function textOrDash(value: string | null | undefined): string {
 function userLabel(value: string | null | undefined): string {
   const normalized = value?.trim()
   if (!normalized || normalized === '未绑定') {
-    return '未知'
+    return t('未知', 'Unknown')
   }
   return normalized
 }
@@ -586,7 +602,7 @@ function renderUserLabel(row: UsageRecordListItem) {
 
 function apiKeyDescriptionLabel(value: string | null | undefined): string {
   const normalized = value?.trim()
-  return normalized || '未知'
+  return normalized || t('未知', 'Unknown')
 }
 
 function formatLatency(value: number | null): string {
@@ -619,7 +635,7 @@ function formatOutputTps(row: Pick<UsageRecordListItem, 'latency_ms' | 'output_t
     return '-'
   }
   const tokensPerSecond = (row.output_tokens / row.latency_ms) * 1000
-  return new Intl.NumberFormat('zh-CN', {
+  return new Intl.NumberFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
     maximumFractionDigits: tokensPerSecond < 10 ? 2 : 1,
   }).format(tokensPerSecond)
 }
@@ -668,7 +684,10 @@ function isClaudeProvider(provider: string | null | undefined): boolean {
 
 function formatCacheTokens(row: UsageRecordListItem): string {
   if (isClaudeProvider(row.provider)) {
-    return `(读 ${formatInteger(row.cache_read_tokens)} / 写 ${formatInteger(row.cache_creation_tokens)})`
+    return t(
+      `(读 ${formatInteger(row.cache_read_tokens)} / 写 ${formatInteger(row.cache_creation_tokens)})`,
+      `(read ${formatInteger(row.cache_read_tokens)} / write ${formatInteger(row.cache_creation_tokens)})`,
+    )
   }
   return formatInteger(row.cached_tokens)
 }
@@ -687,31 +706,31 @@ const detailRows = computed(() => {
     return []
   }
   const rows = [
-    { label: '时间', value: formatDateTime(record.timestamp) },
-    { label: '模型', value: formatModelWithReasoning(record) },
-    { label: '服务商', value: textOrDash(record.provider) },
-    { label: '接口', value: textOrDash(record.endpoint) },
-    { label: 'API KEY 描述', value: apiKeyDescriptionLabel(record.api_key_description) },
-    { label: '认证类型', value: textOrDash(record.auth) },
-    { label: '请求 ID', value: textOrDash(record.request_id) },
-    { label: '结果', value: record.failed ? '失败' : '成功' },
-    { label: '首字耗时', value: formatPositiveLatency(record.ttft_ms) },
-    { label: '总耗时', value: formatLatency(record.latency_ms) },
-    { label: '输入 Token', value: formatInteger(record.input_tokens) },
-    { label: '缓存 Token', value: formatInteger(record.cached_tokens) },
-    { label: '缓存读 Token', value: formatInteger(record.cache_read_tokens) },
-    { label: '缓存写 Token', value: formatInteger(record.cache_creation_tokens) },
-    { label: '输出 Token', value: formatOutputWithTps(record) },
-    { label: '思考 Token', value: formatInteger(record.reasoning_tokens) },
-    { label: '总 Token', value: formatInteger(record.total_tokens) },
-    { label: '费用', value: formatUsd(record.estimated_cost_usd) },
+    { label: t('时间', 'Time'), value: formatDateTime(record.timestamp) },
+    { label: t('模型', 'Model'), value: formatModelWithReasoning(record) },
+    { label: t('服务商', 'Provider'), value: textOrDash(record.provider) },
+    { label: t('接口', 'Endpoint'), value: textOrDash(record.endpoint) },
+    { label: t('API KEY 描述', 'API key description'), value: apiKeyDescriptionLabel(record.api_key_description) },
+    { label: t('认证类型', 'Auth type'), value: textOrDash(record.auth) },
+    { label: t('请求 ID', 'Request ID'), value: textOrDash(record.request_id) },
+    { label: t('结果', 'Result'), value: record.failed ? t('失败', 'Failed') : t('成功', 'Success') },
+    { label: t('首字耗时', 'TTFT'), value: formatPositiveLatency(record.ttft_ms) },
+    { label: t('总耗时', 'Latency'), value: formatLatency(record.latency_ms) },
+    { label: t('输入 Token', 'Input tokens'), value: formatInteger(record.input_tokens) },
+    { label: t('缓存 Token', 'Cached tokens'), value: formatInteger(record.cached_tokens) },
+    { label: t('缓存读 Token', 'Cache read tokens'), value: formatInteger(record.cache_read_tokens) },
+    { label: t('缓存写 Token', 'Cache write tokens'), value: formatInteger(record.cache_creation_tokens) },
+    { label: t('输出 Token', 'Output tokens'), value: formatOutputWithTps(record) },
+    { label: t('思考 Token', 'Reasoning tokens'), value: formatInteger(record.reasoning_tokens) },
+    { label: t('总 Token', 'Total tokens'), value: formatInteger(record.total_tokens) },
+    { label: t('费用', 'Cost'), value: formatUsd(record.estimated_cost_usd) },
   ]
   if (!isAccountScope.value) {
     rows.splice(
       4,
       0,
-      { label: '来源', value: textOrDash(record.source) },
-      { label: '用户昵称', value: userLabel(record.user_label) },
+      { label: t('来源', 'Source'), value: textOrDash(record.source) },
+      { label: t('用户昵称', 'User nickname'), value: userLabel(record.user_label) },
     )
   }
   return rows
@@ -719,7 +738,7 @@ const detailRows = computed(() => {
 
 const columns = computed<DataTableColumns<UsageRecordListItem>>(() => [
   {
-    title: '时间',
+    title: t('时间', 'Time'),
     key: 'timestamp',
     width: RECORDS_TABLE_COLUMN_WIDTHS.timestamp,
     render: (row) => formatDateTime(row.timestamp),
@@ -728,7 +747,7 @@ const columns = computed<DataTableColumns<UsageRecordListItem>>(() => [
     ? []
     : [
         {
-          title: '用户昵称',
+          title: t('用户昵称', 'User nickname'),
           key: 'user_label',
           width: RECORDS_TABLE_COLUMN_WIDTHS.user,
           ellipsis: { tooltip: true },
@@ -736,14 +755,14 @@ const columns = computed<DataTableColumns<UsageRecordListItem>>(() => [
         },
       ]),
   {
-    title: 'KEY 描述',
+    title: t('KEY 描述', 'Key description'),
     key: 'api_key_description',
     width: RECORDS_TABLE_COLUMN_WIDTHS.apiKeyDescription,
     ellipsis: { tooltip: true },
     render: (row) => apiKeyDescriptionLabel(row.api_key_description),
   },
   {
-    title: '模型',
+    title: t('模型', 'Model'),
     key: 'model',
     width: RECORDS_TABLE_COLUMN_WIDTHS.model,
     ellipsis: { tooltip: true },
@@ -753,85 +772,85 @@ const columns = computed<DataTableColumns<UsageRecordListItem>>(() => [
     ? []
     : [
         {
-          title: '来源',
+          title: t('来源', 'Source'),
           key: 'source',
           width: RECORDS_TABLE_COLUMN_WIDTHS.source,
           ellipsis: { tooltip: true },
         },
       ]),
   {
-    title: '结果',
+    title: t('结果', 'Result'),
     key: 'failed',
     width: RECORDS_TABLE_COLUMN_WIDTHS.failed,
     render: (row) =>
       h(
         NTag,
         { type: row.failed ? 'error' : 'success', size: 'small', bordered: false },
-        { default: () => (row.failed ? '失败' : '成功') },
+        { default: () => (row.failed ? t('失败', 'Failed') : t('成功', 'Success')) },
       ),
   },
   {
-    title: '首字耗时',
+    title: t('首字耗时', 'TTFT'),
     key: 'ttft_ms',
     width: RECORDS_TABLE_COLUMN_WIDTHS.ttft,
     render: (row) => formatPositiveLatency(row.ttft_ms),
   },
   {
-    title: '总耗时',
+    title: t('总耗时', 'Latency'),
     key: 'latency_ms',
     width: RECORDS_TABLE_COLUMN_WIDTHS.latency,
     render: (row) => formatLatency(row.latency_ms),
   },
   {
-    title: '输入',
+    title: t('输入', 'Input'),
     key: 'input_tokens',
     width: RECORDS_TABLE_COLUMN_WIDTHS.inputTokens,
     render: (row) => formatInteger(row.input_tokens),
   },
   {
-    title: '输出',
+    title: t('输出', 'Output'),
     key: 'output_tokens',
     width: RECORDS_TABLE_COLUMN_WIDTHS.outputTokens,
     render: renderOutputWithTps,
   },
   {
-    title: '思考',
+    title: t('思考', 'Reasoning'),
     key: 'reasoning_tokens',
     width: RECORDS_TABLE_COLUMN_WIDTHS.reasoningTokens,
     render: (row) => formatInteger(row.reasoning_tokens),
   },
   {
-    title: '缓存',
+    title: t('缓存', 'Cache'),
     key: 'cached_tokens',
     width: RECORDS_TABLE_COLUMN_WIDTHS.cachedTokens,
     render: formatCacheTokens,
   },
   {
-    title: '总 Token',
+    title: t('总 Token', 'Total tokens'),
     key: 'total_tokens',
     width: RECORDS_TABLE_COLUMN_WIDTHS.totalTokens,
     render: (row) => formatInteger(row.total_tokens),
   },
   {
-    title: '费用',
+    title: t('费用', 'Cost'),
     key: 'estimated_cost_usd',
     width: RECORDS_TABLE_COLUMN_WIDTHS.estimatedCost,
     render: (row) => formatUsd(row.estimated_cost_usd),
   },
   {
-    title: '服务商',
+    title: t('服务商', 'Provider'),
     key: 'provider',
     width: RECORDS_TABLE_COLUMN_WIDTHS.provider,
     ellipsis: { tooltip: true },
   },
   {
-    title: '接口',
+    title: t('接口', 'Endpoint'),
     key: 'endpoint',
     width: RECORDS_TABLE_COLUMN_WIDTHS.endpoint,
     ellipsis: { tooltip: true },
   },
   {
-    title: '请求 ID',
+    title: t('请求 ID', 'Request ID'),
     key: 'request_id',
     width: RECORDS_TABLE_COLUMN_WIDTHS.requestId,
     ellipsis: { tooltip: true },
@@ -845,7 +864,7 @@ const columns = computed<DataTableColumns<UsageRecordListItem>>(() => [
       h(
         NButton,
         { size: 'small', quaternary: true, onClick: () => void openRecord(row) },
-        { default: () => '详情' },
+        { default: () => t('详情', 'Details') },
       ),
   },
 ])
@@ -885,7 +904,7 @@ onBeforeUnmount(() => {
     <section class="panel">
       <div class="panel-inner filter-toolbar">
         <div class="time-row">
-          <div class="quick-ranges" role="group" aria-label="快捷时间范围">
+          <div class="quick-ranges" role="group" :aria-label="t('快捷时间范围', 'Quick time ranges')">
             <NButton
               v-for="option in quickRangeOptions"
               :key="option.key"
@@ -913,7 +932,7 @@ onBeforeUnmount(() => {
             :options="selectOptions.users"
             clearable
             filterable
-            placeholder="用户昵称"
+            :placeholder="t('用户昵称', 'User nickname')"
             @update:value="handleUserChange"
           />
           <NSelect
@@ -921,7 +940,7 @@ onBeforeUnmount(() => {
             :options="selectOptions.apiKeyDescriptions"
             clearable
             filterable
-            placeholder="KEY 描述"
+            :placeholder="t('KEY 描述', 'Key description')"
             @update:value="handleApiKeyChange"
           />
           <NSelect
@@ -929,7 +948,7 @@ onBeforeUnmount(() => {
             :options="selectOptions.providers"
             clearable
             filterable
-            placeholder="服务商"
+            :placeholder="t('服务商', 'Provider')"
             @update:value="handleProviderChange"
           />
           <NSelect
@@ -937,7 +956,7 @@ onBeforeUnmount(() => {
             :options="selectOptions.models"
             clearable
             filterable
-            placeholder="模型"
+            :placeholder="t('模型', 'Model')"
             @update:value="handleModelChange"
           />
           <NSelect
@@ -946,7 +965,7 @@ onBeforeUnmount(() => {
             :options="selectOptions.sources"
             clearable
             filterable
-            placeholder="来源"
+            :placeholder="t('来源', 'Source')"
             @update:value="handleSourceChange"
           />
           <NSelect
@@ -954,22 +973,18 @@ onBeforeUnmount(() => {
             :options="selectOptions.endpoints"
             clearable
             filterable
-            placeholder="接口"
+            :placeholder="t('接口', 'Endpoint')"
             @update:value="handleEndpointChange"
           />
           <div class="status-actions">
             <NSelect
               :value="filterForm.failed"
               class="status-select"
-              :options="[
-                { label: '全部', value: 'all' },
-                { label: '成功', value: 'success' },
-                { label: '失败', value: 'failed' },
-              ]"
+              :options="failedFilterOptions"
               @update:value="handleFailedChange"
             />
             <NButton secondary :loading="isLoading" @click="refresh({ resetPage: true })">
-              筛选
+              {{ t('筛选', 'Filter') }}
             </NButton>
           </div>
         </div>
@@ -1006,15 +1021,15 @@ onBeforeUnmount(() => {
     </section>
 
     <NDrawer v-model:show="drawerOpen" placement="right" width="min(760px, 100vw)">
-      <NDrawerContent title="请求事件详情">
-        <h3 class="drawer-section-title">结构化信息</h3>
+      <NDrawerContent :title="t('请求事件详情', 'Request event details')">
+        <h3 class="drawer-section-title">{{ t('结构化信息', 'Structured information') }}</h3>
         <div class="detail-grid">
           <div v-for="row in detailRows" :key="row.label" class="detail-item">
             <div class="detail-label">{{ row.label }}</div>
             <div class="detail-value">{{ row.value }}</div>
           </div>
         </div>
-        <h3 class="drawer-section-title">原始数据</h3>
+        <h3 class="drawer-section-title">{{ t('原始数据', 'Raw data') }}</h3>
         <pre class="mono-json">{{ jsonPretty(selectedRecord?.raw_json ?? {}) }}</pre>
       </NDrawerContent>
     </NDrawer>

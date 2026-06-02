@@ -50,11 +50,13 @@ import type {
   UserApiKeySummary,
   UserQuotaStatus,
 } from '@/shared/types/api'
+import { useI18n } from '@/shared/i18n'
 import { copyToClipboard } from '@/shared/utils/clipboard'
 import { formatCompact, formatDateTime, formatInteger, formatUsd } from '@/shared/utils/format'
 
 const message = useMessage()
 const dialog = useDialog()
+const { copiedText, currentLanguage, errorText, t } = useI18n()
 const isLoading = ref(false)
 const isSaving = ref(false)
 const apiKeys = ref<UserApiKeySummary[]>([])
@@ -67,7 +69,11 @@ const requestTestVisible = ref(false)
 const requestTestApiKey = ref<UserApiKeySummary | null>(null)
 const requestEndpoint = ref<ModelRequestEndpoint>('chat_completions')
 const requestTestModel = ref<string | null>(null)
-const requestTestMessage = ref('请用一句中文回复：连接测试成功。')
+const requestTestMessageDefaults = {
+  zh: '请用一句中文回复：连接测试成功。',
+  en: 'Reply in one English sentence: connection test succeeded.',
+} as const
+const requestTestMessage = ref(requestTestMessageDefaults[currentLanguage.value])
 const requestTestResult = ref<ModelRequestTestResponse | null>(null)
 const requestTestError = ref<string | null>(null)
 const isAvailableModelsLoading = ref(false)
@@ -78,7 +84,7 @@ const generatedApiKey = ref<string | null>(null)
 const generatedApiKeyHash = ref<string | null>(null)
 const visibleApiKeyHashes = ref<Set<string>>(new Set())
 
-const requestLoadingText = '加载中'
+const requestLoadingText = computed(() => t('加载中', 'Loading'))
 
 interface RequestEndpointOption {
   label: string
@@ -87,28 +93,28 @@ interface RequestEndpointOption {
   urlLabel: string
 }
 
-const chatCompletionsEndpointOption: RequestEndpointOption = {
-  label: 'Chat Completions',
+const chatCompletionsEndpointOption = computed<RequestEndpointOption>(() => ({
+  label: t('聊天补全', 'Chat Completions'),
   value: 'chat_completions',
   path: '/chat/completions',
-  urlLabel: 'Chat Completions URL',
-}
+  urlLabel: t('聊天补全 URL', 'Chat Completions URL'),
+}))
 
-const requestEndpointOptions: RequestEndpointOption[] = [
-  chatCompletionsEndpointOption,
+const requestEndpointOptions = computed<RequestEndpointOption[]>(() => [
+  chatCompletionsEndpointOption.value,
   {
-    label: 'Responses',
+    label: t('Responses 响应', 'Responses'),
     value: 'responses',
     path: '/responses',
-    urlLabel: 'Responses URL',
+    urlLabel: t('Responses 响应 URL', 'Responses URL'),
   },
   {
-    label: 'Claude Messages',
+    label: t('Claude 消息', 'Claude Messages'),
     value: 'claude_messages',
     path: '/messages',
-    urlLabel: 'Claude Messages URL',
+    urlLabel: t('Claude 消息 URL', 'Claude Messages URL'),
   },
-]
+])
 
 interface ApiKeyMetricCard {
   key: string
@@ -129,39 +135,39 @@ const apiKeyMetrics = computed<ApiKeyMetricCard[]>(() => {
   return [
     {
       key: 'keys',
-      label: 'API 密钥',
+      label: t('API 密钥', 'API keys'),
       value: formatInteger(apiKeys.value.length),
-      footnote: '当前账号',
+      footnote: t('当前账号', 'Current account'),
       tone: 'teal',
       icon: KeyRound,
     },
     {
       key: 'requests',
-      label: '今日请求',
+      label: t('今日请求', 'Requests today'),
       value: formatInteger(todayRequests),
-      footnote: `失败 ${formatInteger(failedToday)}`,
+      footnote: t(`失败 ${formatInteger(failedToday)}`, `${formatInteger(failedToday)} failed`),
       tone: 'blue',
       icon: Activity,
     },
     {
       key: 'tokens',
-      label: '今日 Token',
+      label: t('今日 Token', 'Tokens today'),
       value: formatCompact(todayTokens),
-      footnote: '当前账号用量',
+      footnote: t('当前账号用量', 'Current account usage'),
       tone: 'purple',
       icon: Layers3,
     },
     {
       key: 'cost',
-      label: '今日费用',
+      label: t('今日费用', 'Cost today'),
       value: formatUsd(todayCost),
-      footnote: '按现价估算',
+      footnote: t('按现价估算', 'Estimated at current prices'),
       tone: 'green',
       icon: CircleDollarSign,
     },
     {
       key: 'quota',
-      label: '可用余额',
+      label: t('可用余额', 'Available balance'),
       value: quotaValueText(quota),
       footnote: quotaFootnote(quota),
       tone: quota?.paused ? 'purple' : 'green',
@@ -172,21 +178,21 @@ const apiKeyMetrics = computed<ApiKeyMetricCard[]>(() => {
 
 const canCreateApiKey = computed(() => quotaStatus.value?.can_create_keys ?? true)
 
-const requestBaseURL = computed(() => modelRequestGuide.value?.openai_base_url ?? requestLoadingText)
+const requestBaseURL = computed(() => modelRequestGuide.value?.openai_base_url ?? requestLoadingText.value)
 const requestEndpointMeta = computed(
   () =>
-    requestEndpointOptions.find((option) => option.value === requestEndpoint.value) ??
-    chatCompletionsEndpointOption,
+    requestEndpointOptions.value.find((option) => option.value === requestEndpoint.value) ??
+    chatCompletionsEndpointOption.value,
 )
 const requestEndpointURL = computed(() => {
   const baseURL = modelRequestGuide.value?.openai_base_url
   if (!baseURL) {
-    return requestLoadingText
+    return requestLoadingText.value
   }
   return `${baseURL.replace(/\/$/, '')}${requestEndpointMeta.value.path}`
 })
 const requestEndpointURLLabel = computed(() => requestEndpointMeta.value.urlLabel)
-const requestTestApiKeyText = computed(() => requestTestApiKey.value?.api_key || '<你的 API KEY>')
+const requestTestApiKeyText = computed(() => requestTestApiKey.value?.api_key || t('<你的 API KEY>', '<your API key>'))
 const requestHeaderLines = computed(() => {
   if (requestEndpoint.value === 'claude_messages') {
     return [`x-api-key: ${requestTestApiKeyText.value}`, 'anthropic-version: 2023-06-01']
@@ -196,11 +202,11 @@ const requestHeaderLines = computed(() => {
 const requestHeadersText = computed(() => requestHeaderLines.value.join('\n'))
 const sampleRequest = computed(() => {
   const targetURL =
-    requestEndpointURL.value === requestLoadingText
+    requestEndpointURL.value === requestLoadingText.value
       ? `<${requestEndpointURLLabel.value}>`
       : requestEndpointURL.value
-  const model = requestTestModel.value || '<模型名>'
-  const content = requestTestMessage.value.trim() || '你好'
+  const model = requestTestModel.value || t('<模型名>', '<model name>')
+  const content = requestTestMessage.value.trim() || t('你好', 'Hello')
   const body = requestBodyForEndpoint(requestEndpoint.value, model, content)
   return [
     `curl ${targetURL} \\`,
@@ -222,7 +228,7 @@ const requestTestModelOptions = computed(() => {
 })
 const requestTestReplyText = computed(() => {
   const reply = requestTestResult.value?.reply?.trim()
-  return reply || '模型返回成功，但没有可展示文本。'
+  return reply || t('模型返回成功，但没有可展示文本。', 'The model returned successfully, but there is no displayable text.')
 })
 const requestTestUsageText = computed(() => {
   const usage = requestTestResult.value?.usage
@@ -234,13 +240,13 @@ const requestTestUsageText = computed(() => {
   const total = numberFromUsage(usage.total_tokens)
   const parts: string[] = []
   if (input !== null) {
-    parts.push(`输入 ${formatInteger(input)}`)
+    parts.push(t(`输入 ${formatInteger(input)}`, `Input ${formatInteger(input)}`))
   }
   if (output !== null) {
-    parts.push(`输出 ${formatInteger(output)}`)
+    parts.push(t(`输出 ${formatInteger(output)}`, `Output ${formatInteger(output)}`))
   }
   if (total !== null) {
-    parts.push(`总计 ${formatInteger(total)}`)
+    parts.push(t(`总计 ${formatInteger(total)}`, `Total ${formatInteger(total)}`))
   }
   return parts.join(' / ')
 })
@@ -248,6 +254,13 @@ const requestTestUsageText = computed(() => {
 watch(requestEndpoint, () => {
   requestTestResult.value = null
   requestTestError.value = null
+})
+
+watch(currentLanguage, (language, previousLanguage) => {
+  const previousDefault = requestTestMessageDefaults[previousLanguage]
+  if (requestTestMessage.value === previousDefault) {
+    requestTestMessage.value = requestTestMessageDefaults[language]
+  }
 })
 
 function requestBodyForEndpoint(
@@ -282,31 +295,37 @@ function quoteForCurl(value: string): string {
 
 function quotaValueText(quota: UserQuotaStatus | null): string {
   if (!quota) {
-    return '加载中'
+    return t('加载中', 'Loading')
   }
   if (quota.unlimited) {
-    return '每月余额 无限制'
+    return t('每月余额 无限制', 'Monthly balance unlimited')
   }
-  return `每月余额 ${formatUsd(quota.monthly_remaining_usd ?? 0)}`
+  return t(
+    `每月余额 ${formatUsd(quota.monthly_remaining_usd ?? 0)}`,
+    `Monthly balance ${formatUsd(quota.monthly_remaining_usd ?? 0)}`,
+  )
 }
 
 function quotaFootnote(quota: UserQuotaStatus | null): string {
   if (!quota) {
-    return '额度加载中'
+    return t('额度加载中', 'Quota loading')
   }
   if (quota.unlimited) {
-    return '不限时余额 无限制'
+    return t('不限时余额 无限制', 'Lifetime balance unlimited')
   }
-  const lifetimeText = `不限时余额 ${formatUsd(quota.lifetime_remaining_usd ?? 0)}`
+  const lifetimeText = t(
+    `不限时余额 ${formatUsd(quota.lifetime_remaining_usd ?? 0)}`,
+    `Lifetime balance ${formatUsd(quota.lifetime_remaining_usd ?? 0)}`,
+  )
   const notes: string[] = []
   if (quota.sync_error) {
-    notes.push('Key 同步异常')
+    notes.push(t('Key 同步异常', 'Key sync error'))
   }
   if (quota.unpriced_records > 0) {
-    notes.push(`未定价 ${formatInteger(quota.unpriced_records)} 条`)
+    notes.push(t(`未定价 ${formatInteger(quota.unpriced_records)} 条`, `${formatInteger(quota.unpriced_records)} unpriced records`))
   }
   if (quota.paused) {
-    notes.push('Key 已因余额暂停')
+    notes.push(t('Key 已因余额暂停', 'Key paused due to balance'))
   }
   return notes.length > 0 ? `${lifetimeText} · ${notes.join(' · ')}` : lifetimeText
 }
@@ -343,7 +362,7 @@ function displayedApiKey(row: UserApiKeySummary): string {
 
 function maskDisplayedApiKey(apiKey: string | null | undefined): string {
   if (!apiKey) {
-    return '未知'
+    return t('未知', 'Unknown')
   }
   if (apiKey.length <= 12) {
     return `${apiKey.slice(0, 3)}${'*'.repeat(Math.max(apiKey.length - 3, 0))}`
@@ -357,7 +376,7 @@ function maskDisplayedApiKey(apiKey: string | null | undefined): string {
 function renderMaskedKeyTitle() {
   return h('span', { class: 'api-key-title' }, [
     h(NIcon, { class: 'api-key-mask-icon', component: EyeOff }),
-    h('span', '密钥（点击复制）'),
+    h('span', t('密钥（点击复制）', 'Key (click to copy)')),
   ])
 }
 
@@ -367,7 +386,7 @@ function isApiKeyVisible(row: UserApiKeySummary): boolean {
 
 function toggleApiKeyVisibility(row: UserApiKeySummary) {
   if (!row.api_key) {
-    message.info('当前没有完整密钥可显示')
+    message.info(t('当前没有完整密钥可显示', 'No full key is available to show'))
     return
   }
   const nextVisible = new Set(visibleApiKeyHashes.value)
@@ -382,13 +401,13 @@ function toggleApiKeyVisibility(row: UserApiKeySummary) {
 async function copyApiKey(row: UserApiKeySummary) {
   try {
     if (!row.api_key) {
-      message.info('当前没有完整密钥可复制')
+      message.info(t('当前没有完整密钥可复制', 'No full key is available to copy'))
       return
     }
     await copyToClipboard(row.api_key)
-    message.success('API 密钥已复制')
+    message.success(t('API 密钥已复制', 'API key copied'))
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '复制失败')
+    message.error(errorText(error, '复制失败', 'Copy failed'))
   }
 }
 
@@ -398,9 +417,9 @@ async function copyGeneratedApiKey() {
   }
   try {
     await copyToClipboard(generatedApiKey.value)
-    message.success('API 密钥已复制')
+    message.success(t('API 密钥已复制', 'API key copied'))
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '复制失败')
+    message.error(errorText(error, '复制失败', 'Copy failed'))
   }
 }
 
@@ -408,7 +427,7 @@ async function loadModelRequestGuide() {
   try {
     modelRequestGuide.value = await getModelRequestGuide()
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载请求地址失败')
+    message.error(errorText(error, '加载请求地址失败', 'Failed to load request endpoints'))
   }
 }
 
@@ -418,7 +437,7 @@ async function loadAvailableModelsForTest() {
     availableModels.value = await listAvailableModels()
     ensureRequestTestModel()
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载可用模型失败')
+    message.error(errorText(error, '加载可用模型失败', 'Failed to load available models'))
   } finally {
     isAvailableModelsLoading.value = false
   }
@@ -427,6 +446,7 @@ async function loadAvailableModelsForTest() {
 function openRequestTest(row: UserApiKeySummary) {
   requestTestApiKey.value = row
   requestTestModel.value = row.last_model ?? row.models[0] ?? null
+  requestTestMessage.value = requestTestMessageDefaults[currentLanguage.value]
   requestTestResult.value = null
   requestTestError.value = null
   requestTestVisible.value = true
@@ -441,14 +461,14 @@ function openRequestTest(row: UserApiKeySummary) {
 }
 
 async function copyRequestValue(label: string, value: string) {
-  if (!value || value === requestLoadingText) {
+  if (!value || value === requestLoadingText.value) {
     return
   }
   try {
     await copyToClipboard(value)
-    message.success(`${label} 已复制`)
+    message.success(copiedText(label))
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '复制失败')
+    message.error(errorText(error, '复制失败', 'Copy failed'))
   }
 }
 
@@ -459,11 +479,11 @@ async function runRequestTest() {
   const currentKey = requestTestApiKey.value
   const model = requestTestModel.value?.trim() ?? ''
   if (!currentKey) {
-    message.error('请选择要测试的 API KEY')
+    message.error(t('请选择要测试的 API KEY', 'Select an API key to test'))
     return
   }
   if (!model) {
-    message.error('请选择测试模型')
+    message.error(t('请选择测试模型', 'Select a test model'))
     return
   }
   isRequestTesting.value = true
@@ -476,9 +496,9 @@ async function runRequestTest() {
       model,
       message: requestTestMessage.value,
     })
-    message.success('请求测试完成')
+    message.success(t('请求测试完成', 'Request test completed'))
   } catch (error) {
-    requestTestError.value = error instanceof Error ? error.message : '请求测试失败'
+    requestTestError.value = errorText(error, '请求测试失败', 'Request test failed')
   } finally {
     isRequestTesting.value = false
   }
@@ -486,7 +506,7 @@ async function runRequestTest() {
 
 function openCreateDialog() {
   if (!canCreateApiKey.value) {
-    message.error('当前账号额度已用尽，API KEY 已暂停')
+    message.error(t('当前账号额度已用尽，API KEY 已暂停', 'This account has exhausted its quota, so API keys are paused'))
     return
   }
   editingApiKeyHash.value = null
@@ -530,7 +550,7 @@ async function refresh() {
       }
     }
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载 API 密钥失败')
+    message.error(errorText(error, '加载 API 密钥失败', 'Failed to load API keys'))
   } finally {
     isLoading.value = false
   }
@@ -542,29 +562,29 @@ async function saveApiKey() {
   }
   const description = apiKeyDescription.value.trim()
   if (!description) {
-    message.error('API KEY 描述不能为空')
+    message.error(t('API KEY 描述不能为空', 'API key description is required'))
     return
   }
   isSaving.value = true
   try {
     if (editingApiKeyHash.value) {
       await updateApiKey(editingApiKeyHash.value, { description })
-      message.success('API 密钥已更新')
+      message.success(t('API 密钥已更新', 'API key updated'))
     } else {
       if (!canCreateApiKey.value) {
-        message.error('当前账号额度已用尽，API KEY 已暂停')
+        message.error(t('当前账号额度已用尽，API KEY 已暂停', 'This account has exhausted its quota, so API keys are paused'))
         return
       }
       const created = await createApiKey({ description })
       generatedApiKey.value = created.api_key ?? null
       generatedApiKeyHash.value = created.api_key_hash
-      message.success('API 密钥已创建并同步到 CPA')
+      message.success(t('API 密钥已创建并同步到 CPA', 'API key created and synced to CPA'))
     }
     editorVisible.value = false
     editingApiKeyHash.value = null
     await refresh()
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '保存 API 密钥失败')
+    message.error(errorText(error, '保存 API 密钥失败', 'Failed to save API key'))
   } finally {
     isSaving.value = false
   }
@@ -572,13 +592,16 @@ async function saveApiKey() {
 
 function confirmDelete(row: UserApiKeySummary) {
   dialog.warning({
-    title: '删除 API 密钥',
-    content: `将删除 ${row.description || '未命名'} 对应的密钥，并从 CPA 中移除。`,
-    positiveText: '删除',
-    negativeText: '取消',
+    title: t('删除 API 密钥', 'Delete API key'),
+    content: t(
+      `将删除 ${row.description || '未命名'} 对应的密钥，并从 CPA 中移除。`,
+      `This deletes the key for ${row.description || 'Unnamed'} and removes it from CPA.`,
+    ),
+    positiveText: t('删除', 'Delete'),
+    negativeText: t('取消', 'Cancel'),
     onPositiveClick: async () => {
       await deleteApiKey(row.api_key_hash)
-      message.success('API 密钥已删除')
+      message.success(t('API 密钥已删除', 'API key deleted'))
       if (editingApiKeyHash.value === row.api_key_hash) {
         editorVisible.value = false
         editingApiKeyHash.value = null
@@ -592,7 +615,7 @@ function confirmDelete(row: UserApiKeySummary) {
   })
 }
 
-const columns: DataTableColumns<UserApiKeySummary> = [
+const columns = computed<DataTableColumns<UserApiKeySummary>>(() => [
   {
     title: renderMaskedKeyTitle,
     key: 'api_key',
@@ -607,7 +630,7 @@ const columns: DataTableColumns<UserApiKeySummary> = [
             {
               class: 'api-key-visibility-button',
               disabled: !row.api_key,
-              title: isApiKeyVisible(row) ? '隐藏完整密钥' : '显示完整密钥',
+              title: isApiKeyVisible(row) ? t('隐藏完整密钥', 'Hide full key') : t('显示完整密钥', 'Show full key'),
               type: 'button',
               onClick: () => toggleApiKeyVisibility(row),
             },
@@ -623,7 +646,7 @@ const columns: DataTableColumns<UserApiKeySummary> = [
             {
               class: 'api-key-copy-button',
               type: 'button',
-              title: row.api_key ? '点击复制完整密钥' : '无完整密钥可复制',
+              title: row.api_key ? t('点击复制完整密钥', 'Click to copy full key') : t('无完整密钥可复制', 'No full key available to copy'),
               onClick: () => copyApiKey(row),
             },
             h('span', { class: 'api-key-mask-text' }, displayedApiKey(row)),
@@ -632,13 +655,13 @@ const columns: DataTableColumns<UserApiKeySummary> = [
       ),
   },
   {
-    title: '描述',
+    title: t('描述', 'Description'),
     key: 'description',
     width: 240,
     render: (row) => row.description || '-',
   },
   {
-    title: '创建时间',
+    title: t('创建时间', 'Created at'),
     key: 'created_at',
     width: 180,
     render: (row) => formatDateTime(row.created_at),
@@ -656,23 +679,23 @@ const columns: DataTableColumns<UserApiKeySummary> = [
             { size: 'small', quaternary: true, onClick: () => openRequestTest(row) },
             {
               icon: () => h(NIcon, { component: Send }),
-              default: () => '请求测试',
+              default: () => t('请求测试', 'Request test'),
             },
           ),
           h(
             NButton,
             { size: 'small', quaternary: true, onClick: () => editApiKey(row) },
-            { default: () => '编辑' },
+            { default: () => t('编辑', 'Edit') },
           ),
           h(
             NButton,
             { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDelete(row) },
-            { default: () => '删除' },
+            { default: () => t('删除', 'Delete') },
           ),
         ],
       }),
   },
-]
+])
 
 onMounted(refresh)
 </script>
@@ -681,13 +704,13 @@ onMounted(refresh)
   <section class="page">
     <div class="page-header">
       <div>
-        <h1 class="page-title">API 密钥</h1>
-        <p class="page-subtitle">仅管理当前账号自己的密钥</p>
+        <h1 class="page-title">{{ t('API 密钥', 'API keys') }}</h1>
+        <p class="page-subtitle">{{ t('仅管理当前账号自己的密钥', 'Manage only keys for the current account') }}</p>
       </div>
       <NSpace>
-        <NButton secondary :loading="isLoading" @click="refresh">刷新</NButton>
+        <NButton secondary :loading="isLoading" @click="refresh">{{ t('刷新', 'Refresh') }}</NButton>
         <NButton type="primary" :disabled="!canCreateApiKey" @click="openCreateDialog">
-          新建 API 密钥
+          {{ t('新建 API 密钥', 'New API key') }}
         </NButton>
       </NSpace>
     </div>
@@ -705,27 +728,25 @@ onMounted(refresh)
 
     <section class="panel api-key-panel-shell">
       <div class="panel-inner api-key-panel">
-        <NAlert type="warning" :bordered="false" title="请求链路说明">
-          Agent 发起的模型请求仍需 Agent 直接发送到 CPA，CPA-Helper 不代理或中转这些请求；仅调用 CPA
-          的 usage 队列、API KEY 创建与删除、凭证管理等接口，用于用量查看、密钥创建和凭证维护。API
-          密钥拥有当前账号的完整权限，请妥善保管。
+        <NAlert type="warning" :bordered="false" :title="t('请求链路说明', 'Request path note')">
+          {{ t('Agent 发起的模型请求仍需 Agent 直接发送到 CPA，CPA-Helper 不代理或中转这些请求；仅调用 CPA 的 usage 队列、API KEY 创建与删除、凭证管理等接口，用于用量查看、密钥创建和凭证维护。API 密钥拥有当前账号的完整权限，请妥善保管。', 'Model requests from agents must still be sent directly to CPA by the agent. CPA-Helper does not proxy or relay these requests. It only calls CPA usage queue, API key create/delete, and credential management APIs for usage views, key creation, and credential maintenance. API keys have full permissions for the current account; store them carefully.') }}
         </NAlert>
 
-        <NAlert v-if="quotaStatus?.paused" type="error" :bordered="false" title="额度已用尽">
-          当前账号 API KEY 已从 CPA 暂停。补充额度或进入新月份恢复月额度后，系统会自动恢复可用 Key。
+        <NAlert v-if="quotaStatus?.paused" type="error" :bordered="false" :title="t('额度已用尽', 'Quota exhausted')">
+          {{ t('当前账号 API KEY 已从 CPA 暂停。补充额度或进入新月份恢复月额度后，系统会自动恢复可用 Key。', 'API keys for this account are paused in CPA. After quota is added or monthly quota resets, available keys are restored automatically.') }}
         </NAlert>
         <NAlert v-else-if="quotaStatus?.unpriced_records" type="warning" :bordered="false">
-          当前账号存在 {{ formatInteger(quotaStatus.unpriced_records) }} 条未定价用量，未计入额度扣减。
+          {{ t(`当前账号存在 ${formatInteger(quotaStatus.unpriced_records)} 条未定价用量，未计入额度扣减。`, `This account has ${formatInteger(quotaStatus.unpriced_records)} unpriced usage records that are not deducted from quota.`) }}
         </NAlert>
 
         <div v-if="generatedApiKey" class="generated-key-box">
           <div class="generated-key-main">
-            <div class="generated-key-title">新创建的密钥</div>
+            <div class="generated-key-title">{{ t('新创建的密钥', 'Newly created key') }}</div>
             <div class="generated-key-value">{{ generatedApiKey }}</div>
           </div>
           <NSpace>
-            <NButton secondary @click="copyGeneratedApiKey">复制</NButton>
-            <NButton tertiary @click="closeGeneratedApiKey">关闭</NButton>
+            <NButton secondary @click="copyGeneratedApiKey">{{ t('复制', 'Copy') }}</NButton>
+            <NButton tertiary @click="closeGeneratedApiKey">{{ t('关闭', 'Close') }}</NButton>
           </NSpace>
         </div>
 
@@ -747,27 +768,27 @@ onMounted(refresh)
       preset="card"
       :mask-closable="false"
       :closable="false"
-      :title="editingApiKeyHash ? '编辑 API 密钥' : '新建 API 密钥'"
+      :title="editingApiKeyHash ? t('编辑 API 密钥', 'Edit API key') : t('新建 API 密钥', 'New API key')"
       :style="{ width: 'min(520px, calc(100vw - 32px))' }"
     >
       <NForm label-placement="top">
-        <NFormItem label="API KEY 描述">
+        <NFormItem :label="t('API KEY 描述', 'API key description')">
           <NInput
             v-model:value="apiKeyDescription"
             :disabled="isSaving"
-            placeholder="例如：VSCode"
+            :placeholder="t('例如：VSCode', 'Example: VSCode')"
             @keyup.enter="saveApiKey"
           />
         </NFormItem>
         <div class="modal-actions">
-          <NButton secondary :disabled="isSaving" @click="editorVisible = false">取消</NButton>
+          <NButton secondary :disabled="isSaving" @click="editorVisible = false">{{ t('取消', 'Cancel') }}</NButton>
           <NButton
             type="primary"
             :loading="isSaving"
             :disabled="isSaving || (!editingApiKeyHash && !canCreateApiKey)"
             @click="saveApiKey"
           >
-            {{ editingApiKeyHash ? '保存' : '创建' }}
+            {{ editingApiKeyHash ? t('保存', 'Save') : t('创建', 'Create') }}
           </NButton>
         </div>
       </NForm>
@@ -776,16 +797,16 @@ onMounted(refresh)
     <NModal
       v-model:show="requestTestVisible"
       preset="card"
-      title="请求测试"
+      :title="t('请求测试', 'Request test')"
       :style="{ width: 'min(760px, calc(100vw - 32px))' }"
     >
       <div class="request-test">
         <NAlert type="info" :bordered="false">
-          这里提供当前 API KEY 的请求说明，也可以直接选择模型发起一次真实测试。
+          {{ t('这里提供当前 API KEY 的请求说明，也可以直接选择模型发起一次真实测试。', 'This shows request instructions for the current API key. You can also choose a model to run a real test request.') }}
         </NAlert>
 
         <div class="request-endpoint-switch">
-          <span class="request-endpoint-label">请求格式</span>
+          <span class="request-endpoint-label">{{ t('请求格式', 'Request format') }}</span>
           <NRadioGroup v-model:value="requestEndpoint" size="small">
             <NRadioButton
               v-for="option in requestEndpointOptions"
@@ -800,14 +821,14 @@ onMounted(refresh)
         <div class="request-guide-list">
           <div class="request-guide-row">
             <div>
-              <div class="request-guide-label">Base URL</div>
+              <div class="request-guide-label">{{ t('基础 URL', 'Base URL') }}</div>
               <code class="request-guide-value">{{ requestBaseURL }}</code>
             </div>
-            <NButton size="small" secondary @click="copyRequestValue('Base URL', requestBaseURL)">
+            <NButton size="small" secondary @click="copyRequestValue(t('基础 URL', 'Base URL'), requestBaseURL)">
               <template #icon>
                 <NIcon :component="Copy" />
               </template>
-              复制
+              {{ t('复制', 'Copy') }}
             </NButton>
           </div>
           <div class="request-guide-row">
@@ -815,59 +836,59 @@ onMounted(refresh)
               <div class="request-guide-label">{{ requestEndpointURLLabel }}</div>
               <code class="request-guide-value">{{ requestEndpointURL }}</code>
             </div>
-            <NButton size="small" secondary @click="copyRequestValue('请求 URL', requestEndpointURL)">
+            <NButton size="small" secondary @click="copyRequestValue(t('请求 URL', 'Request URL'), requestEndpointURL)">
               <template #icon>
                 <NIcon :component="Copy" />
               </template>
-              复制
+              {{ t('复制', 'Copy') }}
             </NButton>
           </div>
           <div class="request-guide-row">
             <div>
-              <div class="request-guide-label">Header</div>
+              <div class="request-guide-label">{{ t('请求 Header', 'Request headers') }}</div>
               <code class="request-guide-value request-guide-value-multiline">{{ requestHeadersText }}</code>
             </div>
-            <NButton size="small" secondary @click="copyRequestValue('Header', requestHeadersText)">
+            <NButton size="small" secondary @click="copyRequestValue(t('请求 Header', 'Request headers'), requestHeadersText)">
               <template #icon>
                 <NIcon :component="Copy" />
               </template>
-              复制
+              {{ t('复制', 'Copy') }}
             </NButton>
           </div>
         </div>
 
         <div class="request-example">
           <div class="request-example-head">
-            <span>curl 示例</span>
-            <NButton size="small" secondary @click="copyRequestValue('curl 示例', sampleRequest)">
+            <span>{{ t('curl 示例', 'curl example') }}</span>
+            <NButton size="small" secondary @click="copyRequestValue(t('curl 示例', 'curl example'), sampleRequest)">
               <template #icon>
                 <NIcon :component="Copy" />
               </template>
-              复制示例
+              {{ t('复制示例', 'Copy example') }}
             </NButton>
           </div>
           <pre>{{ sampleRequest }}</pre>
         </div>
 
-        <div class="request-test-section-title">请求测试</div>
+        <div class="request-test-section-title">{{ t('请求测试', 'Request test') }}</div>
 
         <NForm label-placement="top" class="request-test-form">
-          <NFormItem label="测试模型">
+          <NFormItem :label="t('测试模型', 'Test model')">
             <NSelect
               v-model:value="requestTestModel"
               filterable
               clearable
               :loading="isAvailableModelsLoading"
               :options="requestTestModelOptions"
-              placeholder="选择当前 Key 可用的模型"
+              :placeholder="t('选择当前 Key 可用的模型', 'Select a model available to this key')"
             />
           </NFormItem>
-          <NFormItem label="测试消息">
+          <NFormItem :label="t('测试消息', 'Test message')">
             <NInput
               v-model:value="requestTestMessage"
               type="textarea"
               :autosize="{ minRows: 3, maxRows: 5 }"
-              placeholder="输入要发送给模型的测试消息"
+              :placeholder="t('输入要发送给模型的测试消息', 'Enter the test message to send to the model')"
             />
           </NFormItem>
         </NForm>
@@ -877,12 +898,12 @@ onMounted(refresh)
           type="warning"
           :bordered="false"
         >
-          当前 Key 暂未查询到可选模型，可以先刷新模型列表，或到「可用模型」页面检查 Key 是否可用。
+          {{ t('当前 Key 暂未查询到可选模型，可以先刷新模型列表，或到「可用模型」页面检查 Key 是否可用。', 'No selectable models were found for this key. Refresh the model list, or check whether the key is available on the Available models page.') }}
         </NAlert>
 
         <div class="modal-actions request-test-actions">
           <NButton secondary :loading="isAvailableModelsLoading" @click="loadAvailableModelsForTest">
-            刷新模型
+            {{ t('刷新模型', 'Refresh models') }}
           </NButton>
           <NButton
             type="primary"
@@ -893,7 +914,7 @@ onMounted(refresh)
             <template #icon>
               <NIcon :component="Send" />
             </template>
-            发送测试
+            {{ t('发送测试', 'Send test') }}
           </NButton>
         </div>
 
@@ -903,7 +924,7 @@ onMounted(refresh)
 
         <div v-if="requestTestResult" class="request-test-result">
           <div class="request-test-result-head">
-            <span>模型回复</span>
+            <span>{{ t('模型回复', 'Model reply') }}</span>
             <span>
               HTTP {{ requestTestResult.status_code }} · {{ requestTestResult.duration_ms }}ms
               <template v-if="requestTestUsageText"> · {{ requestTestUsageText }}</template>

@@ -43,6 +43,7 @@ import type {
   CodexKeeperSettingsUpdatePayload,
   CodexKeeperStatus,
 } from '@/shared/types/api'
+import { useI18n } from '@/shared/i18n'
 import { copyToClipboard } from '@/shared/utils/clipboard'
 import { formatDateTime, formatInteger } from '@/shared/utils/format'
 
@@ -59,6 +60,7 @@ interface ParsedLogLine {
 }
 
 const message = useMessage()
+const { errorText, keeperStatusText, serverText, t } = useI18n()
 const isLoading = ref(false)
 const isSaving = ref(false)
 const isActing = ref(false)
@@ -72,13 +74,13 @@ const shouldFollowLatestLog = ref(true)
 let statusTimer: number | undefined
 let schedulePreviewTimer: number | undefined
 
-const conditionalRefreshIntervalOptions = [
-  { label: '关闭', value: 0 },
-  { label: '5 秒', value: 5 },
-  { label: '10 秒', value: 10 },
-  { label: '30 秒', value: 30 },
-  { label: '60 秒', value: 60 },
-]
+const conditionalRefreshIntervalOptions = computed(() => [
+  { label: t('关闭', 'Off'), value: 0 },
+  { label: t('5 秒', '5 seconds'), value: 5 },
+  { label: t('10 秒', '10 seconds'), value: 10 },
+  { label: t('30 秒', '30 seconds'), value: 30 },
+  { label: t('60 秒', '60 seconds'), value: 60 },
+])
 
 const form = reactive({
   schedule_cron: '*/30 * * * *',
@@ -145,18 +147,16 @@ const stateType = computed(() => {
 const statusDetailText = computed(() => {
   const detail = status.value?.detail
   if (isDaemonRunning.value && !isRunning.value) {
-    return '自动巡检已开启'
+    return t('自动巡检已开启', 'Automatic inspection is enabled')
   }
   if (!detail) {
-    return '未运行'
+    return t('未运行', 'Not running')
   }
-  return detail
-    .replace(/守护运行中/g, '自动巡检运行中')
-    .replace(/守护进程/g, '后台自动巡检')
-    .replace(/守护任务/g, '自动巡检任务')
-    .replace(/守护已启动/g, '已开始自动巡检')
+  return keeperStatusText(detail)
 })
-const statusFootnoteText = computed(() => (isDaemonRunning.value ? '等待 Cron 调度' : '后台自动巡检'))
+const statusFootnoteText = computed(() =>
+  isDaemonRunning.value ? t('等待 Cron 调度', 'Waiting for Cron schedule') : t('后台自动巡检', 'Background automatic inspection'),
+)
 
 watch(logText, () => {
   if (shouldFollowLatestLog.value) {
@@ -197,7 +197,7 @@ async function loadAll() {
     status.value = nextStatus
     accounts.value = accountResponse.items
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '加载账号巡检失败')
+    message.error(errorText(error, '加载账号巡检失败', 'Failed to load account inspection'))
   } finally {
     isLoading.value = false
   }
@@ -235,7 +235,7 @@ function normalizedRules(): CodexKeeperPriorityRule[] {
 async function saveSettings() {
   const rules = normalizedRules()
   if (rules.length !== priorityRules.value.length) {
-    message.error('账号类型不可为空或重复，优先级必须在 0 ~ 20')
+    message.error(t('账号类型不可为空或重复，优先级必须在 0 ~ 20', 'Account types cannot be empty or duplicated, and priorities must be 0-20'))
     return
   }
   isSaving.value = true
@@ -246,9 +246,9 @@ async function saveSettings() {
     }
     const saved = await updateCodexKeeperSettings(payload)
     applySettings(saved)
-    message.success('巡检配置已保存')
+    message.success(t('巡检配置已保存', 'Inspection settings saved'))
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '保存巡检配置失败')
+    message.error(errorText(error, '保存巡检配置失败', 'Failed to save inspection settings'))
   } finally {
     isSaving.value = false
   }
@@ -258,7 +258,7 @@ async function loadSchedulePreview() {
   const scheduleCron = form.schedule_cron.trim()
   if (!scheduleCron) {
     nextRunTimes.value = []
-    schedulePreviewError.value = '请填写 Cron 表达式'
+    schedulePreviewError.value = t('请填写 Cron 表达式', 'Enter a Cron expression')
     return
   }
   try {
@@ -273,8 +273,11 @@ async function loadSchedulePreview() {
       return
     }
     nextRunTimes.value = []
-    schedulePreviewError.value =
-      error instanceof Error ? error.message : 'Cron 表达式无效，请使用 5 段格式'
+    schedulePreviewError.value = errorText(
+      error,
+      'Cron 表达式无效，请使用 5 段格式',
+      'Invalid Cron expression. Use the 5-field format',
+    )
   }
 }
 
@@ -294,7 +297,7 @@ async function runAction(action: () => Promise<void>, successText: string) {
     message.success(successText)
     await loadStatus()
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '操作失败')
+    message.error(errorText(error, '操作失败', 'Operation failed'))
   } finally {
     isActing.value = false
   }
@@ -430,34 +433,34 @@ function scrollLogToTop() {
 
 async function copyLogText() {
   if (!logText.value) {
-    message.info('暂无日志可复制')
+    message.info(t('暂无日志可复制', 'No logs to copy'))
     return
   }
   try {
     await copyToClipboard(logText.value)
-    message.success('维护日志已复制')
+    message.success(t('维护日志已复制', 'Maintenance logs copied'))
   } catch (error) {
-    message.error(error instanceof Error ? error.message : '复制失败')
+    message.error(errorText(error, '复制失败', 'Copy failed'))
   }
 }
 
-const priorityColumns: DataTableColumns<CodexKeeperPriorityRule> = [
+const priorityColumns = computed<DataTableColumns<CodexKeeperPriorityRule>>(() => [
   {
-    title: '账号类型',
+    title: t('账号类型', 'Account Type'),
     key: 'account_type',
     minWidth: 132,
     render: (row) =>
       h(NInput, {
         size: 'small',
         value: row.account_type,
-        placeholder: '例如 pro_20x',
+        placeholder: t('例如 pro_20x', 'For example, pro_20x'),
         onUpdateValue: (value: string) => {
           row.account_type = value
         },
       }),
   },
   {
-    title: '优先级',
+    title: t('优先级', 'Priority'),
     key: 'priority',
     width: 112,
     render: (row) =>
@@ -479,10 +482,10 @@ const priorityColumns: DataTableColumns<CodexKeeperPriorityRule> = [
       h(
         NButton,
         { size: 'tiny', quaternary: true, type: 'error', onClick: () => removeRule(row) },
-        { default: () => '移除' },
+        { default: () => t('移除', 'Remove') },
       ),
   },
-]
+])
 
 onMounted(() => {
   void loadAll()
@@ -507,13 +510,13 @@ onBeforeUnmount(() => {
   <section class="page inspection-page">
     <div class="page-header">
       <div>
-        <h1 class="page-title">巡检设置</h1>
-        <p class="page-subtitle">维护 Codex auth file 的健康状态和调度优先级</p>
+        <h1 class="page-title">{{ t('巡检设置', 'Inspection Settings') }}</h1>
+        <p class="page-subtitle">{{ t('维护 Codex auth file 的健康状态和调度优先级', 'Maintain Codex auth file health and scheduling priorities') }}</p>
       </div>
       <NSpace>
-        <NButton secondary :loading="isLoading" @click="loadAll">重新加载</NButton>
+        <NButton secondary :loading="isLoading" @click="loadAll">{{ t('重新加载', 'Reload') }}</NButton>
         <NButton type="primary" :loading="isSaving" :disabled="isRunning" @click="saveSettings">
-          保存配置
+          {{ t('保存配置', 'Save Settings') }}
         </NButton>
       </NSpace>
     </div>
@@ -523,7 +526,7 @@ onBeforeUnmount(() => {
         <div class="metric-icon" aria-hidden="true">
           <Activity :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">运行状态</div>
+        <div class="metric-label">{{ t('运行状态', 'Run Status') }}</div>
         <div class="metric-value inspection-status-value" :title="statusDetailText">
           <NTag class="inspection-status-tag" :type="stateType" size="small" :bordered="false">
             {{ statusDetailText }}
@@ -535,31 +538,31 @@ onBeforeUnmount(() => {
         <div class="metric-icon" aria-hidden="true">
           <Users :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">账号总数</div>
+        <div class="metric-label">{{ t('账号总数', 'Total Accounts') }}</div>
         <div class="metric-value">{{ formatInteger(accountTotalCount) }}</div>
-        <div class="metric-footnote">全部 auth file</div>
+        <div class="metric-footnote">{{ t('全部 auth file', 'All auth files') }}</div>
       </div>
       <div class="metric-card is-green">
         <div class="metric-icon" aria-hidden="true">
           <ShieldCheck :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">启用中</div>
+        <div class="metric-label">{{ t('启用中', 'Enabled') }}</div>
         <div class="metric-value">{{ formatInteger(enabledAccountCount) }}</div>
-        <div class="metric-footnote">可参与调度</div>
+        <div class="metric-footnote">{{ t('可参与调度', 'Available for scheduling') }}</div>
       </div>
       <div class="metric-card is-warning">
         <div class="metric-icon" aria-hidden="true">
           <PauseCircle :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">已禁用</div>
+        <div class="metric-label">{{ t('已禁用', 'Disabled') }}</div>
         <div class="metric-value">{{ formatInteger(disabledAccountCount) }}</div>
-        <div class="metric-footnote">停用账号</div>
+        <div class="metric-footnote">{{ t('停用账号', 'Inactive accounts') }}</div>
       </div>
       <div class="metric-card is-danger">
         <div class="metric-icon" aria-hidden="true">
           <ShieldAlert :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">401报错</div>
+        <div class="metric-label">{{ t('401报错', '401 Errors') }}</div>
         <div class="metric-value">{{ formatInteger(unauthorizedErrorAccountCount) }}</div>
         <div class="metric-footnote">HTTP 401</div>
       </div>
@@ -567,9 +570,9 @@ onBeforeUnmount(() => {
         <div class="metric-icon" aria-hidden="true">
           <Gauge :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">额度耗尽</div>
+        <div class="metric-label">{{ t('额度耗尽', 'Quota Exhausted') }}</div>
         <div class="metric-value">{{ formatInteger(quotaExhaustedAccountCount) }}</div>
-        <div class="metric-footnote">临时降级</div>
+        <div class="metric-footnote">{{ t('临时降级', 'Temporary downgrade') }}</div>
       </div>
     </div>
 
@@ -577,25 +580,25 @@ onBeforeUnmount(() => {
       <section class="panel inspection-config-panel">
         <div class="panel-inner config-panel-inner">
           <div class="section-heading">
-            <h2 class="section-title">巡检配置</h2>
+            <h2 class="section-title">{{ t('巡检配置', 'Inspection Configuration') }}</h2>
             <NSpace class="config-actions" size="small">
               <NButton
                 size="small"
                 secondary
                 :loading="isActing"
                 :disabled="isRunOnceBlocked"
-                @click="runAction(runCodexKeeperOnce, '已开始执行一轮')"
+                @click="runAction(runCodexKeeperOnce, t('已开始执行一轮', 'Started one inspection run'))"
               >
-                执行一轮
+                {{ t('执行一轮', 'Run Once') }}
               </NButton>
               <NButton
                 size="small"
                 type="primary"
                 :loading="isActing"
                 :disabled="isDaemonRunning"
-                @click="runAction(startCodexKeeper, '已开始自动巡检')"
+                @click="runAction(startCodexKeeper, t('已开始自动巡检', 'Automatic inspection started'))"
               >
-                开始自动巡检
+                {{ t('开始自动巡检', 'Start Automatic Inspection') }}
               </NButton>
               <NButton
                 size="small"
@@ -603,22 +606,22 @@ onBeforeUnmount(() => {
                 type="warning"
                 :loading="isActing"
                 :disabled="!isDaemonRunning"
-                @click="runAction(stopCodexKeeper, '已请求停止')"
+                @click="runAction(stopCodexKeeper, t('已请求停止', 'Stop requested'))"
               >
-                停止
+                {{ t('停止', 'Stop') }}
               </NButton>
             </NSpace>
           </div>
           <NForm class="config-form" :model="form" label-placement="top" size="small">
             <div class="config-sections">
               <section class="config-block">
-                <h3 class="config-block-title">调度</h3>
+                <h3 class="config-block-title">{{ t('调度', 'Schedule') }}</h3>
                 <div class="schedule-grid">
-                  <NFormItem label="Cron 表达式">
-                    <NInput v-model:value="form.schedule_cron" placeholder="例如 */30 * * * *" />
+                  <NFormItem :label="t('Cron 表达式', 'Cron Expression')">
+                    <NInput v-model:value="form.schedule_cron" :placeholder="t('例如 */30 * * * *', 'For example, */30 * * * *')" />
                   </NFormItem>
                   <div class="schedule-preview">
-                    <div class="preview-title">后续 5 次调用</div>
+                    <div class="preview-title">{{ t('后续 5 次调用', 'Next 5 Runs') }}</div>
                     <div v-if="schedulePreviewError" class="preview-error">
                       {{ schedulePreviewError }}
                     </div>
@@ -627,17 +630,17 @@ onBeforeUnmount(() => {
                         {{ formatDateTime(time) }}
                       </span>
                     </div>
-                    <div v-else class="preview-muted">填写 Cron 表达式后显示</div>
+                    <div v-else class="preview-muted">{{ t('填写 Cron 表达式后显示', 'Enter a Cron expression to preview') }}</div>
                   </div>
                 </div>
                 <div class="conditional-refresh-grid">
-                  <NFormItem label="按条件扫描间隔">
+                  <NFormItem :label="t('按条件扫描间隔', 'Conditional Scan Interval')">
                     <NSelect
                       v-model:value="form.conditional_refresh_interval_seconds"
                       :options="conditionalRefreshIntervalOptions"
                     />
                   </NFormItem>
-                  <NFormItem label="账号刷新缓存（分钟）">
+                  <NFormItem :label="t('账号刷新缓存（分钟）', 'Account Refresh Cache (minutes)')">
                     <NInputNumber
                       v-model:value="form.account_refresh_cache_minutes"
                       :min="1"
@@ -647,30 +650,30 @@ onBeforeUnmount(() => {
                 </div>
                 <div class="conditional-refresh-help">
                   <p>
-                    <strong>按条件扫描间隔：</strong>后台自动巡检开启后，每隔多久检查一次是否有账号需要刷新；会查找缓存时间内有实际请求的账号、额度刷新时间已到的账号、检测异常账号，并同步本地记录与 CPA 当前账号列表的差异。
+                    <strong>{{ t('按条件扫描间隔：', 'Conditional scan interval:') }}</strong>{{ t('后台自动巡检开启后，每隔多久检查一次是否有账号需要刷新；会查找缓存时间内有实际请求的账号、额度刷新时间已到的账号、检测异常账号，并同步本地记录与 CPA 当前账号列表的差异。', 'How often automatic inspection checks whether accounts need refreshing after it is enabled. It looks for accounts with actual requests during the cache window, expired quota refresh times, inspection errors, and differences between local records and the current CPA account list.') }}
                   </p>
                   <p>
-                    <strong>账号刷新缓存：</strong>控制自动任务的防重复时间；同一账号在缓存时间内不会被自动巡检或按条件扫描重复刷新，手动刷新会绕过缓存但会更新缓存时间。
+                    <strong>{{ t('账号刷新缓存：', 'Account refresh cache:') }}</strong>{{ t('控制自动任务的防重复时间；同一账号在缓存时间内不会被自动巡检或按条件扫描重复刷新，手动刷新会绕过缓存但会更新缓存时间。', 'Controls duplicate prevention for automatic tasks. The same account will not be refreshed repeatedly by automatic inspection or conditional scans during the cache window. Manual refresh bypasses the cache but updates the cache time.') }}
                   </p>
                 </div>
               </section>
 
               <section class="config-block">
-                <h3 class="config-block-title">执行参数</h3>
+                <h3 class="config-block-title">{{ t('执行参数', 'Execution Parameters') }}</h3>
                 <div class="params-grid">
-                  <NFormItem label="额度阈值（%）">
+                  <NFormItem :label="t('额度阈值（%）', 'Quota Threshold (%)')">
                     <NInputNumber v-model:value="form.quota_threshold" :min="0" :max="100" />
                   </NFormItem>
-                  <NFormItem label="额度检测超时（秒）">
+                  <NFormItem :label="t('额度检测超时（秒）', 'Quota Check Timeout (seconds)')">
                     <NInputNumber v-model:value="form.usage_timeout_seconds" :min="1" />
                   </NFormItem>
-                  <NFormItem label="账号管理接口超时（秒）">
+                  <NFormItem :label="t('账号管理接口超时（秒）', 'Account API Timeout (seconds)')">
                     <NInputNumber v-model:value="form.cpa_timeout_seconds" :min="1" />
                   </NFormItem>
-                  <NFormItem label="失败重试次数">
+                  <NFormItem :label="t('失败重试次数', 'Failure Retries')">
                     <NInputNumber v-model:value="form.max_retries" :min="0" :max="5" />
                   </NFormItem>
-                  <NFormItem label="账号处理并发数">
+                  <NFormItem :label="t('账号处理并发数', 'Account Processing Concurrency')">
                     <NInputNumber v-model:value="form.worker_threads" :min="1" :max="64" />
                   </NFormItem>
                 </div>
@@ -678,8 +681,8 @@ onBeforeUnmount(() => {
                   <NFormItem class="switch-form-item">
                     <div class="switch-setting">
                       <div class="switch-copy">
-                        <span class="switch-title">只检查不修改</span>
-                        <p class="switch-help">开启后只模拟处理，不会禁用账号或调整优先级。</p>
+                        <span class="switch-title">{{ t('只检查不修改', 'Check Only') }}</span>
+                        <p class="switch-help">{{ t('开启后只模拟处理，不会禁用账号或调整优先级。', 'When enabled, processing is simulated and accounts are not disabled or reprioritized.') }}</p>
                       </div>
                       <NSwitch v-model:value="form.dry_run" class="switch-control" />
                     </div>
@@ -687,9 +690,9 @@ onBeforeUnmount(() => {
                   <NFormItem class="switch-form-item">
                     <div class="switch-setting">
                       <div class="switch-copy">
-                        <span class="switch-title">启用凭证 WebSocket</span>
+                        <span class="switch-title">{{ t('启用凭证 WebSocket', 'Enable Credential WebSocket') }}</span>
                         <p class="switch-help">
-                          刷新时为每个 Codex 凭证写入 websockets=true，用于 Responses API 的 WebSocket 传输。
+                          {{ t('刷新时为每个 Codex 凭证写入 websockets=true，用于 Responses API 的 WebSocket 传输。', 'During refresh, write websockets=true to each Codex credential for Responses API WebSocket transport.') }}
                         </p>
                       </div>
                       <NSwitch
@@ -701,8 +704,8 @@ onBeforeUnmount(() => {
                   <NFormItem class="switch-form-item">
                     <div class="switch-setting">
                       <div class="switch-copy">
-                        <span class="switch-title">启动后自动巡检</span>
-                        <p class="switch-help">每次 CPA-Helper 启动后，自动按上面的计划检查账号。</p>
+                        <span class="switch-title">{{ t('启动后自动巡检', 'Auto Inspect on Startup') }}</span>
+                        <p class="switch-help">{{ t('每次 CPA-Helper 启动后，自动按上面的计划检查账号。', 'Automatically inspect accounts using the schedule above whenever CPA-Helper starts.') }}</p>
                       </div>
                       <NSwitch v-model:value="form.auto_start_daemon" class="switch-control" />
                     </div>
@@ -712,22 +715,22 @@ onBeforeUnmount(() => {
             </div>
           </NForm>
           <section class="config-block runtime-block">
-            <h3 class="config-block-title">运行信息</h3>
+            <h3 class="config-block-title">{{ t('运行信息', 'Runtime Information') }}</h3>
             <div class="runtime-info-grid">
               <div class="runtime-stat">
                 <span class="runtime-label">CLIProxyAPI</span>
                 <strong class="runtime-value">
-                  {{ status ? '使用系统设置中的地址和管理密钥' : '等待加载' }}
+                  {{ status ? t('使用系统设置中的地址和管理密钥', 'Using the system settings URL and admin key') : t('等待加载', 'Waiting to load') }}
                 </strong>
               </div>
               <div class="runtime-stat">
-                <span class="runtime-label">最近开始</span>
+                <span class="runtime-label">{{ t('最近开始', 'Last Started') }}</span>
                 <strong class="runtime-value">
                   {{ formatDateTime(status?.last_started_at ?? null) }}
                 </strong>
               </div>
               <div class="runtime-stat">
-                <span class="runtime-label">最近完成</span>
+                <span class="runtime-label">{{ t('最近完成', 'Last Finished') }}</span>
                 <strong class="runtime-value">
                   {{ formatDateTime(status?.last_finished_at ?? null) }}
                 </strong>
@@ -740,11 +743,11 @@ onBeforeUnmount(() => {
       <section class="panel priority-rules-panel">
         <div class="panel-inner">
           <div class="section-heading">
-            <h2 class="section-title">账号类型优先级</h2>
-            <NButton size="small" secondary @click="addRule">新增规则</NButton>
+            <h2 class="section-title">{{ t('账号类型优先级', 'Account Type Priorities') }}</h2>
+            <NButton size="small" secondary @click="addRule">{{ t('新增规则', 'Add Rule') }}</NButton>
           </div>
           <p class="section-hint">
-            账号当前优先级超过 20 时视为手动优先，巡检不会覆盖；0 ~ 20 会按这里的账号类型规则维护。
+            {{ t('账号当前优先级超过 20 时视为手动优先，巡检不会覆盖；0 ~ 20 会按这里的账号类型规则维护。', 'Current account priorities above 20 are treated as manual priority and will not be overwritten. Priorities from 0 to 20 are maintained using the account type rules here.') }}
           </p>
           <NDataTable
             class="priority-table"
@@ -761,19 +764,19 @@ onBeforeUnmount(() => {
     <section class="panel log-panel">
       <div class="panel-inner log-panel-inner">
         <div class="section-heading">
-          <h2 class="section-title">维护日志</h2>
+          <h2 class="section-title">{{ t('维护日志', 'Maintenance Logs') }}</h2>
           <NSpace class="log-actions" size="small">
             <NButton secondary :disabled="!logText" @click="copyLogText">
               <template #icon>
                 <NIcon :component="Copy" />
               </template>
-              复制日志
+              {{ t('复制日志', 'Copy Logs') }}
             </NButton>
-            <NButton secondary :loading="isActing" @click="runAction(clearCodexKeeperLogs, '日志已清空')">
+            <NButton secondary :loading="isActing" @click="runAction(clearCodexKeeperLogs, t('日志已清空', 'Logs cleared'))">
               <template #icon>
                 <NIcon :component="Trash2" />
               </template>
-              清空日志
+              {{ t('清空日志', 'Clear Logs') }}
             </NButton>
           </NSpace>
         </div>
@@ -781,22 +784,22 @@ onBeforeUnmount(() => {
           ref="logBodyRef"
           class="log-view"
           role="log"
-          aria-label="维护日志"
+          :aria-label="t('维护日志', 'Maintenance Logs')"
           @scroll="handleLogScroll"
         >
-          <div v-if="displayedLogLines.length === 0" class="log-empty">暂无日志</div>
+          <div v-if="displayedLogLines.length === 0" class="log-empty">{{ t('暂无日志', 'No logs') }}</div>
           <div v-else class="log-lines">
             <div
               v-for="line in displayedLogLines"
               :key="line.key"
               class="log-line"
               :class="`is-${line.tone}`"
-              :title="line.raw"
+              :title="serverText(line.message, '维护日志', 'Maintenance log')"
             >
               <time class="log-time">{{ line.time }}</time>
               <span class="log-level">{{ line.level }}</span>
               <span class="log-component">{{ line.component }}</span>
-              <span class="log-message">{{ line.message }}</span>
+              <span class="log-message">{{ serverText(line.message, '维护日志', 'Maintenance log') }}</span>
             </div>
           </div>
         </div>
