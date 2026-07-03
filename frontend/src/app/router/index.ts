@@ -50,12 +50,6 @@ export const router = createRouter({
           meta: { requiresAdmin: true },
         },
         {
-          path: 'admin/card-shops',
-          name: 'admin-card-shops',
-          component: () => import('@/features/card-shops/views/CardShopsView.vue'),
-          meta: { requiresAdmin: true },
-        },
-        {
           path: 'admin/users',
           name: 'admin-users',
           component: () => import('@/features/users/views/UserManagementView.vue'),

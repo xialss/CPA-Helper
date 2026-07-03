@@ -47,7 +47,6 @@ For clarity, model requests initiated by an Agent are still sent directly from t
 - **User balances and automatic key pause**: Users are unlimited by default; admins can configure monthly balance and lifetime balance, usage is priced in USD with current model prices, monthly balance is consumed first, and exhausted users only have their CPA API keys paused.
 - **API key lifecycle management**: Each user can independently create, edit, copy and delete their own API keys and synchronize them to CPA, with usage counted per user and per-key request guidance plus live request testing.
 - **Model pricing maintenance**: Maintain token-model input, output and cache prices in USD per million tokens; models whose name contains `image` are charged by a fixed USD price per successful request, with CPA model comparison for quickly filling LiteLLM / manual prices.
-- **Card shop index**: Admins can browse real-time public card-shop and product snapshots, search by product title, use popular tags, sort results and favorite shops for faster lookup. This is only a public information index and does not participate in transactions.
 - **Available model aggregation**: Query available models through the current account's bound CPA API keys and enrich them with local pricing data.
 - **CLIProxyAPI / CPAMC integration**: Configure the service URL, management key, usage queue and local collector options to persist remote usage events into SQLite.
 - **Codex auth file inspection**: Support Cron scheduling, quota thresholds, check-only mode, conditional scanning, concurrent workers, priority rules, account enable/disable and deletion.
@@ -81,12 +80,6 @@ Admins can create or disable regular accounts, manage nicknames, roles and enabl
 Compare CPA's currently available models with the local price catalog, quickly price missing models, and recalculate historical request costs using the latest configured prices.
 
 ![Model pricing](pictures/模型价格.png)
-
-**Card shop index**
-
-Browse public card-shop and product snapshots, search by product title, use popular tags, sort results and favorite shops for follow-up lookup.
-
-![Card shop index](pictures/卡网收录.png)
 
 **System settings**
 
