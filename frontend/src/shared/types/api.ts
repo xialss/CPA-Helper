@@ -88,50 +88,6 @@ export interface CollectorStatus {
   records_collected: number
 }
 
-export interface CardShopProductItem {
-  name?: string | null
-  price?: number | null
-  stockCount?: number | null
-  salesCount?: number | null
-  itemUrl?: string | null
-  category?: string | null
-  group?: string | null
-}
-
-export interface CardShop {
-  id?: string | null
-  shopName?: string | null
-  shopUrl?: string | null
-  telegram?: string | null
-  shopSellCount?: number | null
-  productsInStock?: string[] | null
-  productItems?: CardShopProductItem[] | null
-  notes?: string | null
-  updatedAt?: string | null
-}
-
-export interface CardShopsResponse {
-  shops: CardShop[]
-  fetched_at: string
-}
-
-export interface CardShopFavoritesResponse {
-  shop_keys: string[]
-}
-
-export interface CardShopFavoriteUpdatePayload {
-  shop_key: string
-  favorite: boolean
-}
-
-export interface CardShopTagsResponse {
-  tags: string[]
-}
-
-export interface CardShopTagsUpdatePayload {
-  tags: string[]
-}
-
 export interface CodexKeeperPriorityRule {
   account_type: string
   priority: number

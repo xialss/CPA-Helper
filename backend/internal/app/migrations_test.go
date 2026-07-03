@@ -72,23 +72,14 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if !testTableExists(t, app.db, "user_quota_charges") {
 		t.Fatal("user_quota_charges was not created")
 	}
-	if !testTableExists(t, app.db, "user_card_shop_favorites") {
-		t.Fatal("user_card_shop_favorites was not created")
+	if testTableExists(t, app.db, "user_card_shop_favorites") {
+		t.Fatal("user_card_shop_favorites should not exist")
 	}
-	if !testTableExists(t, app.db, "user_card_shop_tags") {
-		t.Fatal("user_card_shop_tags was not created")
+	if testTableExists(t, app.db, "user_card_shop_tags") {
+		t.Fatal("user_card_shop_tags should not exist")
 	}
 	if !testColumnExists(t, app.db, "user_quota_charges", "lifetime_deducted_usd") {
 		t.Fatal("user_quota_charges.lifetime_deducted_usd was not created")
-	}
-	if !testColumnExists(t, app.db, "user_card_shop_favorites", "shop_key") {
-		t.Fatal("user_card_shop_favorites.shop_key was not created")
-	}
-	if !testColumnExists(t, app.db, "user_card_shop_tags", "tag") {
-		t.Fatal("user_card_shop_tags.tag was not created")
-	}
-	if !testColumnExists(t, app.db, "user_card_shop_tags", "position") {
-		t.Fatal("user_card_shop_tags.position was not created")
 	}
 	if testColumnExists(t, app.db, "user_quota_charges", "total_deducted_usd") {
 		t.Fatal("old user_quota_charges.total_deducted_usd should not exist")

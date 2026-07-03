@@ -204,8 +204,6 @@ func requireSchemaShape(ctx context.Context, db *sql.DB) error {
 		{"usage_records", "ttft_ms"},
 		{"model_prices", "request_usd"},
 		{"user_quota_charges", "lifetime_deducted_usd"},
-		{"user_card_shop_favorites", "shop_key"},
-		{"user_card_shop_tags", "tag"},
 	}
 	for _, item := range required {
 		ok, err := columnExists(ctx, db, item.table, item.column)
