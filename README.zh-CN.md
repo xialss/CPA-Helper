@@ -189,7 +189,7 @@ CPA-Helper/
 ```yaml
 services:
   cpa-helper:
-    image: walkingd/cpa-helper:latest
+    image: ghcr.io/xialss/cpa-helper:latest
     container_name: cpa-helper
     restart: always
     # 如需改为bridge,需将容器内部端口 18317 映射至主机
@@ -207,6 +207,11 @@ services:
 docker compose pull
 docker compose up -d
 ```
+
+接管 fork 时，需要先发布 GHCR 镜像：可以在 `main` 分支更新 `VERSION`
+触发，也可以在 GitHub Actions 页面手动运行 `Build and Release CPA-Helper`
+workflow。已有 VPS 部署切换镜像行即可，继续保留同一个
+`./data:/app/data` 挂载。
 
 访问：
 
@@ -400,7 +405,7 @@ npm run dev -- --host 127.0.0.1 --port 5174 --strictPort
 
 ### 版本管理
 
-项目版本统一写在根目录 `VERSION` 文件中，例如 `0.1.0`。GitHub Actions 会读取它并推送 `walkingd/cpa-helper:v0.1.0` 和 `walkingd/cpa-helper:latest`；前端构建也会读取同一个文件并显示为 `v0.1.0`。
+项目版本统一写在根目录 `VERSION` 文件中，例如 `0.1.0`。`VERSION` 在 `main` 分支变化时，GitHub Actions 会读取它并推送 `ghcr.io/xialss/cpa-helper:v0.1.0` 和 `ghcr.io/xialss/cpa-helper:latest`；同一个 workflow 也可以手动运行，用于发布当前版本。前端构建也会读取同一个文件并显示为 `v0.1.0`。GHCR 包按公开包使用，Docker Compose 部署默认不需要 `docker login ghcr.io`。
 
 后端：
 

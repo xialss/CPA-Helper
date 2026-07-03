@@ -189,7 +189,7 @@ Create `docker-compose.yml` in the deployment directory:
 ```yaml
 services:
   cpa-helper:
-    image: walkingd/cpa-helper:latest
+    image: ghcr.io/xialss/cpa-helper:latest
     container_name: cpa-helper
     restart: always
     # 如需改为bridge,需将容器内部端口 18317 映射至主机
@@ -207,6 +207,11 @@ Then pull the image and start the service:
 docker compose pull
 docker compose up -d
 ```
+
+For a fork takeover, publish the GHCR image first by either updating `VERSION`
+on `main` or manually running the `Build and Release CPA-Helper` workflow from
+the GitHub Actions page. Existing VPS deployments can switch the image line
+while keeping the same `./data:/app/data` mount.
 
 Open:
 
@@ -409,9 +414,12 @@ connect to real CPA only after the risk is explicitly accepted.
 ### Version Management
 
 The project version is stored in the root `VERSION` file, for example `0.1.0`.
-GitHub Actions reads it to push `walkingd/cpa-helper:v0.1.0` and
-`walkingd/cpa-helper:latest`; the frontend build reads the same file and
-displays it as `v0.1.0`.
+GitHub Actions reads it to push `ghcr.io/xialss/cpa-helper:v0.1.0` and
+`ghcr.io/xialss/cpa-helper:latest` when `VERSION` changes on `main`, and the
+same workflow can be run manually to publish the current version. The frontend
+build reads the same file and displays it as `v0.1.0`. The GHCR package is
+intended to be public so Docker Compose deployments can pull it without
+`docker login ghcr.io`.
 
 Backend:
 

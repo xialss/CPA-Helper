@@ -1,6 +1,6 @@
 services:
   cpa-helper:
-    image: walkingd/cpa-helper:latest
+    image: ghcr.io/xialss/cpa-helper:latest
     container_name: cpa-helper
     restart: always
     # 如需改为bridge,需将容器内部端口 18317 映射至主机
