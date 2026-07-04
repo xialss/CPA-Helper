@@ -268,6 +268,8 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("/api/account/models", a.wrap(a.handleAvailableModels))
 	mux.HandleFunc("/api/account/model-request/test", a.wrap(a.handleCurrentModelRequestTest))
 	mux.HandleFunc("/api/account/model-request", a.wrap(a.handleCurrentModelRequestGuide))
+	mux.HandleFunc("/api/ai-providers", a.wrap(a.handleAIProviders))
+	mux.HandleFunc("/api/ai-providers/", a.wrap(a.handleAIProviderByPath))
 	mux.HandleFunc("/api/codex-keeper/", a.wrap(a.handleCodexKeeper))
 	mux.HandleFunc("/", a.wrap(a.handleSPA))
 	return withCORS(mux)

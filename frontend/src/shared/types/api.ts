@@ -74,6 +74,116 @@ export interface ModelRequestTestResponse {
   usage?: Record<string, unknown>
 }
 
+export type AIProviderBrand = 'gemini' | 'codex' | 'claude' | 'openai_compatibility' | 'vertex'
+
+export interface AIProviderModel {
+  name: string
+  alias?: string
+  force_mapping?: boolean | null
+  image?: boolean | null
+  thinking?: Record<string, unknown>
+}
+
+export interface AIProviderHeader {
+  name: string
+  value: string
+}
+
+export interface AIProviderKeyEntry {
+  api_key?: string
+  api_key_hash?: string | null
+  api_key_masked?: string | null
+  proxy_url?: string | null
+}
+
+export interface AIProviderCloak {
+  mode?: string | null
+  strict_mode?: boolean | null
+  sensitive_words: string[]
+  cache_user_id?: boolean | null
+}
+
+export interface AIProviderItem {
+  brand: AIProviderBrand
+  brand_label: string
+  index: number
+  identity_hash: string
+  api_key?: string
+  api_key_hash?: string | null
+  api_key_masked?: string | null
+  auth_index?: string | null
+  name?: string | null
+  priority?: number | null
+  disabled?: boolean | null
+  prefix?: string | null
+  base_url?: string | null
+  original_base_url?: string | null
+  proxy_url?: string | null
+  models: AIProviderModel[]
+  headers: AIProviderHeader[]
+  excluded_models: string[]
+  disable_cooling?: boolean | null
+  websockets?: boolean | null
+  rebuild_mid_system_message?: boolean | null
+  experimental_cch_signing?: boolean | null
+  cloak?: AIProviderCloak | null
+  api_key_entries: AIProviderKeyEntry[]
+  recent_success: number
+  recent_failure: number
+  recent_status: 'healthy' | 'failing' | 'unknown' | string
+  metadata?: Record<string, unknown>
+}
+
+export interface AIProviderUsage {
+  provider?: string
+  api_key_hash?: string | null
+  api_key_masked?: string | null
+  auth_index?: string | null
+  name?: string | null
+  base_url?: string | null
+  success_count: number
+  failure_count: number
+  total_count: number
+  last_seen?: string | null
+  identity_hash?: string | null
+  upstream_label?: string | null
+}
+
+export interface AIProviderSummary {
+  total: number
+  gemini: number
+  codex: number
+  claude: number
+  openai_compatibility: number
+  vertex: number
+  recent_success: number
+  recent_failure: number
+}
+
+export interface AIProvidersResponse {
+  providers: AIProviderItem[]
+  usage: AIProviderUsage[]
+  summary: AIProviderSummary
+  usage_error?: string | null
+}
+
+export interface AIProviderActionPayload {
+  brand: AIProviderBrand
+  provider: AIProviderItem
+  model?: string
+  message?: string
+}
+
+export interface AIProviderActionResponse {
+  ok: boolean
+  status: string
+  status_code: number
+  duration_ms: number
+  models?: AIProviderModel[]
+  reply?: string
+  error?: string
+}
+
 export interface CollectorStatus {
   enabled: boolean
   running: boolean

@@ -74,6 +74,12 @@ export const router = createRouter({
           meta: { requiresAdmin: true },
         },
         {
+          path: 'admin/ai-providers',
+          name: 'admin-ai-providers',
+          component: () => import('@/features/ai-providers/views/AIProvidersView.vue'),
+          meta: { requiresAdmin: true },
+        },
+        {
           path: 'admin/settings',
           name: 'admin-settings',
           component: () => import('@/features/settings/views/SettingsView.vue'),

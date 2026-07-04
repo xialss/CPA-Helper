@@ -30,6 +30,7 @@ import {
   Menu,
   Monitor,
   Moon,
+  PlugZap,
   Settings,
   Shield,
   Sun,
@@ -122,6 +123,7 @@ const adminMenuItems = computed<MenuOption[]>(() => [
   { label: t('请求明细', 'Request Records'), key: '/admin/records', icon: renderIcon(List) },
   { label: t('用户管理', 'Users'), key: '/admin/users', icon: renderIcon(Users) },
   { label: t('模型价格', 'Model Prices'), key: '/admin/pricing', icon: renderIcon(DollarSign) },
+  { label: t('AI 提供商', 'AI Providers'), key: '/admin/ai-providers', icon: renderIcon(PlugZap) },
   { label: t('系统设置', 'System Settings'), key: '/admin/settings', icon: renderIcon(Settings) },
 ])
 
