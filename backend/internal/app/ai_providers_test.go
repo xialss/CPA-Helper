@@ -3,6 +3,7 @@ package app_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,13 +15,22 @@ import (
 
 type aiProvidersTestResponse struct {
 	Providers []struct {
-		Brand         string `json:"brand"`
-		Index         int    `json:"index"`
-		IdentityHash  string `json:"identity_hash"`
-		APIKeyHash    string `json:"api_key_hash"`
-		APIKeyMasked  string `json:"api_key_masked"`
-		RecentSuccess int    `json:"recent_success"`
-		RecentFailure int    `json:"recent_failure"`
+		Brand                 string   `json:"brand"`
+		Index                 int      `json:"index"`
+		IdentityHash          string   `json:"identity_hash"`
+		APIKeyHash            string   `json:"api_key_hash"`
+		APIKeyMasked          string   `json:"api_key_masked"`
+		Disabled              *bool    `json:"disabled"`
+		ExcludedModels        []string `json:"excluded_models"`
+		RecentSuccess         int      `json:"recent_success"`
+		RecentFailure         int      `json:"recent_failure"`
+		RecentStatus          string   `json:"recent_status"`
+		RecentStatusAvailable bool     `json:"recent_status_available"`
+		RecentRequests        []struct {
+			Time    string `json:"time"`
+			Success int    `json:"success"`
+			Failed  int    `json:"failed"`
+		} `json:"recent_requests"`
 	} `json:"providers"`
 	Summary struct {
 		Total         int `json:"total"`
@@ -315,6 +325,658 @@ func TestAIProvidersSnapshotDoesNotDuplicateSharedKeyUsageAcrossBaseURLs(t *test
 	}
 	if response.Summary.RecentSuccess != 2 || response.Summary.RecentFailure != 1 {
 		t.Fatalf("summary usage = %d/%d, want 2/1", response.Summary.RecentSuccess, response.Summary.RecentFailure)
+	}
+}
+
+func TestAIProvidersSnapshotMapsRecentRequestBuckets(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key":  "gemini-secret-key",
+			"base-url": "https://gemini.example",
+		},
+	}
+	fake.usage = []map[string]any{
+		{
+			"provider": "gemini",
+			"api_key":  "gemini-secret-key",
+			"recent_requests": []map[string]any{
+				{"time": "2026-07-05T10:00:00+08:00", "success": 2, "failed": 0},
+				{"time": "2026-07-05T10:10:00+08:00", "success": 1, "failed": 1},
+			},
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	responseBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	response := aiProvidersTestResponse{}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode ai providers response: %v", err)
+	}
+	if len(response.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(response.Providers))
+	}
+	provider := response.Providers[0]
+	if !provider.RecentStatusAvailable || provider.RecentStatus != "failing" {
+		t.Fatalf("recent status = %q available %v, want failing available", provider.RecentStatus, provider.RecentStatusAvailable)
+	}
+	if provider.RecentSuccess != 3 || provider.RecentFailure != 1 {
+		t.Fatalf("provider usage = %d/%d, want 3/1", provider.RecentSuccess, provider.RecentFailure)
+	}
+	if len(provider.RecentRequests) != 2 || provider.RecentRequests[1].Success != 1 || provider.RecentRequests[1].Failed != 1 {
+		t.Fatalf("recent requests = %#v, want two parsed buckets", provider.RecentRequests)
+	}
+	if strings.Contains(string(responseBody), "gemini-secret-key") {
+		t.Fatalf("response leaked usage secret: %s", string(responseBody))
+	}
+}
+
+func TestAIProvidersSnapshotDerivesCountsFromRecentRequestBuckets(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key": "gemini-secret-key",
+		},
+	}
+	fake.usage = []map[string]any{
+		{
+			"provider":    "gemini",
+			"api_key":     "gemini-secret-key",
+			"total_count": 5,
+			"recent_requests": []map[string]any{
+				{"time": "2026-07-05T10:00:00+08:00", "success": 3, "failed": 0},
+				{"time": "2026-07-05T10:10:00+08:00", "success": 0, "failed": 2},
+			},
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	responseBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	response := aiProvidersTestResponse{}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode ai providers response: %v", err)
+	}
+	if len(response.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(response.Providers))
+	}
+	provider := response.Providers[0]
+	if !provider.RecentStatusAvailable || provider.RecentStatus != "failing" {
+		t.Fatalf("recent status = %q available %v, want failing available", provider.RecentStatus, provider.RecentStatusAvailable)
+	}
+	if provider.RecentSuccess != 3 || provider.RecentFailure != 2 {
+		t.Fatalf("provider usage = %d/%d, want derived 3/2", provider.RecentSuccess, provider.RecentFailure)
+	}
+}
+
+func TestAIProvidersSnapshotMergesMixedTimedBucketsDeterministically(t *testing.T) {
+	cases := []struct {
+		name     string
+		incoming []map[string]any
+	}{
+		{
+			name: "untimed first",
+			incoming: []map[string]any{
+				{"success": 1, "failed": 0},
+				{"time": "2026-07-05T10:10:00+08:00", "success": 1, "failed": 0},
+			},
+		},
+		{
+			name: "timed first",
+			incoming: []map[string]any{
+				{"time": "2026-07-05T10:10:00+08:00", "success": 1, "failed": 0},
+				{"success": 1, "failed": 0},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake, server := newFakeAIProviderManagement(t)
+			defer server.Close()
+			fake.config["gemini-api-key"] = []map[string]any{
+				{
+					"api-key": "gemini-secret-key",
+				},
+			}
+			fake.usage = []map[string]any{
+				{
+					"provider": "gemini",
+					"api_key":  "gemini-secret-key",
+					"recent_requests": []map[string]any{
+						{"success": 1, "failed": 0},
+					},
+				},
+				{
+					"provider":        "gemini",
+					"api_key":         "gemini-secret-key",
+					"recent_requests": tc.incoming,
+				},
+			}
+
+			handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+			defer closeApp()
+			responseBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+			response := aiProvidersTestResponse{}
+			if err := json.Unmarshal(responseBody, &response); err != nil {
+				t.Fatalf("decode ai providers response: %v", err)
+			}
+			if len(response.Providers) != 1 {
+				t.Fatalf("providers length = %d, want 1", len(response.Providers))
+			}
+			provider := response.Providers[0]
+			if provider.RecentStatusAvailable || provider.RecentStatus != "unavailable" {
+				t.Fatalf("recent status = %q available %v, want unavailable", provider.RecentStatus, provider.RecentStatusAvailable)
+			}
+			if provider.RecentSuccess != 3 || provider.RecentFailure != 0 {
+				t.Fatalf("provider usage = %d/%d, want merged 3/0", provider.RecentSuccess, provider.RecentFailure)
+			}
+			if len(provider.RecentRequests) != 3 {
+				t.Fatalf("recent requests length = %d, want deterministic 3 buckets: %#v", len(provider.RecentRequests), provider.RecentRequests)
+			}
+		})
+	}
+}
+
+func TestAIProvidersSnapshotNormalizesSingleUsagePaddedRecentRequestsBeforeTrimming(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key": "gemini-secret-key",
+		},
+	}
+	recentRequests := make([]map[string]any, 0, 46)
+	for index := 20; index >= 0; index-- {
+		recentRequests = append(recentRequests, map[string]any{
+			"time":    fmt.Sprintf("2026-07-05T%02d:%02d:00+08:00", 10+index/6, (index%6)*10),
+			"success": 1,
+			"failed":  0,
+		})
+	}
+	for index := 0; index < 25; index++ {
+		recentRequests = append(recentRequests, map[string]any{"success": 0, "failed": 0})
+	}
+	fake.usage = []map[string]any{
+		{
+			"provider":        "gemini",
+			"api_key":         "gemini-secret-key",
+			"recent_requests": recentRequests,
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	responseBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	response := aiProvidersTestResponse{}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode ai providers response: %v", err)
+	}
+	if len(response.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(response.Providers))
+	}
+	provider := response.Providers[0]
+	if !provider.RecentStatusAvailable || provider.RecentStatus != "healthy" {
+		t.Fatalf("recent status = %q available %v, want healthy available", provider.RecentStatus, provider.RecentStatusAvailable)
+	}
+	if provider.RecentSuccess != 20 || provider.RecentFailure != 0 {
+		t.Fatalf("provider usage = %d/%d, want newest timed bucket counts 20/0", provider.RecentSuccess, provider.RecentFailure)
+	}
+	if len(provider.RecentRequests) != 20 {
+		t.Fatalf("recent requests length = %d, want newest 20 timed buckets: %#v", len(provider.RecentRequests), provider.RecentRequests)
+	}
+	for index, bucket := range provider.RecentRequests {
+		expectedTime := fmt.Sprintf("2026-07-05T%02d:%02d:00+08:00", 10+(index+1)/6, ((index+1)%6)*10)
+		if bucket.Time != expectedTime {
+			t.Fatalf("recent request %d time = %q, want %q in sorted newest window: %#v", index, bucket.Time, expectedTime, provider.RecentRequests)
+		}
+		if bucket.Success != 1 || bucket.Failed != 0 {
+			t.Fatalf("recent request %d = %#v, want timed success bucket", index, bucket)
+		}
+	}
+}
+
+func TestAIProvidersSnapshotKeepsTimedBucketsWhenMergingUntimedZeroBuckets(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key": "gemini-secret-key",
+		},
+	}
+	timedBuckets := make([]map[string]any, 0, 20)
+	for index := 0; index < 20; index++ {
+		timedBuckets = append(timedBuckets, map[string]any{
+			"time":    fmt.Sprintf("2026-07-05T%02d:%02d:00+08:00", 10+index/6, (index%6)*10),
+			"success": 1,
+			"failed":  0,
+		})
+	}
+	untimedZeroBuckets := make([]map[string]any, 0, 25)
+	for index := 0; index < 25; index++ {
+		untimedZeroBuckets = append(untimedZeroBuckets, map[string]any{"success": 0, "failed": 0})
+	}
+	fake.usage = []map[string]any{
+		{
+			"provider":        "gemini",
+			"api_key":         "gemini-secret-key",
+			"recent_requests": timedBuckets,
+		},
+		{
+			"provider":        "gemini",
+			"api_key":         "gemini-secret-key",
+			"recent_requests": untimedZeroBuckets,
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	responseBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	response := aiProvidersTestResponse{}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode ai providers response: %v", err)
+	}
+	if len(response.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(response.Providers))
+	}
+	provider := response.Providers[0]
+	if !provider.RecentStatusAvailable || provider.RecentStatus != "healthy" {
+		t.Fatalf("recent status = %q available %v, want healthy available", provider.RecentStatus, provider.RecentStatusAvailable)
+	}
+	if provider.RecentSuccess != 20 || provider.RecentFailure != 0 {
+		t.Fatalf("provider usage = %d/%d, want timed bucket counts 20/0", provider.RecentSuccess, provider.RecentFailure)
+	}
+	if len(provider.RecentRequests) != 20 {
+		t.Fatalf("recent requests length = %d, want all 20 timed buckets: %#v", len(provider.RecentRequests), provider.RecentRequests)
+	}
+	for index, bucket := range provider.RecentRequests {
+		if strings.TrimSpace(bucket.Time) == "" {
+			t.Fatalf("recent request %d has blank time after merge: %#v", index, provider.RecentRequests)
+		}
+		if bucket.Success != 1 || bucket.Failed != 0 {
+			t.Fatalf("recent request %d = %#v, want untouched timed bucket", index, bucket)
+		}
+	}
+}
+
+func TestAIProvidersSnapshotRejectsUsageWithMismatchedAPIKeyHash(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key":    "gemini-secret-key",
+			"auth-index": "shared-auth",
+		},
+	}
+	fake.usage = []map[string]any{
+		{
+			"provider":      "gemini",
+			"api_key":       "other-secret-key",
+			"auth_index":    "shared-auth",
+			"success_count": 3,
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	responseBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	response := aiProvidersTestResponse{}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode ai providers response: %v", err)
+	}
+	if len(response.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(response.Providers))
+	}
+	provider := response.Providers[0]
+	if provider.RecentSuccess != 0 || provider.RecentFailure != 0 {
+		t.Fatalf("provider usage = %d/%d, want mismatched hash usage ignored", provider.RecentSuccess, provider.RecentFailure)
+	}
+	if provider.RecentStatus != "unknown" || !provider.RecentStatusAvailable {
+		t.Fatalf("recent status = %q available %v, want unknown available", provider.RecentStatus, provider.RecentStatusAvailable)
+	}
+}
+
+func TestAIProvidersSnapshotMarksPositiveUsageWithoutBucketsUnavailable(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key": "gemini-secret-key",
+		},
+	}
+	fake.usage = []map[string]any{
+		{
+			"provider":        "gemini",
+			"api_key":         "gemini-secret-key",
+			"success_count":   2,
+			"recent_requests": []map[string]any{},
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	responseBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	response := aiProvidersTestResponse{}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode ai providers response: %v", err)
+	}
+	if len(response.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(response.Providers))
+	}
+	provider := response.Providers[0]
+	if provider.RecentStatusAvailable || provider.RecentStatus != "unavailable" {
+		t.Fatalf("recent status = %q available %v, want unavailable", provider.RecentStatus, provider.RecentStatusAvailable)
+	}
+	if provider.RecentSuccess != 2 || provider.RecentFailure != 0 {
+		t.Fatalf("provider usage = %d/%d, want 2/0", provider.RecentSuccess, provider.RecentFailure)
+	}
+}
+
+func TestAIProvidersSnapshotKeepsZeroUsageEmptyBucketsAvailable(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key": "gemini-secret-key",
+		},
+	}
+	fake.usage = []map[string]any{
+		{
+			"provider":        "gemini",
+			"api_key":         "gemini-secret-key",
+			"recent_requests": []map[string]any{},
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	responseBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	response := aiProvidersTestResponse{}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode ai providers response: %v", err)
+	}
+	if len(response.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(response.Providers))
+	}
+	provider := response.Providers[0]
+	if !provider.RecentStatusAvailable || provider.RecentStatus != "unknown" {
+		t.Fatalf("recent status = %q available %v, want unknown available", provider.RecentStatus, provider.RecentStatusAvailable)
+	}
+	if provider.RecentSuccess != 0 || provider.RecentFailure != 0 || len(provider.RecentRequests) != 0 {
+		t.Fatalf("provider usage = %d/%d requests %#v, want zero usage with empty buckets", provider.RecentSuccess, provider.RecentFailure, provider.RecentRequests)
+	}
+}
+
+func TestAIProvidersSnapshotMarksPositiveUsageWithoutTimedBucketsUnavailable(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key": "gemini-secret-key",
+		},
+	}
+	fake.usage = []map[string]any{
+		{
+			"provider": "gemini",
+			"api_key":  "gemini-secret-key",
+			"recent_requests": []map[string]any{
+				{"success": 2, "failed": 0},
+			},
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	responseBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	response := aiProvidersTestResponse{}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode ai providers response: %v", err)
+	}
+	if len(response.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(response.Providers))
+	}
+	provider := response.Providers[0]
+	if provider.RecentStatusAvailable || provider.RecentStatus != "unavailable" {
+		t.Fatalf("recent status = %q available %v, want unavailable", provider.RecentStatus, provider.RecentStatusAvailable)
+	}
+	if provider.RecentSuccess != 2 || provider.RecentFailure != 0 {
+		t.Fatalf("provider usage = %d/%d, want 2/0", provider.RecentSuccess, provider.RecentFailure)
+	}
+}
+
+func TestAIProvidersSnapshotMarksUnsupportedUsageUnavailable(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key": "gemini-secret-key",
+		},
+	}
+	fake.usage = map[string]any{"unexpected": "shape"}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	responseBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	response := aiProvidersTestResponse{}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode ai providers response: %v", err)
+	}
+	if len(response.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(response.Providers))
+	}
+	provider := response.Providers[0]
+	if provider.RecentStatusAvailable || provider.RecentStatus != "unavailable" {
+		t.Fatalf("recent status = %q available %v, want unavailable", provider.RecentStatus, provider.RecentStatusAvailable)
+	}
+	if !strings.Contains(string(responseBody), "api-key-usage") {
+		t.Fatalf("response missing usage warning: %s", string(responseBody))
+	}
+}
+
+func TestAIProviderExcludedModelsDisableRuleNormalizesAndWritesBack(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key":         "gemini-secret-key",
+			"disabled":        true,
+			"excluded-models": []string{"gemini-old", "*"},
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	snapshot := aiProvidersTestResponse{}
+	requestJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, &snapshot)
+	if len(snapshot.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(snapshot.Providers))
+	}
+	provider := snapshot.Providers[0]
+	if provider.Disabled == nil || !*provider.Disabled {
+		t.Fatalf("disabled = %#v, want true from excluded-models wildcard", provider.Disabled)
+	}
+	if len(provider.ExcludedModels) != 1 || provider.ExcludedModels[0] != "gemini-old" {
+		t.Fatalf("excluded models = %#v, want wildcard filtered", provider.ExcludedModels)
+	}
+
+	requestJSON(t, handler, http.MethodPut, "/api/ai-providers/gemini/0", map[string]any{
+		"brand":           "gemini",
+		"identity_hash":   provider.IdentityHash,
+		"api_key_hash":    provider.APIKeyHash,
+		"api_key":         "",
+		"disabled":        false,
+		"models":          []map[string]any{},
+		"headers":         []map[string]any{},
+		"excluded_models": []string{"gemini-old"},
+	}, cookies, nil)
+
+	fake.mu.Lock()
+	items := fake.config["gemini-api-key"].([]map[string]any)
+	excluded, ok := items[0]["excluded-models"].([]any)
+	fake.mu.Unlock()
+	if !ok || len(excluded) != 1 || excluded[0] != "gemini-old" {
+		t.Fatalf("enabled excluded-models = %#v, want wildcard removed", excluded)
+	}
+	if _, ok := items[0]["disabled"]; ok {
+		t.Fatalf("enabled provider kept stale disabled field: %#v", items[0])
+	}
+
+	requestJSON(t, handler, http.MethodPut, "/api/ai-providers/gemini/0", map[string]any{
+		"brand":           "gemini",
+		"identity_hash":   provider.IdentityHash,
+		"api_key_hash":    provider.APIKeyHash,
+		"api_key":         "",
+		"disabled":        true,
+		"models":          []map[string]any{},
+		"headers":         []map[string]any{},
+		"excluded_models": []string{"gemini-old"},
+	}, cookies, nil)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	items = fake.config["gemini-api-key"].([]map[string]any)
+	excluded, ok = items[0]["excluded-models"].([]any)
+	if !ok || len(excluded) != 2 || excluded[0] != "gemini-old" || excluded[1] != "*" {
+		t.Fatalf("disabled excluded-models = %#v, want wildcard appended", excluded)
+	}
+	if _, ok := items[0]["disabled"]; ok {
+		t.Fatalf("disabled non-OpenAI provider kept stale disabled field: %#v", items[0])
+	}
+}
+
+func TestAIProviderOpenAICompatibilityPreservesExcludedModelsWildcard(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["openai-compatibility"] = []map[string]any{
+		{
+			"name":            "custom-openai",
+			"base-url":        "https://openai.example",
+			"excluded-models": []string{"*", "gpt-old"},
+			"api-key-entries": []map[string]any{},
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	snapshot := aiProvidersTestResponse{}
+	requestJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, &snapshot)
+	if len(snapshot.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(snapshot.Providers))
+	}
+	provider := snapshot.Providers[0]
+	if provider.Disabled != nil && *provider.Disabled {
+		t.Fatalf("disabled = %#v, want OpenAI-compatible disabled independent of wildcard", provider.Disabled)
+	}
+	if len(provider.ExcludedModels) != 2 || provider.ExcludedModels[0] != "*" || provider.ExcludedModels[1] != "gpt-old" {
+		t.Fatalf("excluded models = %#v, want wildcard preserved for OpenAI-compatible", provider.ExcludedModels)
+	}
+
+	requestJSON(t, handler, http.MethodPut, "/api/ai-providers/openai_compatibility/0", map[string]any{
+		"brand":           "openai_compatibility",
+		"identity_hash":   provider.IdentityHash,
+		"name":            "custom-openai",
+		"disabled":        false,
+		"base_url":        "https://openai.example",
+		"api_key_entries": []map[string]any{},
+		"models":          []map[string]any{},
+		"headers":         []map[string]any{},
+		"excluded_models": []string{"*", "gpt-old"},
+	}, cookies, nil)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	items := fake.config["openai-compatibility"].([]map[string]any)
+	excluded, ok := items[0]["excluded-models"].([]any)
+	if !ok || len(excluded) != 2 || excluded[0] != "*" || excluded[1] != "gpt-old" {
+		t.Fatalf("saved excluded-models = %#v, want wildcard preserved", items[0]["excluded-models"])
+	}
+}
+
+func TestAIProviderLegacyDisabledFieldMigratesToExcludedModelsWildcard(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key":         "gemini-secret-key",
+			"disabled":        true,
+			"excluded-models": []string{"gemini-old"},
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	snapshot := aiProvidersTestResponse{}
+	requestJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, &snapshot)
+	if len(snapshot.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(snapshot.Providers))
+	}
+	provider := snapshot.Providers[0]
+	if provider.Disabled == nil || !*provider.Disabled {
+		t.Fatalf("disabled = %#v, want true from legacy disabled field", provider.Disabled)
+	}
+	if len(provider.ExcludedModels) != 1 || provider.ExcludedModels[0] != "gemini-old" {
+		t.Fatalf("excluded models = %#v, want existing exclusion preserved", provider.ExcludedModels)
+	}
+
+	requestJSON(t, handler, http.MethodPut, "/api/ai-providers/gemini/0", map[string]any{
+		"brand":         "gemini",
+		"identity_hash": provider.IdentityHash,
+		"api_key_hash":  provider.APIKeyHash,
+		"api_key":       "",
+		"models":        []map[string]any{},
+		"headers":       []map[string]any{},
+	}, cookies, nil)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	items := fake.config["gemini-api-key"].([]map[string]any)
+	if _, ok := items[0]["disabled"]; ok {
+		t.Fatalf("migrated provider kept stale disabled field: %#v", items[0])
+	}
+	excluded, ok := items[0]["excluded-models"].([]any)
+	if !ok || len(excluded) != 2 || excluded[0] != "gemini-old" || excluded[1] != "*" {
+		t.Fatalf("migrated excluded-models = %#v, want legacy disabled converted to wildcard", items[0]["excluded-models"])
+	}
+}
+
+func TestAIProviderUpdateOmittedExcludedModelsPreservesRemoteExclusions(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key":         "gemini-secret-key",
+			"excluded-models": []string{"gemini-old", "gemini-legacy"},
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	snapshot := aiProvidersTestResponse{}
+	requestJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, &snapshot)
+	if len(snapshot.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(snapshot.Providers))
+	}
+	provider := snapshot.Providers[0]
+
+	requestJSON(t, handler, http.MethodPut, "/api/ai-providers/gemini/0", map[string]any{
+		"brand":         "gemini",
+		"identity_hash": provider.IdentityHash,
+		"api_key_hash":  provider.APIKeyHash,
+		"api_key":       "",
+		"disabled":      false,
+		"models":        []map[string]any{},
+		"headers":       []map[string]any{},
+	}, cookies, nil)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	items := fake.config["gemini-api-key"].([]map[string]any)
+	excluded, ok := items[0]["excluded-models"].([]any)
+	if !ok || len(excluded) != 2 || excluded[0] != "gemini-old" || excluded[1] != "gemini-legacy" {
+		t.Fatalf("excluded-models = %#v, want omitted payload to preserve remote exclusions", items[0]["excluded-models"])
 	}
 }
 

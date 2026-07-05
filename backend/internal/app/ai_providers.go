@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ const (
 
 	aiProviderMissingConfigMessage = "AI 提供商管理需要先到「系统设置」填写 CLIProxyAPI 地址和管理密钥。"
 	aiProviderAPICallToken         = "$TOKEN$"
+	aiProviderDisableAllModelsRule = "*"
 )
 
 type aiProviderBrand string
@@ -65,34 +67,36 @@ type aiProviderSummary struct {
 }
 
 type aiProviderItem struct {
-	Brand                   aiProviderBrand        `json:"brand"`
-	BrandLabel              string                 `json:"brand_label"`
-	Index                   int                    `json:"index"`
-	IdentityHash            string                 `json:"identity_hash"`
-	APIKey                  string                 `json:"api_key,omitempty"`
-	APIKeyHash              *string                `json:"api_key_hash,omitempty"`
-	APIKeyMasked            *string                `json:"api_key_masked,omitempty"`
-	AuthIndex               *string                `json:"auth_index,omitempty"`
-	Name                    *string                `json:"name,omitempty"`
-	Priority                *int                   `json:"priority,omitempty"`
-	Disabled                *bool                  `json:"disabled,omitempty"`
-	Prefix                  *string                `json:"prefix,omitempty"`
-	BaseURL                 *string                `json:"base_url,omitempty"`
-	OriginalBaseURL         *string                `json:"original_base_url,omitempty"`
-	ProxyURL                *string                `json:"proxy_url,omitempty"`
-	Models                  []aiProviderModel      `json:"models"`
-	Headers                 []aiProviderHeader     `json:"headers"`
-	ExcludedModels          []string               `json:"excluded_models"`
-	DisableCooling          *bool                  `json:"disable_cooling,omitempty"`
-	Websockets              *bool                  `json:"websockets,omitempty"`
-	RebuildMidSystemMessage *bool                  `json:"rebuild_mid_system_message,omitempty"`
-	ExperimentalCCHSigning  *bool                  `json:"experimental_cch_signing,omitempty"`
-	Cloak                   *aiProviderCloak       `json:"cloak,omitempty"`
-	APIKeyEntries           []aiProviderKeyEntry   `json:"api_key_entries"`
-	RecentSuccess           int                    `json:"recent_success"`
-	RecentFailure           int                    `json:"recent_failure"`
-	RecentStatus            string                 `json:"recent_status"`
-	Metadata                map[string]interface{} `json:"metadata,omitempty"`
+	Brand                   aiProviderBrand           `json:"brand"`
+	BrandLabel              string                    `json:"brand_label"`
+	Index                   int                       `json:"index"`
+	IdentityHash            string                    `json:"identity_hash"`
+	APIKey                  string                    `json:"api_key,omitempty"`
+	APIKeyHash              *string                   `json:"api_key_hash,omitempty"`
+	APIKeyMasked            *string                   `json:"api_key_masked,omitempty"`
+	AuthIndex               *string                   `json:"auth_index,omitempty"`
+	Name                    *string                   `json:"name,omitempty"`
+	Priority                *int                      `json:"priority,omitempty"`
+	Disabled                *bool                     `json:"disabled,omitempty"`
+	Prefix                  *string                   `json:"prefix,omitempty"`
+	BaseURL                 *string                   `json:"base_url,omitempty"`
+	OriginalBaseURL         *string                   `json:"original_base_url,omitempty"`
+	ProxyURL                *string                   `json:"proxy_url,omitempty"`
+	Models                  []aiProviderModel         `json:"models"`
+	Headers                 []aiProviderHeader        `json:"headers"`
+	ExcludedModels          []string                  `json:"excluded_models"`
+	DisableCooling          *bool                     `json:"disable_cooling,omitempty"`
+	Websockets              *bool                     `json:"websockets,omitempty"`
+	RebuildMidSystemMessage *bool                     `json:"rebuild_mid_system_message,omitempty"`
+	ExperimentalCCHSigning  *bool                     `json:"experimental_cch_signing,omitempty"`
+	Cloak                   *aiProviderCloak          `json:"cloak,omitempty"`
+	APIKeyEntries           []aiProviderKeyEntry      `json:"api_key_entries"`
+	RecentSuccess           int                       `json:"recent_success"`
+	RecentFailure           int                       `json:"recent_failure"`
+	RecentStatus            string                    `json:"recent_status"`
+	RecentStatusAvailable   bool                      `json:"recent_status_available"`
+	RecentRequests          []aiProviderRecentRequest `json:"recent_requests"`
+	Metadata                map[string]interface{}    `json:"metadata,omitempty"`
 
 	prioritySet bool
 	prefixSet   bool
@@ -100,6 +104,8 @@ type aiProviderItem struct {
 	proxyURLSet bool
 	headersSet  bool
 	entriesSet  bool
+
+	excludedModelsSet bool
 }
 
 type aiProviderModel struct {
@@ -122,6 +128,12 @@ type aiProviderKeyEntry struct {
 	ProxyURL     *string `json:"proxy_url,omitempty"`
 
 	proxyURLSet bool
+}
+
+type aiProviderRecentRequest struct {
+	Time    *string `json:"time,omitempty"`
+	Success int     `json:"success"`
+	Failed  int     `json:"failed"`
 }
 
 type aiProviderCloak struct {
@@ -148,6 +160,7 @@ func (item *aiProviderItem) UnmarshalJSON(data []byte) error {
 	_, item.proxyURLSet = raw["proxy_url"]
 	_, item.headersSet = raw["headers"]
 	_, item.entriesSet = raw["api_key_entries"]
+	_, item.excludedModelsSet = raw["excluded_models"]
 	return nil
 }
 
@@ -167,18 +180,20 @@ func (entry *aiProviderKeyEntry) UnmarshalJSON(data []byte) error {
 }
 
 type aiProviderUsage struct {
-	Provider      string  `json:"provider,omitempty"`
-	APIKeyHash    *string `json:"api_key_hash,omitempty"`
-	APIKeyMasked  *string `json:"api_key_masked,omitempty"`
-	AuthIndex     *string `json:"auth_index,omitempty"`
-	Name          *string `json:"name,omitempty"`
-	BaseURL       *string `json:"base_url,omitempty"`
-	SuccessCount  int     `json:"success_count"`
-	FailureCount  int     `json:"failure_count"`
-	TotalCount    int     `json:"total_count"`
-	LastSeen      *string `json:"last_seen,omitempty"`
-	IdentityHash  *string `json:"identity_hash,omitempty"`
-	UpstreamLabel *string `json:"upstream_label,omitempty"`
+	Provider                string                    `json:"provider,omitempty"`
+	APIKeyHash              *string                   `json:"api_key_hash,omitempty"`
+	APIKeyMasked            *string                   `json:"api_key_masked,omitempty"`
+	AuthIndex               *string                   `json:"auth_index,omitempty"`
+	Name                    *string                   `json:"name,omitempty"`
+	BaseURL                 *string                   `json:"base_url,omitempty"`
+	SuccessCount            int                       `json:"success_count"`
+	FailureCount            int                       `json:"failure_count"`
+	TotalCount              int                       `json:"total_count"`
+	LastSeen                *string                   `json:"last_seen,omitempty"`
+	IdentityHash            *string                   `json:"identity_hash,omitempty"`
+	UpstreamLabel           *string                   `json:"upstream_label,omitempty"`
+	RecentRequests          []aiProviderRecentRequest `json:"recent_requests"`
+	RecentRequestsAvailable bool                      `json:"recent_requests_available"`
 }
 
 type aiProviderActionRequest struct {
@@ -351,9 +366,15 @@ func (a *App) aiProvidersSnapshot(ctx context.Context) (aiProvidersResponse, err
 	if err != nil {
 		message := err.Error()
 		response.UsageError = &message
+		applyAIProviderUsage(response.Providers, nil, false)
 	} else {
-		response.Usage = parseAIProviderUsage(usagePayload)
-		applyAIProviderUsage(response.Providers, response.Usage)
+		usage, ok := parseAIProviderUsage(usagePayload)
+		response.Usage = usage
+		if !ok {
+			message := "api-key-usage 响应格式不支持近期状态条"
+			response.UsageError = &message
+		}
+		applyAIProviderUsage(response.Providers, response.Usage, ok)
 	}
 	response.Summary = aiProviderSummaryFromItems(response.Providers)
 	return response, nil
@@ -743,6 +764,16 @@ func aiProviderItemFromRaw(brandConfig aiProviderBrandConfig, index int, raw map
 	if identity == "" {
 		identity = hashAPIKey(fmt.Sprintf("%s:%d:%s", brandConfig.Brand, index, aiProviderOptionalString(baseURL)))
 	}
+	usesExcludedModelsDisabled := aiProviderUsesExcludedModelsDisabled(brandConfig.Brand)
+	excludedModels, disabledByExcludedModels := aiProviderExcludedModelsFromRaw(raw, usesExcludedModelsDisabled)
+	disabled := aiProviderBoolPtrFromKeys(raw, "disabled")
+	if usesExcludedModelsDisabled {
+		isDisabled := disabledByExcludedModels
+		if disabled != nil && *disabled {
+			isDisabled = true
+		}
+		disabled = &isDisabled
+	}
 	return aiProviderItem{
 		Brand:                   brandConfig.Brand,
 		BrandLabel:              brandConfig.Label,
@@ -753,13 +784,13 @@ func aiProviderItemFromRaw(brandConfig aiProviderBrandConfig, index int, raw map
 		AuthIndex:               authIndex,
 		Name:                    name,
 		Priority:                aiProviderIntPtrFromKeys(raw, "priority"),
-		Disabled:                aiProviderBoolPtrFromKeys(raw, "disabled"),
+		Disabled:                disabled,
 		Prefix:                  aiProviderStringFromKeys(raw, "prefix"),
 		BaseURL:                 baseURL,
 		ProxyURL:                aiProviderStringFromKeys(raw, "proxy-url", "proxy_url"),
 		Models:                  aiProviderModelsFromAny(raw["models"], brandConfig.Brand == aiProviderBrandOpenAICompatibility),
 		Headers:                 aiProviderHeadersFromAny(raw["headers"]),
-		ExcludedModels:          aiProviderStringListFromAny(raw["excluded-models"]),
+		ExcludedModels:          excludedModels,
 		DisableCooling:          aiProviderBoolPtrFromKeys(raw, "disable-cooling", "disable_cooling"),
 		Websockets:              aiProviderBoolPtrFromKeys(raw, "websockets"),
 		RebuildMidSystemMessage: aiProviderBoolPtrFromKeys(raw, "rebuild-mid-system-message", "rebuild_mid_system_message"),
@@ -767,6 +798,7 @@ func aiProviderItemFromRaw(brandConfig aiProviderBrandConfig, index int, raw map
 		Cloak:                   aiProviderCloakFromAny(raw["cloak"]),
 		APIKeyEntries:           aiProviderKeyEntriesFromAny(raw["api-key-entries"]),
 		RecentStatus:            "unknown",
+		RecentRequests:          []aiProviderRecentRequest{},
 	}
 }
 
@@ -791,6 +823,7 @@ func aiProviderPayloadToUpstream(brandConfig aiProviderBrandConfig, payload aiPr
 		}
 		next["api-key-entries"] = entries
 	} else {
+		delete(next, "disabled")
 		apiKey := strings.TrimSpace(payload.APIKey)
 		if apiKey == "" {
 			if create {
@@ -814,7 +847,18 @@ func aiProviderPayloadToUpstream(brandConfig aiProviderBrandConfig, payload aiPr
 	}
 	next["models"] = aiProviderModelsToUpstream(payload.Models, brandConfig.Brand == aiProviderBrandOpenAICompatibility, current)
 	next["headers"] = aiProviderHeadersToUpstream(payload.Headers)
-	next["excluded-models"] = aiProviderStringListToUpstream(payload.ExcludedModels)
+	if aiProviderUsesExcludedModelsDisabled(brandConfig.Brand) {
+		excludedModels := []string{}
+		if payload.excludedModelsSet {
+			excludedModels = aiProviderStringListToUpstream(payload.ExcludedModels)
+		} else if current != nil {
+			excludedModels, _ = aiProviderExcludedModelsFromRaw(current, true)
+		}
+		excludedModels = aiProviderExcludedModelsWithDisabled(excludedModels, payload.Disabled, current)
+		next["excluded-models"] = excludedModels
+	} else if payload.excludedModelsSet {
+		next["excluded-models"] = aiProviderStringListToUpstream(payload.ExcludedModels)
+	}
 	if payload.DisableCooling != nil && brandConfig.Brand != aiProviderBrandVertex {
 		next["disable-cooling"] = *payload.DisableCooling
 	}
@@ -1226,13 +1270,34 @@ func extractGeminiReply(raw map[string]any) string {
 	return ""
 }
 
-func applyAIProviderUsage(providers []aiProviderItem, usage []aiProviderUsage) {
+func applyAIProviderUsage(providers []aiProviderItem, usage []aiProviderUsage, usageAvailable bool) {
 	for index := range providers {
+		providers[index].RecentStatusAvailable = usageAvailable
+		providers[index].RecentSuccess = 0
+		providers[index].RecentFailure = 0
+		providers[index].RecentRequests = []aiProviderRecentRequest{}
+		if !usageAvailable {
+			providers[index].RecentStatus = "unavailable"
+			continue
+		}
+		matched := false
+		bucketUnavailable := false
 		for _, item := range usage {
-			if matchesAIProviderUsage(providers[index], item) {
-				providers[index].RecentSuccess += item.SuccessCount
-				providers[index].RecentFailure += item.FailureCount
+			if !matchesAIProviderUsage(providers[index], item) {
+				continue
 			}
+			matched = true
+			providers[index].RecentSuccess += item.SuccessCount
+			providers[index].RecentFailure += item.FailureCount
+			providers[index].RecentRequests = mergeAIProviderRecentRequests(providers[index].RecentRequests, item.RecentRequests)
+			if aiProviderUsageRecentRequestsUnavailable(item) {
+				bucketUnavailable = true
+			}
+		}
+		if matched && bucketUnavailable {
+			providers[index].RecentStatusAvailable = false
+			providers[index].RecentStatus = "unavailable"
+			continue
 		}
 		switch {
 		case providers[index].RecentFailure > 0:
@@ -1245,35 +1310,180 @@ func applyAIProviderUsage(providers []aiProviderItem, usage []aiProviderUsage) {
 	}
 }
 
+func aiProviderUsageRecentRequestsUnavailable(usage aiProviderUsage) bool {
+	if usage.TotalCount <= 0 {
+		return false
+	}
+	if !usage.RecentRequestsAvailable {
+		return true
+	}
+	hasPositiveBucket := false
+	for _, item := range usage.RecentRequests {
+		if item.Success+item.Failed <= 0 {
+			continue
+		}
+		hasPositiveBucket = true
+		if item.Time == nil || strings.TrimSpace(*item.Time) == "" {
+			return true
+		}
+	}
+	return !hasPositiveBucket
+}
+
+func mergeAIProviderRecentRequests(existing []aiProviderRecentRequest, incoming []aiProviderRecentRequest) []aiProviderRecentRequest {
+	if len(incoming) == 0 {
+		return existing
+	}
+	if len(existing) == 0 {
+		return normalizeAIProviderRecentRequests(incoming)
+	}
+	hasTime := false
+	positions := make(map[string]int, len(existing))
+	for index, item := range existing {
+		if item.Time == nil || strings.TrimSpace(*item.Time) == "" {
+			continue
+		}
+		hasTime = true
+		positions[strings.TrimSpace(*item.Time)] = index
+	}
+	for _, item := range incoming {
+		if item.Time != nil && strings.TrimSpace(*item.Time) != "" {
+			hasTime = true
+			break
+		}
+	}
+	for index, item := range incoming {
+		if item.Time != nil && strings.TrimSpace(*item.Time) != "" {
+			key := strings.TrimSpace(*item.Time)
+			if position, ok := positions[key]; ok {
+				existing[position].Success += item.Success
+				existing[position].Failed += item.Failed
+				continue
+			}
+			positions[key] = len(existing)
+			existing = append(existing, item)
+			continue
+		}
+		if !hasTime && index < len(existing) {
+			existing[index].Success += item.Success
+			existing[index].Failed += item.Failed
+			continue
+		}
+		if hasTime && item.Success+item.Failed <= 0 {
+			continue
+		}
+		existing = append(existing, item)
+	}
+	return normalizeAIProviderRecentRequests(existing)
+}
+
+func normalizeAIProviderRecentRequests(items []aiProviderRecentRequest) []aiProviderRecentRequest {
+	items = filterAIProviderTimedSeriesBuckets(items)
+	sortAIProviderTimedSeriesBuckets(items)
+	return trimAIProviderRecentRequests(items)
+}
+
+func filterAIProviderTimedSeriesBuckets(items []aiProviderRecentRequest) []aiProviderRecentRequest {
+	hasTime := false
+	for _, item := range items {
+		if aiProviderRecentRequestTime(item) != "" {
+			hasTime = true
+			break
+		}
+	}
+	if !hasTime {
+		return items
+	}
+	filtered := items[:0]
+	for _, item := range items {
+		if aiProviderRecentRequestTime(item) == "" && item.Success+item.Failed <= 0 {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func sortAIProviderTimedSeriesBuckets(items []aiProviderRecentRequest) {
+	sort.SliceStable(items, func(leftIndex, rightIndex int) bool {
+		leftTime := aiProviderRecentRequestTime(items[leftIndex])
+		rightTime := aiProviderRecentRequestTime(items[rightIndex])
+		if leftTime == "" || rightTime == "" {
+			return leftTime != "" && rightTime == ""
+		}
+		leftParsed, leftOK := aiProviderParseRecentRequestTime(leftTime)
+		rightParsed, rightOK := aiProviderParseRecentRequestTime(rightTime)
+		if leftOK && rightOK {
+			return leftParsed.Before(rightParsed)
+		}
+		return leftTime < rightTime
+	})
+}
+
+func aiProviderRecentRequestTime(item aiProviderRecentRequest) string {
+	if item.Time == nil {
+		return ""
+	}
+	return strings.TrimSpace(*item.Time)
+}
+
+func aiProviderParseRecentRequestTime(value string) (time.Time, bool) {
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
+}
+
+func trimAIProviderRecentRequests(items []aiProviderRecentRequest) []aiProviderRecentRequest {
+	if len(items) <= 20 {
+		return items
+	}
+	return items[len(items)-20:]
+}
+
 func matchesAIProviderUsage(provider aiProviderItem, usage aiProviderUsage) bool {
 	if !matchesAIProviderUsageMetadata(provider, usage) {
 		return false
 	}
+	matchedSelector := false
 	if usage.APIKeyHash != nil {
-		if provider.APIKeyHash != nil && *provider.APIKeyHash == *usage.APIKeyHash {
-			return true
+		if !aiProviderHasAPIKeyHash(provider, *usage.APIKeyHash) {
+			return false
 		}
-		for _, entry := range provider.APIKeyEntries {
-			if entry.APIKeyHash != nil && *entry.APIKeyHash == *usage.APIKeyHash {
-				return true
-			}
-		}
+		matchedSelector = true
 	}
 	if usage.IdentityHash != nil {
-		if provider.IdentityHash == *usage.IdentityHash {
-			return true
+		if provider.IdentityHash != *usage.IdentityHash {
+			return false
 		}
+		matchedSelector = true
 	}
 	if usage.AuthIndex != nil {
-		return provider.AuthIndex != nil && *usage.AuthIndex == *provider.AuthIndex
+		if provider.AuthIndex == nil || *usage.AuthIndex != *provider.AuthIndex {
+			return false
+		}
+		matchedSelector = true
 	}
-	if usage.APIKeyHash != nil || usage.IdentityHash != nil {
-		return false
+	if matchedSelector {
+		return true
 	}
 	if strings.TrimSpace(usage.Provider) != "" {
 		return true
 	}
 	return usage.Name != nil && strings.TrimSpace(*usage.Name) != ""
+}
+
+func aiProviderHasAPIKeyHash(provider aiProviderItem, hash string) bool {
+	if provider.APIKeyHash != nil && *provider.APIKeyHash == hash {
+		return true
+	}
+	for _, entry := range provider.APIKeyEntries {
+		if entry.APIKeyHash != nil && *entry.APIKeyHash == hash {
+			return true
+		}
+	}
+	return false
 }
 
 func matchesAIProviderUsageMetadata(provider aiProviderItem, usage aiProviderUsage) bool {
@@ -1362,33 +1572,45 @@ func aiProviderSummaryFromItems(items []aiProviderItem) aiProviderSummary {
 	return summary
 }
 
-func parseAIProviderUsage(payload []byte) []aiProviderUsage {
+func parseAIProviderUsage(payload []byte) ([]aiProviderUsage, bool) {
 	var raw any
 	if err := json.Unmarshal(payload, &raw); err != nil {
-		return []aiProviderUsage{}
+		return []aiProviderUsage{}, false
 	}
 	items := []aiProviderUsage{}
-	collectAIProviderUsage(raw, &items)
-	return items
+	ok := collectAIProviderUsage(raw, &items)
+	return items, ok
 }
 
-func collectAIProviderUsage(value any, items *[]aiProviderUsage) {
+func collectAIProviderUsage(value any, items *[]aiProviderUsage) bool {
 	switch typed := value.(type) {
 	case []any:
-		for _, item := range typed {
-			collectAIProviderUsage(item, items)
+		if len(typed) == 0 {
+			return true
 		}
+		ok := false
+		for _, item := range typed {
+			ok = collectAIProviderUsage(item, items) || ok
+		}
+		return ok
 	case map[string]any:
+		if len(typed) == 0 {
+			return true
+		}
 		if usage, ok := aiProviderUsageFromMap(typed); ok {
 			*items = append(*items, usage)
-			return
+			return true
 		}
 		if collectAIProviderUsageBuckets(typed, items) {
-			return
+			return true
 		}
+		ok := false
 		for _, nested := range typed {
-			collectAIProviderUsage(nested, items)
+			ok = collectAIProviderUsage(nested, items) || ok
 		}
+		return ok
+	default:
+		return false
 	}
 }
 
@@ -1467,14 +1689,59 @@ func aiProviderUsageFromMap(raw map[string]any) (aiProviderUsage, bool) {
 	usage.LastSeen = aiProviderFirstString(raw, "last_seen", "last-seen", "updated_at")
 	usage.IdentityHash = aiProviderFirstString(raw, "identity_hash", "identity-hash")
 	usage.UpstreamLabel = aiProviderFirstString(raw, "label", "description")
-	usage.SuccessCount = aiProviderFirstInt(raw, "success_count", "success", "successful", "ok_count", "succeeded")
-	usage.FailureCount = aiProviderFirstInt(raw, "failure_count", "failed_count", "failed", "error_count", "errors")
+	usage.SuccessCount, _ = aiProviderFirstIntValue(raw, "success_count", "success", "successful", "ok_count", "succeeded")
+	usage.FailureCount, _ = aiProviderFirstIntValue(raw, "failure_count", "failed_count", "failed", "error_count", "errors")
 	usage.TotalCount = aiProviderFirstInt(raw, "total_count", "total", "request_count", "requests")
+	if requests, ok := aiProviderRecentRequestsFromAny(raw["recent_requests"]); ok {
+		usage.RecentRequests = requests
+		usage.RecentRequestsAvailable = true
+	} else if requests, ok := aiProviderRecentRequestsFromAny(raw["recentRequests"]); ok {
+		usage.RecentRequests = requests
+		usage.RecentRequestsAvailable = true
+	}
+	if usage.RecentRequestsAvailable {
+		bucketSuccess, bucketFailure := aiProviderRecentRequestCounts(usage.RecentRequests)
+		if usage.SuccessCount+usage.FailureCount == 0 && bucketSuccess+bucketFailure > 0 {
+			usage.SuccessCount = bucketSuccess
+			usage.FailureCount = bucketFailure
+		}
+	}
 	if usage.TotalCount == 0 {
 		usage.TotalCount = usage.SuccessCount + usage.FailureCount
 	}
-	ok := usage.Provider != "" || usage.APIKeyHash != nil || usage.AuthIndex != nil || usage.SuccessCount > 0 || usage.FailureCount > 0
+	ok := usage.Provider != "" || usage.APIKeyHash != nil || usage.AuthIndex != nil || usage.SuccessCount > 0 || usage.FailureCount > 0 || usage.RecentRequestsAvailable
 	return usage, ok
+}
+
+func aiProviderRecentRequestCounts(items []aiProviderRecentRequest) (int, int) {
+	success := 0
+	failure := 0
+	for _, item := range items {
+		success += item.Success
+		failure += item.Failed
+	}
+	return success, failure
+}
+
+func aiProviderRecentRequestsFromAny(value any) ([]aiProviderRecentRequest, bool) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+	result := make([]aiProviderRecentRequest, 0, len(items))
+	for _, item := range items {
+		object, ok := item.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		request := aiProviderRecentRequest{
+			Time:    aiProviderFirstString(object, "time", "timestamp", "bucket", "bucket_time"),
+			Success: aiProviderFirstInt(object, "success", "success_count", "successful", "ok_count", "succeeded"),
+			Failed:  aiProviderFirstInt(object, "failed", "failure_count", "failed_count", "error_count", "errors"),
+		}
+		result = append(result, request)
+	}
+	return normalizeAIProviderRecentRequests(result), true
 }
 
 func aiProviderRawAPIKey(raw map[string]any) string {
@@ -1756,6 +2023,63 @@ func removeAIProviderKnownCloakFields(item map[string]any) {
 	}
 }
 
+func aiProviderUsesExcludedModelsDisabled(brand aiProviderBrand) bool {
+	return brand != aiProviderBrandOpenAICompatibility
+}
+
+func aiProviderExcludedModelsFromRaw(raw map[string]any, useDisableSentinel bool) ([]string, bool) {
+	if raw == nil {
+		return []string{}, false
+	}
+	items := aiProviderStringListFromAny(raw["excluded-models"])
+	result := make([]string, 0, len(items))
+	disabled := false
+	for _, item := range items {
+		normalized := strings.TrimSpace(item)
+		if normalized == "" {
+			continue
+		}
+		if useDisableSentinel && normalized == aiProviderDisableAllModelsRule {
+			disabled = true
+			continue
+		}
+		result = append(result, normalized)
+	}
+	return result, disabled
+}
+
+func aiProviderExcludedModelsWithDisabled(items []string, disabled *bool, current map[string]any) []string {
+	next := make([]string, 0, len(items)+1)
+	for _, item := range items {
+		normalized := strings.TrimSpace(item)
+		if normalized != "" && normalized != aiProviderDisableAllModelsRule {
+			next = append(next, normalized)
+		}
+	}
+	isDisabled := false
+	if disabled != nil {
+		isDisabled = *disabled
+	} else if current != nil {
+		isDisabled = aiProviderNonOpenAIDisabledFromRaw(current)
+	}
+	if isDisabled {
+		next = append(next, aiProviderDisableAllModelsRule)
+	}
+	return next
+}
+
+func aiProviderNonOpenAIDisabledFromRaw(raw map[string]any) bool {
+	if raw == nil {
+		return false
+	}
+	_, disabledByExcludedModels := aiProviderExcludedModelsFromRaw(raw, true)
+	if disabledByExcludedModels {
+		return true
+	}
+	disabled := aiProviderBoolPtrFromKeys(raw, "disabled")
+	return disabled != nil && *disabled
+}
+
 func aiProviderStringListFromAny(value any) []string {
 	items, ok := value.([]any)
 	if !ok {
@@ -1826,12 +2150,17 @@ func aiProviderIntPtrFromKeys(raw map[string]any, keys ...string) *int {
 }
 
 func aiProviderFirstInt(raw map[string]any, keys ...string) int {
+	value, _ := aiProviderFirstIntValue(raw, keys...)
+	return value
+}
+
+func aiProviderFirstIntValue(raw map[string]any, keys ...string) (int, bool) {
 	for _, key := range keys {
 		if value, ok := aiProviderIntFromAny(raw[key]); ok {
-			return value
+			return value, true
 		}
 	}
-	return 0
+	return 0, false
 }
 
 func aiProviderIntFromAny(value any) (int, bool) {
@@ -1936,6 +2265,7 @@ func removeAIProviderResponseOnlyFields(raw map[string]any) {
 	for _, key := range []string{
 		"auth-index", "auth_index", "api_key_hash", "api-key-hash", "api_key_masked", "api-key-masked",
 		"identity_hash", "identity-hash", "brand", "brand_label", "index", "recent_success", "recent_failure", "recent_status",
+		"recent_status_available", "recent_requests", "recent-requests",
 	} {
 		delete(raw, key)
 	}

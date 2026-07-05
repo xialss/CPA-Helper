@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import {
   NAlert,
   NButton,
+  NCheckbox,
   NDataTable,
   NDrawer,
   NDrawerContent,
@@ -52,9 +53,14 @@ import type {
   AIProviderHeader,
   AIProviderItem,
   AIProviderModel,
+  AIProviderRecentRequestBucket,
   AIProviderSummary,
 } from '@/shared/types/api'
 import { formatInteger } from '@/shared/utils/format'
+
+type ProviderEnabledFilter = 'all' | 'enabled' | 'disabled'
+
+type DiscoveryModelStatus = 'existing' | 'new' | 'conflict'
 
 interface BrandConfig {
   brand: AIProviderBrand
@@ -82,6 +88,24 @@ interface CloakDraft {
   strict_mode: boolean
   sensitive_words: string[]
   cache_user_id: boolean
+}
+
+interface DiscoveryModelItem {
+  key: string
+  name: string
+  alias: string
+  status: DiscoveryModelStatus
+  statusLabel: string
+  selectable: boolean
+  selected: boolean
+}
+
+interface ProviderStatusBucket {
+  key: string
+  success: number
+  failed: number
+  time: string | null
+  tone: 'idle' | 'success' | 'warning' | 'danger' | 'unavailable'
 }
 
 interface ProviderDraft {
@@ -112,6 +136,8 @@ interface ProviderDraft {
   recent_success: number
   recent_failure: number
   recent_status: string
+  recent_status_available: boolean
+  recent_requests: AIProviderRecentRequestBucket[]
 }
 
 const providerBrands: BrandConfig[] = [
@@ -121,6 +147,9 @@ const providerBrands: BrandConfig[] = [
   { brand: 'openai_compatibility', label: 'OpenAI-compatible', keyLabel: 'Provider API key' },
   { brand: 'vertex', label: 'Vertex', keyLabel: 'Vertex API key' },
 ]
+
+const providerStatusBucketCount = 20
+const providerStatusBucketIntervalMs = 10 * 60 * 1000
 
 const emptySummary: AIProviderSummary = {
   total: 0,
@@ -144,16 +173,20 @@ const usageError = ref<string | null>(null)
 const isLoading = ref(false)
 const loadError = ref<string | null>(null)
 const activeBrand = ref<AIProviderBrand>('gemini')
+const enabledFilter = ref<ProviderEnabledFilter>('all')
 const search = ref('')
 
 const drawerOpen = ref(false)
 const editorMode = ref<'create' | 'edit'>('create')
 const form = ref<ProviderDraft>(defaultDraft('gemini'))
 const originalFormText = ref('')
+const originalDisabled = ref(false)
 const isSaving = ref(false)
 const isDiscovering = ref(false)
 const isTesting = ref(false)
 const discoveredModels = ref<AIProviderModel[]>([])
+const discoverySearch = ref('')
+const selectedDiscoveryModelKeys = ref<string[]>([])
 const actionResult = ref<AIProviderActionResponse | null>(null)
 const testModel = ref('')
 const testMessage = ref('请用一句中文回复：连接测试成功。')
@@ -161,12 +194,23 @@ const testMessage = ref('请用一句中文回复：连接测试成功。')
 const brandOptions = computed<SelectOption[]>(() =>
   providerBrands.map((item) => ({ label: item.label, value: item.brand })),
 )
+const enabledFilterOptions = computed<SelectOption[]>(() => [
+  { label: t('全部', 'All'), value: 'all' },
+  { label: t('启用', 'Enabled'), value: 'enabled' },
+  { label: t('禁用', 'Disabled'), value: 'disabled' },
+])
 const currentBrandConfig = computed(() => brandConfig(form.value.brand))
 const missingSettings = computed(() => isMissingSettingsError(loadError.value))
 const tableRows = computed(() => {
   const keyword = search.value.trim().toLowerCase()
   return providers.value.filter((provider) => {
     if (provider.brand !== activeBrand.value) {
+      return false
+    }
+    if (enabledFilter.value === 'enabled' && provider.disabled === true) {
+      return false
+    }
+    if (enabledFilter.value === 'disabled' && provider.disabled !== true) {
       return false
     }
     if (!keyword) {
@@ -176,9 +220,10 @@ const tableRows = computed(() => {
       provider.brand_label,
       provider.name ?? '',
       provider.api_key_masked ?? '',
+      provider.auth_index ?? '',
       provider.base_url ?? '',
       provider.prefix ?? '',
-      provider.models.map((model) => model.name).join(' '),
+      provider.models.map((model) => `${model.name} ${model.alias ?? ''}`).join(' '),
     ]
       .join(' ')
       .toLowerCase()
@@ -197,6 +242,10 @@ function brandConfig(brand: AIProviderBrand): BrandConfig {
     return found
   }
   return { brand: 'gemini', label: 'Gemini', keyLabel: 'Gemini API key' }
+}
+
+function providerUsesExcludedModelsDisabled(brand: AIProviderBrand): boolean {
+  return brand !== 'openai_compatibility'
 }
 
 function defaultDraft(brand: AIProviderBrand): ProviderDraft {
@@ -237,6 +286,8 @@ function defaultDraft(brand: AIProviderBrand): ProviderDraft {
     recent_success: 0,
     recent_failure: 0,
     recent_status: 'unknown',
+    recent_status_available: true,
+    recent_requests: [],
   }
 }
 
@@ -269,7 +320,7 @@ function providerToDraft(provider: AIProviderItem): ProviderDraft {
     proxy_url: provider.proxy_url ?? '',
     models: provider.models.map(modelToDraft),
     headers: provider.headers.map((header) => ({ ...header })),
-    excluded_models: [...provider.excluded_models],
+    excluded_models: provider.excluded_models.filter((item) => !providerUsesExcludedModelsDisabled(provider.brand) || item.trim() !== '*'),
     disable_cooling: provider.disable_cooling ?? false,
     websockets: provider.websockets ?? false,
     rebuild_mid_system_message: provider.rebuild_mid_system_message ?? false,
@@ -292,6 +343,8 @@ function providerToDraft(provider: AIProviderItem): ProviderDraft {
     recent_success: provider.recent_success,
     recent_failure: provider.recent_failure,
     recent_status: provider.recent_status,
+    recent_status_available: provider.recent_status_available !== false,
+    recent_requests: provider.recent_requests ?? [],
   }
 }
 
@@ -320,7 +373,10 @@ function openCreateDialog() {
   editorMode.value = 'create'
   form.value = defaultDraft(activeBrand.value)
   originalFormText.value = JSON.stringify(form.value)
+  originalDisabled.value = false
   discoveredModels.value = []
+  discoverySearch.value = ''
+  selectedDiscoveryModelKeys.value = []
   actionResult.value = null
   testModel.value = ''
   drawerOpen.value = true
@@ -330,7 +386,10 @@ function openEditDialog(provider: AIProviderItem) {
   editorMode.value = 'edit'
   form.value = providerToDraft(provider)
   originalFormText.value = JSON.stringify(form.value)
+  originalDisabled.value = form.value.disabled
   discoveredModels.value = []
+  discoverySearch.value = ''
+  selectedDiscoveryModelKeys.value = []
   actionResult.value = null
   testModel.value = provider.models[0]?.name ?? ''
   drawerOpen.value = true
@@ -339,6 +398,12 @@ function openEditDialog(provider: AIProviderItem) {
 function handleBrandChange(value: string) {
   form.value = defaultDraft(value as AIProviderBrand)
   originalFormText.value = JSON.stringify(form.value)
+  originalDisabled.value = false
+  discoveredModels.value = []
+  discoverySearch.value = ''
+  selectedDiscoveryModelKeys.value = []
+  actionResult.value = null
+  testModel.value = ''
 }
 
 function addModel(name = '') {
@@ -409,7 +474,7 @@ function isBlankKeyEntry(entry: KeyEntryDraft) {
   return !entry.api_key.trim() && !entry.api_key_hash && !entry.api_key_masked && !entry.proxy_url.trim()
 }
 
-function draftToPayload(draft: ProviderDraft): AIProviderItem {
+function draftToPayload(draft: ProviderDraft, mode: 'create' | 'edit' = editorMode.value): AIProviderItem {
   const models = draft.models
     .map((model) => {
       const name = model.name.trim()
@@ -445,16 +510,18 @@ function draftToPayload(draft: ProviderDraft): AIProviderItem {
     auth_index: draft.auth_index,
     name: draft.brand === 'openai_compatibility' ? draft.name.trim() : null,
     priority: draft.priority,
-    disabled: draft.brand === 'openai_compatibility' ? draft.disabled : null,
+    disabled: draft.disabled,
     prefix: draft.prefix.trim(),
     base_url: draft.base_url.trim(),
-    original_base_url: editorMode.value === 'edit' ? draft.original_base_url : null,
+    original_base_url: mode === 'edit' ? draft.original_base_url : null,
     proxy_url: draft.proxy_url.trim(),
     models,
     headers: draft.headers
       .map((header) => ({ name: header.name.trim(), value: header.value }))
       .filter((header) => header.name !== ''),
-    excluded_models: draft.excluded_models.map((item) => item.trim()).filter((item) => item !== ''),
+    excluded_models: draft.excluded_models
+      .map((item) => item.trim())
+      .filter((item) => item !== '' && (!providerUsesExcludedModelsDisabled(draft.brand) || item !== '*')),
     disable_cooling: draft.brand === 'vertex' ? null : draft.disable_cooling,
     websockets: draft.brand === 'codex' ? draft.websockets : null,
     rebuild_mid_system_message: draft.brand === 'claude' ? draft.rebuild_mid_system_message : null,
@@ -482,11 +549,13 @@ function draftToPayload(draft: ProviderDraft): AIProviderItem {
     recent_success: draft.recent_success,
     recent_failure: draft.recent_failure,
     recent_status: draft.recent_status,
+    recent_status_available: draft.recent_status_available,
+    recent_requests: draft.recent_requests,
   }
   if (draft.brand === 'openai_compatibility' && !payload.name) {
     throw new Error(t('Provider 名称不能为空', 'Provider name is required'))
   }
-  if (draft.brand !== 'openai_compatibility' && editorMode.value === 'create' && !payload.api_key) {
+  if (draft.brand !== 'openai_compatibility' && mode === 'create' && !payload.api_key) {
     throw new Error(t('新建 provider 必须填写 API key', 'A new provider requires an API key'))
   }
   return payload
@@ -496,9 +565,23 @@ async function saveProvider() {
   if (!canSave.value) {
     return
   }
+  let payload: AIProviderItem
+  try {
+    payload = draftToPayload(form.value, editorMode.value)
+  } catch (error) {
+    message.error(errorText(error, '保存 AI provider 失败', 'Failed to save AI provider'))
+    return
+  }
+  if (editorMode.value === 'edit' && !originalDisabled.value && payload.disabled === true) {
+    confirmDisableProvider(payload, () => void persistProvider(payload))
+    return
+  }
+  await persistProvider(payload)
+}
+
+async function persistProvider(payload: AIProviderItem) {
   isSaving.value = true
   try {
-    const payload = draftToPayload(form.value)
     const response =
       editorMode.value === 'edit'
         ? await updateAIProvider(payload)
@@ -513,8 +596,26 @@ async function saveProvider() {
   }
 }
 
+function providerIdentityLabel(provider: Pick<AIProviderItem, 'name' | 'api_key_masked' | 'auth_index' | 'identity_hash'>): string {
+  return provider.name || provider.api_key_masked || provider.auth_index || provider.identity_hash.slice(0, 12)
+}
+
+function confirmDisableProvider(provider: AIProviderItem, onConfirm: () => void) {
+  const identity = providerIdentityLabel(provider)
+  dialog.warning({
+    title: t('禁用 AI provider', 'Disable AI provider'),
+    content: t(
+      `将禁用 ${provider.brand_label} provider（${identity}）。禁用会写入 CLIProxyAPI 远端配置。`,
+      `This disables the ${provider.brand_label} provider (${identity}) in the remote CLIProxyAPI config.`,
+    ),
+    positiveText: t('禁用', 'Disable'),
+    negativeText: t('取消', 'Cancel'),
+    onPositiveClick: onConfirm,
+  })
+}
+
 function confirmDelete(provider: AIProviderItem) {
-  const identity = provider.name || provider.api_key_masked || provider.auth_index || provider.identity_hash.slice(0, 12)
+  const identity = providerIdentityLabel(provider)
   dialog.warning({
     title: t('删除 AI provider', 'Delete AI provider'),
     content: t(
@@ -535,17 +636,110 @@ function confirmDelete(provider: AIProviderItem) {
 }
 
 async function toggleProviderDisabled(provider: AIProviderItem) {
-  if (provider.brand !== 'openai_compatibility') {
-    return
-  }
   const draft = providerToDraft(provider)
   draft.disabled = !draft.disabled
+  let payload: AIProviderItem
   try {
-    setSnapshot(await updateAIProvider(draftToPayload(draft)))
-    message.success(draft.disabled ? t('Provider 已停用', 'Provider disabled') : t('Provider 已启用', 'Provider enabled'))
+    payload = draftToPayload(draft, 'edit')
   } catch (error) {
     message.error(errorText(error, '更新启用状态失败', 'Failed to update enabled state'))
+    return
   }
+  const execute = async () => {
+    try {
+      setSnapshot(await updateAIProvider(payload))
+      message.success(draft.disabled ? t('Provider 已禁用', 'Provider disabled') : t('Provider 已启用', 'Provider enabled'))
+    } catch (error) {
+      message.error(errorText(error, '更新启用状态失败', 'Failed to update enabled state'))
+    }
+  }
+  if (draft.disabled) {
+    confirmDisableProvider(payload, () => void execute())
+    return
+  }
+  await execute()
+}
+
+function normalizeDiscoveryModelName(value: string): string {
+  return value.trim().replace(/^models\//, '').replace(/^publishers\/google\/models\//, '').toLowerCase()
+}
+
+function discoveryModelKey(model: Pick<AIProviderModel, 'name' | 'alias'>): string {
+  return `${model.name.trim()}\u0000${model.alias ?? ''}`
+}
+
+function buildDiscoveryModelItems(): DiscoveryModelItem[] {
+  const existingNames = new Set(form.value.models.map((model) => model.name.trim()).filter((name) => name !== ''))
+  const existingAliases = new Set(form.value.models.map((model) => model.alias.trim()).filter((alias) => alias !== ''))
+  const normalizedDisplays = new Map<string, Set<string>>()
+  for (const model of discoveredModels.value) {
+    const name = model.name.trim()
+    if (!name) {
+      continue
+    }
+    const normalized = normalizeDiscoveryModelName(name)
+    const displays = normalizedDisplays.get(normalized) ?? new Set<string>()
+    displays.add(name)
+    normalizedDisplays.set(normalized, displays)
+  }
+  return discoveredModels.value
+    .map((model) => {
+      const name = model.name.trim()
+      const alias = model.alias ?? ''
+      const normalized = normalizeDiscoveryModelName(name)
+      const internalConflict = (normalizedDisplays.get(normalized)?.size ?? 0) > 1
+      const existing = existingNames.has(name)
+      const conflict = !existing && (existingAliases.has(name) || internalConflict)
+      const status: DiscoveryModelStatus = existing ? 'existing' : conflict ? 'conflict' : 'new'
+      return {
+        key: discoveryModelKey(model),
+        name,
+        alias,
+        status,
+        statusLabel:
+          status === 'existing'
+            ? t('已存在', 'Existing')
+            : status === 'conflict'
+              ? t('名称冲突', 'Name conflict')
+              : t('新发现', 'New'),
+        selectable: status === 'new',
+        selected: status === 'new' && selectedDiscoveryModelKeys.value.includes(discoveryModelKey(model)),
+      }
+    })
+    .filter((item) => item.name !== '')
+}
+
+const discoveredModelItems = computed(() => buildDiscoveryModelItems())
+const visibleDiscoveredModelItems = computed(() => {
+  const keyword = discoverySearch.value.trim().toLowerCase()
+  if (!keyword) {
+    return discoveredModelItems.value
+  }
+  return discoveredModelItems.value.filter((item) =>
+    [item.name, item.alias, item.statusLabel].join(' ').toLowerCase().includes(keyword),
+  )
+})
+const selectableDiscoveredModelItems = computed(() => discoveredModelItems.value.filter((item) => item.selectable))
+const selectedDiscoveredModelCount = computed(() =>
+  discoveredModelItems.value.filter((item) => item.selectable && selectedDiscoveryModelKeys.value.includes(item.key)).length,
+)
+
+function selectAllDiscoveredModels() {
+  selectedDiscoveryModelKeys.value = selectableDiscoveredModelItems.value.map((item) => item.key)
+}
+
+function clearSelectedDiscoveredModels() {
+  selectedDiscoveryModelKeys.value = []
+}
+
+function toggleDiscoveredModel(item: DiscoveryModelItem, checked: boolean) {
+  const selected = new Set(selectedDiscoveryModelKeys.value)
+  if (checked && item.selectable) {
+    selected.add(item.key)
+  } else {
+    selected.delete(item.key)
+  }
+  selectedDiscoveryModelKeys.value = Array.from(selected)
 }
 
 async function runDiscovery() {
@@ -557,6 +751,11 @@ async function runDiscovery() {
     actionResult.value = result
     if (result.ok) {
       discoveredModels.value = result.models ?? []
+      discoverySearch.value = ''
+      selectedDiscoveryModelKeys.value = []
+      selectedDiscoveryModelKeys.value = buildDiscoveryModelItems()
+        .filter((item) => item.selectable)
+        .map((item) => item.key)
       message.success(t('模型发现完成', 'Model discovery completed'))
     } else {
       message.error(result.error || t('模型发现失败', 'Model discovery failed'))
@@ -568,15 +767,24 @@ async function runDiscovery() {
   }
 }
 
-function applyDiscoveredModels() {
+function applySelectedDiscoveredModels() {
+  const selected = new Set(selectedDiscoveryModelKeys.value)
   const existing = new Set(form.value.models.map((model) => model.name.trim()).filter((name) => name !== ''))
-  for (const model of discoveredModels.value) {
-    if (!existing.has(model.name)) {
-      addModel(model.name)
-      existing.add(model.name)
+  let added = 0
+  for (const item of discoveredModelItems.value) {
+    if (!item.selectable || !selected.has(item.key) || existing.has(item.name)) {
+      continue
     }
+    addModel(item.name)
+    existing.add(item.name)
+    added++
   }
-  message.success(t('发现模型已加入表单', 'Discovered models added to the form'))
+  selectedDiscoveryModelKeys.value = []
+  if (added === 0) {
+    message.warning(t('没有可加入的新模型', 'No new models to add'))
+    return
+  }
+  message.success(t(`已加入 ${added} 个发现模型`, `${added} discovered models added`))
 }
 
 async function runConnectivityTest() {
@@ -622,71 +830,317 @@ function isMissingSettingsError(message: string | null) {
   )
 }
 
-function statusTagType(provider: AIProviderItem): 'success' | 'warning' | 'default' {
+function providerEnabledText(provider: AIProviderItem): string {
+  return provider.disabled ? t('禁用', 'Disabled') : t('启用', 'Enabled')
+}
+
+function providerRecentRequestTotal(provider: AIProviderItem): number {
+  return provider.recent_success + provider.recent_failure
+}
+
+function recentRequestBucketTotal(bucket: Pick<AIProviderRecentRequestBucket, 'success' | 'failed'>): number {
+  return Math.max(0, bucket.success ?? 0) + Math.max(0, bucket.failed ?? 0)
+}
+
+function parseProviderStatusBucketTime(value: string | null | undefined): number | null {
+  const trimmed = value?.trim()
+  if (!trimmed) {
+    return null
+  }
+  const parsed = Date.parse(trimmed)
+  if (!Number.isFinite(parsed)) {
+    return null
+  }
+  return Math.floor(parsed / providerStatusBucketIntervalMs) * providerStatusBucketIntervalMs
+}
+
+function providerHasRenderableRecentRequestBuckets(provider: AIProviderItem): boolean {
+  if (providerRecentRequestTotal(provider) <= 0) {
+    return true
+  }
+  const source = provider.recent_requests ?? []
+  if (source.length === 0) {
+    return false
+  }
+  let hasPositiveTimedBucket = false
+  for (const item of source) {
+    if (recentRequestBucketTotal(item) <= 0) {
+      continue
+    }
+    if (parseProviderStatusBucketTime(item.time) === null) {
+      return false
+    }
+    hasPositiveTimedBucket = true
+  }
+  return hasPositiveTimedBucket
+}
+
+function providerStatusAvailable(provider: AIProviderItem): boolean {
+  return (
+    provider.recent_status_available !== false &&
+    provider.recent_status !== 'unavailable' &&
+    providerHasRenderableRecentRequestBuckets(provider)
+  )
+}
+
+function providerStatusText(provider: AIProviderItem): string {
+  if (!providerStatusAvailable(provider)) {
+    return t('状态不可用', 'Status unavailable')
+  }
+  if (providerRecentRequestTotal(provider) === 0) {
+    return t('无近期请求', 'No recent requests')
+  }
   if (provider.recent_status === 'healthy') {
-    return 'success'
+    return t('近期成功', 'Recently healthy')
   }
   if (provider.recent_status === 'failing') {
-    return 'warning'
+    return t('近期失败', 'Recent failures')
   }
-  return 'default'
+  return t('未知', 'Unknown')
+}
+
+function providerSuccessRate(provider: AIProviderItem): string {
+  const total = providerRecentRequestTotal(provider)
+  if (total <= 0) {
+    return '--'
+  }
+  return `${Math.round((provider.recent_success / total) * 100)}%`
+}
+
+function providerStatusCountText(provider: AIProviderItem): string {
+  if (!providerStatusAvailable(provider) && providerRecentRequestTotal(provider) === 0) {
+    return t('成功 -- / 失败 --', 'S -- / F --')
+  }
+  return t(
+    `成功 ${formatInteger(provider.recent_success)} / 失败 ${formatInteger(provider.recent_failure)}`,
+    `S ${formatInteger(provider.recent_success)} / F ${formatInteger(provider.recent_failure)}`,
+  )
+}
+
+function providerStatusBucketTone(success: number, failed: number): ProviderStatusBucket['tone'] {
+  const total = success + failed
+  if (total <= 0) {
+    return 'idle'
+  }
+  const rate = success / total
+  return rate >= 0.9 ? 'success' : rate >= 0.5 ? 'warning' : 'danger'
+}
+
+function emptyProviderStatusBuckets(tone: 'idle' | 'unavailable'): ProviderStatusBucket[] {
+  return Array.from({ length: providerStatusBucketCount }, (_, index) => ({
+    key: `${tone}-${index}`,
+    success: 0,
+    failed: 0,
+    time: null,
+    tone,
+  }))
+}
+
+function providerTimeAlignedStatusBuckets(source: AIProviderRecentRequestBucket[]): ProviderStatusBucket[] | null {
+  const bucketsByTime = new Map<number, { success: number; failed: number; time: string | null }>()
+  for (const item of source) {
+    const success = Math.max(0, item.success ?? 0)
+    const failed = Math.max(0, item.failed ?? 0)
+    const timestamp = parseProviderStatusBucketTime(item.time)
+    if (timestamp === null) {
+      if (success + failed > 0) {
+        return null
+      }
+      continue
+    }
+    const existing = bucketsByTime.get(timestamp)
+    if (existing) {
+      existing.success += success
+      existing.failed += failed
+      existing.time = existing.time ?? item.time ?? null
+    } else {
+      bucketsByTime.set(timestamp, { success, failed, time: item.time ?? null })
+    }
+  }
+  if (bucketsByTime.size === 0) {
+    return null
+  }
+  const latestTimestamp = Math.max(...Array.from(bucketsByTime.keys()))
+  const firstTimestamp = latestTimestamp - (providerStatusBucketCount - 1) * providerStatusBucketIntervalMs
+  const buckets: ProviderStatusBucket[] = []
+  for (let index = 0; index < providerStatusBucketCount; index++) {
+    const timestamp = firstTimestamp + index * providerStatusBucketIntervalMs
+    const item = bucketsByTime.get(timestamp)
+    if (!item) {
+      buckets.push({ key: `idle-${timestamp}`, success: 0, failed: 0, time: null, tone: 'idle' })
+      continue
+    }
+    buckets.push({
+      key: `bucket-${timestamp}`,
+      success: item.success,
+      failed: item.failed,
+      time: item.time,
+      tone: providerStatusBucketTone(item.success, item.failed),
+    })
+  }
+  return buckets
+}
+
+function providerSequentialStatusBuckets(source: AIProviderRecentRequestBucket[]): ProviderStatusBucket[] {
+  const recentSource = source.slice(-providerStatusBucketCount)
+  const buckets: ProviderStatusBucket[] = []
+  const idleCount = providerStatusBucketCount - recentSource.length
+  for (let index = 0; index < idleCount; index++) {
+    buckets.push({ key: `idle-${index}`, success: 0, failed: 0, time: null, tone: 'idle' })
+  }
+  recentSource.forEach((item, index) => {
+    const success = Math.max(0, item.success ?? 0)
+    const failed = Math.max(0, item.failed ?? 0)
+    buckets.push({
+      key: `${item.time ?? 'bucket'}-${index}`,
+      success,
+      failed,
+      time: item.time ?? null,
+      tone: providerStatusBucketTone(success, failed),
+    })
+  })
+  return buckets
+}
+
+function providerStatusBuckets(provider: AIProviderItem): ProviderStatusBucket[] {
+  if (!providerStatusAvailable(provider)) {
+    return emptyProviderStatusBuckets('unavailable')
+  }
+  const source = provider.recent_requests ?? []
+  const timeAlignedBuckets = providerTimeAlignedStatusBuckets(source)
+  if (timeAlignedBuckets) {
+    return timeAlignedBuckets
+  }
+  return providerSequentialStatusBuckets(source)
+}
+
+function providerStatusBucketTitle(bucket: ProviderStatusBucket): string {
+  if (bucket.tone === 'unavailable') {
+    return t('状态不可用', 'Status unavailable')
+  }
+  const total = bucket.success + bucket.failed
+  if (total <= 0) {
+    return t('该 10 分钟段无请求', 'No requests in this 10-minute bucket')
+  }
+  const rate = Math.round((bucket.success / total) * 100)
+  const prefix = bucket.time ? `${bucket.time} · ` : ''
+  return t(
+    `${prefix}成功 ${bucket.success} / 失败 ${bucket.failed} / 成功率 ${rate}%`,
+    `${prefix}S ${bucket.success} / F ${bucket.failed} / Success ${rate}%`,
+  )
+}
+
+function renderProviderStatus(row: AIProviderItem) {
+  return h('div', { class: 'provider-status-cell' }, [
+    h('div', { class: 'provider-status-head' }, [
+      h(NTag, { size: 'small', type: row.disabled ? 'warning' : 'success', round: false }, { default: () => providerEnabledText(row) }),
+      h('span', { class: ['provider-status-text', providerStatusAvailable(row) ? undefined : 'is-unavailable'] }, providerStatusText(row)),
+    ]),
+    h(
+      'div',
+      { class: 'provider-status-bars' },
+      providerStatusBuckets(row).map((bucket) =>
+        h('span', {
+          key: bucket.key,
+          class: ['provider-status-block', `is-${bucket.tone}`],
+          title: providerStatusBucketTitle(bucket),
+        }),
+      ),
+    ),
+    h('div', { class: 'provider-status-meta' }, [
+      h('strong', providerSuccessRate(row)),
+      h('span', providerStatusCountText(row)),
+    ]),
+  ])
+}
+
+function renderModelHeaderSummary(row: AIProviderItem) {
+  const chips = row.models.slice(0, 2).map((model) => h(NTag, { size: 'small', round: false }, { default: () => model.alias || model.name }))
+  if (row.models.length > 2) {
+    chips.push(h(NTag, { size: 'small', round: false }, { default: () => `+${row.models.length - 2}` }))
+  }
+  return h('div', { class: 'provider-config-summary' }, [
+    h('div', { class: 'provider-config-counts' }, [
+      h(NTag, { size: 'small', round: false }, { default: () => t(`模型 ${row.models.length}`, `${row.models.length} models`) }),
+      h(NTag, { size: 'small', round: false }, { default: () => t(`请求头 ${row.headers.length}`, `${row.headers.length} headers`) }),
+      row.brand === 'openai_compatibility'
+        ? h(NTag, { size: 'small', round: false }, { default: () => t(`Key ${row.api_key_entries.length}`, `${row.api_key_entries.length} keys`) })
+        : null,
+    ]),
+    chips.length > 0 ? h('div', { class: 'model-chip-list' }, chips) : h('span', { class: 'empty-cell' }, '-'),
+  ])
+}
+
+function providerTableRowProps(row: AIProviderItem) {
+  return {
+    class: {
+      'is-provider-disabled-row': row.disabled === true,
+    },
+  }
 }
 
 const columns = computed<DataTableColumns<AIProviderItem>>(() => [
   {
-    title: t('标识', 'Identity'),
-    key: 'identity',
-    width: 260,
+    title: t('密钥', 'Key'),
+    key: 'key',
+    width: 210,
     render: (row) =>
       h('div', { class: 'provider-identity' }, [
-        h('strong', row.name || row.api_key_masked || row.auth_index || row.identity_hash.slice(0, 12)),
-        h('span', row.base_url || '-'),
+        h('strong', { title: providerIdentityLabel(row) }, providerIdentityLabel(row)),
+        h('span', row.brand_label),
       ]),
   },
   {
-    title: t('Priority', 'Priority'),
+    title: t('服务地址', 'Service URL'),
+    key: 'base_url',
+    minWidth: 220,
+    render: (row) => h('span', { class: ['provider-url', row.base_url ? undefined : 'empty-cell'], title: row.base_url || '' }, row.base_url || '-'),
+  },
+  {
+    title: t('优先级', 'Priority'),
     key: 'priority',
-    width: 110,
+    width: 90,
     render: (row) => String(row.priority ?? '-'),
   },
   {
-    title: t('模型', 'Models'),
-    key: 'models',
-    minWidth: 240,
-    render: (row) =>
-      h(
-        'div',
-        { class: 'model-chip-list' },
-        row.models.slice(0, 4).map((model) => h(NTag, { size: 'small', round: false }, { default: () => model.alias || model.name })),
-      ),
+    title: t('前缀', 'Prefix'),
+    key: 'prefix',
+    width: 120,
+    render: (row) => h('span', { class: row.prefix ? undefined : 'empty-cell', title: row.prefix || '' }, row.prefix || '-'),
   },
   {
-    title: t('近期状态', 'Recent status'),
+    title: t('模型/请求头', 'Models / Headers'),
+    key: 'models_headers',
+    minWidth: 260,
+    render: (row) => renderModelHeaderSummary(row),
+  },
+  {
+    title: t('状态', 'Status'),
     key: 'status',
-    width: 190,
-    render: (row) =>
-      h(NSpace, { size: 4 }, {
-        default: () => [
-          h(NTag, { size: 'small', type: statusTagType(row), round: false }, { default: () => statusText(row) }),
-          h('span', { class: 'usage-count' }, `S ${formatInteger(row.recent_success)} / F ${formatInteger(row.recent_failure)}`),
-        ],
-      }),
+    width: 320,
+    render: (row) => renderProviderStatus(row),
   },
   {
-    title: '',
+    title: t('操作', 'Actions'),
     key: 'actions',
-    width: 300,
+    width: 250,
     fixed: 'right',
     render: (row) =>
-      h(NSpace, { size: 4 }, {
+      h(NSpace, { size: 6 }, {
         default: () => [
-          row.brand === 'openai_compatibility'
-            ? h(
-                NButton,
-                { size: 'small', quaternary: true, onClick: () => void toggleProviderDisabled(row) },
-                { default: () => (row.disabled ? t('启用', 'Enable') : t('停用', 'Disable')) },
-              )
-            : null,
+          h(
+            NButton,
+            {
+              size: 'small',
+              secondary: true,
+              type: row.disabled ? 'success' : 'warning',
+              onClick: () => void toggleProviderDisabled(row),
+            },
+            {
+              icon: () => h(NIcon, { component: row.disabled ? CheckCircle2 : XCircle }),
+              default: () => (row.disabled ? t('启用', 'Enable') : t('禁用', 'Disable')),
+            },
+          ),
           h(
             NButton,
             { size: 'small', quaternary: true, onClick: () => openEditDialog(row) },
@@ -701,16 +1155,6 @@ const columns = computed<DataTableColumns<AIProviderItem>>(() => [
       }),
   },
 ])
-
-function statusText(provider: AIProviderItem): string {
-  if (provider.recent_status === 'healthy') {
-    return t('成功', 'Healthy')
-  }
-  if (provider.recent_status === 'failing') {
-    return t('失败', 'Failing')
-  }
-  return t('未知', 'Unknown')
-}
 
 onMounted(refresh)
 </script>
@@ -770,10 +1214,11 @@ onMounted(refresh)
     <section class="panel provider-panel-shell">
       <div class="panel-inner provider-panel">
         <div class="provider-toolbar">
-          <NTabs v-model:value="activeBrand" type="segment">
+          <NTabs v-model:value="activeBrand" type="segment" class="provider-brand-tabs">
             <NTabPane v-for="item in providerBrands" :key="item.brand" :name="item.brand" :tab="item.label" />
           </NTabs>
-          <NInput v-model:value="search" clearable :placeholder="t('搜索名称、Base URL、模型', 'Search name, base URL, or model')">
+          <NSelect v-model:value="enabledFilter" class="provider-enabled-filter" :options="enabledFilterOptions" />
+          <NInput v-model:value="search" class="provider-search" clearable :placeholder="t('搜索名称、服务地址、模型', 'Search name, service URL, or model')">
             <template #prefix><NIcon :component="Search" /></template>
           </NInput>
         </div>
@@ -783,9 +1228,10 @@ onMounted(refresh)
           :loading="isLoading"
           :columns="columns"
           :data="tableRows"
+          :row-props="providerTableRowProps"
           :pagination="{ pageSize: 10 }"
           table-layout="fixed"
-          :scroll-x="1120"
+          :scroll-x="1450"
         />
       </div>
     </section>
@@ -805,16 +1251,16 @@ onMounted(refresh)
               <NFormItem v-if="form.brand === 'openai_compatibility'" :label="t('Provider 名称', 'Provider name')" required>
                 <NInput v-model:value="form.name" />
               </NFormItem>
-              <NFormItem :label="t('Priority', 'Priority')">
+              <NFormItem :label="t('优先级', 'Priority')">
                 <NInputNumber v-model:value="form.priority" clearable />
               </NFormItem>
-              <NFormItem :label="t('Prefix', 'Prefix')">
+              <NFormItem :label="t('前缀 Prefix', 'Prefix')">
                 <NInput v-model:value="form.prefix" clearable />
               </NFormItem>
               <NFormItem :label="t('Base URL', 'Base URL')">
                 <NInput v-model:value="form.base_url" clearable />
               </NFormItem>
-              <NFormItem v-if="form.brand !== 'openai_compatibility'" :label="t('Proxy URL', 'Proxy URL')">
+              <NFormItem v-if="form.brand !== 'openai_compatibility'" :label="t('代理 URL', 'Proxy URL')">
                 <NInput v-model:value="form.proxy_url" clearable />
               </NFormItem>
               <NFormItem v-if="form.brand !== 'openai_compatibility'" :label="currentBrandConfig.keyLabel">
@@ -826,10 +1272,15 @@ onMounted(refresh)
                   :placeholder="editorMode === 'edit' ? t('留空保留远端原值', 'Leave blank to keep remote value') : ''"
                 />
               </NFormItem>
-              <NFormItem v-if="form.brand === 'openai_compatibility'" :label="t('停用 Provider', 'Disable provider')">
-                <NSwitch v-model:value="form.disabled" />
+              <NFormItem :label="t('启用状态', 'Enabled state')">
+                <div class="enable-switch-row">
+                  <NSwitch v-model:value="form.disabled" :checked-value="false" :unchecked-value="true" />
+                  <span :class="['enable-switch-label', form.disabled ? 'is-disabled' : 'is-enabled']">
+                    {{ form.disabled ? t('禁用', 'Disabled') : t('启用', 'Enabled') }}
+                  </span>
+                </div>
               </NFormItem>
-              <NFormItem v-if="form.brand !== 'vertex'" :label="t('Disable cooling', 'Disable cooling')">
+              <NFormItem v-if="form.brand !== 'vertex'" :label="t('禁用冷却调度', 'Disable cooling')">
                 <NSwitch v-model:value="form.disable_cooling" />
               </NFormItem>
               <NFormItem v-if="form.brand === 'codex'" :label="t('WebSockets', 'WebSockets')">
@@ -856,7 +1307,7 @@ onMounted(refresh)
                 show-password-on="click"
                 :placeholder="entry.api_key_masked || t('留空保留远端原值', 'Leave blank to keep remote value')"
               />
-              <NInput v-model:value="entry.proxy_url" clearable :placeholder="t('Proxy URL', 'Proxy URL')" />
+              <NInput v-model:value="entry.proxy_url" clearable :placeholder="t('代理 URL', 'Proxy URL')" />
               <NButton tertiary type="error" @click="removeKeyEntry(index)">{{ t('删除', 'Delete') }}</NButton>
             </div>
           </section>
@@ -888,8 +1339,8 @@ onMounted(refresh)
               <NButton size="small" secondary @click="addHeader">{{ t('新增 Header', 'Add header') }}</NButton>
             </div>
             <div v-for="(header, index) in form.headers" :key="index" class="list-row">
-              <NInput v-model:value="header.name" :placeholder="t('名称', 'Name')" />
-              <NInput v-model:value="header.value" :placeholder="t('值', 'Value')" />
+              <NInput v-model:value="header.name" placeholder="X-Custom-Header" />
+              <NInput v-model:value="header.value" placeholder="value" />
               <NButton tertiary type="error" @click="removeHeader(index)">{{ t('删除', 'Delete') }}</NButton>
             </div>
           </section>
@@ -947,11 +1398,36 @@ onMounted(refresh)
                 {{ t('连通性测试', 'Test connectivity') }}
               </NButton>
             </div>
-            <div v-if="discoveredModels.length > 0" class="discovery-result">
-              <div class="model-chip-list">
-                <NTag v-for="model in discoveredModels" :key="model.name" size="small" :round="false">{{ model.name }}</NTag>
+            <div v-if="discoveredModels.length > 0" class="discovery-result-panel">
+              <div class="discovery-toolbar">
+                <NInput v-model:value="discoverySearch" clearable :placeholder="t('搜索发现模型', 'Search discovered models')">
+                  <template #prefix><NIcon :component="Search" /></template>
+                </NInput>
+                <NSpace size="small">
+                  <NButton size="small" secondary :disabled="selectableDiscoveredModelItems.length === 0" @click="selectAllDiscoveredModels">
+                    {{ t('全选可选项', 'Select all') }}
+                  </NButton>
+                  <NButton size="small" secondary :disabled="selectedDiscoveredModelCount === 0" @click="clearSelectedDiscoveredModels">
+                    {{ t('清空选择', 'Clear') }}
+                  </NButton>
+                  <NButton size="small" type="primary" secondary :disabled="selectedDiscoveredModelCount === 0" @click="applySelectedDiscoveredModels">
+                    {{ t(`添加选中模型 (${selectedDiscoveredModelCount})`, `Add selected (${selectedDiscoveredModelCount})`) }}
+                  </NButton>
+                </NSpace>
               </div>
-              <NButton size="small" type="primary" secondary @click="applyDiscoveredModels">{{ t('加入模型列表', 'Add to models') }}</NButton>
+              <div class="discovery-list">
+                <div v-for="item in visibleDiscoveredModelItems" :key="item.key" class="discovery-row" :class="`is-${item.status}`">
+                  <NCheckbox :checked="item.selected" :disabled="!item.selectable" @update:checked="(checked) => toggleDiscoveredModel(item, checked)" />
+                  <div class="discovery-model-main">
+                    <strong>{{ item.name }}</strong>
+                    <span v-if="item.alias">{{ item.alias }}</span>
+                  </div>
+                  <NTag size="small" :type="item.status === 'new' ? 'success' : item.status === 'conflict' ? 'warning' : 'default'" :round="false">
+                    {{ item.statusLabel }}
+                  </NTag>
+                </div>
+                <div v-if="visibleDiscoveredModelItems.length === 0" class="empty-state">{{ t('没有匹配的发现模型', 'No discovered models match') }}</div>
+              </div>
             </div>
             <NAlert v-if="actionResult" :type="actionResult.ok ? 'success' : 'error'" :bordered="false">
               <template v-if="actionResult.ok">
@@ -977,10 +1453,9 @@ onMounted(refresh)
 
 <style scoped>
 .settings-alert-content,
-.provider-toolbar,
 .section-head,
 .drawer-actions,
-.discovery-result {
+.discovery-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -998,16 +1473,16 @@ onMounted(refresh)
 }
 
 .provider-toolbar {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) 160px minmax(240px, 360px);
+  gap: 12px;
   align-items: flex-start;
 }
 
-.provider-toolbar > :first-child {
-  flex: 1 1 auto;
-  min-width: 280px;
-}
-
-.provider-toolbar > :last-child {
-  flex: 0 1 360px;
+.provider-brand-tabs,
+.provider-enabled-filter,
+.provider-search {
+  min-width: 0;
 }
 
 .provider-identity {
@@ -1024,10 +1499,116 @@ onMounted(refresh)
 }
 
 .provider-identity span,
-.usage-count,
-.dirty-state {
+.provider-status-meta,
+.dirty-state,
+.empty-cell {
   color: var(--cpa-text-muted);
   font-size: 12px;
+}
+
+.provider-url {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-config-summary,
+.provider-status-cell {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.provider-config-counts,
+.provider-status-head,
+.provider-status-meta,
+.enable-switch-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.provider-status-head,
+.provider-status-meta {
+  justify-content: space-between;
+}
+
+.provider-status-text {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-status-text.is-unavailable {
+  color: var(--cpa-warning);
+}
+
+.provider-status-bars {
+  display: grid;
+  grid-template-columns: repeat(20, minmax(4px, 1fr));
+  gap: 2px;
+  width: 100%;
+  min-width: 0;
+}
+
+.provider-status-block {
+  height: 12px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--cpa-border) 68%, transparent);
+}
+
+.provider-status-block.is-success {
+  background: var(--cpa-success);
+}
+
+.provider-status-block.is-warning {
+  background: var(--cpa-warning);
+}
+
+.provider-status-block.is-danger {
+  background: var(--cpa-danger);
+}
+
+.provider-status-block.is-unavailable {
+  background: repeating-linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--cpa-warning) 42%, transparent),
+    color-mix(in srgb, var(--cpa-warning) 42%, transparent) 3px,
+    color-mix(in srgb, var(--cpa-border) 70%, transparent) 3px,
+    color-mix(in srgb, var(--cpa-border) 70%, transparent) 6px
+  );
+}
+
+.provider-status-meta strong {
+  color: var(--cpa-text);
+  font-size: 12px;
+}
+
+.enable-switch-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.enable-switch-label.is-enabled {
+  color: var(--cpa-success);
+}
+
+.enable-switch-label.is-disabled {
+  color: var(--cpa-warning);
+}
+
+:global(.is-provider-disabled-row td) {
+  background: color-mix(in srgb, var(--cpa-warning) 7%, transparent);
+}
+
+:global(.is-provider-disabled-row .provider-identity strong) {
+  color: var(--cpa-text-muted);
 }
 
 .model-chip-list {
@@ -1107,6 +1688,68 @@ onMounted(refresh)
   align-items: center;
 }
 
+.discovery-result-panel {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.discovery-toolbar > :first-child {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.discovery-list {
+  display: grid;
+  max-height: 280px;
+  overflow: auto;
+  border: 1px solid var(--cpa-border);
+  border-radius: var(--cpa-radius);
+}
+
+.discovery-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--cpa-border);
+}
+
+.discovery-row:last-child {
+  border-bottom: 0;
+}
+
+.discovery-row.is-existing,
+.discovery-row.is-conflict {
+  background: color-mix(in srgb, var(--cpa-border) 24%, transparent);
+}
+
+.discovery-model-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.discovery-model-main strong,
+.discovery-model-main span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.discovery-model-main span {
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+}
+
+.empty-state {
+  padding: 18px;
+  color: var(--cpa-text-muted);
+  text-align: center;
+}
+
 .drawer-actions {
   position: sticky;
   bottom: 0;
@@ -1123,20 +1766,22 @@ onMounted(refresh)
   .action-grid,
   .model-row,
   .list-row,
-  .two-col-list-row {
+  .two-col-list-row,
+  .discovery-row {
     grid-template-columns: 1fr;
   }
 
-  .provider-toolbar,
   .settings-alert-content,
   .drawer-actions,
-  .discovery-result {
+  .discovery-toolbar {
     align-items: stretch;
     flex-direction: column;
   }
 
-  .provider-toolbar > :first-child,
-  .provider-toolbar > :last-child {
+  .provider-brand-tabs,
+  .provider-enabled-filter,
+  .provider-search,
+  .discovery-toolbar > :first-child {
     min-width: 0;
     width: 100%;
   }

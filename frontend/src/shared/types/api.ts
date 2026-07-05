@@ -103,6 +103,12 @@ export interface AIProviderCloak {
   cache_user_id?: boolean | null
 }
 
+export interface AIProviderRecentRequestBucket {
+  time?: string | null
+  success: number
+  failed: number
+}
+
 export interface AIProviderItem {
   brand: AIProviderBrand
   brand_label: string
@@ -130,7 +136,9 @@ export interface AIProviderItem {
   api_key_entries: AIProviderKeyEntry[]
   recent_success: number
   recent_failure: number
-  recent_status: 'healthy' | 'failing' | 'unknown' | string
+  recent_status: 'healthy' | 'failing' | 'unknown' | 'unavailable' | string
+  recent_status_available?: boolean
+  recent_requests?: AIProviderRecentRequestBucket[] | null
   metadata?: Record<string, unknown>
 }
 
@@ -147,6 +155,8 @@ export interface AIProviderUsage {
   last_seen?: string | null
   identity_hash?: string | null
   upstream_label?: string | null
+  recent_requests?: AIProviderRecentRequestBucket[] | null
+  recent_requests_available?: boolean
 }
 
 export interface AIProviderSummary {
