@@ -19,6 +19,7 @@ import {
   NTabPane,
   NTabs,
   NTag,
+  NTooltip,
   useDialog,
   useMessage,
   type DataTableColumns,
@@ -106,6 +107,9 @@ interface ProviderStatusBucket {
   failed: number
   time: string | null
   tone: 'idle' | 'success' | 'warning' | 'danger' | 'unavailable'
+  label?: string
+  note?: string
+  aggregate?: boolean
 }
 
 interface ProviderDraft {
@@ -144,12 +148,20 @@ const providerBrands: BrandConfig[] = [
   { brand: 'gemini', label: 'Gemini', keyLabel: 'Gemini API key' },
   { brand: 'codex', label: 'Codex', keyLabel: 'Codex API key' },
   { brand: 'claude', label: 'Claude', keyLabel: 'Claude API key' },
-  { brand: 'openai_compatibility', label: 'OpenAI-compatible', keyLabel: 'Provider API key' },
   { brand: 'vertex', label: 'Vertex', keyLabel: 'Vertex API key' },
+  { brand: 'openai_compatibility', label: 'OpenAI-compatible', keyLabel: 'Provider API key' },
 ]
 
 const providerStatusBucketCount = 20
 const providerStatusBucketIntervalMs = 10 * 60 * 1000
+const providerStatusTimestampPattern = /^\d{4}-\d{2}-\d{2}[T\s]/
+const providerStatusTooltipThemeOverrides = {
+  color: 'var(--cpa-surface-raised)',
+  textColor: 'var(--cpa-text)',
+  boxShadow: '0 12px 30px rgb(15 23 42 / 14%)',
+  padding: '10px 12px',
+  borderRadius: '8px',
+}
 
 const emptySummary: AIProviderSummary = {
   total: 0,
@@ -201,6 +213,7 @@ const enabledFilterOptions = computed<SelectOption[]>(() => [
 ])
 const currentBrandConfig = computed(() => brandConfig(form.value.brand))
 const missingSettings = computed(() => isMissingSettingsError(loadError.value))
+const enabledProviderCount = computed(() => providers.value.filter((provider) => provider.disabled !== true).length)
 const tableRows = computed(() => {
   const keyword = search.value.trim().toLowerCase()
   return providers.value.filter((provider) => {
@@ -826,7 +839,7 @@ function isMissingSettingsError(message: string | null) {
   return (
     text.includes('AI 提供商管理需要先到') ||
     (text.includes('系统设置') && text.includes('CLIProxyAPI 地址和管理密钥')) ||
-    (lowerText.includes('system settings') && lowerText.includes('cliaproxyapi url and management key'))
+    (lowerText.includes('system settings') && lowerText.includes('cliproxyapi url and management key'))
   )
 }
 
@@ -847,6 +860,9 @@ function parseProviderStatusBucketTime(value: string | null | undefined): number
   if (!trimmed) {
     return null
   }
+  if (!providerStatusTimestampPattern.test(trimmed)) {
+    return null
+  }
   const parsed = Date.parse(trimmed)
   if (!Number.isFinite(parsed)) {
     return null
@@ -854,33 +870,31 @@ function parseProviderStatusBucketTime(value: string | null | undefined): number
   return Math.floor(parsed / providerStatusBucketIntervalMs) * providerStatusBucketIntervalMs
 }
 
-function providerHasRenderableRecentRequestBuckets(provider: AIProviderItem): boolean {
-  if (providerRecentRequestTotal(provider) <= 0) {
-    return true
+function parseProviderClockBucketStart(value: string | null | undefined): number | null {
+  const match = value?.trim().match(/(?:^|\D)([01]?\d|2[0-3]):([0-5]\d)(?:\D|$)/)
+  if (!match) {
+    return null
   }
-  const source = provider.recent_requests ?? []
-  if (source.length === 0) {
-    return false
-  }
-  let hasPositiveTimedBucket = false
-  for (const item of source) {
-    if (recentRequestBucketTotal(item) <= 0) {
-      continue
-    }
-    if (parseProviderStatusBucketTime(item.time) === null) {
-      return false
-    }
-    hasPositiveTimedBucket = true
-  }
-  return hasPositiveTimedBucket
+  return Number(match[1]) * 60 + Number(match[2])
+}
+
+function formatProviderClockMinute(value: number): string {
+  const normalized = ((value % 1440) + 1440) % 1440
+  const hour = String(Math.floor(normalized / 60)).padStart(2, '0')
+  const minute = String(normalized % 60).padStart(2, '0')
+  return `${hour}:${minute}`
+}
+
+function providerClockBucketTimeRange(startMinute: number): string {
+  return `${formatProviderClockMinute(startMinute)} - ${formatProviderClockMinute(startMinute + providerStatusBucketIntervalMs / 60_000)}`
 }
 
 function providerStatusAvailable(provider: AIProviderItem): boolean {
-  return (
-    provider.recent_status_available !== false &&
-    provider.recent_status !== 'unavailable' &&
-    providerHasRenderableRecentRequestBuckets(provider)
-  )
+  return provider.recent_status_available !== false && provider.recent_status !== 'unavailable'
+}
+
+function providerStatusTextUnavailable(provider: AIProviderItem): boolean {
+  return !providerStatusAvailable(provider)
 }
 
 function providerStatusText(provider: AIProviderItem): string {
@@ -905,6 +919,16 @@ function providerSuccessRate(provider: AIProviderItem): string {
     return '--'
   }
   return `${Math.round((provider.recent_success / total) * 100)}%`
+}
+
+function providerStatusRateTone(provider: AIProviderItem): ProviderStatusBucket['tone'] {
+  if (!providerStatusAvailable(provider)) {
+    return 'unavailable'
+  }
+  if (providerRecentRequestTotal(provider) > 0) {
+    return providerStatusBucketTone(provider.recent_success, provider.recent_failure)
+  }
+  return providerStatusBucketTone(provider.recent_success, provider.recent_failure)
 }
 
 function providerStatusCountText(provider: AIProviderItem): string {
@@ -936,6 +960,35 @@ function emptyProviderStatusBuckets(tone: 'idle' | 'unavailable'): ProviderStatu
   }))
 }
 
+function providerAggregateStatusBuckets(provider: AIProviderItem): ProviderStatusBucket[] {
+  const success = Math.max(0, provider.recent_success)
+  const failed = Math.max(0, provider.recent_failure)
+  const total = success + failed
+  if (total <= 0) {
+    return emptyProviderStatusBuckets(providerStatusAvailable(provider) ? 'idle' : 'unavailable')
+  }
+  const failedSegments =
+    failed <= 0 ? 0 : success <= 0 ? providerStatusBucketCount : Math.min(providerStatusBucketCount - 1, Math.max(1, Math.round((failed / total) * providerStatusBucketCount)))
+  const successSegments = providerStatusBucketCount - failedSegments
+  const note = t(
+    'CPA 未返回带时间的 20 段明细，当前色块按累计成功/失败比例展示概览。',
+    'CPA did not return timed 20-bucket details, so these blocks summarize aggregate success/failure ratio.',
+  )
+  return Array.from({ length: providerStatusBucketCount }, (_, index) => {
+    const isFailureSegment = index >= successSegments
+    return {
+      key: `aggregate-${index}`,
+      success,
+      failed,
+      time: null,
+      tone: isFailureSegment ? 'danger' : 'success',
+      label: t('近期请求汇总', 'Recent request summary'),
+      note,
+      aggregate: true,
+    }
+  })
+}
+
 function providerTimeAlignedStatusBuckets(source: AIProviderRecentRequestBucket[]): ProviderStatusBucket[] | null {
   const bucketsByTime = new Map<number, { success: number; failed: number; time: string | null }>()
   for (const item of source) {
@@ -960,14 +1013,17 @@ function providerTimeAlignedStatusBuckets(source: AIProviderRecentRequestBucket[
   if (bucketsByTime.size === 0) {
     return null
   }
-  const latestTimestamp = Math.max(...Array.from(bucketsByTime.keys()))
+  const activeTimestamps = Array.from(bucketsByTime.entries())
+    .filter(([, item]) => item.success + item.failed > 0)
+    .map(([timestamp]) => timestamp)
+  const latestTimestamp = activeTimestamps.length > 0 ? Math.max(...activeTimestamps) : Math.max(...Array.from(bucketsByTime.keys()))
   const firstTimestamp = latestTimestamp - (providerStatusBucketCount - 1) * providerStatusBucketIntervalMs
   const buckets: ProviderStatusBucket[] = []
   for (let index = 0; index < providerStatusBucketCount; index++) {
     const timestamp = firstTimestamp + index * providerStatusBucketIntervalMs
     const item = bucketsByTime.get(timestamp)
     if (!item) {
-      buckets.push({ key: `idle-${timestamp}`, success: 0, failed: 0, time: null, tone: 'idle' })
+      buckets.push({ key: `idle-${timestamp}`, success: 0, failed: 0, time: new Date(timestamp).toISOString(), tone: 'idle' })
       continue
     }
     buckets.push({
@@ -976,6 +1032,75 @@ function providerTimeAlignedStatusBuckets(source: AIProviderRecentRequestBucket[
       failed: item.failed,
       time: item.time,
       tone: providerStatusBucketTone(item.success, item.failed),
+    })
+  }
+  return buckets
+}
+
+function providerClockStatusBuckets(source: AIProviderRecentRequestBucket[]): ProviderStatusBucket[] | null {
+  const bucketsByMinute = new Map<number, { success: number; failed: number; time: string | null }>()
+  for (const item of source) {
+    const success = Math.max(0, item.success ?? 0)
+    const failed = Math.max(0, item.failed ?? 0)
+    const minute = parseProviderClockBucketStart(item.time)
+    if (minute === null) {
+      if (success + failed > 0) {
+        return null
+      }
+      continue
+    }
+    const existing = bucketsByMinute.get(minute)
+    if (existing) {
+      existing.success += success
+      existing.failed += failed
+      existing.time = existing.time ?? item.time ?? null
+    } else {
+      bucketsByMinute.set(minute, { success, failed, time: item.time ?? null })
+    }
+  }
+  if (bucketsByMinute.size === 0) {
+    return null
+  }
+
+  const sortedMinutes = Array.from(bucketsByMinute.keys()).sort((left, right) => left - right)
+  let largestGapIndex = sortedMinutes.length - 1
+  let largestGap = -1
+  for (let index = 0; index < sortedMinutes.length; index++) {
+    const current = sortedMinutes[index]!
+    const next = sortedMinutes[(index + 1) % sortedMinutes.length]! + (index === sortedMinutes.length - 1 ? 1440 : 0)
+    const gap = next - current
+    if (gap > largestGap) {
+      largestGap = gap
+      largestGapIndex = index
+    }
+  }
+  const intervalMinutes = providerStatusBucketIntervalMs / 60_000
+  const orderedMinutes =
+    largestGap <= intervalMinutes ? sortedMinutes : [...sortedMinutes.slice(largestGapIndex + 1), ...sortedMinutes.slice(0, largestGapIndex + 1)]
+  const latestMinute = orderedMinutes[orderedMinutes.length - 1]!
+  const firstMinute = latestMinute - (providerStatusBucketCount - 1) * intervalMinutes
+  const buckets: ProviderStatusBucket[] = []
+  for (let index = 0; index < providerStatusBucketCount; index++) {
+    const minute = ((firstMinute + index * intervalMinutes) % 1440 + 1440) % 1440
+    const item = bucketsByMinute.get(minute)
+    if (!item) {
+      buckets.push({
+        key: `clock-idle-${minute}`,
+        success: 0,
+        failed: 0,
+        time: null,
+        tone: 'idle',
+        label: providerClockBucketTimeRange(minute),
+      })
+      continue
+    }
+    buckets.push({
+      key: `clock-${minute}`,
+      success: item.success,
+      failed: item.failed,
+      time: item.time,
+      tone: providerStatusBucketTone(item.success, item.failed),
+      label: providerClockBucketTimeRange(minute),
     })
   }
   return buckets
@@ -991,13 +1116,17 @@ function providerSequentialStatusBuckets(source: AIProviderRecentRequestBucket[]
   recentSource.forEach((item, index) => {
     const success = Math.max(0, item.success ?? 0)
     const failed = Math.max(0, item.failed ?? 0)
-    buckets.push({
+    const bucket: ProviderStatusBucket = {
       key: `${item.time ?? 'bucket'}-${index}`,
       success,
       failed,
       time: item.time ?? null,
       tone: providerStatusBucketTone(success, failed),
-    })
+    }
+    if (!item.time) {
+      bucket.label = t(`最近分段 ${index + 1}`, `Recent bucket ${index + 1}`)
+    }
+    buckets.push(bucket)
   })
   return buckets
 }
@@ -1007,11 +1136,49 @@ function providerStatusBuckets(provider: AIProviderItem): ProviderStatusBucket[]
     return emptyProviderStatusBuckets('unavailable')
   }
   const source = provider.recent_requests ?? []
+  const sourceHasRequests = source.some((item) => recentRequestBucketTotal(item) > 0)
+  const providerTotal = providerRecentRequestTotal(provider)
   const timeAlignedBuckets = providerTimeAlignedStatusBuckets(source)
-  if (timeAlignedBuckets) {
+  if (timeAlignedBuckets && (sourceHasRequests || providerTotal <= 0)) {
     return timeAlignedBuckets
   }
-  return providerSequentialStatusBuckets(source)
+  const clockBuckets = providerClockStatusBuckets(source)
+  if (clockBuckets && (sourceHasRequests || providerTotal <= 0)) {
+    return clockBuckets
+  }
+  if (sourceHasRequests) {
+    return providerSequentialStatusBuckets(source)
+  }
+  if (providerTotal > 0) {
+    return providerAggregateStatusBuckets(provider)
+  }
+  return emptyProviderStatusBuckets('idle')
+}
+
+function formatProviderStatusBucketTime(value: number): string {
+  const date = new Date(value)
+  const hour = String(date.getHours()).padStart(2, '0')
+  const minute = String(date.getMinutes()).padStart(2, '0')
+  return `${hour}:${minute}`
+}
+
+function providerStatusBucketTimeRange(bucket: ProviderStatusBucket): string {
+  if (bucket.label) {
+    return bucket.label
+  }
+  const parsed = bucket.time ? Date.parse(bucket.time) : Number.NaN
+  if (!Number.isFinite(parsed)) {
+    return bucket.time || t('该 10 分钟段', 'This 10-minute bucket')
+  }
+  return `${formatProviderStatusBucketTime(parsed)} - ${formatProviderStatusBucketTime(parsed + providerStatusBucketIntervalMs)}`
+}
+
+function providerStatusBucketRate(bucket: ProviderStatusBucket): string {
+  const total = bucket.success + bucket.failed
+  if (total <= 0) {
+    return '--'
+  }
+  return `${Math.round((bucket.success / total) * 100)}%`
 }
 
 function providerStatusBucketTitle(bucket: ProviderStatusBucket): string {
@@ -1019,46 +1186,72 @@ function providerStatusBucketTitle(bucket: ProviderStatusBucket): string {
     return t('状态不可用', 'Status unavailable')
   }
   const total = bucket.success + bucket.failed
+  const range = providerStatusBucketTimeRange(bucket)
   if (total <= 0) {
-    return t('该 10 分钟段无请求', 'No requests in this 10-minute bucket')
+    return t(`${range} 无请求`, `${range} no requests`)
   }
-  const rate = Math.round((bucket.success / total) * 100)
-  const prefix = bucket.time ? `${bucket.time} · ` : ''
   return t(
-    `${prefix}成功 ${bucket.success} / 失败 ${bucket.failed} / 成功率 ${rate}%`,
-    `${prefix}S ${bucket.success} / F ${bucket.failed} / Success ${rate}%`,
+    `${range} 成功 ${formatInteger(bucket.success)} / 失败 ${formatInteger(bucket.failed)} / 成功率 ${providerStatusBucketRate(bucket)}`,
+    `${range} S ${formatInteger(bucket.success)} / F ${formatInteger(bucket.failed)} / Success ${providerStatusBucketRate(bucket)}`,
   )
 }
 
-function renderProviderStatus(row: AIProviderItem) {
-  return h('div', { class: 'provider-status-cell' }, [
-    h('div', { class: 'provider-status-head' }, [
-      h(NTag, { size: 'small', type: row.disabled ? 'warning' : 'success', round: false }, { default: () => providerEnabledText(row) }),
-      h('span', { class: ['provider-status-text', providerStatusAvailable(row) ? undefined : 'is-unavailable'] }, providerStatusText(row)),
-    ]),
-    h(
-      'div',
-      { class: 'provider-status-bars' },
-      providerStatusBuckets(row).map((bucket) =>
-        h('span', {
-          key: bucket.key,
-          class: ['provider-status-block', `is-${bucket.tone}`],
-          title: providerStatusBucketTitle(bucket),
-        }),
-      ),
-    ),
-    h('div', { class: 'provider-status-meta' }, [
-      h('strong', providerSuccessRate(row)),
-      h('span', providerStatusCountText(row)),
+function renderProviderStatusBucketTooltip(bucket: ProviderStatusBucket) {
+  if (bucket.tone === 'unavailable') {
+    return h('div', { class: 'provider-status-tooltip' }, [
+      h('strong', { class: 'provider-status-tooltip-range' }, t('状态不可用', 'Status unavailable')),
+      h('span', { class: 'provider-status-tooltip-note' }, t('近期请求状态条缺少可渲染分段数据', 'Recent status buckets are not available')),
+    ])
+  }
+  return h('div', { class: 'provider-status-tooltip' }, [
+    h('strong', { class: 'provider-status-tooltip-range' }, providerStatusBucketTimeRange(bucket)),
+    bucket.note ? h('span', { class: 'provider-status-tooltip-note' }, bucket.note) : null,
+    h('div', { class: 'provider-status-tooltip-counts' }, [
+      h('span', { class: 'is-success' }, t(`成功 ${formatInteger(bucket.success)}`, `${formatInteger(bucket.success)} succeeded`)),
+      h('span', { class: 'is-danger' }, t(`失败 ${formatInteger(bucket.failed)}`, `${formatInteger(bucket.failed)} failed`)),
+      h('span', providerStatusBucketRate(bucket)),
     ]),
   ])
 }
 
+function renderProviderStatus(row: AIProviderItem) {
+  const rateTone = providerStatusRateTone(row)
+  return h('div', { class: 'provider-status-cell' }, [
+    h('div', { class: 'provider-status-head' }, [
+      h(NTag, { size: 'small', type: row.disabled ? 'warning' : 'success', round: false }, { default: () => providerEnabledText(row) }),
+      h('span', { class: ['provider-status-text', providerStatusTextUnavailable(row) ? 'is-unavailable' : undefined] }, providerStatusText(row)),
+    ]),
+    h('div', { class: 'provider-status-progress' }, [
+      h(
+        'div',
+        { class: 'provider-status-bars' },
+        providerStatusBuckets(row).map((bucket) =>
+          h(
+            NTooltip,
+            {
+              key: bucket.key,
+              trigger: 'hover',
+              placement: 'top',
+              themeOverrides: providerStatusTooltipThemeOverrides,
+            },
+            {
+              trigger: () =>
+                h('span', {
+                  class: ['provider-status-block', `is-${bucket.tone}`, bucket.aggregate ? 'is-aggregate' : undefined],
+                  'aria-label': providerStatusBucketTitle(bucket),
+                }),
+              default: () => renderProviderStatusBucketTooltip(bucket),
+            },
+          ),
+        ),
+      ),
+      h('strong', { class: ['provider-status-rate-pill', `is-${rateTone}`] }, providerSuccessRate(row)),
+    ]),
+    h('div', { class: 'provider-status-counts' }, providerStatusCountText(row)),
+  ])
+}
+
 function renderModelHeaderSummary(row: AIProviderItem) {
-  const chips = row.models.slice(0, 2).map((model) => h(NTag, { size: 'small', round: false }, { default: () => model.alias || model.name }))
-  if (row.models.length > 2) {
-    chips.push(h(NTag, { size: 'small', round: false }, { default: () => `+${row.models.length - 2}` }))
-  }
   return h('div', { class: 'provider-config-summary' }, [
     h('div', { class: 'provider-config-counts' }, [
       h(NTag, { size: 'small', round: false }, { default: () => t(`模型 ${row.models.length}`, `${row.models.length} models`) }),
@@ -1067,7 +1260,6 @@ function renderModelHeaderSummary(row: AIProviderItem) {
         ? h(NTag, { size: 'small', round: false }, { default: () => t(`Key ${row.api_key_entries.length}`, `${row.api_key_entries.length} keys`) })
         : null,
     ]),
-    chips.length > 0 ? h('div', { class: 'model-chip-list' }, chips) : h('span', { class: 'empty-cell' }, '-'),
   ])
 }
 
@@ -1083,47 +1275,46 @@ const columns = computed<DataTableColumns<AIProviderItem>>(() => [
   {
     title: t('密钥', 'Key'),
     key: 'key',
-    width: 210,
+    width: 160,
     render: (row) =>
       h('div', { class: 'provider-identity' }, [
         h('strong', { title: providerIdentityLabel(row) }, providerIdentityLabel(row)),
-        h('span', row.brand_label),
       ]),
   },
   {
     title: t('服务地址', 'Service URL'),
     key: 'base_url',
-    minWidth: 220,
+    width: 260,
     render: (row) => h('span', { class: ['provider-url', row.base_url ? undefined : 'empty-cell'], title: row.base_url || '' }, row.base_url || '-'),
   },
   {
     title: t('优先级', 'Priority'),
     key: 'priority',
-    width: 90,
+    width: 80,
     render: (row) => String(row.priority ?? '-'),
   },
   {
     title: t('前缀', 'Prefix'),
     key: 'prefix',
-    width: 120,
+    width: 100,
     render: (row) => h('span', { class: row.prefix ? undefined : 'empty-cell', title: row.prefix || '' }, row.prefix || '-'),
   },
   {
     title: t('模型/请求头', 'Models / Headers'),
     key: 'models_headers',
-    minWidth: 260,
+    width: 190,
     render: (row) => renderModelHeaderSummary(row),
   },
   {
     title: t('状态', 'Status'),
     key: 'status',
-    width: 320,
+    width: 340,
     render: (row) => renderProviderStatus(row),
   },
   {
     title: t('操作', 'Actions'),
     key: 'actions',
-    width: 250,
+    width: 230,
     fixed: 'right',
     render: (row) =>
       h(NSpace, { size: 6 }, {
@@ -1195,7 +1386,7 @@ onMounted(refresh)
         <div class="metric-icon"><Bot :size="20" /></div>
         <div class="metric-label">{{ t('Provider 总数', 'Providers') }}</div>
         <div class="metric-value">{{ formatInteger(summary.total) }}</div>
-        <div class="metric-footnote">{{ t('五类 provider 实时读取', 'Loaded from five provider groups') }}</div>
+        <div class="metric-footnote">{{ t(`启用 ${formatInteger(enabledProviderCount)} 个 · 五类 provider 实时读取`, `${formatInteger(enabledProviderCount)} enabled · Loaded from five provider groups`) }}</div>
       </div>
       <div class="metric-card is-success">
         <div class="metric-icon"><CheckCircle2 :size="20" /></div>
@@ -1224,6 +1415,7 @@ onMounted(refresh)
         </div>
 
         <NDataTable
+          class="provider-table"
           size="small"
           :loading="isLoading"
           :columns="columns"
@@ -1231,7 +1423,7 @@ onMounted(refresh)
           :row-props="providerTableRowProps"
           :pagination="{ pageSize: 10 }"
           table-layout="fixed"
-          :scroll-x="1450"
+          :scroll-x="1360"
         />
       </div>
     </section>
@@ -1473,8 +1665,8 @@ onMounted(refresh)
 }
 
 .provider-toolbar {
-  display: grid;
-  grid-template-columns: minmax(280px, 1fr) 160px minmax(240px, 360px);
+  display: flex;
+  flex-wrap: wrap;
   gap: 12px;
   align-items: flex-start;
 }
@@ -1485,21 +1677,35 @@ onMounted(refresh)
   min-width: 0;
 }
 
-.provider-identity {
-  display: grid;
-  gap: 3px;
+.provider-brand-tabs {
+  flex: 1 1 640px;
+  overflow: hidden;
+}
+
+.provider-enabled-filter {
+  flex: 0 0 150px;
+}
+
+.provider-search {
+  flex: 1 1 280px;
+  max-width: 380px;
+}
+
+.provider-table {
   min-width: 0;
 }
 
-.provider-identity strong,
-.provider-identity span {
+.provider-identity {
+  display: grid;
+  min-width: 0;
+}
+
+.provider-identity strong {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.provider-identity span,
-.provider-status-meta,
 .dirty-state,
 .empty-cell {
   color: var(--cpa-text-muted);
@@ -1514,29 +1720,44 @@ onMounted(refresh)
   white-space: nowrap;
 }
 
-.provider-config-summary,
-.provider-status-cell {
+.provider-config-summary {
   display: grid;
-  gap: 6px;
+  gap: 7px;
   min-width: 0;
 }
 
 .provider-config-counts,
-.provider-status-head,
-.provider-status-meta,
 .enable-switch-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 10px;
   min-width: 0;
 }
 
-.provider-status-head,
-.provider-status-meta {
-  justify-content: space-between;
+.provider-config-counts {
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
-.provider-status-text {
+:global(.provider-status-cell) {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+:global(.provider-status-head),
+:global(.provider-status-progress) {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+:global(.provider-status-head) {
+  justify-content: flex-start;
+}
+
+:global(.provider-status-text) {
   min-width: 0;
   overflow: hidden;
   color: var(--cpa-text-muted);
@@ -1545,37 +1766,45 @@ onMounted(refresh)
   white-space: nowrap;
 }
 
-.provider-status-text.is-unavailable {
+:global(.provider-status-text.is-unavailable) {
   color: var(--cpa-warning);
 }
 
-.provider-status-bars {
+:global(.provider-status-bars) {
   display: grid;
-  grid-template-columns: repeat(20, minmax(4px, 1fr));
-  gap: 2px;
-  width: 100%;
-  min-width: 0;
+  flex: 0 0 157px;
+  grid-template-columns: repeat(20, 5px);
+  gap: 3px;
+  width: 157px;
+  min-width: 157px;
+  max-width: 157px;
 }
 
-.provider-status-block {
+:global(.provider-status-block) {
+  display: block;
+  width: 5px;
   height: 12px;
-  border-radius: 2px;
+  border-radius: 999px;
   background: color-mix(in srgb, var(--cpa-border) 68%, transparent);
 }
 
-.provider-status-block.is-success {
+:global(.provider-status-block.is-idle) {
+  background: color-mix(in srgb, var(--cpa-border) 68%, transparent);
+}
+
+:global(.provider-status-block.is-success) {
   background: var(--cpa-success);
 }
 
-.provider-status-block.is-warning {
+:global(.provider-status-block.is-warning) {
   background: var(--cpa-warning);
 }
 
-.provider-status-block.is-danger {
+:global(.provider-status-block.is-danger) {
   background: var(--cpa-danger);
 }
 
-.provider-status-block.is-unavailable {
+:global(.provider-status-block.is-unavailable) {
   background: repeating-linear-gradient(
     135deg,
     color-mix(in srgb, var(--cpa-warning) 42%, transparent),
@@ -1585,9 +1814,57 @@ onMounted(refresh)
   );
 }
 
-.provider-status-meta strong {
+:global(.provider-status-block.is-aggregate) {
+  opacity: 0.82;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--cpa-text-muted) 45%, transparent);
+}
+
+:global(.provider-status-rate-pill) {
+  flex: 0 0 auto;
+  min-width: 48px;
+  padding: 2px 7px;
+  border-radius: 6px;
   color: var(--cpa-text);
   font-size: 12px;
+  line-height: 1.35;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  background: var(--cpa-surface-muted);
+}
+
+:global(.provider-status-rate-pill.is-success) {
+  color: var(--cpa-success);
+  background: var(--cpa-success-weak);
+}
+
+:global(.provider-status-rate-pill.is-idle) {
+  color: var(--cpa-text-muted);
+  background: var(--cpa-surface-muted);
+}
+
+:global(.provider-status-rate-pill.is-warning) {
+  color: var(--cpa-warning);
+  background: color-mix(in srgb, var(--cpa-warning) 12%, var(--cpa-surface-raised));
+}
+
+:global(.provider-status-rate-pill.is-danger) {
+  color: var(--cpa-danger);
+  background: var(--cpa-danger-weak);
+}
+
+:global(.provider-status-rate-pill.is-unavailable) {
+  color: var(--cpa-warning);
+  background: color-mix(in srgb, var(--cpa-warning) 10%, var(--cpa-surface-raised));
+}
+
+:global(.provider-status-counts) {
+  overflow: hidden;
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 .enable-switch-label {
@@ -1611,11 +1888,39 @@ onMounted(refresh)
   color: var(--cpa-text-muted);
 }
 
-.model-chip-list {
+:global(.provider-status-tooltip) {
+  display: grid;
+  gap: 8px;
+  min-width: 150px;
+  color: var(--cpa-text);
+}
+
+:global(.provider-status-tooltip-range) {
+  color: var(--cpa-text-strong);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+:global(.provider-status-tooltip-note) {
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+}
+
+:global(.provider-status-tooltip-counts) {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+:global(.provider-status-tooltip-counts .is-success) {
+  color: var(--cpa-success);
+}
+
+:global(.provider-status-tooltip-counts .is-danger) {
+  color: var(--cpa-danger);
 }
 
 .provider-drawer,
@@ -1762,7 +2067,6 @@ onMounted(refresh)
 @media (max-width: 980px) {
   .provider-metrics,
   .form-grid,
-  .provider-toolbar,
   .action-grid,
   .model-row,
   .list-row,
@@ -1783,6 +2087,7 @@ onMounted(refresh)
   .provider-search,
   .discovery-toolbar > :first-child {
     min-width: 0;
+    max-width: none;
     width: 100%;
   }
 }

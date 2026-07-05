@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,7 +21,10 @@ const (
 	aiProviderMissingConfigMessage = "AI 提供商管理需要先到「系统设置」填写 CLIProxyAPI 地址和管理密钥。"
 	aiProviderAPICallToken         = "$TOKEN$"
 	aiProviderDisableAllModelsRule = "*"
+	aiProviderClockBucketMinutes   = 10
 )
+
+var aiProviderRecentRequestClockPattern = regexp.MustCompile(`(^|[^0-9])([01]?[0-9]|2[0-3]):([0-5][0-9])([^0-9]|$)`)
 
 type aiProviderBrand string
 
@@ -1405,6 +1409,9 @@ func filterAIProviderTimedSeriesBuckets(items []aiProviderRecentRequest) []aiPro
 }
 
 func sortAIProviderTimedSeriesBuckets(items []aiProviderRecentRequest) {
+	if sortAIProviderClockSeriesBuckets(items) {
+		return
+	}
 	sort.SliceStable(items, func(leftIndex, rightIndex int) bool {
 		leftTime := aiProviderRecentRequestTime(items[leftIndex])
 		rightTime := aiProviderRecentRequestTime(items[rightIndex])
@@ -1420,6 +1427,78 @@ func sortAIProviderTimedSeriesBuckets(items []aiProviderRecentRequest) {
 	})
 }
 
+func sortAIProviderClockSeriesBuckets(items []aiProviderRecentRequest) bool {
+	minutes := map[int]struct{}{}
+	hasClockTime := false
+	for _, item := range items {
+		value := aiProviderRecentRequestTime(item)
+		if value == "" {
+			continue
+		}
+		if _, ok := aiProviderParseRecentRequestTime(value); ok {
+			return false
+		}
+		minute, ok := aiProviderParseRecentRequestClockMinute(value)
+		if !ok {
+			return false
+		}
+		minutes[minute] = struct{}{}
+		hasClockTime = true
+	}
+	if !hasClockTime {
+		return false
+	}
+	orderedMinutes := aiProviderOrderedClockMinutes(minutes)
+	minuteRank := make(map[int]int, len(orderedMinutes))
+	for rank, minute := range orderedMinutes {
+		minuteRank[minute] = rank
+	}
+	sort.SliceStable(items, func(leftIndex, rightIndex int) bool {
+		leftTime := aiProviderRecentRequestTime(items[leftIndex])
+		rightTime := aiProviderRecentRequestTime(items[rightIndex])
+		if leftTime == "" || rightTime == "" {
+			return leftTime != "" && rightTime == ""
+		}
+		leftMinute, leftOK := aiProviderParseRecentRequestClockMinute(leftTime)
+		rightMinute, rightOK := aiProviderParseRecentRequestClockMinute(rightTime)
+		if !leftOK || !rightOK || leftMinute == rightMinute {
+			return false
+		}
+		return minuteRank[leftMinute] < minuteRank[rightMinute]
+	})
+	return true
+}
+
+func aiProviderOrderedClockMinutes(minutes map[int]struct{}) []int {
+	ordered := make([]int, 0, len(minutes))
+	for minute := range minutes {
+		ordered = append(ordered, minute)
+	}
+	sort.Ints(ordered)
+	if len(ordered) <= 1 {
+		return ordered
+	}
+	largestGapIndex := len(ordered) - 1
+	largestGap := -1
+	for index, current := range ordered {
+		next := ordered[(index+1)%len(ordered)]
+		if index == len(ordered)-1 {
+			next += 24 * 60
+		}
+		gap := next - current
+		if gap > largestGap {
+			largestGap = gap
+			largestGapIndex = index
+		}
+	}
+	if largestGap <= aiProviderClockBucketMinutes {
+		return ordered
+	}
+	result := append([]int{}, ordered[largestGapIndex+1:]...)
+	result = append(result, ordered[:largestGapIndex+1]...)
+	return result
+}
+
 func aiProviderRecentRequestTime(item aiProviderRecentRequest) string {
 	if item.Time == nil {
 		return ""
@@ -1433,6 +1512,22 @@ func aiProviderParseRecentRequestTime(value string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return parsed, true
+}
+
+func aiProviderParseRecentRequestClockMinute(value string) (int, bool) {
+	matches := aiProviderRecentRequestClockPattern.FindStringSubmatch(strings.TrimSpace(value))
+	if len(matches) != 5 {
+		return 0, false
+	}
+	hour, err := strconv.Atoi(matches[2])
+	if err != nil {
+		return 0, false
+	}
+	minute, err := strconv.Atoi(matches[3])
+	if err != nil {
+		return 0, false
+	}
+	return hour*60 + minute, true
 }
 
 func trimAIProviderRecentRequests(items []aiProviderRecentRequest) []aiProviderRecentRequest {

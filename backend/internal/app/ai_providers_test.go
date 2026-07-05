@@ -539,6 +539,65 @@ func TestAIProvidersSnapshotNormalizesSingleUsagePaddedRecentRequestsBeforeTrimm
 	}
 }
 
+func TestAIProvidersSnapshotTrimsClockBucketsAcrossMidnight(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key": "gemini-secret-key",
+		},
+	}
+	recentRequests := make([]map[string]any, 0, 25)
+	for index := 0; index < 25; index++ {
+		start := (20*60 + 40 + index*10) % (24 * 60)
+		end := (start + 10) % (24 * 60)
+		recentRequests = append(recentRequests, map[string]any{
+			"time":    fmt.Sprintf("%02d:%02d-%02d:%02d", start/60, start%60, end/60, end%60),
+			"success": 1,
+			"failed":  0,
+		})
+	}
+	fake.usage = []map[string]any{
+		{
+			"provider":        "gemini",
+			"api_key":         "gemini-secret-key",
+			"recent_requests": recentRequests,
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	responseBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	response := aiProvidersTestResponse{}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode ai providers response: %v", err)
+	}
+	if len(response.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(response.Providers))
+	}
+	provider := response.Providers[0]
+	if !provider.RecentStatusAvailable || provider.RecentStatus != "healthy" {
+		t.Fatalf("recent status = %q available %v, want healthy available", provider.RecentStatus, provider.RecentStatusAvailable)
+	}
+	if provider.RecentSuccess != 20 || provider.RecentFailure != 0 {
+		t.Fatalf("provider usage = %d/%d, want newest clock bucket counts 20/0", provider.RecentSuccess, provider.RecentFailure)
+	}
+	if len(provider.RecentRequests) != 20 {
+		t.Fatalf("recent requests length = %d, want newest 20 clock buckets: %#v", len(provider.RecentRequests), provider.RecentRequests)
+	}
+	for index, bucket := range provider.RecentRequests {
+		start := (21*60 + 30 + index*10) % (24 * 60)
+		end := (start + 10) % (24 * 60)
+		expectedTime := fmt.Sprintf("%02d:%02d-%02d:%02d", start/60, start%60, end/60, end%60)
+		if bucket.Time != expectedTime {
+			t.Fatalf("recent request %d time = %q, want %q in clock-sorted newest window: %#v", index, bucket.Time, expectedTime, provider.RecentRequests)
+		}
+		if bucket.Success != 1 || bucket.Failed != 0 {
+			t.Fatalf("recent request %d = %#v, want clock success bucket", index, bucket)
+		}
+	}
+}
+
 func TestAIProvidersSnapshotKeepsTimedBucketsWhenMergingUntimedZeroBuckets(t *testing.T) {
 	fake, server := newFakeAIProviderManagement(t)
 	defer server.Close()
