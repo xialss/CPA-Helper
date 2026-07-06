@@ -30,7 +30,7 @@ import {
   Menu,
   Monitor,
   Moon,
-  PlugZap,
+  Network,
   Settings,
   Shield,
   Sun,
@@ -47,7 +47,7 @@ import { logoUrl } from '@/shared/utils/assets'
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
-const repositoryUrl = 'https://github.com/walkingddd/CPA-Helper'
+const repositoryUrl = 'https://github.com/xialss/CPA-Helper'
 const mobileQuery = window.matchMedia('(max-width: 860px)')
 const isMobile = ref(mobileQuery.matches)
 const drawerOpen = ref(false)
@@ -123,7 +123,7 @@ const adminMenuItems = computed<MenuOption[]>(() => [
   { label: t('请求明细', 'Request Records'), key: '/admin/records', icon: renderIcon(List) },
   { label: t('用户管理', 'Users'), key: '/admin/users', icon: renderIcon(Users) },
   { label: t('模型价格', 'Model Prices'), key: '/admin/pricing', icon: renderIcon(DollarSign) },
-  { label: t('AI 提供商', 'AI Providers'), key: '/admin/ai-providers', icon: renderIcon(PlugZap) },
+  { label: t('AI 提供商', 'AI Providers'), key: '/admin/ai-providers', icon: renderIcon(Network) },
   { label: t('系统设置', 'System Settings'), key: '/admin/settings', icon: renderIcon(Settings) },
 ])
 

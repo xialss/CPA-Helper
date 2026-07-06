@@ -112,6 +112,12 @@ interface ProviderStatusBucket {
   aggregate?: boolean
 }
 
+interface ProviderStatusWindow {
+  available: boolean
+  success: number
+  failed: number
+}
+
 interface ProviderDraft {
   brand: AIProviderBrand
   brand_label: string
@@ -153,6 +159,7 @@ const providerBrands: BrandConfig[] = [
 ]
 
 const providerStatusBucketCount = 20
+const providerStatusCurrentWindowBucketCount = 3
 const providerStatusBucketIntervalMs = 10 * 60 * 1000
 const providerStatusTimestampPattern = /^\d{4}-\d{2}-\d{2}[T\s]/
 const providerStatusTooltipThemeOverrides = {
@@ -897,23 +904,7 @@ function providerStatusTextUnavailable(provider: AIProviderItem): boolean {
   return !providerStatusAvailable(provider)
 }
 
-function providerStatusText(provider: AIProviderItem): string {
-  if (!providerStatusAvailable(provider)) {
-    return t('状态不可用', 'Status unavailable')
-  }
-  if (providerRecentRequestTotal(provider) === 0) {
-    return t('无近期请求', 'No recent requests')
-  }
-  if (provider.recent_status === 'healthy') {
-    return t('近期成功', 'Recently healthy')
-  }
-  if (provider.recent_status === 'failing') {
-    return t('近期失败', 'Recent failures')
-  }
-  return t('未知', 'Unknown')
-}
-
-function providerSuccessRate(provider: AIProviderItem): string {
+function providerSuccessRateValue(provider: AIProviderItem): string {
   const total = providerRecentRequestTotal(provider)
   if (total <= 0) {
     return '--'
@@ -921,12 +912,60 @@ function providerSuccessRate(provider: AIProviderItem): string {
   return `${Math.round((provider.recent_success / total) * 100)}%`
 }
 
+function providerCurrentWindowStatus(provider: AIProviderItem): ProviderStatusWindow {
+  if (!providerStatusAvailable(provider)) {
+    return { available: false, success: 0, failed: 0 }
+  }
+  const buckets = providerStatusBuckets(provider)
+  if (buckets.length === 0 || buckets.some((bucket) => bucket.aggregate)) {
+    return { available: false, success: 0, failed: 0 }
+  }
+  return buckets.slice(-providerStatusCurrentWindowBucketCount).reduce<ProviderStatusWindow>(
+    (acc, bucket) => ({
+      available: true,
+      success: acc.success + Math.max(0, bucket.success),
+      failed: acc.failed + Math.max(0, bucket.failed),
+    }),
+    { available: true, success: 0, failed: 0 },
+  )
+}
+
+function providerCurrentWindowSuccessRate(status: ProviderStatusWindow): string {
+  if (!status.available) {
+    return '--'
+  }
+  const total = status.success + status.failed
+  if (total <= 0) {
+    return '--'
+  }
+  return `${Math.round((status.success / total) * 100)}%`
+}
+
+function providerStatusText(provider: AIProviderItem): string {
+  if (!providerStatusAvailable(provider)) {
+    return t('状态不可用', 'Status unavailable')
+  }
+  const status = providerCurrentWindowStatus(provider)
+  if (!status.available) {
+    return t('近30分钟内无分段数据', 'No 30-minute bucket data')
+  }
+  const rate = providerCurrentWindowSuccessRate(status)
+  if (status.success + status.failed === 0) {
+    return t('近30分钟内无请求', 'Last 30 min no requests')
+  }
+  if (providerStatusBucketTone(status.success, status.failed) === 'success') {
+    return t(`近30分钟内成功 · ${rate}`, `Last 30 min healthy · ${rate}`)
+  }
+  return t(`近30分钟内失败 · ${rate}`, `Last 30 min failures · ${rate}`)
+}
+
+function providerSuccessRate(provider: AIProviderItem): string {
+  return providerSuccessRateValue(provider)
+}
+
 function providerStatusRateTone(provider: AIProviderItem): ProviderStatusBucket['tone'] {
   if (!providerStatusAvailable(provider)) {
     return 'unavailable'
-  }
-  if (providerRecentRequestTotal(provider) > 0) {
-    return providerStatusBucketTone(provider.recent_success, provider.recent_failure)
   }
   return providerStatusBucketTone(provider.recent_success, provider.recent_failure)
 }
@@ -1429,7 +1468,7 @@ onMounted(refresh)
     </section>
 
     <NDrawer v-model:show="drawerOpen" placement="right" width="min(920px, 100vw)" :mask-closable="false">
-      <NDrawerContent :title="drawerTitle">
+      <NDrawerContent :title="drawerTitle" body-content-style="padding: 0; height: 100%;">
         <div class="provider-drawer">
           <NAlert v-if="editorMode === 'edit'" type="info" :bordered="false">
             {{ t('API key 输入框保持空白时会保留远端原值；页面不会回填完整密钥。', 'Leave API key fields blank to keep the remote value. Full keys are never filled back into the form.') }}
@@ -1923,11 +1962,19 @@ onMounted(refresh)
   color: var(--cpa-danger);
 }
 
-.provider-drawer,
 .provider-form,
 .field-section {
   display: grid;
   gap: 14px;
+}
+
+.provider-drawer {
+  display: flex;
+  min-height: 100%;
+  box-sizing: border-box;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px 20px 0;
 }
 
 .form-grid {
@@ -2059,7 +2106,8 @@ onMounted(refresh)
   position: sticky;
   bottom: 0;
   z-index: 1;
-  padding-top: 12px;
+  margin: auto -20px 0;
+  padding: 12px 20px;
   border-top: 1px solid var(--cpa-border);
   background: var(--cpa-surface);
 }

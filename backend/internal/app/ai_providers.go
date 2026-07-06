@@ -22,6 +22,8 @@ const (
 	aiProviderAPICallToken         = "$TOKEN$"
 	aiProviderDisableAllModelsRule = "*"
 	aiProviderClockBucketMinutes   = 10
+	aiProviderHealthyRateNumerator = 9
+	aiProviderHealthyRateDenom     = 10
 )
 
 var aiProviderRecentRequestClockPattern = regexp.MustCompile(`(^|[^0-9])([01]?[0-9]|2[0-3]):([0-5][0-9])([^0-9]|$)`)
@@ -1303,14 +1305,21 @@ func applyAIProviderUsage(providers []aiProviderItem, usage []aiProviderUsage, u
 			providers[index].RecentStatus = "unavailable"
 			continue
 		}
-		switch {
-		case providers[index].RecentFailure > 0:
-			providers[index].RecentStatus = "failing"
-		case providers[index].RecentSuccess > 0:
-			providers[index].RecentStatus = "healthy"
-		default:
-			providers[index].RecentStatus = "unknown"
-		}
+		providers[index].RecentStatus = aiProviderRecentStatus(providers[index].RecentSuccess, providers[index].RecentFailure)
+	}
+}
+
+func aiProviderRecentStatus(successCount int, failureCount int) string {
+	totalCount := successCount + failureCount
+	switch {
+	case totalCount <= 0:
+		return "unknown"
+	case successCount > 0 && successCount*aiProviderHealthyRateDenom >= totalCount*aiProviderHealthyRateNumerator:
+		return "healthy"
+	case failureCount > 0:
+		return "failing"
+	default:
+		return "healthy"
 	}
 }
 

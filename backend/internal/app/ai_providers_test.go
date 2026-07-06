@@ -373,6 +373,44 @@ func TestAIProvidersSnapshotMapsRecentRequestBuckets(t *testing.T) {
 	}
 }
 
+func TestAIProvidersSnapshotKeepsHighSuccessRateRecentUsageHealthy(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key":  "gemini-secret-key",
+			"base-url": "https://gemini.example",
+		},
+	}
+	fake.usage = []map[string]any{
+		{
+			"provider": "gemini",
+			"api_key":  "gemini-secret-key",
+			"recent_requests": []map[string]any{
+				{"time": "2026-07-05T10:00:00+08:00", "success": 1974, "failed": 3},
+			},
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	responseBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	response := aiProvidersTestResponse{}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode ai providers response: %v", err)
+	}
+	if len(response.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(response.Providers))
+	}
+	provider := response.Providers[0]
+	if !provider.RecentStatusAvailable || provider.RecentStatus != "healthy" {
+		t.Fatalf("recent status = %q available %v, want healthy available", provider.RecentStatus, provider.RecentStatusAvailable)
+	}
+	if provider.RecentSuccess != 1974 || provider.RecentFailure != 3 {
+		t.Fatalf("provider usage = %d/%d, want 1974/3", provider.RecentSuccess, provider.RecentFailure)
+	}
+}
+
 func TestAIProvidersSnapshotDerivesCountsFromRecentRequestBuckets(t *testing.T) {
 	fake, server := newFakeAIProviderManagement(t)
 	defer server.Close()
