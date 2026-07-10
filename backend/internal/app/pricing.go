@@ -17,6 +17,11 @@ import (
 const defaultLiteLLMPricingURL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 const modelBillingUnitToken = "token"
 const modelBillingUnitRequest = "request"
+const usageCostKindInput = "input"
+const usageCostKindCacheRead = "cache_read"
+const usageCostKindCacheCreation = "cache_creation"
+const usageCostKindOutput = "output"
+const usageCostKindRequest = "request"
 
 type ModelPrice struct {
 	ID                         int        `json:"id"`
@@ -34,6 +39,46 @@ type ModelPrice struct {
 	LastSyncedAt               *time.Time `json:"last_synced_at"`
 	UpdatedAt                  time.Time  `json:"updated_at"`
 }
+
+type usageTokenBreakdown struct {
+	NormalInputTokens   int
+	CacheReadTokens     int
+	CacheCreationTokens int
+	OutputTokens        int
+}
+
+type usageCostBreakdown struct {
+	BillingUnit         string                   `json:"billing_unit"`
+	NormalInputTokens   int                      `json:"normal_input_tokens"`
+	CacheReadTokens     int                      `json:"cache_read_tokens"`
+	CacheCreationTokens int                      `json:"cache_creation_tokens"`
+	OutputTokens        int                      `json:"output_tokens"`
+	Items               []usageCostBreakdownItem `json:"items"`
+	TotalUSD            float64                  `json:"total_usd"`
+	Unpriced            bool                     `json:"unpriced"`
+}
+
+type usageCostBreakdownItem interface {
+	isUsageCostBreakdownItem()
+}
+
+type usageTokenCostBreakdownItem struct {
+	Kind          string  `json:"kind"`
+	Tokens        int     `json:"tokens"`
+	USDPerMillion float64 `json:"usd_per_million"`
+	SubtotalUSD   float64 `json:"subtotal_usd"`
+}
+
+func (usageTokenCostBreakdownItem) isUsageCostBreakdownItem() {}
+
+type usageRequestCostBreakdownItem struct {
+	Kind          string  `json:"kind"`
+	Requests      int     `json:"requests"`
+	USDPerRequest float64 `json:"usd_per_request"`
+	SubtotalUSD   float64 `json:"subtotal_usd"`
+}
+
+func (usageRequestCostBreakdownItem) isUsageCostBreakdownItem() {}
 
 type modelPricePayload struct {
 	Provider                   string   `json:"provider"`
@@ -784,36 +829,110 @@ func findMatchingPrice(prices map[[2]string]ModelPrice, provider, model *string)
 	return nil
 }
 
-func recordCost(record UsageRecord, prices map[[2]string]ModelPrice) (float64, bool) {
+func calculateRecordCostBreakdown(record UsageRecord, prices map[[2]string]ModelPrice) usageCostBreakdown {
+	return calculateRecordCost(record, prices, true)
+}
+
+func calculateRecordCost(record UsageRecord, prices map[[2]string]ModelPrice, collectItems bool) usageCostBreakdown {
+	tokens := normalizedUsageTokenBreakdown(record)
+	breakdown := usageCostBreakdown{
+		BillingUnit:         billingUnitForModelPtr(record.Model),
+		NormalInputTokens:   tokens.NormalInputTokens,
+		CacheReadTokens:     tokens.CacheReadTokens,
+		CacheCreationTokens: tokens.CacheCreationTokens,
+		OutputTokens:        tokens.OutputTokens,
+	}
+	if collectItems {
+		itemCapacity := 4
+		if breakdown.BillingUnit == modelBillingUnitRequest {
+			itemCapacity = 1
+		}
+		breakdown.Items = make([]usageCostBreakdownItem, 0, itemCapacity)
+	}
 	price := findMatchingPrice(prices, record.Provider, record.Model)
-	if billingUnitForModelPtr(record.Model) == modelBillingUnitRequest {
+	if breakdown.BillingUnit == modelBillingUnitRequest {
 		if record.Failed {
-			return 0, false
+			return breakdown
 		}
 		if price == nil || price.RequestUSD == nil {
-			return 0, true
+			breakdown.Unpriced = true
+			return breakdown
 		}
-		return mathRound(*price.RequestUSD, 8), false
+		breakdown.TotalUSD = mathRound(*price.RequestUSD, 8)
+		if collectItems {
+			breakdown.Items = append(breakdown.Items, usageRequestCostBreakdownItem{
+				Kind:          usageCostKindRequest,
+				Requests:      1,
+				USDPerRequest: *price.RequestUSD,
+				SubtotalUSD:   breakdown.TotalUSD,
+			})
+		}
+		return breakdown
 	}
 	if price == nil {
-		return 0, usageAggregateTotalTokens(record) > 0
+		breakdown.Unpriced = usageAggregateTotalTokens(record) > 0
+		return breakdown
 	}
+	cacheCreationHasSeparatePrice := isClaudeProvider(record.Provider) || price.CacheCreationUSDPerMillion > 0
+	billableInputTokens := tokens.NormalInputTokens
+	if !cacheCreationHasSeparatePrice {
+		billableInputTokens += tokens.CacheCreationTokens
+	}
+	appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindInput, billableInputTokens, price.InputUSDPerMillion)
+	appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindCacheRead, tokens.CacheReadTokens, price.CacheReadUSDPerMillion)
+	if cacheCreationHasSeparatePrice {
+		appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindCacheCreation, tokens.CacheCreationTokens, price.CacheCreationUSDPerMillion)
+	}
+	appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindOutput, tokens.OutputTokens, price.OutputUSDPerMillion)
+	return breakdown
+}
+
+func normalizedUsageTokenBreakdown(record UsageRecord) usageTokenBreakdown {
 	inputTokens := nonNegativeTokens(record.InputTokens)
 	outputTokens := nonNegativeTokens(record.OutputTokens)
-	amount := 0.0
 	if isClaudeProvider(record.Provider) {
-		amount = millionTokenCost(inputTokens, price.InputUSDPerMillion) +
-			millionTokenCost(nonNegativeTokens(record.CacheReadTokens), price.CacheReadUSDPerMillion) +
-			millionTokenCost(nonNegativeTokens(record.CacheCreationTokens), price.CacheCreationUSDPerMillion) +
-			millionTokenCost(outputTokens, price.OutputUSDPerMillion)
-	} else {
-		cacheRead := boundedTokens(record.CachedTokens, inputTokens)
-		normalInput := inputTokens - cacheRead
-		amount = millionTokenCost(normalInput, price.InputUSDPerMillion) +
-			millionTokenCost(cacheRead, price.CacheReadUSDPerMillion) +
-			millionTokenCost(outputTokens, price.OutputUSDPerMillion)
+		return usageTokenBreakdown{
+			NormalInputTokens:   inputTokens,
+			CacheReadTokens:     nonNegativeTokens(record.CacheReadTokens),
+			CacheCreationTokens: nonNegativeTokens(record.CacheCreationTokens),
+			OutputTokens:        outputTokens,
+		}
 	}
-	return mathRound(amount, 8), false
+
+	cacheReadTokens := nonNegativeTokens(record.CacheReadTokens)
+	if cacheReadTokens == 0 {
+		cacheReadTokens = nonNegativeTokens(record.CachedTokens)
+	}
+	cacheReadTokens = boundedTokens(cacheReadTokens, inputTokens)
+	remainingInputTokens := inputTokens - cacheReadTokens
+	cacheCreationTokens := boundedTokens(record.CacheCreationTokens, remainingInputTokens)
+	return usageTokenBreakdown{
+		NormalInputTokens:   remainingInputTokens - cacheCreationTokens,
+		CacheReadTokens:     cacheReadTokens,
+		CacheCreationTokens: cacheCreationTokens,
+		OutputTokens:        outputTokens,
+	}
+}
+
+func appendUsageTokenCostItem(breakdown *usageCostBreakdown, collectItem bool, kind string, tokens int, usdPerMillion float64) {
+	if breakdown == nil || tokens <= 0 {
+		return
+	}
+	subtotal := mathRound(millionTokenCost(tokens, usdPerMillion), 8)
+	if collectItem {
+		breakdown.Items = append(breakdown.Items, usageTokenCostBreakdownItem{
+			Kind:          kind,
+			Tokens:        tokens,
+			USDPerMillion: usdPerMillion,
+			SubtotalUSD:   subtotal,
+		})
+	}
+	breakdown.TotalUSD = mathRound(breakdown.TotalUSD+subtotal, 8)
+}
+
+func recordCost(record UsageRecord, prices map[[2]string]ModelPrice) (float64, bool) {
+	result := calculateRecordCost(record, prices, false)
+	return result.TotalUSD, result.Unpriced
 }
 
 func liteLLMHTTPClient(timeout time.Duration, proxyCfg LiteLLMProxyConfig) (*http.Client, error) {

@@ -436,6 +436,35 @@ export interface UsageOverviewResponse {
   options: UsageOptionsResponse
 }
 
+export interface UsageTokenCostBreakdownItem {
+  kind: 'input' | 'cache_read' | 'cache_creation' | 'output'
+  tokens: number
+  usd_per_million: number
+  subtotal_usd: number
+}
+
+export interface UsageRequestCostBreakdownItem {
+  kind: 'request'
+  requests: number
+  usd_per_request: number
+  subtotal_usd: number
+}
+
+export type UsageCostBreakdownItem =
+  | UsageTokenCostBreakdownItem
+  | UsageRequestCostBreakdownItem
+
+export interface UsageCostBreakdown {
+  billing_unit: 'token' | 'request'
+  normal_input_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  output_tokens: number
+  items: UsageCostBreakdownItem[]
+  total_usd: number
+  unpriced: boolean
+}
+
 export interface UsageRecordListItem {
   id: number
   timestamp: string
@@ -462,6 +491,7 @@ export interface UsageRecordListItem {
   total_tokens: number
   estimated_cost_usd: number
   unpriced: boolean
+  cost_breakdown: UsageCostBreakdown
 }
 
 export interface UsageRecordsResponse {
