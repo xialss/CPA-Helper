@@ -806,7 +806,7 @@ func (a *App) userLookup(ctx context.Context, scope usageAccessScope) (map[strin
 }
 
 func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices map[[2]string]ModelPrice, redaction usageRedactionOptions) map[string]any {
-	amount, unpriced := recordCost(record, prices)
+	costBreakdown := calculateRecordCostBreakdown(record, prices)
 	userID := (*int)(nil)
 	userLabel := "未绑定"
 	if record.UsageUsername != nil {
@@ -848,8 +848,9 @@ func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices ma
 		"cache_creation_tokens": record.CacheCreationTokens,
 		"reasoning_tokens":      record.ReasoningTokens,
 		"total_tokens":          record.TotalTokens,
-		"estimated_cost_usd":    amount,
-		"unpriced":              unpriced,
+		"estimated_cost_usd":    costBreakdown.TotalUSD,
+		"unpriced":              costBreakdown.Unpriced,
+		"cost_breakdown":        costBreakdown,
 	}
 }
 

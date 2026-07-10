@@ -10,6 +10,7 @@ import {
   NPagination,
   NSelect,
   NTag,
+  NTooltip,
   useMessage,
   type DataTableColumns,
 } from 'naive-ui'
@@ -17,6 +18,8 @@ import {
 import { getUsageOptions, getUsageRecord, getUsageRecords } from '@/features/usage/api/usageApi'
 import type {
   RankingItem,
+  UsageCostBreakdown,
+  UsageCostBreakdownItem,
   UsageFilters,
   UsageOptionsResponse,
   UsageRecordDetail,
@@ -65,7 +68,8 @@ const RECORDS_TABLE_COLUMN_WIDTHS = {
   inputTokens: 100,
   outputTokens: 145,
   reasoningTokens: 100,
-  cachedTokens: 160,
+  cacheReadTokens: 104,
+  cacheCreationTokens: 104,
   totalTokens: 120,
   estimatedCost: 110,
   provider: 120,
@@ -83,6 +87,13 @@ const ACCOUNT_RECORDS_TABLE_SCROLL_X =
   RECORDS_TABLE_COLUMN_WIDTHS.source
 const RECORDS_TABLE_FALLBACK_MAX_HEIGHT = 'max(320px, calc(100dvh - 318px))'
 const desktopRecordsLayoutQuery = window.matchMedia('(min-width: 861px)')
+const usageCostTooltipThemeOverrides = {
+  color: 'var(--cpa-surface-raised)',
+  textColor: 'var(--cpa-text)',
+  boxShadow: 'var(--cpa-shadow), 0 0 0 1px var(--cpa-border)',
+  padding: '10px 12px',
+  borderRadius: '8px',
+}
 
 const route = useRoute()
 const router = useRouter()
@@ -96,6 +107,8 @@ const lastRefreshedAt = ref<Date | null>(null)
 const drawerOpen = ref(false)
 const selectedRecord = ref<UsageRecordDetail | null>(null)
 const records = ref<UsageRecordListItem[]>([])
+const hoveredCostRecordId = ref<number | null>(null)
+const focusedCostRecordId = ref<number | null>(null)
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(50)
@@ -677,19 +690,152 @@ function renderOutputWithTps(row: Pick<UsageRecordListItem, 'latency_ms' | 'outp
   )
 }
 
-function isClaudeProvider(provider: string | null | undefined): boolean {
-  const normalized = provider?.trim().toLowerCase()
-  return normalized === 'claude' || normalized === 'anthropic'
+function formatUsdWithPrecision(value: number, maximumFractionDigits: number): string {
+  const normalized = Number.isFinite(value) ? value : 0
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    maximumFractionDigits,
+  }).format(normalized)
 }
 
-function formatCacheTokens(row: UsageRecordListItem): string {
-  if (isClaudeProvider(row.provider)) {
-    return t(
-      `(读 ${formatInteger(row.cache_read_tokens)} / 写 ${formatInteger(row.cache_creation_tokens)})`,
-      `(read ${formatInteger(row.cache_read_tokens)} / write ${formatInteger(row.cache_creation_tokens)})`,
+function formatPreciseUsd(value: number): string {
+  return formatUsdWithPrecision(value, 8)
+}
+
+function formatTokenUnitPrice(value: number): string {
+  return formatUsdWithPrecision(value, 12)
+}
+
+function costBreakdownItemLabel(
+  item: UsageCostBreakdownItem,
+  breakdown: UsageCostBreakdown,
+): string {
+  switch (item.kind) {
+    case 'input': {
+      const includesCacheCreation =
+        breakdown.cache_creation_tokens > 0 &&
+        item.tokens === breakdown.normal_input_tokens + breakdown.cache_creation_tokens &&
+        !breakdown.items.some((candidate) => candidate.kind === 'cache_creation')
+      if (includesCacheCreation) {
+        return t('输入（含缓存写）', 'Input (incl. cache write)')
+      }
+      return t('普通输入', 'Input')
+    }
+    case 'cache_read':
+      return t('缓存读', 'Cache read')
+    case 'cache_creation':
+      return t('缓存写', 'Cache write')
+    case 'output':
+      return t('输出', 'Output')
+    case 'request':
+      return t('单次调用', 'Request')
+  }
+}
+
+function renderCostBreakdownItem(item: UsageCostBreakdownItem, breakdown: UsageCostBreakdown) {
+  const formula =
+    item.kind === 'request'
+      ? `${formatInteger(item.requests)} × ${formatPreciseUsd(item.usd_per_request)}`
+      : `${formatInteger(item.tokens)} × ${formatTokenUnitPrice(item.usd_per_million)} / MTok`
+  return h('div', { key: item.kind, class: 'usage-cost-breakdown-row' }, [
+    h('span', { class: 'usage-cost-breakdown-label' }, costBreakdownItemLabel(item, breakdown)),
+    h('span', { class: 'usage-cost-breakdown-formula' }, formula),
+    h('strong', { class: 'usage-cost-breakdown-subtotal' }, `= ${formatPreciseUsd(item.subtotal_usd)}`),
+  ])
+}
+
+function renderCostBreakdown(row: UsageRecordListItem) {
+  const breakdown = row.cost_breakdown
+  const attributes = {
+    id: costBreakdownTooltipId(row),
+    role: 'tooltip',
+  }
+  if (breakdown.unpriced) {
+    return h(
+      'div',
+      {
+        ...attributes,
+        class: 'usage-cost-breakdown usage-cost-breakdown-unpriced',
+      },
+      t('未定价', 'Unpriced'),
     )
   }
-  return formatInteger(row.cached_tokens)
+  return h('div', { ...attributes, class: 'usage-cost-breakdown' }, [
+    ...breakdown.items.map((item) => renderCostBreakdownItem(item, breakdown)),
+    h('div', { class: 'usage-cost-breakdown-total' }, [
+      h('span', t('总计', 'Total')),
+      h('strong', formatPreciseUsd(breakdown.total_usd)),
+    ]),
+  ])
+}
+
+function costBreakdownTooltipId(row: UsageRecordListItem): string {
+  return `usage-cost-breakdown-${props.scope}-${row.id}`
+}
+
+function isCostTooltipVisible(recordId: number): boolean {
+  return hoveredCostRecordId.value === recordId || focusedCostRecordId.value === recordId
+}
+
+function setHoveredCostRecord(recordId: number, hovered: boolean) {
+  if (hovered) {
+    hoveredCostRecordId.value = recordId
+  } else if (hoveredCostRecordId.value === recordId) {
+    hoveredCostRecordId.value = null
+  }
+}
+
+function setFocusedCostRecord(recordId: number, focused: boolean) {
+  if (focused) {
+    focusedCostRecordId.value = recordId
+  } else if (focusedCostRecordId.value === recordId) {
+    focusedCostRecordId.value = null
+  }
+}
+
+function costBreakdownAriaLabel(row: UsageRecordListItem): string {
+  const breakdown = row.cost_breakdown
+  if (breakdown.unpriced) {
+    return `${t('费用明细', 'Cost breakdown')}: ${t('未定价', 'Unpriced')}`
+  }
+  const items = breakdown.items.map(
+    (item) =>
+      `${costBreakdownItemLabel(item, breakdown)} ${formatPreciseUsd(item.subtotal_usd)}`,
+  )
+  return `${t('费用明细', 'Cost breakdown')}: ${items.join('; ')}; ${t('总计', 'Total')} ${formatPreciseUsd(breakdown.total_usd)}`
+}
+
+function renderCost(row: UsageRecordListItem) {
+  const formattedCost = formatUsd(row.estimated_cost_usd)
+  const tooltipId = costBreakdownTooltipId(row)
+  return h(
+    NTooltip,
+    {
+      trigger: 'manual',
+      show: isCostTooltipVisible(row.id),
+      placement: 'top',
+      themeOverrides: usageCostTooltipThemeOverrides,
+    },
+    {
+      trigger: () =>
+        h(
+          'span',
+          {
+            class: ['usage-cost-trigger', row.unpriced ? 'is-unpriced' : undefined],
+            tabindex: 0,
+            'aria-describedby': tooltipId,
+            'aria-label': costBreakdownAriaLabel(row),
+            onMouseenter: () => setHoveredCostRecord(row.id, true),
+            onMouseleave: () => setHoveredCostRecord(row.id, false),
+            onFocus: () => setFocusedCostRecord(row.id, true),
+            onBlur: () => setFocusedCostRecord(row.id, false),
+          },
+          formattedCost,
+        ),
+      default: () => renderCostBreakdown(row),
+    },
+  )
 }
 
 function recordRowKey(row: UsageRecordListItem): number {
@@ -716,10 +862,9 @@ const detailRows = computed(() => {
     { label: t('结果', 'Result'), value: record.failed ? t('失败', 'Failed') : t('成功', 'Success') },
     { label: t('首字耗时', 'TTFT'), value: formatPositiveLatency(record.ttft_ms) },
     { label: t('总耗时', 'Latency'), value: formatLatency(record.latency_ms) },
-    { label: t('输入 Token', 'Input tokens'), value: formatInteger(record.input_tokens) },
-    { label: t('缓存 Token', 'Cached tokens'), value: formatInteger(record.cached_tokens) },
-    { label: t('缓存读 Token', 'Cache read tokens'), value: formatInteger(record.cache_read_tokens) },
-    { label: t('缓存写 Token', 'Cache write tokens'), value: formatInteger(record.cache_creation_tokens) },
+    { label: t('输入 Token', 'Input tokens'), value: formatInteger(record.cost_breakdown.normal_input_tokens) },
+    { label: t('缓存读 Token', 'Cache read tokens'), value: formatInteger(record.cost_breakdown.cache_read_tokens) },
+    { label: t('缓存写 Token', 'Cache write tokens'), value: formatInteger(record.cost_breakdown.cache_creation_tokens) },
     { label: t('输出 Token', 'Output tokens'), value: formatOutputWithTps(record) },
     { label: t('思考 Token', 'Reasoning tokens'), value: formatInteger(record.reasoning_tokens) },
     { label: t('总 Token', 'Total tokens'), value: formatInteger(record.total_tokens) },
@@ -805,7 +950,7 @@ const columns = computed<DataTableColumns<UsageRecordListItem>>(() => [
     title: t('输入', 'Input'),
     key: 'input_tokens',
     width: RECORDS_TABLE_COLUMN_WIDTHS.inputTokens,
-    render: (row) => formatInteger(row.input_tokens),
+    render: (row) => formatInteger(row.cost_breakdown.normal_input_tokens),
   },
   {
     title: t('输出', 'Output'),
@@ -820,10 +965,16 @@ const columns = computed<DataTableColumns<UsageRecordListItem>>(() => [
     render: (row) => formatInteger(row.reasoning_tokens),
   },
   {
-    title: t('缓存', 'Cache'),
-    key: 'cached_tokens',
-    width: RECORDS_TABLE_COLUMN_WIDTHS.cachedTokens,
-    render: formatCacheTokens,
+    title: t('缓存读', 'Cache read'),
+    key: 'cache_read_tokens',
+    width: RECORDS_TABLE_COLUMN_WIDTHS.cacheReadTokens,
+    render: (row) => formatInteger(row.cost_breakdown.cache_read_tokens),
+  },
+  {
+    title: t('缓存写', 'Cache write'),
+    key: 'cache_creation_tokens',
+    width: RECORDS_TABLE_COLUMN_WIDTHS.cacheCreationTokens,
+    render: (row) => formatInteger(row.cost_breakdown.cache_creation_tokens),
   },
   {
     title: t('总 Token', 'Total tokens'),
@@ -835,7 +986,7 @@ const columns = computed<DataTableColumns<UsageRecordListItem>>(() => [
     title: t('费用', 'Cost'),
     key: 'estimated_cost_usd',
     width: RECORDS_TABLE_COLUMN_WIDTHS.estimatedCost,
-    render: (row) => formatUsd(row.estimated_cost_usd),
+    render: renderCost,
   },
   {
     title: t('服务商', 'Provider'),
@@ -1078,6 +1229,65 @@ onBeforeUnmount(() => {
   border-color: var(--cpa-border-strong);
   background: var(--cpa-surface-muted);
   color: var(--cpa-text-muted);
+}
+
+:global(.usage-cost-trigger) {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border-bottom: 1px dashed currentColor;
+  cursor: help;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+:global(.usage-cost-trigger.is-unpriced) {
+  color: var(--cpa-warning);
+}
+
+:global(.usage-cost-breakdown) {
+  display: grid;
+  width: min(360px, calc(100vw - 32px));
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+:global(.usage-cost-breakdown-row) {
+  display: grid;
+  grid-template-columns: minmax(68px, auto) minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: baseline;
+}
+
+:global(.usage-cost-breakdown-label) {
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+:global(.usage-cost-breakdown-formula) {
+  min-width: 0;
+  opacity: 0.78;
+  overflow-wrap: anywhere;
+}
+
+:global(.usage-cost-breakdown-subtotal) {
+  white-space: nowrap;
+}
+
+:global(.usage-cost-breakdown-total) {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, currentColor 24%, transparent);
+}
+
+:global(.usage-cost-breakdown-unpriced) {
+  width: auto;
+  min-width: 96px;
+  color: inherit;
+  font-weight: 700;
+  text-align: center;
 }
 
 .output-with-tps {

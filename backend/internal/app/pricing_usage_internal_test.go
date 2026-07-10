@@ -44,18 +44,178 @@ func TestRecordCostUsesClaudeCacheReadAndCreationTokens(t *testing.T) {
 	if amount != want {
 		t.Fatalf("cost = %v, want %v", amount, want)
 	}
+	breakdown := calculateRecordCostBreakdown(record, prices)
+	if breakdown.NormalInputTokens != 100 || breakdown.CacheReadTokens != 20 || breakdown.CacheCreationTokens != 30 {
+		t.Fatalf("token breakdown = input %d read %d creation %d, want 100/20/30", breakdown.NormalInputTokens, breakdown.CacheReadTokens, breakdown.CacheCreationTokens)
+	}
+	if len(breakdown.Items) != 4 {
+		t.Fatalf("cost breakdown item count = %d, want 4", len(breakdown.Items))
+	}
+}
+
+func TestRecordCostBreakdownIncludesOpenAICacheWritesInInputWithoutSeparatePrice(t *testing.T) {
+	provider := "codex"
+	model := "gpt-5.5"
+	record := UsageRecord{
+		Provider:            &provider,
+		Model:               &model,
+		InputTokens:         100,
+		OutputTokens:        20,
+		CachedTokens:        30,
+		CacheCreationTokens: 40,
+		TotalTokens:         120,
+	}
+	prices := map[[2]string]ModelPrice{
+		priceKey("openai", model): {
+			Provider:               "openai",
+			Model:                  model,
+			InputUSDPerMillion:     10,
+			OutputUSDPerMillion:    20,
+			CacheReadUSDPerMillion: 1,
+		},
+	}
+
+	breakdown := calculateRecordCostBreakdown(record, prices)
+	if breakdown.Unpriced {
+		t.Fatal("record should be priced")
+	}
+	if breakdown.NormalInputTokens != 30 || breakdown.CacheReadTokens != 30 || breakdown.CacheCreationTokens != 40 || breakdown.OutputTokens != 20 {
+		t.Fatalf("token breakdown = input %d read %d creation %d output %d, want 30/30/40/20", breakdown.NormalInputTokens, breakdown.CacheReadTokens, breakdown.CacheCreationTokens, breakdown.OutputTokens)
+	}
+	if len(breakdown.Items) != 3 {
+		t.Fatalf("cost breakdown item count = %d, want 3", len(breakdown.Items))
+	}
+	wantKinds := []string{usageCostKindInput, usageCostKindCacheRead, usageCostKindOutput}
+	wantTokens := []int{70, 30, 20}
+	wantSubtotals := []float64{0.0007, 0.00003, 0.0004}
+	for index, item := range breakdown.Items {
+		tokenItem, ok := item.(usageTokenCostBreakdownItem)
+		if !ok {
+			t.Fatalf("cost breakdown item %d type = %T, want usageTokenCostBreakdownItem", index, item)
+		}
+		if tokenItem.Kind != wantKinds[index] || tokenItem.Tokens != wantTokens[index] || tokenItem.SubtotalUSD != wantSubtotals[index] {
+			t.Fatalf("cost breakdown item %d = kind %q tokens %d subtotal %v, want %q/%d/%v", index, tokenItem.Kind, tokenItem.Tokens, tokenItem.SubtotalUSD, wantKinds[index], wantTokens[index], wantSubtotals[index])
+		}
+	}
+	if breakdown.TotalUSD != 0.00113 {
+		t.Fatalf("total cost = %v, want 0.00113", breakdown.TotalUSD)
+	}
+	amount, unpriced := recordCost(record, prices)
+	if amount != breakdown.TotalUSD || unpriced {
+		t.Fatalf("recordCost = %v/%v, want %v/false", amount, unpriced, breakdown.TotalUSD)
+	}
+}
+
+func TestRecordCostBreakdownPricesOpenAICacheWritesSeparatelyWhenPriceExists(t *testing.T) {
+	provider := "openai"
+	model := "gpt-5.6"
+	record := UsageRecord{
+		Provider:            &provider,
+		Model:               &model,
+		InputTokens:         100,
+		OutputTokens:        20,
+		CachedTokens:        30,
+		CacheCreationTokens: 40,
+		TotalTokens:         120,
+	}
+	prices := map[[2]string]ModelPrice{
+		priceKey(provider, model): {
+			Provider:                   provider,
+			Model:                      model,
+			InputUSDPerMillion:         10,
+			OutputUSDPerMillion:        20,
+			CacheReadUSDPerMillion:     1,
+			CacheCreationUSDPerMillion: 12,
+		},
+	}
+
+	breakdown := calculateRecordCostBreakdown(record, prices)
+	if breakdown.Unpriced {
+		t.Fatal("record should be priced")
+	}
+	if len(breakdown.Items) != 4 {
+		t.Fatalf("cost breakdown item count = %d, want 4", len(breakdown.Items))
+	}
+	wantKinds := []string{usageCostKindInput, usageCostKindCacheRead, usageCostKindCacheCreation, usageCostKindOutput}
+	wantTokens := []int{30, 30, 40, 20}
+	wantSubtotals := []float64{0.0003, 0.00003, 0.00048, 0.0004}
+	for index, item := range breakdown.Items {
+		tokenItem, ok := item.(usageTokenCostBreakdownItem)
+		if !ok {
+			t.Fatalf("cost breakdown item %d type = %T, want usageTokenCostBreakdownItem", index, item)
+		}
+		if tokenItem.Kind != wantKinds[index] || tokenItem.Tokens != wantTokens[index] || tokenItem.SubtotalUSD != wantSubtotals[index] {
+			t.Fatalf("cost breakdown item %d = kind %q tokens %d subtotal %v, want %q/%d/%v", index, tokenItem.Kind, tokenItem.Tokens, tokenItem.SubtotalUSD, wantKinds[index], wantTokens[index], wantSubtotals[index])
+		}
+	}
+	if breakdown.TotalUSD != 0.00121 {
+		t.Fatalf("total cost = %v, want 0.00121", breakdown.TotalUSD)
+	}
+}
+
+func TestRecordCostTotalOnlySkipsBreakdownItems(t *testing.T) {
+	provider := "openai"
+	model := "gpt-5.6"
+	record := UsageRecord{
+		Provider:            &provider,
+		Model:               &model,
+		InputTokens:         100,
+		OutputTokens:        20,
+		CachedTokens:        30,
+		CacheCreationTokens: 40,
+		TotalTokens:         120,
+	}
+	prices := map[[2]string]ModelPrice{
+		priceKey(provider, model): {
+			Provider:                   provider,
+			Model:                      model,
+			InputUSDPerMillion:         10,
+			OutputUSDPerMillion:        20,
+			CacheReadUSDPerMillion:     1,
+			CacheCreationUSDPerMillion: 12,
+		},
+	}
+
+	totalOnly := calculateRecordCost(record, prices, false)
+	full := calculateRecordCostBreakdown(record, prices)
+	if totalOnly.Items != nil {
+		t.Fatalf("total-only cost items = %#v, want nil", totalOnly.Items)
+	}
+	if totalOnly.TotalUSD != full.TotalUSD || totalOnly.Unpriced != full.Unpriced {
+		t.Fatalf("total-only cost = %v/%v, want %v/%v", totalOnly.TotalUSD, totalOnly.Unpriced, full.TotalUSD, full.Unpriced)
+	}
+	if len(full.Items) != 4 {
+		t.Fatalf("full cost breakdown item count = %d, want 4", len(full.Items))
+	}
+}
+
+func TestRecordCostBreakdownPrefersExplicitCacheReadTokens(t *testing.T) {
+	provider := "openai"
+	model := "gpt-test"
+	breakdown := normalizedUsageTokenBreakdown(UsageRecord{
+		Provider:            &provider,
+		Model:               &model,
+		InputTokens:         100,
+		CachedTokens:        90,
+		CacheReadTokens:     20,
+		CacheCreationTokens: 30,
+	})
+	if breakdown.NormalInputTokens != 50 || breakdown.CacheReadTokens != 20 || breakdown.CacheCreationTokens != 30 {
+		t.Fatalf("token breakdown = input %d read %d creation %d, want 50/20/30", breakdown.NormalInputTokens, breakdown.CacheReadTokens, breakdown.CacheCreationTokens)
+	}
 }
 
 func TestRecordCostTruncatesGenericCachedTokens(t *testing.T) {
 	provider := "openai"
 	model := "gpt-test"
 	record := UsageRecord{
-		Provider:     &provider,
-		Model:        &model,
-		InputTokens:  100,
-		OutputTokens: 10,
-		CachedTokens: 150,
-		TotalTokens:  110,
+		Provider:            &provider,
+		Model:               &model,
+		InputTokens:         100,
+		OutputTokens:        10,
+		CachedTokens:        150,
+		CacheCreationTokens: 50,
+		TotalTokens:         110,
 	}
 	prices := map[[2]string]ModelPrice{
 		priceKey(provider, model): {
@@ -74,6 +234,10 @@ func TestRecordCostTruncatesGenericCachedTokens(t *testing.T) {
 	want := mathRound((100*1+10*20)/1_000_000.0, 8)
 	if amount != want {
 		t.Fatalf("cost = %v, want %v", amount, want)
+	}
+	breakdown := normalizedUsageTokenBreakdown(record)
+	if breakdown.NormalInputTokens != 0 || breakdown.CacheReadTokens != 100 || breakdown.CacheCreationTokens != 0 {
+		t.Fatalf("token breakdown = input %d read %d creation %d, want 0/100/0", breakdown.NormalInputTokens, breakdown.CacheReadTokens, breakdown.CacheCreationTokens)
 	}
 }
 
@@ -99,6 +263,17 @@ func TestRecordCostUsesRequestPriceForImageModels(t *testing.T) {
 	}, prices)
 	if unpriced || amount != 1.25 {
 		t.Fatalf("image cost = %v unpriced=%v, want 1.25 false", amount, unpriced)
+	}
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider: &provider,
+		Model:    &model,
+	}, prices)
+	if breakdown.BillingUnit != modelBillingUnitRequest || breakdown.TotalUSD != 1.25 || len(breakdown.Items) != 1 {
+		t.Fatalf("image breakdown = unit %q total %v items %d, want request/1.25/1", breakdown.BillingUnit, breakdown.TotalUSD, len(breakdown.Items))
+	}
+	requestItem, ok := breakdown.Items[0].(usageRequestCostBreakdownItem)
+	if !ok || requestItem.Requests != 1 || requestItem.USDPerRequest != 1.25 || requestItem.SubtotalUSD != 1.25 {
+		t.Fatalf("image request item = %#v, want one request at 1.25", breakdown.Items[0])
 	}
 
 	amount, unpriced = recordCost(UsageRecord{
@@ -130,6 +305,28 @@ func TestRecordCostTreatsImageWithoutRequestPriceAsUnpriced(t *testing.T) {
 	}, prices)
 	if amount != 0 || !unpriced {
 		t.Fatalf("image without request price cost = %v unpriced=%v, want 0 true", amount, unpriced)
+	}
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider: &provider,
+		Model:    &model,
+	}, prices)
+	if !breakdown.Unpriced || breakdown.TotalUSD != 0 || len(breakdown.Items) != 0 {
+		t.Fatalf("unpriced image breakdown = unpriced %v total %v items %d, want true/0/0", breakdown.Unpriced, breakdown.TotalUSD, len(breakdown.Items))
+	}
+}
+
+func TestRecordCostBreakdownTreatsMissingTokenPriceAsUnpriced(t *testing.T) {
+	provider := "openai"
+	model := "missing-model"
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:     &provider,
+		Model:        &model,
+		InputTokens:  10,
+		OutputTokens: 2,
+		TotalTokens:  12,
+	}, nil)
+	if !breakdown.Unpriced || breakdown.TotalUSD != 0 || len(breakdown.Items) != 0 {
+		t.Fatalf("unpriced token breakdown = unpriced %v total %v items %d, want true/0/0", breakdown.Unpriced, breakdown.TotalUSD, len(breakdown.Items))
 	}
 }
 
