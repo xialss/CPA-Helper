@@ -37,6 +37,7 @@ import type {
   LiteLLMProxySettingsPayload,
   ModelPrice,
   ModelPriceCatalogResponse,
+  ModelPriceLongContext,
   ModelPricePayload,
 } from '@/shared/types/api'
 import { formatDateTime, formatInteger, formatMultiplier } from '@/shared/utils/format'
@@ -72,7 +73,7 @@ interface PriceDisplayRow {
 }
 
 const PRICE_TABLE_FALLBACK_MAX_HEIGHT = 'max(240px, calc(100dvh - 360px))'
-const priceModalStyle: CSSProperties = { width: 'min(640px, calc(100vw - 32px))' }
+const priceModalStyle: CSSProperties = { width: 'min(720px, calc(100vw - 32px))' }
 const priorityModalStyle: CSSProperties = { width: 'min(420px, calc(100vw - 32px))' }
 const proxyModalStyle: CSSProperties = { width: 'min(460px, calc(100vw - 32px))' }
 const proxyModalContentStyle: CSSProperties = { padding: '16px 22px 4px' }
@@ -89,6 +90,7 @@ const priorityModalOpen = ref(false)
 const isProxyLoading = ref(false)
 const isProxySaving = ref(false)
 const isPrioritySaving = ref(false)
+const isPriceSaving = ref(false)
 const editingId = ref<number | null>(null)
 const priorityEditingPrice = ref<ModelPrice | null>(null)
 const priorityMultiplier = ref<number | null>(null)
@@ -97,6 +99,7 @@ const catalog = ref<ModelPriceCatalogResponse | null>(null)
 const selectedProvider = ref<string | null>(null)
 const selectedStatus = ref<PriceStatusFilter | null>(null)
 const searchQuery = ref('')
+const longContextEnabled = ref(false)
 const isDesktopPriceLayout = ref(desktopPriceLayoutQuery.matches)
 const pagination = reactive({
   page: 1,
@@ -111,6 +114,14 @@ const form = reactive<ModelPricePayload>({
   cache_read_usd_per_million: 0,
   cache_creation_usd_per_million: 0,
   request_usd: null,
+  long_context: null,
+})
+const longContextForm = reactive<ModelPriceLongContext>({
+  threshold_input_tokens: 200000,
+  input_usd_per_million: 0,
+  output_usd_per_million: 0,
+  cache_read_usd_per_million: 0,
+  cache_creation_usd_per_million: 0,
 })
 const proxyForm = reactive<LiteLLMProxySettingsPayload>({
   enabled: false,
@@ -383,6 +394,13 @@ function resetForm() {
   form.cache_read_usd_per_million = 0
   form.cache_creation_usd_per_million = 0
   form.request_usd = null
+  form.long_context = null
+  longContextEnabled.value = false
+  longContextForm.threshold_input_tokens = 200000
+  longContextForm.input_usd_per_million = 0
+  longContextForm.output_usd_per_million = 0
+  longContextForm.cache_read_usd_per_million = 0
+  longContextForm.cache_creation_usd_per_million = 0
 }
 
 async function refresh() {
@@ -407,6 +425,9 @@ function openCreate(prefill: Partial<ModelPricePayload> = {}) {
   form.cache_read_usd_per_million = prefill.cache_read_usd_per_million ?? 0
   form.cache_creation_usd_per_million = prefill.cache_creation_usd_per_million ?? 0
   form.request_usd = prefill.request_usd ?? null
+  if (prefill.long_context) {
+    setLongContextForm(prefill.long_context)
+  }
   modalOpen.value = true
 }
 
@@ -418,6 +439,7 @@ function openCreateForRow(row: PriceDisplayRow) {
 }
 
 function openEdit(row: ModelPrice) {
+  resetForm()
   editingId.value = row.id
   form.provider = row.provider
   form.model = row.model
@@ -426,12 +448,40 @@ function openEdit(row: ModelPrice) {
   form.cache_read_usd_per_million = row.cache_read_usd_per_million
   form.cache_creation_usd_per_million = row.cache_creation_usd_per_million
   form.request_usd = row.request_usd
+  if (row.long_context) {
+    setLongContextForm(row.long_context)
+  }
   modalOpen.value = true
+}
+
+function setLongContextForm(value: ModelPriceLongContext) {
+  longContextEnabled.value = true
+  longContextForm.threshold_input_tokens = value.threshold_input_tokens
+  longContextForm.input_usd_per_million = value.input_usd_per_million
+  longContextForm.output_usd_per_million = value.output_usd_per_million
+  longContextForm.cache_read_usd_per_million = value.cache_read_usd_per_million
+  longContextForm.cache_creation_usd_per_million = value.cache_creation_usd_per_million
+}
+
+function validLongContextForm(): boolean {
+  return (
+    Number.isInteger(longContextForm.threshold_input_tokens) &&
+    longContextForm.threshold_input_tokens > 0 &&
+    [
+      longContextForm.input_usd_per_million,
+      longContextForm.output_usd_per_million,
+      longContextForm.cache_read_usd_per_million,
+      longContextForm.cache_creation_usd_per_million,
+    ].every((value) => Number.isFinite(value) && value >= 0)
+  )
 }
 
 async function savePrice() {
   const requestPriceMode = isRequestPriceForm.value
   const requestUSD = requestPriceMode && typeof form.request_usd === 'number' ? form.request_usd : null
+  const longContext = !requestPriceMode && longContextEnabled.value
+    ? { ...longContextForm }
+    : null
   const payload: ModelPricePayload = {
     provider: form.provider.trim(),
     model: form.model.trim(),
@@ -440,6 +490,7 @@ async function savePrice() {
     cache_read_usd_per_million: form.cache_read_usd_per_million,
     cache_creation_usd_per_million: form.cache_creation_usd_per_million,
     request_usd: requestUSD,
+    long_context: longContext,
   }
   if (!payload.provider || !payload.model) {
     message.error(t('服务商和模型不能为空', 'Provider and model are required'))
@@ -449,6 +500,11 @@ async function savePrice() {
     message.error(t('image 模型需要填写每次调用价格', 'Image models require a per-call price'))
     return
   }
+  if (longContext !== null && !validLongContextForm()) {
+    message.error(t('长上下文阈值必须为正整数，价格必须是有限非负数', 'The long-context threshold must be a positive integer and all prices must be finite non-negative numbers'))
+    return
+  }
+  isPriceSaving.value = true
   try {
     if (editingId.value === null) {
       await createModelPrice(payload)
@@ -461,6 +517,8 @@ async function savePrice() {
     await refresh()
   } catch (error) {
     message.error(errorText(error, '保存模型价格失败', 'Failed to save model price'))
+  } finally {
+    isPriceSaving.value = false
   }
 }
 
@@ -638,6 +696,38 @@ function renderPriorityMultiplier(row: PriceDisplayRow) {
   )
 }
 
+function formatThreshold(value: number): string {
+  if (value >= 1000000 && value % 1000000 === 0) {
+    return `${value / 1000000}M`
+  }
+  if (value >= 1000 && value % 1000 === 0) {
+    return `${value / 1000}K`
+  }
+  return formatInteger(value)
+}
+
+function renderLongContextPrice(row: PriceDisplayRow) {
+  const longContext = row.price?.long_context
+  if (row.billing_unit === 'request' || !longContext) {
+    return h('span', { class: 'price-muted' }, '-')
+  }
+  const label = `>${formatThreshold(longContext.threshold_input_tokens)}`
+  const details = [
+    `${t('输入', 'Input')} ${formatPriceValue(longContext.input_usd_per_million)}`,
+    `${t('输出', 'Output')} ${formatPriceValue(longContext.output_usd_per_million)}`,
+    `${t('缓存读', 'Cache read')} ${formatPriceValue(longContext.cache_read_usd_per_million)}`,
+    `${t('缓存写', 'Cache write')} ${formatPriceValue(longContext.cache_creation_usd_per_million)}`,
+  ].join(' · ')
+  return h(
+    NTooltip,
+    null,
+    {
+      trigger: () => h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => label }),
+      default: () => `${label} ${t('输入 Token', 'input tokens')}: ${details}`,
+    },
+  )
+}
+
 function renderPriorityMultiplierAction(price: ModelPrice) {
   const label = t('设置 Fast 倍率', 'Set Fast multiplier')
   return h(
@@ -757,6 +847,12 @@ const columns = computed<DataTableColumns<PriceDisplayRow>>(() => [
     key: 'cache_creation_usd_per_million',
     width: 125,
     render: (row) => renderTokenPriceValue(row, 'cache_creation_usd_per_million'),
+  },
+  {
+    title: t('长上下文', 'Long context'),
+    key: 'long_context',
+    width: 118,
+    render: renderLongContextPrice,
   },
   {
     title: t('Fast 倍率', 'Fast multiplier'),
@@ -902,7 +998,7 @@ onBeforeUnmount(() => {
         :data="filteredPrices"
         :pagination="pagination"
         :row-key="rowKey"
-        :scroll-x="1800"
+        :scroll-x="1920"
       />
     </section>
 
@@ -937,14 +1033,44 @@ onBeforeUnmount(() => {
             <NFormItem :label="t('缓存写价格', 'Cache write price')">
               <NInputNumber v-model:value="form.cache_creation_usd_per_million" :min="0" />
             </NFormItem>
+            <div class="long-context-switch-row wide-form-item">
+              <span>{{ t('长上下文阶梯', 'Long-context tier') }}</span>
+              <NSwitch
+                v-model:value="longContextEnabled"
+                :disabled="isPriceSaving"
+                :aria-label="t('启用长上下文阶梯', 'Enable long-context tier')"
+              />
+            </div>
+            <template v-if="longContextEnabled">
+              <NFormItem :label="t('输入 Token 阈值', 'Input token threshold')" class="wide-form-item">
+                <NInputNumber
+                  v-model:value="longContextForm.threshold_input_tokens"
+                  :min="1"
+                  :precision="0"
+                  :step="1000"
+                />
+              </NFormItem>
+              <NFormItem :label="t('长上下文输入价格', 'Long-context input price')">
+                <NInputNumber v-model:value="longContextForm.input_usd_per_million" :min="0" />
+              </NFormItem>
+              <NFormItem :label="t('长上下文输出价格', 'Long-context output price')">
+                <NInputNumber v-model:value="longContextForm.output_usd_per_million" :min="0" />
+              </NFormItem>
+              <NFormItem :label="t('长上下文缓存读价格', 'Long-context cache read price')">
+                <NInputNumber v-model:value="longContextForm.cache_read_usd_per_million" :min="0" />
+              </NFormItem>
+              <NFormItem :label="t('长上下文缓存写价格', 'Long-context cache write price')">
+                <NInputNumber v-model:value="longContextForm.cache_creation_usd_per_million" :min="0" />
+              </NFormItem>
+            </template>
           </template>
         </div>
       </NForm>
       <p class="price-save-hint">{{ priceSaveHint }}</p>
       <template #footer>
         <NSpace justify="end">
-          <NButton @click="modalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
-          <NButton type="primary" @click="savePrice">{{ t('保存', 'Save') }}</NButton>
+          <NButton :disabled="isPriceSaving" @click="modalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
+          <NButton type="primary" :loading="isPriceSaving" @click="savePrice">{{ t('保存', 'Save') }}</NButton>
         </NSpace>
       </template>
     </NModal>
@@ -1010,7 +1136,12 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .price-modal {
-  width: min(640px, calc(100vw - 24px));
+  width: min(720px, calc(100vw - 24px));
+  max-height: calc(100dvh - 32px);
+}
+
+.price-modal :deep(.n-card__content) {
+  overflow-y: auto;
 }
 
 .proxy-modal {
@@ -1025,6 +1156,19 @@ onBeforeUnmount(() => {
 
 .wide-form-item {
   grid-column: 1 / -1;
+}
+
+.long-context-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 38px;
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px solid var(--cpa-border);
+  color: var(--cpa-text);
+  font-size: 14px;
+  font-weight: 600;
 }
 
 .proxy-form {

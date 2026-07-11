@@ -32,14 +32,15 @@ type AvailableModelSource struct {
 }
 
 type AvailableModelPrice struct {
-	Provider                   string   `json:"provider"`
-	Model                      string   `json:"model"`
-	InputUSDPerMillion         float64  `json:"input_usd_per_million"`
-	OutputUSDPerMillion        float64  `json:"output_usd_per_million"`
-	CacheReadUSDPerMillion     float64  `json:"cache_read_usd_per_million"`
-	CacheCreationUSDPerMillion float64  `json:"cache_creation_usd_per_million"`
-	RequestUSD                 *float64 `json:"request_usd"`
-	BillingUnit                string   `json:"billing_unit"`
+	Provider                   string                 `json:"provider"`
+	Model                      string                 `json:"model"`
+	InputUSDPerMillion         float64                `json:"input_usd_per_million"`
+	OutputUSDPerMillion        float64                `json:"output_usd_per_million"`
+	CacheReadUSDPerMillion     float64                `json:"cache_read_usd_per_million"`
+	CacheCreationUSDPerMillion float64                `json:"cache_creation_usd_per_million"`
+	RequestUSD                 *float64               `json:"request_usd"`
+	LongContext                *ModelPriceLongContext `json:"long_context"`
+	BillingUnit                string                 `json:"billing_unit"`
 }
 
 type AvailableModelItem struct {
@@ -155,16 +156,7 @@ func (a *App) availableModelsForUser(ctx context.Context, userID int) (Available
 	}
 	for _, model := range modelsByID {
 		if price := findMatchingPrice(prices, model.Owner, &model.ID); price != nil {
-			model.Price = &AvailableModelPrice{
-				Provider:                   price.Provider,
-				Model:                      price.Model,
-				InputUSDPerMillion:         price.InputUSDPerMillion,
-				OutputUSDPerMillion:        price.OutputUSDPerMillion,
-				CacheReadUSDPerMillion:     price.CacheReadUSDPerMillion,
-				CacheCreationUSDPerMillion: price.CacheCreationUSDPerMillion,
-				RequestUSD:                 price.RequestUSD,
-				BillingUnit:                price.BillingUnit,
-			}
+			model.Price = availableModelPriceFromPrice(price)
 		}
 		response.Models = append(response.Models, model)
 	}
@@ -172,6 +164,24 @@ func (a *App) availableModelsForUser(ctx context.Context, userID int) (Available
 		return strings.ToLower(response.Models[i].ID) < strings.ToLower(response.Models[j].ID)
 	})
 	return response, nil
+}
+
+func availableModelPriceFromPrice(price *ModelPrice) *AvailableModelPrice {
+	if price == nil {
+		return nil
+	}
+	apiPrice := modelPriceForAPI(*price)
+	return &AvailableModelPrice{
+		Provider:                   apiPrice.Provider,
+		Model:                      apiPrice.Model,
+		InputUSDPerMillion:         apiPrice.InputUSDPerMillion,
+		OutputUSDPerMillion:        apiPrice.OutputUSDPerMillion,
+		CacheReadUSDPerMillion:     apiPrice.CacheReadUSDPerMillion,
+		CacheCreationUSDPerMillion: apiPrice.CacheCreationUSDPerMillion,
+		RequestUSD:                 apiPrice.RequestUSD,
+		LongContext:                apiPrice.LongContext,
+		BillingUnit:                apiPrice.BillingUnit,
+	}
 }
 
 func fetchAvailableModelItems(ctx context.Context, cfg AppConfig, apiKey string) ([]any, error) {

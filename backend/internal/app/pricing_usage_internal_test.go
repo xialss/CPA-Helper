@@ -155,6 +155,235 @@ func TestRecordCostAppliesPriorityMultiplierForCodex(t *testing.T) {
 	}
 }
 
+func TestRecordCostLongContextUsesStrictWholeRequestBand(t *testing.T) {
+	provider := "openai"
+	model := "gpt-long-context-test"
+	prices := map[[2]string]ModelPrice{
+		priceKey(provider, model): {
+			Provider:            provider,
+			Model:               model,
+			InputUSDPerMillion:  2,
+			OutputUSDPerMillion: 4,
+			LongContext: &ModelPriceLongContext{
+				ThresholdInputTokens:       200_000,
+				InputUSDPerMillion:         5,
+				OutputUSDPerMillion:        12,
+				CacheReadUSDPerMillion:     0.5,
+				CacheCreationUSDPerMillion: 6,
+			},
+		},
+	}
+
+	for _, test := range []struct {
+		name        string
+		inputTokens int
+		wantApplied bool
+		wantInput   float64
+		wantOutput  float64
+	}{
+		{name: "below threshold", inputTokens: 199_999, wantInput: 2, wantOutput: 4},
+		{name: "equal threshold", inputTokens: 200_000, wantInput: 2, wantOutput: 4},
+		{name: "above threshold", inputTokens: 200_001, wantApplied: true, wantInput: 5, wantOutput: 12},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			breakdown := calculateRecordCostBreakdown(UsageRecord{
+				Provider:     &provider,
+				Model:        &model,
+				InputTokens:  test.inputTokens,
+				OutputTokens: 1_000_000,
+				TotalTokens:  test.inputTokens + 1_000_000,
+			}, prices)
+			if breakdown.Unpriced || breakdown.LongContextApplied != test.wantApplied || breakdown.ContextInputTokens != test.inputTokens {
+				t.Fatalf("long-context breakdown = %#v", breakdown)
+			}
+			if breakdown.LongContextThresholdTokens == nil || *breakdown.LongContextThresholdTokens != 200_000 {
+				t.Fatalf("threshold = %#v, want 200000", breakdown.LongContextThresholdTokens)
+			}
+			if len(breakdown.Items) != 2 {
+				t.Fatalf("item count = %d, want 2", len(breakdown.Items))
+			}
+			input := breakdown.Items[0].(usageTokenCostBreakdownItem)
+			output := breakdown.Items[1].(usageTokenCostBreakdownItem)
+			if input.USDPerMillion != test.wantInput || output.USDPerMillion != test.wantOutput {
+				t.Fatalf("selected prices = %v/%v, want %v/%v", input.USDPerMillion, output.USDPerMillion, test.wantInput, test.wantOutput)
+			}
+		})
+	}
+}
+
+func TestRecordCostLongContextUsesFullClaudePromptTokens(t *testing.T) {
+	model := "claude-long-context-test"
+	for _, test := range []struct {
+		name          string
+		provider      string
+		cacheCreation int
+		wantApplied   bool
+		wantContext   int
+		wantPrices    []float64
+	}{
+		{
+			name:          "claude equal threshold uses base price",
+			provider:      "claude",
+			cacheCreation: 10_000,
+			wantContext:   200_000,
+			wantPrices:    []float64{2, 0.2, 3, 4},
+		},
+		{
+			name:          "anthropic cached prompt exceeds threshold",
+			provider:      "anthropic",
+			cacheCreation: 10_001,
+			wantApplied:   true,
+			wantContext:   200_001,
+			wantPrices:    []float64{5, 0.5, 6, 12},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			breakdown := calculateRecordCostBreakdown(UsageRecord{
+				Provider:            &test.provider,
+				Model:               &model,
+				InputTokens:         150_000,
+				CacheReadTokens:     40_000,
+				CacheCreationTokens: test.cacheCreation,
+				OutputTokens:        100_000,
+			}, map[[2]string]ModelPrice{
+				priceKey(test.provider, model): {
+					Provider:                   test.provider,
+					Model:                      model,
+					InputUSDPerMillion:         2,
+					OutputUSDPerMillion:        4,
+					CacheReadUSDPerMillion:     0.2,
+					CacheCreationUSDPerMillion: 3,
+					LongContext: &ModelPriceLongContext{
+						ThresholdInputTokens:       200_000,
+						InputUSDPerMillion:         5,
+						OutputUSDPerMillion:        12,
+						CacheReadUSDPerMillion:     0.5,
+						CacheCreationUSDPerMillion: 6,
+					},
+				},
+			})
+			if breakdown.Unpriced || breakdown.LongContextApplied != test.wantApplied || breakdown.ContextInputTokens != test.wantContext {
+				t.Fatalf("Claude long-context breakdown = %#v", breakdown)
+			}
+			if len(breakdown.Items) != len(test.wantPrices) {
+				t.Fatalf("Claude item count = %d, want %d", len(breakdown.Items), len(test.wantPrices))
+			}
+			for index, item := range breakdown.Items {
+				tokenItem := item.(usageTokenCostBreakdownItem)
+				if tokenItem.USDPerMillion != test.wantPrices[index] {
+					t.Fatalf("Claude item %d price = %v, want %v", index, tokenItem.USDPerMillion, test.wantPrices[index])
+				}
+			}
+		})
+	}
+}
+
+func TestRecordCostLongContextAppliesBeforeFastAndUsesSelectedCacheSemantics(t *testing.T) {
+	provider := "codex"
+	model := "gpt-long-fast-test"
+	tier := "priority"
+	multiplier := 2.0
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:            &provider,
+		Model:               &model,
+		ServiceTier:         &tier,
+		InputTokens:         300_000,
+		OutputTokens:        100_000,
+		CachedTokens:        100_000,
+		CacheCreationTokens: 50_000,
+		TotalTokens:         400_000,
+	}, map[[2]string]ModelPrice{
+		priceKey("openai", model): {
+			Provider:                   "openai",
+			Model:                      model,
+			InputUSDPerMillion:         2,
+			OutputUSDPerMillion:        4,
+			CacheReadUSDPerMillion:     0.2,
+			CacheCreationUSDPerMillion: 0,
+			PriorityMultiplier:         &multiplier,
+			LongContext: &ModelPriceLongContext{
+				ThresholdInputTokens:       200_000,
+				InputUSDPerMillion:         5,
+				OutputUSDPerMillion:        12,
+				CacheReadUSDPerMillion:     0.5,
+				CacheCreationUSDPerMillion: 6,
+			},
+		},
+	})
+	if breakdown.Unpriced || !breakdown.LongContextApplied || breakdown.TierMultiplier == nil || *breakdown.TierMultiplier != 2 {
+		t.Fatalf("combined tier breakdown = %#v", breakdown)
+	}
+	if len(breakdown.Items) != 4 {
+		t.Fatalf("combined tier item count = %d, want 4", len(breakdown.Items))
+	}
+	wantPrices := []float64{10, 1, 12, 24}
+	for index, item := range breakdown.Items {
+		tokenItem := item.(usageTokenCostBreakdownItem)
+		if tokenItem.USDPerMillion != wantPrices[index] {
+			t.Fatalf("item %d price = %v, want %v", index, tokenItem.USDPerMillion, wantPrices[index])
+		}
+	}
+}
+
+func TestRecordCostLongContextInvalidLegacyConfigurationFailsClosedOnlyWhenHit(t *testing.T) {
+	provider := "openai"
+	model := "gpt-long-invalid-test"
+	price := ModelPrice{
+		Provider:           provider,
+		Model:              model,
+		InputUSDPerMillion: 2,
+		LongContext: &ModelPriceLongContext{
+			ThresholdInputTokens: 200_000,
+			InputUSDPerMillion:   math.Inf(1),
+		},
+		longContextInvalid: true,
+	}
+	prices := map[[2]string]ModelPrice{priceKey(provider, model): price}
+	base := calculateRecordCostBreakdown(UsageRecord{Provider: &provider, Model: &model, InputTokens: 200_000, TotalTokens: 200_000}, prices)
+	if base.Unpriced || base.TotalUSD != 0.4 {
+		t.Fatalf("base tier with invalid future band = %#v, want priced 0.4", base)
+	}
+	long := calculateRecordCostBreakdown(UsageRecord{Provider: &provider, Model: &model, InputTokens: 200_001, TotalTokens: 200_001}, prices)
+	if !long.Unpriced || long.LongContextApplied || long.TotalUSD != 0 || len(long.Items) != 0 {
+		t.Fatalf("invalid long-context hit = %#v, want unpriced", long)
+	}
+	negative := calculateRecordCostBreakdown(UsageRecord{Provider: &provider, Model: &model, InputTokens: -1}, prices)
+	if negative.Unpriced || negative.ContextInputTokens != 0 || negative.LongContextApplied {
+		t.Fatalf("negative input breakdown = %#v, want base zero-cost", negative)
+	}
+}
+
+func TestRecordCostUnpricedClearsLongContextApplied(t *testing.T) {
+	provider := "openai"
+	model := "gpt-long-invalid-fast-test"
+	tier := "priority"
+	invalidMultiplier := math.Inf(1)
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:     &provider,
+		Model:        &model,
+		ServiceTier:  &tier,
+		InputTokens:  300_000,
+		OutputTokens: 100_000,
+	}, map[[2]string]ModelPrice{
+		priceKey(provider, model): {
+			Provider:           provider,
+			Model:              model,
+			InputUSDPerMillion: 2,
+			PriorityMultiplier: &invalidMultiplier,
+			LongContext: &ModelPriceLongContext{
+				ThresholdInputTokens:       200_000,
+				InputUSDPerMillion:         5,
+				OutputUSDPerMillion:        12,
+				CacheReadUSDPerMillion:     0.5,
+				CacheCreationUSDPerMillion: 6,
+			},
+		},
+	})
+	if !breakdown.Unpriced || breakdown.LongContextApplied || breakdown.TotalUSD != 0 || len(breakdown.Items) != 0 {
+		t.Fatalf("unpriced long-context breakdown = %#v, want unpriced and not applied", breakdown)
+	}
+}
+
 func TestRecordCostKeepsBasePriceForUnreportedUnknownAndUnsupportedTiers(t *testing.T) {
 	model := "gpt-tier-test"
 	multiplier := 2.0
@@ -583,6 +812,108 @@ func TestModelPriceAPIUpdatesImageRequestPrice(t *testing.T) {
 	if updated.RequestUSD == nil || *updated.RequestUSD != 2.5 || updated.BillingUnit != modelBillingUnitRequest {
 		t.Fatalf("updated image price = %#v, want request_usd=2.5 request billing", updated)
 	}
+}
+
+func TestModelPriceAPIRoundTripsAndClearsLongContextPrice(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	basePayload := map[string]any{
+		"provider":                       "openai",
+		"model":                          "gpt-long-api-test",
+		"input_usd_per_million":          2,
+		"output_usd_per_million":         4,
+		"cache_read_usd_per_million":     0.2,
+		"cache_creation_usd_per_million": 0,
+		"long_context": map[string]any{
+			"threshold_input_tokens":         272000,
+			"input_usd_per_million":          5,
+			"output_usd_per_million":         12,
+			"cache_read_usd_per_million":     0.5,
+			"cache_creation_usd_per_million": 6.25,
+		},
+	}
+	var created ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPost, "/api/model-prices", basePayload, cookies, &created)
+	if created.LongContext == nil || created.LongContext.ThresholdInputTokens != 272000 || created.LongContext.CacheCreationUSDPerMillion != 6.25 {
+		t.Fatalf("created long-context price = %#v", created.LongContext)
+	}
+
+	basePayload["long_context"] = nil
+	var updated ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPut, fmt.Sprintf("/api/model-prices/%d", created.ID), basePayload, cookies, &updated)
+	if updated.LongContext != nil {
+		t.Fatalf("cleared long-context price = %#v, want nil", updated.LongContext)
+	}
+	var configuredColumns int
+	if err := app.db.QueryRow(`
+		SELECT
+			(long_context_threshold_tokens IS NOT NULL) +
+			(long_context_input_usd_per_million IS NOT NULL) +
+			(long_context_output_usd_per_million IS NOT NULL) +
+			(long_context_cache_read_usd_per_million IS NOT NULL) +
+			(long_context_cache_creation_usd_per_million IS NOT NULL)
+		FROM model_prices WHERE id = ?
+	`, created.ID).Scan(&configuredColumns); err != nil {
+		t.Fatalf("query cleared long-context columns: %v", err)
+	}
+	if configuredColumns != 0 {
+		t.Fatalf("configured long-context columns = %d, want 0", configuredColumns)
+	}
+}
+
+func TestModelPriceAPIRejectsPartialAndRequestLongContextPrice(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       "openai",
+		"model":                          "gpt-long-partial-test",
+		"input_usd_per_million":          1,
+		"output_usd_per_million":         2,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+		"long_context": map[string]any{
+			"threshold_input_tokens": 200000,
+			"input_usd_per_million":  3,
+		},
+	}, cookies, http.StatusUnprocessableEntity)
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       "openai",
+		"model":                          "gpt-image-long-test",
+		"input_usd_per_million":          0,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+		"request_usd":                    1,
+		"long_context": map[string]any{
+			"threshold_input_tokens":         200000,
+			"input_usd_per_million":          3,
+			"output_usd_per_million":         6,
+			"cache_read_usd_per_million":     0.3,
+			"cache_creation_usd_per_million": 0,
+		},
+	}, cookies, http.StatusUnprocessableEntity)
 }
 
 func TestModelPriceAPIUpdatesPriorityMultiplierWithoutChangingSyncSource(t *testing.T) {
@@ -1109,6 +1440,124 @@ func TestSyncLiteLLMPricesReplacesLiteLLMSource(t *testing.T) {
 	}
 }
 
+func TestLiteLLMSyncAppliesAndPreservesLongContextOverrides(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	rawData := map[string]any{
+		"gpt-5.6-terra": map[string]any{
+			"litellm_provider":            "openai",
+			"input_cost_per_token":        0.0000025,
+			"output_cost_per_token":       0.000015,
+			"cache_read_input_token_cost": 0.00000025,
+		},
+	}
+	if _, err := app.syncLiteLLMPrices(context.Background(), "https://example.com/prices.json", rawData); err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	prices, err := app.listPrices(context.Background())
+	if err != nil || len(prices) != 1 {
+		t.Fatalf("initial synced prices = %#v/%v", prices, err)
+	}
+	price := prices[0]
+	if price.LongContext == nil || price.LongContext.ThresholdInputTokens != 272000 || price.LongContext.InputUSDPerMillion != 5 {
+		t.Fatalf("default synced long-context price = %#v", price.LongContext)
+	}
+
+	if _, err := app.db.Exec(`
+		UPDATE model_prices
+		SET long_context_threshold_tokens = 300000,
+		    long_context_input_usd_per_million = 7,
+		    long_context_output_usd_per_million = 20,
+		    long_context_cache_read_usd_per_million = 0.7,
+		    long_context_cache_creation_usd_per_million = 8
+		WHERE id = ?
+	`, price.ID); err != nil {
+		t.Fatalf("set local override: %v", err)
+	}
+	if _, err := app.syncLiteLLMPrices(context.Background(), "https://example.com/prices.json", rawData); err != nil {
+		t.Fatalf("override sync: %v", err)
+	}
+	prices, err = app.listPrices(context.Background())
+	if err != nil || len(prices) != 1 || prices[0].LongContext == nil {
+		t.Fatalf("preserved synced prices = %#v/%v", prices, err)
+	}
+	if prices[0].LongContext.ThresholdInputTokens != 300000 || prices[0].LongContext.InputUSDPerMillion != 7 || prices[0].LongContext.CacheCreationUSDPerMillion != 8 {
+		t.Fatalf("preserved long-context override = %#v", prices[0].LongContext)
+	}
+
+	if _, err := app.db.Exec(`
+		UPDATE model_prices
+		SET priority_multiplier = NULL,
+		    long_context_output_usd_per_million = 1e300
+		WHERE id = ?
+	`, prices[0].ID); err != nil {
+		t.Fatalf("set multiplier-unsafe local override: %v", err)
+	}
+	if _, err := app.syncLiteLLMPrices(context.Background(), "https://example.com/prices.json", rawData); err != nil {
+		t.Fatalf("multiplier-unsafe override sync: %v", err)
+	}
+	prices, err = app.listPrices(context.Background())
+	if err != nil || len(prices) != 1 || prices[0].LongContext == nil {
+		t.Fatalf("multiplier-unsafe synced price = %#v/%v", prices, err)
+	}
+	if prices[0].PriorityMultiplier != nil || prices[0].LongContext.OutputUSDPerMillion != 1e300 {
+		t.Fatalf("multiplier-unsafe override = %#v, want preserved tier and NULL default multiplier", prices[0])
+	}
+
+	if _, err := app.db.Exec(`
+		UPDATE model_prices
+		SET long_context_output_usd_per_million = NULL
+		WHERE id = ?
+	`, prices[0].ID); err != nil {
+		t.Fatalf("set invalid legacy override: %v", err)
+	}
+	if _, err := app.syncLiteLLMPrices(context.Background(), "https://example.com/prices.json", rawData); err != nil {
+		t.Fatalf("invalid override sync: %v", err)
+	}
+	var threshold sql.NullInt64
+	var input, output sql.NullFloat64
+	if err := app.db.QueryRow(`
+		SELECT long_context_threshold_tokens, long_context_input_usd_per_million,
+		       long_context_output_usd_per_million
+		FROM model_prices WHERE model = 'gpt-5.6-terra'
+	`).Scan(&threshold, &input, &output); err != nil {
+		t.Fatalf("query invalid legacy override: %v", err)
+	}
+	if !threshold.Valid || threshold.Int64 != 300000 || !input.Valid || input.Float64 != 7 || output.Valid {
+		t.Fatalf("invalid legacy override = %#v/%#v/%#v, want preserved partial values", threshold, input, output)
+	}
+	prices, err = app.listPrices(context.Background())
+	if err != nil || len(prices) != 1 || !prices[0].longContextInvalid {
+		t.Fatalf("invalid legacy internal price = %#v/%v", prices, err)
+	}
+	if modelPriceForAPI(prices[0]).LongContext != nil {
+		t.Fatal("invalid legacy long-context price should be JSON-safe null")
+	}
+
+	if _, err := app.updatePrice(context.Background(), prices[0].ID, modelPricePayload{
+		Provider:                   "openai",
+		Model:                      "gpt-5.6-terra",
+		InputUSDPerMillion:         2.5,
+		OutputUSDPerMillion:        15,
+		CacheReadUSDPerMillion:     0.25,
+		CacheCreationUSDPerMillion: 0,
+	}); err != nil {
+		t.Fatalf("convert synced price to manual with disabled long context: %v", err)
+	}
+	if _, err := app.syncLiteLLMPrices(context.Background(), "https://example.com/prices.json", rawData); err != nil {
+		t.Fatalf("manual preservation sync: %v", err)
+	}
+	prices, err = app.listPrices(context.Background())
+	if err != nil || len(prices) != 1 || prices[0].Source != "manual" || prices[0].LongContext != nil {
+		t.Fatalf("manual disabled long-context price = %#v/%v", prices, err)
+	}
+}
+
 func TestListPricesOrdersManualBeforeSynced(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()
@@ -1197,9 +1646,12 @@ func TestModelPriceCatalogListsCPAModelsWithMatchedPrices(t *testing.T) {
 	if _, err := app.db.Exec(`
 		INSERT INTO model_prices (
 			provider, model, input_usd_per_million, output_usd_per_million,
-			cache_read_usd_per_million, cache_creation_usd_per_million, source,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			long_context_threshold_tokens, long_context_input_usd_per_million,
+			long_context_output_usd_per_million, long_context_cache_read_usd_per_million,
+			long_context_cache_creation_usd_per_million, source,
 			source_model, auto_synced, last_synced_at, updated_at
-		) VALUES ('openai', 'gpt-priced', 1, 2, 0.1, 0, 'litellm', 'gpt-priced', 1, ?, ?)
+		) VALUES ('openai', 'gpt-priced', 1, 2, 0.1, 0, 200000, 3, 6, 0.3, 0, 'litellm', 'gpt-priced', 1, ?, ?)
 	`, now, now); err != nil {
 		t.Fatalf("seed model price: %v", err)
 	}
@@ -1224,8 +1676,40 @@ func TestModelPriceCatalogListsCPAModelsWithMatchedPrices(t *testing.T) {
 	if catalog.Models[1].ID != "gpt-priced" || catalog.Models[1].Price == nil || catalog.Models[1].Price.Source != "litellm" {
 		t.Fatalf("second model = %#v, want gpt-priced with litellm price", catalog.Models[1])
 	}
+	if catalog.Models[1].Price.LongContext == nil || catalog.Models[1].Price.LongContext.ThresholdInputTokens != 200000 || catalog.Models[1].Price.LongContext.OutputUSDPerMillion != 6 {
+		t.Fatalf("catalog long-context price = %#v", catalog.Models[1].Price.LongContext)
+	}
 	if len(catalog.Models[1].Sources) != 1 || catalog.Models[1].Sources[0].Description != "Admin Key" || catalog.Models[1].Sources[0].UserLabel != "管理员" {
 		t.Fatalf("sources = %#v, want key description and user label", catalog.Models[1].Sources)
+	}
+}
+
+func TestAvailableModelPriceProjectionIncludesJSONSafeLongContext(t *testing.T) {
+	projected := availableModelPriceFromPrice(&ModelPrice{
+		Provider: "openai",
+		Model:    "gpt-available-long",
+		LongContext: &ModelPriceLongContext{
+			ThresholdInputTokens:   200000,
+			InputUSDPerMillion:     3,
+			OutputUSDPerMillion:    6,
+			CacheReadUSDPerMillion: 0.3,
+		},
+		BillingUnit: modelBillingUnitToken,
+	})
+	if projected == nil || projected.LongContext == nil || projected.LongContext.InputUSDPerMillion != 3 {
+		t.Fatalf("available model price = %#v", projected)
+	}
+	invalid := availableModelPriceFromPrice(&ModelPrice{
+		Provider: "openai",
+		Model:    "gpt-available-invalid-long",
+		LongContext: &ModelPriceLongContext{
+			ThresholdInputTokens: 200000,
+			InputUSDPerMillion:   math.Inf(1),
+		},
+		longContextInvalid: true,
+	})
+	if invalid == nil || invalid.LongContext != nil {
+		t.Fatalf("invalid available model price = %#v, want JSON-safe null long context", invalid)
 	}
 }
 

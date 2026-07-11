@@ -464,6 +464,9 @@ export interface UsageCostBreakdown {
   total_usd: number
   unpriced: boolean
   tier_multiplier?: number
+  context_input_tokens: number
+  long_context_threshold_tokens: number | null
+  long_context_applied: boolean
 }
 
 export interface UsageRecordListItem {
@@ -509,6 +512,14 @@ export interface UsageRecordDetail extends UsageRecordListItem {
   raw_json: Record<string, unknown> | unknown[] | string
 }
 
+export interface ModelPriceLongContext {
+  threshold_input_tokens: number
+  input_usd_per_million: number
+  output_usd_per_million: number
+  cache_read_usd_per_million: number
+  cache_creation_usd_per_million: number
+}
+
 export interface ModelPrice {
   id: number
   provider: string
@@ -519,6 +530,7 @@ export interface ModelPrice {
   cache_creation_usd_per_million: number
   request_usd: number | null
   priority_multiplier: number | null
+  long_context: ModelPriceLongContext | null
   billing_unit: 'token' | 'request' | string
   source: 'manual' | 'litellm' | string
   source_model: string | null
@@ -535,6 +547,7 @@ export interface ModelPricePayload {
   cache_read_usd_per_million: number
   cache_creation_usd_per_million: number
   request_usd: number | null
+  long_context: ModelPriceLongContext | null
 }
 
 export interface PriorityMultiplierPayload {
@@ -647,6 +660,7 @@ export interface AvailableModelPrice {
   cache_read_usd_per_million: number
   cache_creation_usd_per_million: number
   request_usd: number | null
+  long_context: ModelPriceLongContext | null
   billing_unit: 'token' | 'request' | string
 }
 

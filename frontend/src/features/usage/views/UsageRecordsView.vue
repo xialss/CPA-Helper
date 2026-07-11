@@ -676,29 +676,66 @@ function serviceTierLabel(record: Pick<UsageRecordListItem, 'provider' | 'servic
   }
 }
 
-function renderModelWithServiceTier(row: UsageRecordListItem) {
+function renderModelWithPricingMarkers(row: UsageRecordListItem) {
   const model = formatModelWithReasoning(row)
-  if (!isFastRecord(row)) {
+  const fast = isFastRecord(row)
+  const longContext = row.cost_breakdown.long_context_applied
+  if (!fast && !longContext) {
     return model
   }
-  const fastLabel = t('Fast 模式', 'Fast mode')
+
+  const markers: ReturnType<typeof h>[] = []
+  if (longContext) {
+    const longContextLabel =
+      longContextPricingNote(row) ?? t('已应用长上下文价格', 'Long-context price applied')
+    markers.push(
+      h(
+        NTooltip,
+        { themeOverrides: usageTooltipThemeOverrides },
+        {
+          trigger: () =>
+            h(
+              NTag,
+              {
+                class: 'usage-long-context-tag',
+                size: 'small',
+                bordered: false,
+                type: 'success',
+                role: 'img',
+                'aria-label': longContextLabel,
+              },
+              { default: () => 'LC' },
+            ),
+          default: () => longContextLabel,
+        },
+      ),
+    )
+  }
+
+  if (fast) {
+    const fastLabel = t('Fast 模式', 'Fast mode')
+    markers.push(
+      h(
+        NTooltip,
+        { themeOverrides: usageTooltipThemeOverrides },
+        {
+          trigger: () =>
+            h(NIcon, {
+              class: 'usage-fast-icon',
+              component: Zap,
+              size: 15,
+              role: 'img',
+              'aria-label': fastLabel,
+            }),
+          default: () => fastLabel,
+        },
+      ),
+    )
+  }
+
   return h('div', { class: 'usage-model-cell', title: model }, [
     h('span', { class: 'usage-model-name' }, model),
-    h(
-      NTooltip,
-      { themeOverrides: usageTooltipThemeOverrides },
-      {
-        trigger: () =>
-          h(NIcon, {
-            class: 'usage-fast-icon',
-            component: Zap,
-            size: 15,
-            role: 'img',
-            'aria-label': fastLabel,
-          }),
-        default: () => fastLabel,
-      },
-    ),
+    ...markers,
   ])
 }
 
@@ -728,6 +765,29 @@ function tierPricingNote(row: UsageRecordListItem): string | null {
     return t('未知服务层级：未应用 Fast 倍率', 'Unknown service tier: Fast multiplier not applied')
   }
   return null
+}
+
+function longContextPricingNote(row: UsageRecordListItem): string | null {
+  const breakdown = row.cost_breakdown
+  if (breakdown.unpriced) {
+    return null
+  }
+  const threshold = breakdown.long_context_threshold_tokens
+  if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold <= 0) {
+    return null
+  }
+  const observed = formatInteger(breakdown.context_input_tokens)
+  const formattedThreshold = formatInteger(threshold)
+  if (breakdown.long_context_applied) {
+    return t(
+      `长上下文价：输入 ${observed} > ${formattedThreshold}`,
+      `Long-context price: input ${observed} > ${formattedThreshold}`,
+    )
+  }
+  return t(
+    `基础价：输入 ${observed} ≤ ${formattedThreshold}`,
+    `Base price: input ${observed} ≤ ${formattedThreshold}`,
+  )
 }
 
 function formatOutputTps(row: Pick<UsageRecordListItem, 'latency_ms' | 'output_tokens'>): string {
@@ -837,6 +897,11 @@ function renderTierPricingNote(row: UsageRecordListItem) {
   return note === null ? null : h('div', { class: 'usage-cost-breakdown-tier' }, note)
 }
 
+function renderLongContextPricingNote(row: UsageRecordListItem) {
+  const note = longContextPricingNote(row)
+  return note === null ? null : h('div', { class: 'usage-cost-breakdown-tier' }, note)
+}
+
 function renderCostBreakdown(row: UsageRecordListItem) {
   const breakdown = row.cost_breakdown
   const attributes = {
@@ -844,18 +909,26 @@ function renderCostBreakdown(row: UsageRecordListItem) {
     role: 'tooltip',
   }
   if (breakdown.unpriced) {
+    const tierNote = renderTierPricingNote(row)
+    const longContextNote = renderLongContextPricingNote(row)
     return h(
       'div',
       {
         ...attributes,
         class: 'usage-cost-breakdown usage-cost-breakdown-unpriced',
       },
-      t('未定价', 'Unpriced'),
+      [
+        h('span', t('未定价', 'Unpriced')),
+        ...(longContextNote ? [longContextNote] : []),
+        ...(tierNote ? [tierNote] : []),
+      ],
     )
   }
   const tierNote = renderTierPricingNote(row)
+  const longContextNote = renderLongContextPricingNote(row)
   return h('div', { ...attributes, class: 'usage-cost-breakdown' }, [
     ...breakdown.items.map((item) => renderCostBreakdownItem(item, breakdown)),
+    ...(longContextNote ? [longContextNote] : []),
     ...(tierNote ? [tierNote] : []),
     h('div', { class: 'usage-cost-breakdown-total' }, [
       h('span', t('总计', 'Total')),
@@ -891,15 +964,23 @@ function setFocusedCostRecord(recordId: number, focused: boolean) {
 function costBreakdownAriaLabel(row: UsageRecordListItem): string {
   const breakdown = row.cost_breakdown
   if (breakdown.unpriced) {
-    return t('费用明细', 'Cost breakdown') + ': ' + t('未定价', 'Unpriced')
+    return [
+      t('费用明细', 'Cost breakdown') + ': ' + t('未定价', 'Unpriced'),
+      longContextPricingNote(row),
+      tierPricingNote(row),
+    ]
+      .filter((item): item is string => Boolean(item))
+      .join('; ')
   }
   const items = breakdown.items.map(
     (item) =>
       costBreakdownItemLabel(item, breakdown) + ' ' + formatPreciseUsd(item.subtotal_usd),
   )
   const tierNote = tierPricingNote(row)
+  const longContextNote = longContextPricingNote(row)
   return [
     t('费用明细', 'Cost breakdown') + ': ' + items.join('; '),
+    longContextNote,
     tierNote,
     t('总计', 'Total') + ' ' + formatPreciseUsd(breakdown.total_usd),
   ]
@@ -1017,7 +1098,7 @@ const columns = computed<DataTableColumns<UsageRecordListItem>>(() => [
     key: 'model',
     width: RECORDS_TABLE_COLUMN_WIDTHS.model,
     ellipsis: { tooltip: true },
-    render: renderModelWithServiceTier,
+    render: renderModelWithPricingMarkers,
   },
   ...(isAccountScope.value
     ? []
@@ -1354,6 +1435,17 @@ onBeforeUnmount(() => {
 :global(.records-table .usage-fast-icon) {
   flex: 0 0 auto;
   color: var(--cpa-accent-blue);
+}
+
+:global(.records-table .usage-long-context-tag) {
+  flex: 0 0 auto;
+  min-width: 26px;
+  height: 20px;
+  justify-content: center;
+  padding: 0 5px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 20px;
 }
 
 :global(.usage-cost-trigger) {

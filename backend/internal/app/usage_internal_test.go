@@ -160,3 +160,101 @@ func TestSaveUsageMessageExposesCodexCacheCostBreakdown(t *testing.T) {
 		t.Fatalf("API cost breakdown = items %#v total %v estimated %v, want three items with 70 input tokens and total 0.00113", response.CostBreakdown.Items, response.CostBreakdown.TotalUSD, response.EstimatedCostUSD)
 	}
 }
+
+func TestUsageItemExposesLongContextSelectionAndSelectedPrices(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	raw := `{"api_key":"sk-usage-long-context","provider":"openai","model":"gpt-long-usage","request_id":"usage-long-context","input_tokens":300000,"output_tokens":100000}`
+	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw))
+	if err != nil || !created {
+		t.Fatalf("saveUsageMessage created=%v err=%v", created, err)
+	}
+	prices := map[[2]string]ModelPrice{
+		priceKey("openai", "gpt-long-usage"): {
+			Provider:            "openai",
+			Model:               "gpt-long-usage",
+			InputUSDPerMillion:  1,
+			OutputUSDPerMillion: 2,
+			LongContext: &ModelPriceLongContext{
+				ThresholdInputTokens:       200000,
+				InputUSDPerMillion:         3,
+				OutputUSDPerMillion:        6,
+				CacheReadUSDPerMillion:     0.3,
+				CacheCreationUSDPerMillion: 0,
+			},
+		},
+	}
+	item := listItemFromRecord(record, map[string]userInfo{}, prices, usageRedactionOptions{})
+	encoded, err := json.Marshal(item)
+	if err != nil {
+		t.Fatalf("marshal long-context usage item: %v", err)
+	}
+	var response struct {
+		EstimatedCostUSD float64 `json:"estimated_cost_usd"`
+		CostBreakdown    struct {
+			ContextInputTokens         int    `json:"context_input_tokens"`
+			LongContextThresholdTokens *int64 `json:"long_context_threshold_tokens"`
+			LongContextApplied         bool   `json:"long_context_applied"`
+			Unpriced                   bool   `json:"unpriced"`
+			Items                      []struct {
+				Kind          string  `json:"kind"`
+				USDPerMillion float64 `json:"usd_per_million"`
+			} `json:"items"`
+		} `json:"cost_breakdown"`
+	}
+	if err := json.Unmarshal(encoded, &response); err != nil {
+		t.Fatalf("unmarshal long-context usage item: %v", err)
+	}
+	if response.CostBreakdown.ContextInputTokens != 300000 || response.CostBreakdown.LongContextThresholdTokens == nil ||
+		*response.CostBreakdown.LongContextThresholdTokens != 200000 || !response.CostBreakdown.LongContextApplied {
+		t.Fatalf("long-context API selection = %#v", response.CostBreakdown)
+	}
+	if len(response.CostBreakdown.Items) != 2 || response.CostBreakdown.Items[0].Kind != usageCostKindInput ||
+		response.CostBreakdown.Items[0].USDPerMillion != 3 || response.CostBreakdown.Items[1].USDPerMillion != 6 ||
+		response.EstimatedCostUSD != 1.5 {
+		t.Fatalf("long-context API prices = %#v total=%v, want 3/6 and 1.5", response.CostBreakdown.Items, response.EstimatedCostUSD)
+	}
+
+	invalidPrices := map[[2]string]ModelPrice{
+		priceKey("openai", "gpt-long-usage"): {
+			Provider:            "openai",
+			Model:               "gpt-long-usage",
+			InputUSDPerMillion:  1,
+			OutputUSDPerMillion: 2,
+			LongContext: &ModelPriceLongContext{
+				ThresholdInputTokens: 200000,
+				InputUSDPerMillion:   3,
+			},
+			longContextInvalid: true,
+		},
+	}
+	encoded, err = json.Marshal(listItemFromRecord(record, map[string]userInfo{}, invalidPrices, usageRedactionOptions{}))
+	if err != nil {
+		t.Fatalf("marshal invalid long-context usage item: %v", err)
+	}
+	response = struct {
+		EstimatedCostUSD float64 `json:"estimated_cost_usd"`
+		CostBreakdown    struct {
+			ContextInputTokens         int    `json:"context_input_tokens"`
+			LongContextThresholdTokens *int64 `json:"long_context_threshold_tokens"`
+			LongContextApplied         bool   `json:"long_context_applied"`
+			Unpriced                   bool   `json:"unpriced"`
+			Items                      []struct {
+				Kind          string  `json:"kind"`
+				USDPerMillion float64 `json:"usd_per_million"`
+			} `json:"items"`
+		} `json:"cost_breakdown"`
+	}{}
+	if err := json.Unmarshal(encoded, &response); err != nil {
+		t.Fatalf("unmarshal invalid long-context usage item: %v", err)
+	}
+	if !response.CostBreakdown.Unpriced || response.CostBreakdown.LongContextApplied ||
+		response.EstimatedCostUSD != 0 || len(response.CostBreakdown.Items) != 0 {
+		t.Fatalf("invalid long-context API selection = %#v, want unpriced and not applied", response)
+	}
+}
