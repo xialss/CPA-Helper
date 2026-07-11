@@ -22,6 +22,16 @@ const usageCostKindCacheRead = "cache_read"
 const usageCostKindCacheCreation = "cache_creation"
 const usageCostKindOutput = "output"
 const usageCostKindRequest = "request"
+const serviceTierPriority = "priority"
+
+var defaultPriorityMultipliers = map[string]float64{
+	"gpt-5.5":       2.5,
+	"gpt-5.4":       2,
+	"gpt-5.4-mini":  2,
+	"gpt-5.6-sol":   2,
+	"gpt-5.6-terra": 2,
+	"gpt-5.6-luna":  2,
+}
 
 type ModelPrice struct {
 	ID                         int        `json:"id"`
@@ -32,6 +42,7 @@ type ModelPrice struct {
 	CacheReadUSDPerMillion     float64    `json:"cache_read_usd_per_million"`
 	CacheCreationUSDPerMillion float64    `json:"cache_creation_usd_per_million"`
 	RequestUSD                 *float64   `json:"request_usd"`
+	PriorityMultiplier         *float64   `json:"priority_multiplier"`
 	BillingUnit                string     `json:"billing_unit"`
 	Source                     string     `json:"source"`
 	SourceModel                *string    `json:"source_model"`
@@ -56,6 +67,7 @@ type usageCostBreakdown struct {
 	Items               []usageCostBreakdownItem `json:"items"`
 	TotalUSD            float64                  `json:"total_usd"`
 	Unpriced            bool                     `json:"unpriced"`
+	TierMultiplier      *float64                 `json:"tier_multiplier,omitempty"`
 }
 
 type usageCostBreakdownItem interface {
@@ -88,6 +100,10 @@ type modelPricePayload struct {
 	CacheReadUSDPerMillion     float64  `json:"cache_read_usd_per_million"`
 	CacheCreationUSDPerMillion float64  `json:"cache_creation_usd_per_million"`
 	RequestUSD                 *float64 `json:"request_usd"`
+}
+
+type priorityMultiplierPayload struct {
+	PriorityMultiplier *float64 `json:"priority_multiplier"`
 }
 
 type modelPriceSyncRequest struct {
@@ -136,7 +152,7 @@ func (a *App) handleModelPrices(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, prices)
+		writeJSON(w, http.StatusOK, modelPricesForAPI(prices))
 		return nil
 	case http.MethodPost:
 		if strings.HasSuffix(r.URL.Path, "/sync/litellm") {
@@ -150,7 +166,7 @@ func (a *App) handleModelPrices(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusCreated, price)
+		writeJSON(w, http.StatusCreated, modelPriceForAPI(price))
 		return nil
 	default:
 		return methodNotAllowed()
@@ -185,7 +201,29 @@ func (a *App) handleModelPriceByPath(w http.ResponseWriter, r *http.Request) err
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, response)
+		writeJSON(w, http.StatusOK, modelPriceCatalogForAPI(response))
+		return nil
+	}
+	if strings.HasSuffix(path, "/priority-multiplier") {
+		if _, err := a.adminUser(r.Context(), r); err != nil {
+			return err
+		}
+		if err := requireMethod(r, http.MethodPut); err != nil {
+			return err
+		}
+		id, err := parseIntPath(strings.TrimSuffix(path, "/priority-multiplier"))
+		if err != nil {
+			return err
+		}
+		var payload priorityMultiplierPayload
+		if err := decodeJSON(r, &payload); err != nil {
+			return err
+		}
+		price, err := a.updatePriorityMultiplier(r.Context(), id, payload)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, modelPriceForAPI(price))
 		return nil
 	}
 	if _, err := a.adminUser(r.Context(), r); err != nil {
@@ -206,7 +244,7 @@ func (a *App) handleModelPriceByPath(w http.ResponseWriter, r *http.Request) err
 		if err != nil {
 			return err
 		}
-		writeJSON(w, http.StatusOK, price)
+		writeJSON(w, http.StatusOK, modelPriceForAPI(price))
 		return nil
 	case http.MethodDelete:
 		if err := a.deletePrice(r.Context(), id); err != nil {
@@ -282,11 +320,60 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 	return payload, nil
 }
 
+func modelPriceFromPayload(payload modelPricePayload, priorityMultiplier *float64) ModelPrice {
+	return ModelPrice{
+		Provider:                   payload.Provider,
+		Model:                      payload.Model,
+		InputUSDPerMillion:         payload.InputUSDPerMillion,
+		OutputUSDPerMillion:        payload.OutputUSDPerMillion,
+		CacheReadUSDPerMillion:     payload.CacheReadUSDPerMillion,
+		CacheCreationUSDPerMillion: payload.CacheCreationUSDPerMillion,
+		RequestUSD:                 payload.RequestUSD,
+		PriorityMultiplier:         priorityMultiplier,
+	}
+}
+
+func modelPriceForAPI(price ModelPrice) ModelPrice {
+	if price.PriorityMultiplier != nil && (math.IsNaN(*price.PriorityMultiplier) || math.IsInf(*price.PriorityMultiplier, 0)) {
+		price.PriorityMultiplier = nil
+	}
+	return price
+}
+
+func modelPricesForAPI(prices []ModelPrice) []ModelPrice {
+	result := make([]ModelPrice, len(prices))
+	for index, price := range prices {
+		result[index] = modelPriceForAPI(price)
+	}
+	return result
+}
+
+func modelPriceCatalogForAPI(response ModelPriceCatalogResponse) ModelPriceCatalogResponse {
+	for index := range response.Models {
+		if response.Models[index].Price == nil {
+			continue
+		}
+		price := modelPriceForAPI(*response.Models[index].Price)
+		response.Models[index].Price = &price
+	}
+	return response
+}
+
+func validatePriorityMultiplierForPrice(price ModelPrice) error {
+	if price.PriorityMultiplier == nil || !isFastPricingProvider(price.Provider) {
+		return nil
+	}
+	if !priorityMultiplierProducesRoundableCost(price, *price.PriorityMultiplier) {
+		return validationError("Fast 倍率会产生无法安全计价的金额")
+	}
+	return nil
+}
+
 func (a *App) listPrices(ctx context.Context) ([]ModelPrice, error) {
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT id, provider, model, input_usd_per_million, output_usd_per_million,
 		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
-		       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
+		       priority_multiplier, source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
 		FROM model_prices
 		ORDER BY auto_synced ASC, lower(provider), lower(model)
 	`)
@@ -523,12 +610,15 @@ func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 	for rows.Next() {
 		var price ModelPrice
 		var sourceModel, lastSynced, updatedAt sql.NullString
-		var requestUSD sql.NullFloat64
-		if err := rows.Scan(&price.ID, &price.Provider, &price.Model, &price.InputUSDPerMillion, &price.OutputUSDPerMillion, &price.CacheReadUSDPerMillion, &price.CacheCreationUSDPerMillion, &requestUSD, &price.Source, &sourceModel, &price.AutoSynced, &lastSynced, &updatedAt); err != nil {
+		var requestUSD, priorityMultiplier sql.NullFloat64
+		if err := rows.Scan(&price.ID, &price.Provider, &price.Model, &price.InputUSDPerMillion, &price.OutputUSDPerMillion, &price.CacheReadUSDPerMillion, &price.CacheCreationUSDPerMillion, &requestUSD, &priorityMultiplier, &price.Source, &sourceModel, &price.AutoSynced, &lastSynced, &updatedAt); err != nil {
 			return nil, err
 		}
 		if requestUSD.Valid {
 			price.RequestUSD = &requestUSD.Float64
+		}
+		if priorityMultiplier.Valid {
+			price.PriorityMultiplier = &priorityMultiplier.Float64
 		}
 		price.BillingUnit = billingUnitForModel(price.Model)
 		price.SourceModel = nullableString(sourceModel)
@@ -541,19 +631,48 @@ func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 	return prices, rows.Err()
 }
 
+type priceRowsQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func getPriceWithQuerier(ctx context.Context, querier priceRowsQuerier, id int) (ModelPrice, error) {
+	rows, err := querier.QueryContext(ctx, `
+		SELECT id, provider, model, input_usd_per_million, output_usd_per_million,
+		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+		       priority_multiplier, source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
+		FROM model_prices WHERE id = ?
+	`, id)
+	if err != nil {
+		return ModelPrice{}, err
+	}
+	defer rows.Close()
+	prices, err := scanPrices(rows)
+	if err != nil {
+		return ModelPrice{}, err
+	}
+	if len(prices) == 0 {
+		return ModelPrice{}, notFoundError("模型价格不存在")
+	}
+	return prices[0], nil
+}
+
 func (a *App) createPrice(ctx context.Context, payload modelPricePayload) (ModelPrice, error) {
 	payload, err := validatePricePayload(payload)
 	if err != nil {
 		return ModelPrice{}, err
 	}
 	now := dbTime(time.Now())
+	priorityMultiplier := defaultPriorityMultiplier(payload.Provider, payload.Model)
+	if err := validatePriorityMultiplierForPrice(modelPriceFromPayload(payload, priorityMultiplier)); err != nil {
+		return ModelPrice{}, err
+	}
 	result, err := a.db.ExecContext(ctx, `
 		INSERT INTO model_prices (
 			provider, model, input_usd_per_million, output_usd_per_million,
 			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
-			source, source_model, auto_synced, last_synced_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
-	`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), now)
+			priority_multiplier, source, source_model, auto_synced, last_synced_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
+	`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), nullableFloatArg(priorityMultiplier), now)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return ModelPrice{}, conflictError("该 provider/model 价格已存在")
@@ -569,14 +688,30 @@ func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload
 	if err != nil {
 		return ModelPrice{}, err
 	}
-	result, err := a.db.ExecContext(ctx, `
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ModelPrice{}, err
+	}
+	defer tx.Rollback()
+	existing, err := getPriceWithQuerier(ctx, tx, id)
+	if err != nil {
+		return ModelPrice{}, err
+	}
+	priorityMultiplier := existing.PriorityMultiplier
+	if priceKey(existing.Provider, existing.Model) != priceKey(payload.Provider, payload.Model) {
+		priorityMultiplier = defaultPriorityMultiplier(payload.Provider, payload.Model)
+	}
+	if err := validatePriorityMultiplierForPrice(modelPriceFromPayload(payload, priorityMultiplier)); err != nil {
+		return ModelPrice{}, err
+	}
+	result, err := tx.ExecContext(ctx, `
 		UPDATE model_prices
 		SET provider = ?, model = ?, input_usd_per_million = ?, output_usd_per_million = ?,
 		    cache_read_usd_per_million = ?, cache_creation_usd_per_million = ?,
-		    request_usd = ?, source = 'manual',
+		    request_usd = ?, priority_multiplier = ?, source = 'manual',
 		    source_model = NULL, auto_synced = 0, last_synced_at = NULL, updated_at = ?
 		WHERE id = ?
-	`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), dbTime(time.Now()), id)
+	`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), nullableFloatArg(priorityMultiplier), dbTime(time.Now()), id)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return ModelPrice{}, conflictError("该 provider/model 价格已存在")
@@ -587,7 +722,56 @@ func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload
 	if affected == 0 {
 		return ModelPrice{}, notFoundError("模型价格不存在")
 	}
-	return a.getPrice(ctx, id)
+	updated, err := getPriceWithQuerier(ctx, tx, id)
+	if err != nil {
+		return ModelPrice{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return ModelPrice{}, err
+	}
+	return updated, nil
+}
+
+func (a *App) updatePriorityMultiplier(ctx context.Context, id int, payload priorityMultiplierPayload) (ModelPrice, error) {
+	if payload.PriorityMultiplier == nil || !finitePositive(*payload.PriorityMultiplier) {
+		return ModelPrice{}, validationError("Fast 倍率必须是大于 0 的有限数值")
+	}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ModelPrice{}, err
+	}
+	defer tx.Rollback()
+	price, err := getPriceWithQuerier(ctx, tx, id)
+	if err != nil {
+		return ModelPrice{}, err
+	}
+	if !isFastPricingProvider(price.Provider) {
+		return ModelPrice{}, validationError("Fast 倍率仅支持 OpenAI/Codex 模型")
+	}
+	price.PriorityMultiplier = payload.PriorityMultiplier
+	if err := validatePriorityMultiplierForPrice(price); err != nil {
+		return ModelPrice{}, err
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE model_prices
+		SET priority_multiplier = ?, updated_at = ?
+		WHERE id = ?
+	`, *payload.PriorityMultiplier, dbTime(time.Now()), id)
+	if err != nil {
+		return ModelPrice{}, err
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return ModelPrice{}, notFoundError("模型价格不存在")
+	}
+	updated, err := getPriceWithQuerier(ctx, tx, id)
+	if err != nil {
+		return ModelPrice{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return ModelPrice{}, err
+	}
+	return updated, nil
 }
 
 func (a *App) deletePrice(ctx context.Context, id int) error {
@@ -603,24 +787,7 @@ func (a *App) deletePrice(ctx context.Context, id int) error {
 }
 
 func (a *App) getPrice(ctx context.Context, id int) (ModelPrice, error) {
-	rows, err := a.db.QueryContext(ctx, `
-		SELECT id, provider, model, input_usd_per_million, output_usd_per_million,
-		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
-		       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
-		FROM model_prices WHERE id = ?
-	`, id)
-	if err != nil {
-		return ModelPrice{}, err
-	}
-	defer rows.Close()
-	prices, err := scanPrices(rows)
-	if err != nil {
-		return ModelPrice{}, err
-	}
-	if len(prices) == 0 {
-		return ModelPrice{}, notFoundError("模型价格不存在")
-	}
-	return prices[0], nil
+	return getPriceWithQuerier(ctx, a.db, id)
 }
 
 func (a *App) handleSyncLiteLLMPrices(w http.ResponseWriter, r *http.Request) error {
@@ -683,7 +850,12 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 			skippedInvalid++
 			continue
 		}
-		rows = append(rows, litellmPriceRow{modelName: modelName, payload: payload})
+		validatedPayload, err := validatePricePayload(payload)
+		if err != nil {
+			skippedInvalid++
+			continue
+		}
+		rows = append(rows, litellmPriceRow{modelName: modelName, payload: validatedPayload})
 	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -695,19 +867,30 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 			_ = tx.Rollback()
 		}
 	}()
+	priorityMultipliers, err := liteLLMPriorityMultiplierSnapshot(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM model_prices WHERE source = 'litellm'`); err != nil {
 		return nil, err
 	}
 	inserted, skippedManual := 0, 0
 	for _, row := range rows {
 		payload := row.payload
+		priorityMultiplier, preserved := priorityMultipliers[priceKey(payload.Provider, payload.Model)]
+		if !preserved {
+			priorityMultiplier = defaultPriorityMultiplier(payload.Provider, payload.Model)
+			if err := validatePriorityMultiplierForPrice(modelPriceFromPayload(payload, priorityMultiplier)); err != nil {
+				priorityMultiplier = nil
+			}
+		}
 		result, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO model_prices (
 				provider, model, input_usd_per_million, output_usd_per_million,
 				cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
-				source, source_model, auto_synced, last_synced_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, 'litellm', ?, 1, ?, ?)
-		`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), row.modelName, now, now)
+				priority_multiplier, source, source_model, auto_synced, last_synced_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'litellm', ?, 1, ?, ?)
+		`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), nullableFloatArg(priorityMultiplier), row.modelName, now, now)
 		if err != nil {
 			return nil, err
 		}
@@ -732,6 +915,33 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 		"skipped_manual":  skippedManual,
 		"skipped_invalid": skippedInvalid,
 	}, nil
+}
+
+func liteLLMPriorityMultiplierSnapshot(ctx context.Context, tx *sql.Tx) (map[[2]string]*float64, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT provider, model, priority_multiplier
+		FROM model_prices
+		WHERE source = 'litellm'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := map[[2]string]*float64{}
+	for rows.Next() {
+		var provider, model string
+		var multiplier sql.NullFloat64
+		if err := rows.Scan(&provider, &model, &multiplier); err != nil {
+			return nil, err
+		}
+		if !multiplier.Valid {
+			continue
+		}
+		value := multiplier.Float64
+		result[priceKey(provider, model)] = &value
+	}
+	return result, rows.Err()
 }
 
 func litellmEntryToPrice(modelName string, rawEntry any) (modelPricePayload, bool) {
@@ -785,10 +995,12 @@ func mathRound(value float64, places int) float64 {
 	for i := 0; i < places; i++ {
 		factor *= 10
 	}
-	if value >= 0 {
-		return float64(int64(value*factor+0.5)) / factor
+	scaled := value * factor
+	if math.IsInf(scaled, 0) && !math.IsInf(value, 0) {
+		// Decimal rounding cannot change a finite float at this magnitude.
+		return value
 	}
-	return float64(int64(value*factor-0.5)) / factor
+	return math.Round(scaled) / factor
 }
 
 func pricesEqual(item ModelPrice, payload modelPricePayload) bool {
@@ -829,6 +1041,78 @@ func findMatchingPrice(prices map[[2]string]ModelPrice, provider, model *string)
 	return nil
 }
 
+func defaultPriorityMultiplier(provider, model string) *float64 {
+	if !isFastPricingProvider(provider) {
+		return nil
+	}
+	value, ok := defaultPriorityMultipliers[strings.ToLower(strings.TrimSpace(model))]
+	if !ok {
+		return nil
+	}
+	return &value
+}
+
+func isFastPricingProvider(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "openai", "codex":
+		return true
+	default:
+		return false
+	}
+}
+
+func priorityMultiplierForRecord(record UsageRecord, price *ModelPrice) (*float64, bool) {
+	if price == nil || record.Provider == nil || record.ServiceTier == nil {
+		return nil, false
+	}
+	if !isFastPricingProvider(*record.Provider) || !strings.EqualFold(strings.TrimSpace(*record.ServiceTier), serviceTierPriority) {
+		return nil, false
+	}
+	if price.PriorityMultiplier == nil {
+		return nil, false
+	}
+	if !priorityMultiplierProducesRoundableCost(*price, *price.PriorityMultiplier) {
+		return nil, true
+	}
+	value := *price.PriorityMultiplier
+	return &value, false
+}
+
+func applyTierMultiplier(value float64, multiplier *float64) float64 {
+	if multiplier == nil {
+		return value
+	}
+	return value * *multiplier
+}
+
+func priorityMultiplierProducesRoundableCost(price ModelPrice, multiplier float64) bool {
+	if !finitePositive(multiplier) {
+		return false
+	}
+	if billingUnitForModel(price.Model) == modelBillingUnitRequest {
+		if price.RequestUSD == nil {
+			return true
+		}
+		_, ok := roundCostUSD(applyTierMultiplier(*price.RequestUSD, &multiplier))
+		return ok
+	}
+	for _, usdPerMillion := range []float64{
+		price.InputUSDPerMillion,
+		price.CacheReadUSDPerMillion,
+		price.CacheCreationUSDPerMillion,
+		price.OutputUSDPerMillion,
+	} {
+		if usdPerMillion == 0 {
+			continue
+		}
+		_, ok := roundCostUSD(applyTierMultiplier(usdPerMillion, &multiplier))
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func calculateRecordCostBreakdown(record UsageRecord, prices map[[2]string]ModelPrice) usageCostBreakdown {
 	return calculateRecordCost(record, prices, true)
 }
@@ -858,12 +1142,26 @@ func calculateRecordCost(record UsageRecord, prices map[[2]string]ModelPrice, co
 			breakdown.Unpriced = true
 			return breakdown
 		}
-		breakdown.TotalUSD = mathRound(*price.RequestUSD, 8)
+		multiplier, invalidMultiplier := priorityMultiplierForRecord(record, price)
+		if invalidMultiplier {
+			markCostBreakdownUnpriced(&breakdown)
+			return breakdown
+		}
+		if multiplier != nil {
+			breakdown.TierMultiplier = multiplier
+		}
+		requestUSD := applyTierMultiplier(*price.RequestUSD, multiplier)
+		totalUSD, ok := roundCostUSD(requestUSD)
+		if !ok {
+			markCostBreakdownUnpriced(&breakdown)
+			return breakdown
+		}
+		breakdown.TotalUSD = totalUSD
 		if collectItems {
 			breakdown.Items = append(breakdown.Items, usageRequestCostBreakdownItem{
 				Kind:          usageCostKindRequest,
 				Requests:      1,
-				USDPerRequest: *price.RequestUSD,
+				USDPerRequest: requestUSD,
 				SubtotalUSD:   breakdown.TotalUSD,
 			})
 		}
@@ -873,17 +1171,33 @@ func calculateRecordCost(record UsageRecord, prices map[[2]string]ModelPrice, co
 		breakdown.Unpriced = usageAggregateTotalTokens(record) > 0
 		return breakdown
 	}
+	multiplier, invalidMultiplier := priorityMultiplierForRecord(record, price)
+	if invalidMultiplier {
+		markCostBreakdownUnpriced(&breakdown)
+		return breakdown
+	}
+	if multiplier != nil {
+		breakdown.TierMultiplier = multiplier
+	}
 	cacheCreationHasSeparatePrice := isClaudeProvider(record.Provider) || price.CacheCreationUSDPerMillion > 0
 	billableInputTokens := tokens.NormalInputTokens
 	if !cacheCreationHasSeparatePrice {
 		billableInputTokens += tokens.CacheCreationTokens
 	}
-	appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindInput, billableInputTokens, price.InputUSDPerMillion)
-	appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindCacheRead, tokens.CacheReadTokens, price.CacheReadUSDPerMillion)
-	if cacheCreationHasSeparatePrice {
-		appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindCacheCreation, tokens.CacheCreationTokens, price.CacheCreationUSDPerMillion)
+	if !appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindInput, billableInputTokens, applyTierMultiplier(price.InputUSDPerMillion, multiplier)) ||
+		!appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindCacheRead, tokens.CacheReadTokens, applyTierMultiplier(price.CacheReadUSDPerMillion, multiplier)) {
+		markCostBreakdownUnpriced(&breakdown)
+		return breakdown
 	}
-	appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindOutput, tokens.OutputTokens, price.OutputUSDPerMillion)
+	if cacheCreationHasSeparatePrice {
+		if !appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindCacheCreation, tokens.CacheCreationTokens, applyTierMultiplier(price.CacheCreationUSDPerMillion, multiplier)) {
+			markCostBreakdownUnpriced(&breakdown)
+			return breakdown
+		}
+	}
+	if !appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindOutput, tokens.OutputTokens, applyTierMultiplier(price.OutputUSDPerMillion, multiplier)) {
+		markCostBreakdownUnpriced(&breakdown)
+	}
 	return breakdown
 }
 
@@ -914,11 +1228,18 @@ func normalizedUsageTokenBreakdown(record UsageRecord) usageTokenBreakdown {
 	}
 }
 
-func appendUsageTokenCostItem(breakdown *usageCostBreakdown, collectItem bool, kind string, tokens int, usdPerMillion float64) {
+func appendUsageTokenCostItem(breakdown *usageCostBreakdown, collectItem bool, kind string, tokens int, usdPerMillion float64) bool {
 	if breakdown == nil || tokens <= 0 {
-		return
+		return true
 	}
-	subtotal := mathRound(millionTokenCost(tokens, usdPerMillion), 8)
+	subtotal, ok := roundCostUSD(millionTokenCost(tokens, usdPerMillion))
+	if !ok {
+		return false
+	}
+	totalUSD, ok := roundCostUSD(breakdown.TotalUSD + subtotal)
+	if !ok {
+		return false
+	}
 	if collectItem {
 		breakdown.Items = append(breakdown.Items, usageTokenCostBreakdownItem{
 			Kind:          kind,
@@ -927,7 +1248,29 @@ func appendUsageTokenCostItem(breakdown *usageCostBreakdown, collectItem bool, k
 			SubtotalUSD:   subtotal,
 		})
 	}
-	breakdown.TotalUSD = mathRound(breakdown.TotalUSD+subtotal, 8)
+	breakdown.TotalUSD = totalUSD
+	return true
+}
+
+func markCostBreakdownUnpriced(breakdown *usageCostBreakdown) {
+	breakdown.TotalUSD = 0
+	breakdown.Unpriced = true
+	breakdown.TierMultiplier = nil
+	breakdown.Items = breakdown.Items[:0]
+}
+
+func roundCostUSD(value float64) (float64, bool) {
+	if !finiteNonNegative(value) {
+		return 0, false
+	}
+	if !finiteNonNegative(value * math.Pow10(8)) {
+		return 0, false
+	}
+	rounded := mathRound(value, 8)
+	if !finiteNonNegative(rounded) {
+		return 0, false
+	}
+	return rounded, true
 }
 
 func recordCost(record UsageRecord, prices map[[2]string]ModelPrice) (float64, bool) {
@@ -1034,6 +1377,10 @@ func millionTokenCost(tokens int, usdPerMillion float64) float64 {
 
 func finiteNonNegative(value float64) bool {
 	return value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func finitePositive(value float64) bool {
+	return value > 0 && finiteNonNegative(value)
 }
 
 func nullableFloatArg(value *float64) any {

@@ -6,6 +6,7 @@ import type {
   ModelPriceCatalogResponse,
   ModelPricePayload,
   ModelPriceSyncResponse,
+  PriorityMultiplierPayload,
 } from '@/shared/types/api'
 
 export function listModelPrices(): Promise<ModelPrice[]> {
@@ -22,6 +23,13 @@ export function createModelPrice(payload: ModelPricePayload): Promise<ModelPrice
 
 export function updateModelPrice(id: number, payload: ModelPricePayload): Promise<ModelPrice> {
   return apiClient.put<ModelPrice>(`/model-prices/${id}`, payload)
+}
+
+export function updateModelPricePriorityMultiplier(
+  id: number,
+  payload: PriorityMultiplierPayload,
+): Promise<ModelPrice> {
+  return apiClient.put<ModelPrice>(`/model-prices/${id}/priority-multiplier`, payload)
 }
 
 export function deleteModelPrice(id: number): Promise<void> {

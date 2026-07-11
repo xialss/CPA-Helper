@@ -36,6 +36,9 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if !testColumnExists(t, app.db, "usage_records", "ttft_ms") {
 		t.Fatal("usage_records.ttft_ms was not created")
 	}
+	if !testColumnExists(t, app.db, "usage_records", "service_tier") {
+		t.Fatal("usage_records.service_tier was not created")
+	}
 	if !testColumnExists(t, app.db, "model_prices", "cache_read_usd_per_million") {
 		t.Fatal("model_prices.cache_read_usd_per_million was not created")
 	}
@@ -44,6 +47,9 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	}
 	if !testColumnExists(t, app.db, "model_prices", "request_usd") {
 		t.Fatal("model_prices.request_usd was not created")
+	}
+	if !testColumnExists(t, app.db, "model_prices", "priority_multiplier") {
+		t.Fatal("model_prices.priority_multiplier was not created")
 	}
 	if testColumnExists(t, app.db, "model_prices", "cached_usd_per_million") {
 		t.Fatal("old model_prices.cached_usd_per_million should not exist")
@@ -194,7 +200,7 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 			'openai', 'gpt-test', '/v1/chat/completions', 'queue', 'req-1',
 			'bearer', 12.5, 0, 10, 20, 0, 0, 30, 'dedupe-1', ?
 		)
-	`, apiKeyHash, `{"api_key":"`+apiKey+`","auth":"bearer","reasoning_effort":"xhigh","ttft_ms":710,"tokens":{"cache_read_tokens":7,"cache_creation_tokens":8}}`); err != nil {
+	`, apiKeyHash, `{"api_key":"`+apiKey+`","auth":"bearer","reasoning_effort":"xhigh","ttft_ms":710,"service_tier":"priority","tokens":{"cache_read_tokens":7,"cache_creation_tokens":8}}`); err != nil {
 		_ = db.Close()
 		t.Fatal(err)
 	}
@@ -217,7 +223,9 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 		INSERT INTO model_prices (
 			provider, model, input_usd_per_million, output_usd_per_million,
 			cached_usd_per_million, reasoning_usd_per_million, updated_at
-		) VALUES ('openai', 'gpt-old-price', 1, 2, 0.5, 9, '2026-05-04 00:00:00')
+		) VALUES
+			('openai', 'gpt-5.5', 1, 2, 0.5, 9, '2026-05-04 00:00:00'),
+			('openai', 'gpt-5.4', 1e308, 0, 0, 0, '2026-05-04 00:00:00')
 	`); err != nil {
 		_ = db.Close()
 		t.Fatal(err)
@@ -231,6 +239,14 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 		t.Fatalf("New() failed: %v", err)
 	}
 	defer app.Close()
+
+	var quotaChargeCount int
+	if err := app.db.QueryRow(`SELECT COUNT(*) FROM user_quota_charges`).Scan(&quotaChargeCount); err != nil {
+		t.Fatalf("query migrated quota charges: %v", err)
+	}
+	if quotaChargeCount != 0 {
+		t.Fatalf("migrated quota charges = %d, want 0", quotaChargeCount)
+	}
 
 	if testColumnExists(t, app.db, "usage_records", "api_key_hash") {
 		t.Fatal("old usage_records.api_key_hash should be removed")
@@ -273,12 +289,13 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 		t.Fatalf("migrated cache tokens = read %d creation %d, want 7 and 8", cacheReadTokens, cacheCreationTokens)
 	}
 	var reasoningEffort string
+	var serviceTier sql.NullString
 	var ttftMS sql.NullFloat64
-	if err := app.db.QueryRow(`SELECT reasoning_effort, ttft_ms FROM usage_records WHERE dedupe_key = 'dedupe-1'`).Scan(&reasoningEffort, &ttftMS); err != nil {
+	if err := app.db.QueryRow(`SELECT reasoning_effort, ttft_ms, service_tier FROM usage_records WHERE dedupe_key = 'dedupe-1'`).Scan(&reasoningEffort, &ttftMS, &serviceTier); err != nil {
 		t.Fatalf("migrated reasoning/ttft not found: %v", err)
 	}
-	if reasoningEffort != "xhigh" || !ttftMS.Valid || ttftMS.Float64 != 710 {
-		t.Fatalf("migrated reasoning/ttft = %q/%v, want xhigh/710", reasoningEffort, ttftMS)
+	if reasoningEffort != "xhigh" || !ttftMS.Valid || ttftMS.Float64 != 710 || !serviceTier.Valid || serviceTier.String != "priority" {
+		t.Fatalf("migrated reasoning/ttft/tier = %q/%v/%#v, want xhigh/710/priority", reasoningEffort, ttftMS, serviceTier)
 	}
 	if err := app.db.QueryRow(`SELECT ttft_ms FROM usage_records WHERE dedupe_key = 'dedupe-ttft-zero'`).Scan(&ttftMS); err != nil {
 		t.Fatalf("migrated zero ttft record not found: %v", err)
@@ -293,18 +310,28 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 		t.Fatal("old model_prices.reasoning_usd_per_million should be removed")
 	}
 	var cacheReadPrice, cacheCreationPrice float64
-	if err := app.db.QueryRow(`SELECT cache_read_usd_per_million, cache_creation_usd_per_million FROM model_prices WHERE provider = 'openai' AND model = 'gpt-old-price'`).Scan(&cacheReadPrice, &cacheCreationPrice); err != nil {
+	if err := app.db.QueryRow(`SELECT cache_read_usd_per_million, cache_creation_usd_per_million FROM model_prices WHERE provider = 'openai' AND model = 'gpt-5.5'`).Scan(&cacheReadPrice, &cacheCreationPrice); err != nil {
 		t.Fatalf("migrated model price not found: %v", err)
 	}
 	if cacheReadPrice != 0.5 || cacheCreationPrice != 0 {
 		t.Fatalf("migrated cache prices = read %v creation %v, want 0.5 and 0", cacheReadPrice, cacheCreationPrice)
 	}
 	var requestUSD sql.NullFloat64
-	if err := app.db.QueryRow(`SELECT request_usd FROM model_prices WHERE provider = 'openai' AND model = 'gpt-old-price'`).Scan(&requestUSD); err != nil {
-		t.Fatalf("migrated request price not found: %v", err)
+	var priorityMultiplier sql.NullFloat64
+	if err := app.db.QueryRow(`SELECT request_usd, priority_multiplier FROM model_prices WHERE provider = 'openai' AND model = 'gpt-5.5'`).Scan(&requestUSD, &priorityMultiplier); err != nil {
+		t.Fatalf("migrated request price/multiplier not found: %v", err)
 	}
 	if requestUSD.Valid {
 		t.Fatalf("migrated request_usd = %v, want NULL", requestUSD.Float64)
+	}
+	if !priorityMultiplier.Valid || priorityMultiplier.Float64 != 2.5 {
+		t.Fatalf("migrated priority_multiplier = %v, want 2.5", priorityMultiplier)
+	}
+	if err := app.db.QueryRow(`SELECT priority_multiplier FROM model_prices WHERE provider = 'openai' AND model = 'gpt-5.4'`).Scan(&priorityMultiplier); err != nil {
+		t.Fatalf("unsafe migrated priority multiplier not found: %v", err)
+	}
+	if priorityMultiplier.Valid {
+		t.Fatalf("unsafe migrated priority_multiplier = %v, want NULL", priorityMultiplier.Float64)
 	}
 }
 

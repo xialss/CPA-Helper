@@ -40,6 +40,7 @@ type UsageRecord struct {
 	APIKeyDescription   *string
 	Provider            *string
 	Model               *string
+	ServiceTier         *string
 	ReasoningEffort     *string
 	Endpoint            *string
 	Source              *string
@@ -604,7 +605,7 @@ func parsePositiveInt(value string, fallback int) int {
 
 func (a *App) filteredUsageRecords(ctx context.Context, filters UsageFilters, orderBy string) ([]UsageRecord, error) {
 	where, args := usageWhere(filters)
-	query := `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, reasoning_effort, endpoint, source,
+	query := `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, service_tier, reasoning_effort, endpoint, source,
 		source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
 		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json FROM usage_records ` + where
 	if strings.TrimSpace(orderBy) != "" {
@@ -656,7 +657,7 @@ func (a *App) pagedUsageRecords(ctx context.Context, filters UsageFilters, page,
 	}
 	where, args := usageWhere(filters)
 	args = append(args, pageSize, (page-1)*pageSize)
-	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, reasoning_effort, endpoint, source,
+	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, service_tier, reasoning_effort, endpoint, source,
 		source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
 		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json FROM usage_records `+where+` ORDER BY timestamp DESC LIMIT ? OFFSET ?`, args...)
 	if err != nil {
@@ -688,7 +689,7 @@ func applyUsagePostFilters(records []UsageRecord, filters UsageFilters) []UsageR
 }
 
 func (a *App) getUsageRecord(ctx context.Context, id int) (UsageRecord, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, reasoning_effort, endpoint, source,
+	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, service_tier, reasoning_effort, endpoint, source,
 		source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
 		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json FROM usage_records WHERE id = ?`, id)
 	if err != nil {
@@ -751,9 +752,9 @@ func scanUsageRecords(rows *sql.Rows) ([]UsageRecord, error) {
 	var records []UsageRecord
 	for rows.Next() {
 		var record UsageRecord
-		var timestamp, usageUsername, description, provider, model, reasoningEffort, endpoint, source, sourceAccount, requestID, auth, authIndex, latency sql.NullString
+		var timestamp, usageUsername, description, provider, model, serviceTier, reasoningEffort, endpoint, source, sourceAccount, requestID, auth, authIndex, latency sql.NullString
 		var latencyFloat, ttftFloat sql.NullFloat64
-		if err := rows.Scan(&record.ID, &timestamp, &usageUsername, &description, &provider, &model, &reasoningEffort, &endpoint, &source, &sourceAccount, &requestID, &auth, &authIndex, &latencyFloat, &ttftFloat, &record.Failed, &record.InputTokens, &record.OutputTokens, &record.CachedTokens, &record.CacheReadTokens, &record.CacheCreationTokens, &record.ReasoningTokens, &record.TotalTokens, &record.DedupeKey, &record.RawJSON); err != nil {
+		if err := rows.Scan(&record.ID, &timestamp, &usageUsername, &description, &provider, &model, &serviceTier, &reasoningEffort, &endpoint, &source, &sourceAccount, &requestID, &auth, &authIndex, &latencyFloat, &ttftFloat, &record.Failed, &record.InputTokens, &record.OutputTokens, &record.CachedTokens, &record.CacheReadTokens, &record.CacheCreationTokens, &record.ReasoningTokens, &record.TotalTokens, &record.DedupeKey, &record.RawJSON); err != nil {
 			return nil, err
 		}
 		_ = latency
@@ -764,6 +765,7 @@ func scanUsageRecords(rows *sql.Rows) ([]UsageRecord, error) {
 		record.APIKeyDescription = nullableString(description)
 		record.Provider = nullableString(provider)
 		record.Model = nullableString(model)
+		record.ServiceTier = nullableString(serviceTier)
 		record.ReasoningEffort = nullableString(reasoningEffort)
 		record.Endpoint = nullableString(endpoint)
 		record.Source = nullableString(source)
@@ -832,6 +834,7 @@ func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices ma
 		"user_label":            userLabel,
 		"provider":              record.Provider,
 		"model":                 record.Model,
+		"service_tier":          record.ServiceTier,
 		"reasoning_effort":      record.ReasoningEffort,
 		"endpoint":              record.Endpoint,
 		"source":                redactedUsageSource(record.Source, auth, redaction),
@@ -1264,11 +1267,11 @@ func (a *App) saveUsageMessage(ctx context.Context, raw []byte) (UsageRecord, bo
 	now := dbTime(time.Now())
 	result, err := a.db.ExecContext(ctx, `
 		INSERT INTO usage_records (
-			created_at, timestamp, usage_username, api_key_description, provider, model, endpoint,
+			created_at, timestamp, usage_username, api_key_description, provider, model, service_tier, endpoint,
 			reasoning_effort, source, source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens,
 			cached_tokens, cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, now, dbTime(normalized.Timestamp), usageUsername, description, normalized.Provider, normalized.Model, normalized.Endpoint, normalized.ReasoningEffort, normalized.Source, normalized.SourceAccount, normalized.RequestID, normalized.Auth, normalized.AuthIndex, normalized.LatencyMS, normalized.TTFTMS, normalized.Failed, normalized.InputTokens, normalized.OutputTokens, normalized.CachedTokens, normalized.CacheReadTokens, normalized.CacheCreationTokens, normalized.ReasoningTokens, normalized.TotalTokens, normalized.DedupeKey, normalized.RawJSON)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, now, dbTime(normalized.Timestamp), usageUsername, description, normalized.Provider, normalized.Model, normalized.ServiceTier, normalized.Endpoint, normalized.ReasoningEffort, normalized.Source, normalized.SourceAccount, normalized.RequestID, normalized.Auth, normalized.AuthIndex, normalized.LatencyMS, normalized.TTFTMS, normalized.Failed, normalized.InputTokens, normalized.OutputTokens, normalized.CachedTokens, normalized.CacheReadTokens, normalized.CacheCreationTokens, normalized.ReasoningTokens, normalized.TotalTokens, normalized.DedupeKey, normalized.RawJSON)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			record, getErr := a.usageRecordByDedupe(ctx, normalized.DedupeKey)
@@ -1288,7 +1291,7 @@ func (a *App) saveUsageMessage(ctx context.Context, raw []byte) (UsageRecord, bo
 }
 
 func (a *App) usageRecordByDedupe(ctx context.Context, dedupeKey string) (UsageRecord, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, reasoning_effort, endpoint, source,
+	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, service_tier, reasoning_effort, endpoint, source,
 		source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
 		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json FROM usage_records WHERE dedupe_key = ?`, dedupeKey)
 	if err != nil {
@@ -1310,6 +1313,7 @@ type normalizedUsage struct {
 	APIKeyHash          string
 	Provider            *string
 	Model               *string
+	ServiceTier         *string
 	Endpoint            *string
 	Source              *string
 	SourceAccount       *string
@@ -1365,6 +1369,7 @@ func normalizeUsage(raw []byte) (normalizedUsage, error) {
 		APIKeyHash:          hashAPIKey(*apiKey),
 		Provider:            toString(findFirst(parsed, "provider", "provider_name")),
 		Model:               toString(findFirst(parsed, "model", "model_name")),
+		ServiceTier:         toString(findFirst(parsed, "service_tier", "serviceTier")),
 		Endpoint:            toString(findFirst(parsed, "endpoint", "path", "route")),
 		Source:              source,
 		SourceAccount:       sourceAccountFromUsageSource(source),

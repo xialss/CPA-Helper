@@ -14,6 +14,10 @@ export function formatCompact(value: number): string {
   }).format(value)
 }
 
+export function formatMultiplier(value: number): string {
+  return String(value)
+}
+
 export function formatUsd(value: number | null | undefined): string {
   const normalized = typeof value === 'number' && Number.isFinite(value) ? value : 0
   return new Intl.NumberFormat('en-US', {

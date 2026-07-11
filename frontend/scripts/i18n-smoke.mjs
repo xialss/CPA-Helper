@@ -93,10 +93,12 @@ try {
   assert.equal(localizedApiErrorMessage('validation_error', null), '请求参数无效')
   assert.equal(localizedApiErrorMessage(null, null), '请求失败')
   assert.equal(localizedKeeperStatusDetail('守护运行中'), '自动巡检运行中')
-  const { formatCompact } = await server.ssrLoadModule('/src/shared/utils/format.ts')
+  const { formatCompact, formatMultiplier } = await server.ssrLoadModule('/src/shared/utils/format.ts')
   assert.equal(formatCompact(12_300), '12.3K')
   assert.equal(formatCompact(52_646_000), '52.6M')
   assert.equal(formatCompact(3_560_000_000), '3.6B')
+  assert.equal(formatMultiplier(1.00001), '1.00001')
+  assert.equal(formatMultiplier(0.00001), '0.00001')
 
   let browserCase = await loadI18nWithBrowserStubs({
     browserLanguages: ['fr-FR', 'zh-CN', 'en-US'],

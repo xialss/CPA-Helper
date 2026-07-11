@@ -1295,7 +1295,7 @@ func keeperQuotaWindowBounds(minStart, maxEnd time.Time, usage *keeperQuotaWindo
 }
 
 func (a *App) keeperUsageRecordsInRange(ctx context.Context, start, end time.Time) ([]UsageRecord, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, reasoning_effort, endpoint, source,
+	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, service_tier, reasoning_effort, endpoint, source,
 		source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
 		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json
 		FROM usage_records

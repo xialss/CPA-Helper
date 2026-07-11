@@ -15,11 +15,12 @@ import {
   NSpace,
   NSwitch,
   NTag,
+  NTooltip,
   useDialog,
   useMessage,
   type DataTableColumns,
 } from 'naive-ui'
-import { Database, Layers3, RefreshCw, Search, Server, Settings2 } from 'lucide-vue-next'
+import { Database, Layers3, RefreshCw, Search, Server, Settings2, Zap } from 'lucide-vue-next'
 
 import {
   createModelPrice,
@@ -30,6 +31,7 @@ import {
   syncLitellmModelPrices,
   updateLiteLLMProxySettings,
   updateModelPrice,
+  updateModelPricePriorityMultiplier,
 } from '@/features/pricing/api/pricingApi'
 import type {
   LiteLLMProxySettingsPayload,
@@ -37,7 +39,7 @@ import type {
   ModelPriceCatalogResponse,
   ModelPricePayload,
 } from '@/shared/types/api'
-import { formatDateTime, formatInteger } from '@/shared/utils/format'
+import { formatDateTime, formatInteger, formatMultiplier } from '@/shared/utils/format'
 import { useI18n } from '@/shared/i18n'
 
 type PriceTableLayoutProps =
@@ -71,6 +73,7 @@ interface PriceDisplayRow {
 
 const PRICE_TABLE_FALLBACK_MAX_HEIGHT = 'max(240px, calc(100dvh - 360px))'
 const priceModalStyle: CSSProperties = { width: 'min(640px, calc(100vw - 32px))' }
+const priorityModalStyle: CSSProperties = { width: 'min(420px, calc(100vw - 32px))' }
 const proxyModalStyle: CSSProperties = { width: 'min(460px, calc(100vw - 32px))' }
 const proxyModalContentStyle: CSSProperties = { padding: '16px 22px 4px' }
 const proxyModalFooterStyle: CSSProperties = { padding: '12px 22px 18px' }
@@ -82,9 +85,13 @@ const isLoading = ref(false)
 const isSyncing = ref(false)
 const modalOpen = ref(false)
 const proxyModalOpen = ref(false)
+const priorityModalOpen = ref(false)
 const isProxyLoading = ref(false)
 const isProxySaving = ref(false)
+const isPrioritySaving = ref(false)
 const editingId = ref<number | null>(null)
+const priorityEditingPrice = ref<ModelPrice | null>(null)
+const priorityMultiplier = ref<number | null>(null)
 const prices = ref<ModelPrice[]>([])
 const catalog = ref<ModelPriceCatalogResponse | null>(null)
 const selectedProvider = ref<string | null>(null)
@@ -457,6 +464,40 @@ async function savePrice() {
   }
 }
 
+function supportsPriorityMultiplier(price: ModelPrice | null): boolean {
+  if (!price) {
+    return false
+  }
+  const provider = price.provider.trim().toLowerCase()
+  return provider === 'openai' || provider === 'codex'
+}
+
+function openPriorityMultiplierEditor(price: ModelPrice) {
+  priorityEditingPrice.value = price
+  priorityMultiplier.value = price.priority_multiplier
+  priorityModalOpen.value = true
+}
+
+async function savePriorityMultiplier() {
+  const price = priorityEditingPrice.value
+  const multiplier = priorityMultiplier.value
+  if (!price || multiplier === null || !Number.isFinite(multiplier) || multiplier <= 0) {
+    message.error(t('Fast 倍率必须大于 0', 'Fast multiplier must be greater than 0'))
+    return
+  }
+  isPrioritySaving.value = true
+  try {
+    await updateModelPricePriorityMultiplier(price.id, { priority_multiplier: multiplier })
+    priorityModalOpen.value = false
+    message.success(t('Fast 倍率已更新', 'Fast multiplier updated'))
+    await refresh()
+  } catch (error) {
+    message.error(errorText(error, '保存 Fast 倍率失败', 'Failed to save Fast multiplier'))
+  } finally {
+    isPrioritySaving.value = false
+  }
+}
+
 async function syncPrices() {
   isSyncing.value = true
   try {
@@ -578,6 +619,47 @@ function renderRequestPriceValue(row: PriceDisplayRow) {
   return formatPriceValue(row.price.request_usd)
 }
 
+function renderPriorityMultiplier(row: PriceDisplayRow) {
+  if (!supportsPriorityMultiplier(row.price)) {
+    return h('span', { class: 'price-muted' }, '-')
+  }
+  const multiplier = row.price?.priority_multiplier
+  if (typeof multiplier !== 'number') {
+    return h(
+      NTag,
+      { size: 'small', type: 'warning', bordered: false },
+      { default: () => t('未配置', 'Unconfigured') },
+    )
+  }
+  return h(
+    NTag,
+    { size: 'small', type: 'warning', bordered: false },
+    { default: () => 'Fast x' + formatMultiplier(multiplier) },
+  )
+}
+
+function renderPriorityMultiplierAction(price: ModelPrice) {
+  const label = t('设置 Fast 倍率', 'Set Fast multiplier')
+  return h(
+    NTooltip,
+    null,
+    {
+      trigger: () =>
+        h(
+          NButton,
+          {
+            size: 'small',
+            quaternary: true,
+            'aria-label': label,
+            onClick: () => openPriorityMultiplierEditor(price),
+          },
+          { icon: () => h(NIcon, { component: Zap }) },
+        ),
+      default: () => label,
+    },
+  )
+}
+
 function renderModelCell(row: PriceDisplayRow) {
   return h('div', { class: 'model-cell' }, [
     h('div', { class: 'model-title-row' }, [
@@ -677,6 +759,12 @@ const columns = computed<DataTableColumns<PriceDisplayRow>>(() => [
     render: (row) => renderTokenPriceValue(row, 'cache_creation_usd_per_million'),
   },
   {
+    title: t('Fast 倍率', 'Fast multiplier'),
+    key: 'priority_multiplier',
+    width: 116,
+    render: renderPriorityMultiplier,
+  },
+  {
     title: t('更新', 'Updated'),
     key: 'updated_at',
     width: 140,
@@ -685,7 +773,7 @@ const columns = computed<DataTableColumns<PriceDisplayRow>>(() => [
   {
     title: '',
     key: 'actions',
-    width: 132,
+    width: 168,
     fixed: 'right',
     render: (row) =>
       h(
@@ -693,6 +781,9 @@ const columns = computed<DataTableColumns<PriceDisplayRow>>(() => [
         { size: 4 },
         {
           default: () => [
+            ...(row.price && supportsPriorityMultiplier(row.price)
+              ? [renderPriorityMultiplierAction(row.price)]
+              : []),
             row.price
               ? h(
                   NButton,
@@ -811,7 +902,7 @@ onBeforeUnmount(() => {
         :data="filteredPrices"
         :pagination="pagination"
         :row-key="rowKey"
-        :scroll-x="1620"
+        :scroll-x="1800"
       />
     </section>
 
@@ -854,6 +945,26 @@ onBeforeUnmount(() => {
         <NSpace justify="end">
           <NButton @click="modalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
           <NButton type="primary" @click="savePrice">{{ t('保存', 'Save') }}</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <NModal
+      v-model:show="priorityModalOpen"
+      preset="card"
+      :title="t('编辑 Fast 倍率', 'Edit Fast multiplier')"
+      :style="priorityModalStyle"
+      class="priority-modal"
+    >
+      <NForm label-placement="top">
+        <NFormItem :label="t('Fast 倍率', 'Fast multiplier')">
+          <NInputNumber v-model:value="priorityMultiplier" :min="0" :disabled="isPrioritySaving" />
+        </NFormItem>
+      </NForm>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton :disabled="isPrioritySaving" @click="priorityModalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
+          <NButton type="primary" :loading="isPrioritySaving" @click="savePriorityMultiplier">{{ t('保存', 'Save') }}</NButton>
         </NSpace>
       </template>
     </NModal>

@@ -63,6 +63,40 @@ func TestSaveUsageMessageIgnoresZeroTTFT(t *testing.T) {
 	}
 }
 
+func TestSaveUsageMessageStoresServiceTier(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	raw := `{"api_key":"sk-usage-tier","provider":"codex","model":"gpt-5.5","request_id":"usage-tier","service_tier":"priority","input_tokens":10,"output_tokens":2}`
+	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw))
+	if err != nil || !created {
+		t.Fatalf("saveUsageMessage created=%v err=%v", created, err)
+	}
+	if record.ServiceTier == nil || *record.ServiceTier != "priority" {
+		t.Fatalf("record service_tier = %#v, want priority", record.ServiceTier)
+	}
+
+	var serviceTier sql.NullString
+	if err := app.db.QueryRow(`SELECT service_tier FROM usage_records WHERE id = ?`, record.ID).Scan(&serviceTier); err != nil {
+		t.Fatal(err)
+	}
+	if !serviceTier.Valid || serviceTier.String != "priority" {
+		t.Fatalf("stored service_tier = %#v, want priority", serviceTier)
+	}
+
+	withoutTier, created, err := app.saveUsageMessage(context.Background(), []byte(`{"api_key":"sk-usage-tier","provider":"codex","model":"gpt-5.5","request_id":"usage-tier-unreported","input_tokens":1}`))
+	if err != nil || !created {
+		t.Fatalf("saveUsageMessage without tier created=%v err=%v", created, err)
+	}
+	if withoutTier.ServiceTier != nil {
+		t.Fatalf("record without service_tier = %#v, want nil", withoutTier.ServiceTier)
+	}
+}
+
 func TestSaveUsageMessageExposesCodexCacheCostBreakdown(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()

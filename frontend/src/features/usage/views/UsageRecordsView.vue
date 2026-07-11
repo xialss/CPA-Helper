@@ -7,6 +7,7 @@ import {
   NDatePicker,
   NDrawer,
   NDrawerContent,
+  NIcon,
   NPagination,
   NSelect,
   NTag,
@@ -14,6 +15,7 @@ import {
   useMessage,
   type DataTableColumns,
 } from 'naive-ui'
+import { Zap } from 'lucide-vue-next'
 
 import { getUsageOptions, getUsageRecord, getUsageRecords } from '@/features/usage/api/usageApi'
 import type {
@@ -29,6 +31,7 @@ import {
   formatDateTime,
   formatInteger,
   formatLocalDateTimeParam,
+  formatMultiplier,
   formatUsd,
   jsonPretty,
 } from '@/shared/utils/format'
@@ -60,7 +63,7 @@ const RECORDS_TABLE_COLUMN_WIDTHS = {
   timestamp: 150,
   user: 132,
   apiKeyDescription: 118,
-  model: 132,
+  model: 164,
   source: 190,
   failed: 68,
   ttft: 110,
@@ -87,7 +90,7 @@ const ACCOUNT_RECORDS_TABLE_SCROLL_X =
   RECORDS_TABLE_COLUMN_WIDTHS.source
 const RECORDS_TABLE_FALLBACK_MAX_HEIGHT = 'max(320px, calc(100dvh - 318px))'
 const desktopRecordsLayoutQuery = window.matchMedia('(min-width: 861px)')
-const usageCostTooltipThemeOverrides = {
+const usageTooltipThemeOverrides = {
   color: 'var(--cpa-surface-raised)',
   textColor: 'var(--cpa-text)',
   boxShadow: 'var(--cpa-shadow), 0 0 0 1px var(--cpa-border)',
@@ -643,6 +646,90 @@ function formatModelWithReasoning(
   return reasoningEffort ? `${model} ${reasoningEffort}` : model
 }
 
+function isFastPricingProvider(record: Pick<UsageRecordListItem, 'provider'>): boolean {
+  const provider = record.provider?.trim().toLowerCase()
+  return provider === 'openai' || provider === 'codex'
+}
+
+function normalizedServiceTier(record: Pick<UsageRecordListItem, 'service_tier'>): string {
+  return record.service_tier?.trim() ?? ''
+}
+
+function isFastRecord(record: Pick<UsageRecordListItem, 'provider' | 'service_tier'>): boolean {
+  return isFastPricingProvider(record) && normalizedServiceTier(record).toLowerCase() === 'priority'
+}
+
+function serviceTierLabel(record: Pick<UsageRecordListItem, 'provider' | 'service_tier'>): string {
+  const tier = normalizedServiceTier(record)
+  if (!isFastPricingProvider(record)) {
+    return tier || t('未上报', 'Unreported')
+  }
+  switch (tier.toLowerCase()) {
+    case 'priority':
+      return 'Fast'
+    case 'default':
+      return 'Standard'
+    case '':
+      return t('未上报', 'Unreported')
+    default:
+      return t('未知：', 'Unknown: ') + tier
+  }
+}
+
+function renderModelWithServiceTier(row: UsageRecordListItem) {
+  const model = formatModelWithReasoning(row)
+  if (!isFastRecord(row)) {
+    return model
+  }
+  const fastLabel = t('Fast 模式', 'Fast mode')
+  return h('div', { class: 'usage-model-cell', title: model }, [
+    h('span', { class: 'usage-model-name' }, model),
+    h(
+      NTooltip,
+      { themeOverrides: usageTooltipThemeOverrides },
+      {
+        trigger: () =>
+          h(NIcon, {
+            class: 'usage-fast-icon',
+            component: Zap,
+            size: 15,
+            role: 'img',
+            'aria-label': fastLabel,
+          }),
+        default: () => fastLabel,
+      },
+    ),
+  ])
+}
+
+function tierPricingNote(row: UsageRecordListItem): string | null {
+  if (!isFastPricingProvider(row)) {
+    return null
+  }
+  const tier = normalizedServiceTier(row).toLowerCase()
+  if (tier === 'priority') {
+    if (
+      row.failed &&
+      row.cost_breakdown.billing_unit === 'request' &&
+      row.cost_breakdown.total_usd === 0
+    ) {
+      return t('Fast 请求失败：费用为 0', 'Fast request failed: cost is $0')
+    }
+    const multiplier = row.cost_breakdown.tier_multiplier
+    if (typeof multiplier === 'number' && Number.isFinite(multiplier) && multiplier > 0) {
+      return 'Fast x' + formatMultiplier(multiplier)
+    }
+    return t('Fast：未配置倍率，按基础价格估算', 'Fast: multiplier unconfigured; base price estimate')
+  }
+  if (tier === '') {
+    return t('未上报：未应用 Fast 倍率', 'Unreported: Fast multiplier not applied')
+  }
+  if (tier !== 'default') {
+    return t('未知服务层级：未应用 Fast 倍率', 'Unknown service tier: Fast multiplier not applied')
+  }
+  return null
+}
+
 function formatOutputTps(row: Pick<UsageRecordListItem, 'latency_ms' | 'output_tokens'>): string {
   if (row.latency_ms === null || row.latency_ms <= 0) {
     return '-'
@@ -745,6 +832,11 @@ function renderCostBreakdownItem(item: UsageCostBreakdownItem, breakdown: UsageC
   ])
 }
 
+function renderTierPricingNote(row: UsageRecordListItem) {
+  const note = tierPricingNote(row)
+  return note === null ? null : h('div', { class: 'usage-cost-breakdown-tier' }, note)
+}
+
 function renderCostBreakdown(row: UsageRecordListItem) {
   const breakdown = row.cost_breakdown
   const attributes = {
@@ -761,8 +853,10 @@ function renderCostBreakdown(row: UsageRecordListItem) {
       t('未定价', 'Unpriced'),
     )
   }
+  const tierNote = renderTierPricingNote(row)
   return h('div', { ...attributes, class: 'usage-cost-breakdown' }, [
     ...breakdown.items.map((item) => renderCostBreakdownItem(item, breakdown)),
+    ...(tierNote ? [tierNote] : []),
     h('div', { class: 'usage-cost-breakdown-total' }, [
       h('span', t('总计', 'Total')),
       h('strong', formatPreciseUsd(breakdown.total_usd)),
@@ -797,13 +891,20 @@ function setFocusedCostRecord(recordId: number, focused: boolean) {
 function costBreakdownAriaLabel(row: UsageRecordListItem): string {
   const breakdown = row.cost_breakdown
   if (breakdown.unpriced) {
-    return `${t('费用明细', 'Cost breakdown')}: ${t('未定价', 'Unpriced')}`
+    return t('费用明细', 'Cost breakdown') + ': ' + t('未定价', 'Unpriced')
   }
   const items = breakdown.items.map(
     (item) =>
-      `${costBreakdownItemLabel(item, breakdown)} ${formatPreciseUsd(item.subtotal_usd)}`,
+      costBreakdownItemLabel(item, breakdown) + ' ' + formatPreciseUsd(item.subtotal_usd),
   )
-  return `${t('费用明细', 'Cost breakdown')}: ${items.join('; ')}; ${t('总计', 'Total')} ${formatPreciseUsd(breakdown.total_usd)}`
+  const tierNote = tierPricingNote(row)
+  return [
+    t('费用明细', 'Cost breakdown') + ': ' + items.join('; '),
+    tierNote,
+    t('总计', 'Total') + ' ' + formatPreciseUsd(breakdown.total_usd),
+  ]
+    .filter((item): item is string => Boolean(item))
+    .join('; ')
 }
 
 function renderCost(row: UsageRecordListItem) {
@@ -815,14 +916,18 @@ function renderCost(row: UsageRecordListItem) {
       trigger: 'manual',
       show: isCostTooltipVisible(row.id),
       placement: 'top',
-      themeOverrides: usageCostTooltipThemeOverrides,
+      themeOverrides: usageTooltipThemeOverrides,
     },
     {
       trigger: () =>
         h(
           'span',
           {
-            class: ['usage-cost-trigger', row.unpriced ? 'is-unpriced' : undefined],
+            class: [
+              'usage-cost-trigger',
+              row.unpriced ? 'is-unpriced' : undefined,
+              isFastRecord(row) ? 'is-fast' : undefined,
+            ],
             tabindex: 0,
             'aria-describedby': tooltipId,
             'aria-label': costBreakdownAriaLabel(row),
@@ -855,6 +960,7 @@ const detailRows = computed(() => {
     { label: t('时间', 'Time'), value: formatDateTime(record.timestamp) },
     { label: t('模型', 'Model'), value: formatModelWithReasoning(record) },
     { label: t('服务商', 'Provider'), value: textOrDash(record.provider) },
+    { label: t('服务层级', 'Service tier'), value: serviceTierLabel(record) },
     { label: t('接口', 'Endpoint'), value: textOrDash(record.endpoint) },
     { label: t('API KEY 描述', 'API key description'), value: apiKeyDescriptionLabel(record.api_key_description) },
     { label: t('认证类型', 'Auth type'), value: textOrDash(record.auth) },
@@ -911,7 +1017,7 @@ const columns = computed<DataTableColumns<UsageRecordListItem>>(() => [
     key: 'model',
     width: RECORDS_TABLE_COLUMN_WIDTHS.model,
     ellipsis: { tooltip: true },
-    render: (row) => formatModelWithReasoning(row),
+    render: renderModelWithServiceTier,
   },
   ...(isAccountScope.value
     ? []
@@ -1231,6 +1337,25 @@ onBeforeUnmount(() => {
   color: var(--cpa-text-muted);
 }
 
+:global(.records-table .usage-model-cell) {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+:global(.records-table .usage-model-name) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:global(.records-table .usage-fast-icon) {
+  flex: 0 0 auto;
+  color: var(--cpa-accent-blue);
+}
+
 :global(.usage-cost-trigger) {
   display: inline-flex;
   align-items: center;
@@ -1239,6 +1364,11 @@ onBeforeUnmount(() => {
   cursor: help;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+:global(.usage-cost-trigger.is-fast) {
+  color: var(--cpa-accent-blue);
+  font-weight: 700;
 }
 
 :global(.usage-cost-trigger.is-unpriced) {
@@ -1280,6 +1410,16 @@ onBeforeUnmount(() => {
   gap: 16px;
   padding-top: 8px;
   border-top: 1px solid color-mix(in srgb, currentColor 24%, transparent);
+}
+
+:global(.usage-cost-breakdown-tier) {
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--cpa-accent-blue) 38%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--cpa-accent-blue) 12%, transparent);
+  color: var(--cpa-accent-blue);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 :global(.usage-cost-breakdown-unpriced) {

@@ -3,9 +3,11 @@ package app
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -106,6 +108,155 @@ func TestRecordCostBreakdownIncludesOpenAICacheWritesInInputWithoutSeparatePrice
 	}
 }
 
+func TestRecordCostAppliesPriorityMultiplierForCodex(t *testing.T) {
+	provider := "codex"
+	model := "gpt-5.5"
+	serviceTier := "priority"
+	multiplier := 2.5
+	record := UsageRecord{
+		Provider:     &provider,
+		Model:        &model,
+		ServiceTier:  &serviceTier,
+		InputTokens:  1_000_000,
+		OutputTokens: 1_000_000,
+		TotalTokens:  2_000_000,
+	}
+	prices := map[[2]string]ModelPrice{
+		priceKey("openai", model): {
+			Provider:            "openai",
+			Model:               model,
+			InputUSDPerMillion:  2,
+			OutputUSDPerMillion: 4,
+			PriorityMultiplier:  &multiplier,
+		},
+	}
+
+	breakdown := calculateRecordCostBreakdown(record, prices)
+	if breakdown.Unpriced || breakdown.TotalUSD != 15 {
+		t.Fatalf("priority breakdown = %#v, want priced total 15", breakdown)
+	}
+	if breakdown.TierMultiplier == nil || *breakdown.TierMultiplier != 2.5 {
+		t.Fatalf("tier multiplier = %#v, want 2.5", breakdown.TierMultiplier)
+	}
+	if len(breakdown.Items) != 2 {
+		t.Fatalf("priority item count = %d, want 2", len(breakdown.Items))
+	}
+	input, ok := breakdown.Items[0].(usageTokenCostBreakdownItem)
+	if !ok || input.USDPerMillion != 5 || input.SubtotalUSD != 5 {
+		t.Fatalf("priority input item = %#v, want 5 USD/MTok and subtotal", breakdown.Items[0])
+	}
+	output, ok := breakdown.Items[1].(usageTokenCostBreakdownItem)
+	if !ok || output.USDPerMillion != 10 || output.SubtotalUSD != 10 {
+		t.Fatalf("priority output item = %#v, want 10 USD/MTok and subtotal", breakdown.Items[1])
+	}
+	amount, unpriced := recordCost(record, prices)
+	if unpriced || amount != breakdown.TotalUSD {
+		t.Fatalf("priority recordCost = %v/%v, want %v/false", amount, unpriced, breakdown.TotalUSD)
+	}
+}
+
+func TestRecordCostKeepsBasePriceForUnreportedUnknownAndUnsupportedTiers(t *testing.T) {
+	model := "gpt-tier-test"
+	multiplier := 2.0
+	prices := map[[2]string]ModelPrice{
+		priceKey("openai", model): {
+			Provider:           "openai",
+			Model:              model,
+			InputUSDPerMillion: 3,
+			PriorityMultiplier: &multiplier,
+		},
+		priceKey("anthropic", model): {
+			Provider:           "anthropic",
+			Model:              model,
+			InputUSDPerMillion: 3,
+			PriorityMultiplier: &multiplier,
+		},
+	}
+
+	tests := []struct {
+		name        string
+		provider    string
+		serviceTier *string
+	}{
+		{name: "unreported", provider: "openai"},
+		{name: "default", provider: "openai", serviceTier: stringPtr("default")},
+		{name: "unknown", provider: "openai", serviceTier: stringPtr("flex")},
+		{name: "unsupported provider", provider: "anthropic", serviceTier: stringPtr("priority")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			record := UsageRecord{
+				Provider:    &test.provider,
+				Model:       &model,
+				ServiceTier: test.serviceTier,
+				InputTokens: 1_000_000,
+				TotalTokens: 1_000_000,
+			}
+			breakdown := calculateRecordCostBreakdown(record, prices)
+			if breakdown.Unpriced || breakdown.TotalUSD != 3 || breakdown.TierMultiplier != nil {
+				t.Fatalf("base breakdown = %#v, want total 3 without tier multiplier", breakdown)
+			}
+		})
+	}
+}
+
+func TestRecordCostAppliesPriorityMultiplierToRequestPrice(t *testing.T) {
+	provider := "openai"
+	model := "gpt-image-tier-test"
+	serviceTier := "priority"
+	requestUSD := 1.25
+	multiplier := 2.0
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		ServiceTier: &serviceTier,
+	}, map[[2]string]ModelPrice{
+		priceKey(provider, model): {
+			Provider:           provider,
+			Model:              model,
+			RequestUSD:         &requestUSD,
+			PriorityMultiplier: &multiplier,
+		},
+	})
+	if breakdown.Unpriced || breakdown.TotalUSD != 2.5 || breakdown.TierMultiplier == nil || *breakdown.TierMultiplier != 2 {
+		t.Fatalf("priority request breakdown = %#v, want total 2.5 and multiplier 2", breakdown)
+	}
+	item, ok := breakdown.Items[0].(usageRequestCostBreakdownItem)
+	if !ok || item.USDPerRequest != 2.5 {
+		t.Fatalf("priority request item = %#v, want 2.5 USD/request", breakdown.Items[0])
+	}
+}
+
+func TestRecordCostMarksUnroundablePriorityMultiplierUnpriced(t *testing.T) {
+	provider := "openai"
+	model := "gpt-priority-overflow-test"
+	serviceTier := "priority"
+	multiplier := 1e308
+	record := UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		ServiceTier: &serviceTier,
+		InputTokens: 1,
+		TotalTokens: 1,
+	}
+	prices := map[[2]string]ModelPrice{
+		priceKey(provider, model): {
+			Provider:           provider,
+			Model:              model,
+			InputUSDPerMillion: 1,
+			PriorityMultiplier: &multiplier,
+		},
+	}
+	breakdown := calculateRecordCostBreakdown(record, prices)
+	if !breakdown.Unpriced || breakdown.TotalUSD != 0 || breakdown.TierMultiplier != nil || len(breakdown.Items) != 0 {
+		t.Fatalf("overflow priority breakdown = %#v, want unpriced zero-cost breakdown", breakdown)
+	}
+	amount, unpriced := recordCost(record, prices)
+	if !unpriced || amount != 0 {
+		t.Fatalf("overflow priority record cost = %v/%v, want 0/true", amount, unpriced)
+	}
+}
+
 func TestRecordCostBreakdownPricesOpenAICacheWritesSeparatelyWhenPriceExists(t *testing.T) {
 	provider := "openai"
 	model := "gpt-5.6"
@@ -150,6 +301,66 @@ func TestRecordCostBreakdownPricesOpenAICacheWritesSeparatelyWhenPriceExists(t *
 	}
 	if breakdown.TotalUSD != 0.00121 {
 		t.Fatalf("total cost = %v, want 0.00121", breakdown.TotalUSD)
+	}
+}
+
+func TestUsageCostAggregatesRemainFiniteWhenRoundingScaleOverflows(t *testing.T) {
+	provider := "openai"
+	model := "gpt-image-aggregate-overflow"
+	requestUSD := 1e300
+	timestamp := time.Now().In(appTimeLocation)
+	records := []UsageRecord{
+		{ID: 1, Provider: &provider, Model: &model, Timestamp: timestamp},
+		{ID: 2, Provider: &provider, Model: &model, Timestamp: timestamp},
+	}
+	prices := map[[2]string]ModelPrice{
+		priceKey(provider, model): {
+			Provider:   provider,
+			Model:      model,
+			RequestUSD: &requestUSD,
+		},
+	}
+	want := 2e300
+	assertFiniteCost := func(name string, value float64) {
+		t.Helper()
+		if math.IsNaN(value) || math.IsInf(value, 0) || value != want {
+			t.Fatalf("%s cost = %v, want finite %v", name, value, want)
+		}
+	}
+
+	summary := usageSummaryFromRecords(UsageFilters{}, records, prices)
+	assertFiniteCost("summary", summary["estimated_cost_usd"].(float64))
+	trends := trendPointsFromRecords(UsageFilters{}, records, prices)
+	if len(trends) != 1 {
+		t.Fatalf("trend points = %d, want 1", len(trends))
+	}
+	assertFiniteCost("trend", trends[0]["estimated_cost_usd"].(float64))
+	ranking := rankingFromRecords(records, prices, "model", nil)
+	rankingItems := ranking["items"].([]map[string]any)
+	if len(rankingItems) != 1 {
+		t.Fatalf("ranking items = %d, want 1", len(rankingItems))
+	}
+	assertFiniteCost("ranking", rankingItems[0]["estimated_cost_usd"].(float64))
+	distributions := distributionsFromRecords(records, prices)
+	modelDistribution := distributions["models"].([]map[string]any)
+	if len(modelDistribution) != 1 {
+		t.Fatalf("model distribution items = %d, want 1", len(modelDistribution))
+	}
+	assertFiniteCost("distribution", modelDistribution[0]["estimated_cost_usd"].(float64))
+	keeperUsage := &keeperQuotaWindowUsage{}
+	for _, record := range records {
+		addRecordToKeeperQuotaWindowUsage(keeperUsage, record, prices)
+	}
+	assertFiniteCost("keeper", keeperUsage.EstimatedCostUSD)
+
+	if _, err := json.Marshal(apiJSONValue(map[string]any{
+		"summary":       summary,
+		"trends":        trends,
+		"ranking":       ranking,
+		"distributions": distributions,
+		"keeper":        keeperUsage.EstimatedCostUSD,
+	})); err != nil {
+		t.Fatalf("marshal finite aggregate response: %v", err)
 	}
 }
 
@@ -374,6 +585,298 @@ func TestModelPriceAPIUpdatesImageRequestPrice(t *testing.T) {
 	}
 }
 
+func TestModelPriceAPIUpdatesPriorityMultiplierWithoutChangingSyncSource(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	result, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million, source,
+			auto_synced, updated_at
+		) VALUES ('openai', 'gpt-5.5', 1, 2, 0, 0, 'litellm', 1, ?)
+	`, dbTime(time.Now()))
+	if err != nil {
+		t.Fatalf("seed price: %v", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("price id: %v", err)
+	}
+
+	var updated ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPut, fmt.Sprintf("/api/model-prices/%d/priority-multiplier", id), map[string]any{
+		"priority_multiplier": 3,
+	}, cookies, &updated)
+	if updated.PriorityMultiplier == nil || *updated.PriorityMultiplier != 3 || updated.Source != "litellm" || !updated.AutoSynced {
+		t.Fatalf("updated priority price = %#v, want multiplier 3 and retained LiteLLM source", updated)
+	}
+}
+
+func TestModelPriceAPIKeepsLegacyInfiniteMultiplierJSONSafe(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	result, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			priority_multiplier, source, auto_synced, updated_at
+		) VALUES ('openai', 'gpt-json-safe-multiplier', 1, 2, 0, 0, ?, 'litellm', 1, ?)
+	`, math.Inf(1), dbTime(time.Now()))
+	if err != nil {
+		t.Fatalf("seed infinite priority multiplier: %v", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("price id: %v", err)
+	}
+	stored, err := app.getPrice(context.Background(), int(id))
+	if err != nil {
+		t.Fatalf("get stored price: %v", err)
+	}
+	if stored.PriorityMultiplier == nil || !math.IsInf(*stored.PriorityMultiplier, 1) {
+		t.Fatalf("stored priority multiplier = %#v, want +Inf retained internally", stored.PriorityMultiplier)
+	}
+
+	var prices []ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices", nil, cookies, &prices)
+	for _, price := range prices {
+		if price.ID == int(id) {
+			if price.PriorityMultiplier != nil {
+				t.Fatalf("API priority multiplier = %v, want JSON-safe null", *price.PriorityMultiplier)
+			}
+			catalog := modelPriceCatalogForAPI(ModelPriceCatalogResponse{
+				Models: []ModelPriceCatalogItem{{ID: price.Model, Price: &stored}},
+			})
+			if catalog.Models[0].Price == nil || catalog.Models[0].Price.PriorityMultiplier != nil {
+				t.Fatalf("catalog priority multiplier = %#v, want JSON-safe null", catalog.Models[0].Price)
+			}
+			return
+		}
+	}
+	t.Fatalf("API response missing price id %d", id)
+}
+
+func TestModelPriceAPIRejectsUnroundablePriorityMultiplier(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	result, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million, source,
+			auto_synced, updated_at
+		) VALUES ('openai', 'gpt-priority-overflow-test', 1, 2, 0, 0, 'manual', 0, ?)
+	`, dbTime(time.Now()))
+	if err != nil {
+		t.Fatalf("seed price: %v", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("price id: %v", err)
+	}
+
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPut, fmt.Sprintf("/api/model-prices/%d/priority-multiplier", id), map[string]any{
+		"priority_multiplier": 1e301,
+	}, cookies, http.StatusUnprocessableEntity)
+	stored, err := app.getPrice(context.Background(), int(id))
+	if err != nil {
+		t.Fatalf("get stored price: %v", err)
+	}
+	if stored.PriorityMultiplier != nil {
+		t.Fatalf("stored priority multiplier = %v, want NULL after rejection", *stored.PriorityMultiplier)
+	}
+}
+
+func TestModelPriceAPIRejectsPriceUpdateThatInvalidatesPriorityMultiplier(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	result, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			priority_multiplier, source, auto_synced, updated_at
+		) VALUES ('openai', 'gpt-retained-multiplier-test', 1, 0, 0, 0, 1e299, 'manual', 0, ?)
+	`, dbTime(time.Now()))
+	if err != nil {
+		t.Fatalf("seed price: %v", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("price id: %v", err)
+	}
+
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPut, fmt.Sprintf("/api/model-prices/%d", id), map[string]any{
+		"provider":                       "openai",
+		"model":                          "gpt-retained-multiplier-test",
+		"input_usd_per_million":          1e10,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+	}, cookies, http.StatusUnprocessableEntity)
+	stored, err := app.getPrice(context.Background(), int(id))
+	if err != nil {
+		t.Fatalf("get stored price: %v", err)
+	}
+	if stored.InputUSDPerMillion != 1 || stored.PriorityMultiplier == nil || *stored.PriorityMultiplier != 1e299 {
+		t.Fatalf("stored price after rejected update = %#v, want original price and multiplier", stored)
+	}
+}
+
+func TestModelPriceUpdatesSerializeCandidateValidation(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	result, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			priority_multiplier, source, auto_synced, updated_at
+		) VALUES ('openai', 'gpt-concurrent-multiplier-test', 1, 0, 0, 0, 1, 'manual', 0, ?)
+	`, dbTime(time.Now()))
+	if err != nil {
+		t.Fatalf("seed price: %v", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("price id: %v", err)
+	}
+
+	for iteration := 0; iteration < 20; iteration++ {
+		if _, err := app.db.Exec(`
+			UPDATE model_prices
+			SET input_usd_per_million = 1, output_usd_per_million = 0,
+			    cache_read_usd_per_million = 0, cache_creation_usd_per_million = 0,
+			    priority_multiplier = 1, updated_at = ?
+			WHERE id = ?
+		`, dbTime(time.Now()), id); err != nil {
+			t.Fatalf("reset price at iteration %d: %v", iteration, err)
+		}
+
+		start := make(chan struct{})
+		results := make(chan error, 2)
+		go func() {
+			<-start
+			_, err := app.updatePrice(context.Background(), int(id), modelPricePayload{
+				Provider:           "openai",
+				Model:              "gpt-concurrent-multiplier-test",
+				InputUSDPerMillion: 1e100,
+			})
+			results <- err
+		}()
+		go func() {
+			<-start
+			multiplier := 1e208
+			_, err := app.updatePriorityMultiplier(context.Background(), int(id), priorityMultiplierPayload{
+				PriorityMultiplier: &multiplier,
+			})
+			results <- err
+		}()
+		close(start)
+
+		successes, validationFailures := 0, 0
+		for resultIndex := 0; resultIndex < 2; resultIndex++ {
+			err := <-results
+			if err == nil {
+				successes++
+				continue
+			}
+			appErr, ok := err.(*AppError)
+			if !ok || appErr.Status != http.StatusUnprocessableEntity {
+				t.Fatalf("concurrent update error at iteration %d = %v, want validation error", iteration, err)
+			}
+			validationFailures++
+		}
+		if successes != 1 || validationFailures != 1 {
+			t.Fatalf("concurrent results at iteration %d = %d success/%d validation, want 1/1", iteration, successes, validationFailures)
+		}
+		stored, err := app.getPrice(context.Background(), int(id))
+		if err != nil {
+			t.Fatalf("get concurrent price at iteration %d: %v", iteration, err)
+		}
+		if err := validatePriorityMultiplierForPrice(stored); err != nil {
+			t.Fatalf("unsafe concurrent price at iteration %d: %#v (%v)", iteration, stored, err)
+		}
+	}
+}
+
+func TestModelPriceAPIRejectsUnsafeDefaultPriorityMultiplier(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       "openai",
+		"model":                          "gpt-5.5",
+		"input_usd_per_million":          1e308,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+	}, cookies, http.StatusUnprocessableEntity)
+	var count int
+	if err := app.db.QueryRow(`SELECT COUNT(*) FROM model_prices WHERE provider = 'openai' AND model = 'gpt-5.5'`).Scan(&count); err != nil {
+		t.Fatalf("count rejected price: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("rejected unsafe default price count = %d, want 0", count)
+	}
+}
+
 func TestUsageAggregatesClaudeCacheReadAndCreationTokens(t *testing.T) {
 	provider := "claude"
 	model := "claude-sonnet-test"
@@ -440,12 +943,23 @@ func TestSyncLiteLLMPricesReplacesLiteLLMSource(t *testing.T) {
 	if _, err := app.db.Exec(`
 		INSERT INTO model_prices (
 			provider, model, input_usd_per_million, output_usd_per_million,
-			cache_read_usd_per_million, cache_creation_usd_per_million, source, updated_at
+			cache_read_usd_per_million, cache_creation_usd_per_million, priority_multiplier, source, updated_at
 		) VALUES
-			('openai', 'old-litellm-model', 1, 1, 1, 1, 'litellm', ?),
-			('openai', 'manual-model', 9, 9, 9, 9, 'manual', ?)
-	`, now, now); err != nil {
+			('openai', 'old-litellm-model', 1, 1, 1, 1, NULL, 'litellm', ?),
+			('openai', 'gpt-new-model', 1, 1, 1, 1, 3, 'litellm', ?),
+			('openai', 'gpt-5.5', 1, 1, 1, 1, 0, 'litellm', ?),
+			('openai', 'gpt-invalid-negative', 1, 1, 1, 1, -2, 'litellm', ?),
+			('openai', 'manual-model', 9, 9, 9, 9, NULL, 'manual', ?)
+	`, now, now, now, now, now); err != nil {
 		t.Fatalf("seed prices: %v", err)
+	}
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million, priority_multiplier, source, updated_at
+		) VALUES ('openai', 'gpt-invalid-infinite', 1, 1, 1, 1, ?, 'litellm', ?)
+	`, math.Inf(1), now); err != nil {
+		t.Fatalf("seed infinite priority multiplier: %v", err)
 	}
 
 	rawData := map[string]any{
@@ -454,6 +968,34 @@ func TestSyncLiteLLMPricesReplacesLiteLLMSource(t *testing.T) {
 			"input_cost_per_token":        0.000001,
 			"output_cost_per_token":       0.000002,
 			"cache_read_input_token_cost": 0.0000001,
+		},
+		"gpt-5.5": map[string]any{
+			"litellm_provider":     "openai",
+			"input_cost_per_token": 0.000001,
+		},
+		"gpt-invalid-negative": map[string]any{
+			"litellm_provider":     "openai",
+			"input_cost_per_token": 0.000001,
+		},
+		"gpt-invalid-infinite": map[string]any{
+			"litellm_provider":     "openai",
+			"input_cost_per_token": 0.000001,
+		},
+		"gpt-5.4": map[string]any{
+			"litellm_provider":     "openai",
+			"input_cost_per_token": 1e294,
+		},
+		"gpt-invalid-base-overflow": map[string]any{
+			"litellm_provider":     "openai",
+			"input_cost_per_token": 1e308,
+		},
+		"gpt-invalid-base-nan": map[string]any{
+			"litellm_provider":     "openai",
+			"input_cost_per_token": "NaN",
+		},
+		"gpt-invalid-base-infinity": map[string]any{
+			"litellm_provider":     "openai",
+			"input_cost_per_token": "Inf",
 		},
 		"claude-new-model": map[string]any{
 			"litellm_provider":                "anthropic",
@@ -471,8 +1013,8 @@ func TestSyncLiteLLMPricesReplacesLiteLLMSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("syncLiteLLMPrices failed: %v", err)
 	}
-	if result["imported"].(int) != 2 || result["skipped_manual"].(int) != 1 {
-		t.Fatalf("sync result = %#v, want imported 2 skipped_manual 1", result)
+	if result["imported"].(int) != 6 || result["skipped_manual"].(int) != 1 || result["skipped_invalid"].(int) != 3 {
+		t.Fatalf("sync result = %#v, want imported 6 skipped_manual 1 skipped_invalid 3", result)
 	}
 
 	var oldCount int
@@ -481,6 +1023,17 @@ func TestSyncLiteLLMPricesReplacesLiteLLMSource(t *testing.T) {
 	}
 	if oldCount != 0 {
 		t.Fatalf("old litellm rows = %d, want 0", oldCount)
+	}
+	var invalidBasePriceCount int
+	if err := app.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM model_prices
+		WHERE model IN ('gpt-invalid-base-overflow', 'gpt-invalid-base-nan', 'gpt-invalid-base-infinity')
+	`).Scan(&invalidBasePriceCount); err != nil {
+		t.Fatalf("query invalid base price count: %v", err)
+	}
+	if invalidBasePriceCount != 0 {
+		t.Fatalf("invalid base price rows = %d, want 0", invalidBasePriceCount)
 	}
 	var manualInput float64
 	if err := app.db.QueryRow(`SELECT input_usd_per_million FROM model_prices WHERE source = 'manual' AND model = 'manual-model'`).Scan(&manualInput); err != nil {
@@ -495,6 +1048,64 @@ func TestSyncLiteLLMPricesReplacesLiteLLMSource(t *testing.T) {
 	}
 	if cacheRead != 0.3 || cacheCreation != 3.75 {
 		t.Fatalf("claude cache prices = read %v creation %v, want 0.3 and 3.75", cacheRead, cacheCreation)
+	}
+	var priorityMultiplier float64
+	if err := app.db.QueryRow(`SELECT priority_multiplier FROM model_prices WHERE source = 'litellm' AND model = 'gpt-new-model'`).Scan(&priorityMultiplier); err != nil {
+		t.Fatalf("query synced priority multiplier: %v", err)
+	}
+	if priorityMultiplier != 3 {
+		t.Fatalf("synced priority multiplier = %v, want preserved 3", priorityMultiplier)
+	}
+	var zeroMultiplier, negativeMultiplier, infiniteMultiplier float64
+	if err := app.db.QueryRow(`SELECT priority_multiplier FROM model_prices WHERE source = 'litellm' AND model = 'gpt-5.5'`).Scan(&zeroMultiplier); err != nil {
+		t.Fatalf("query zero priority multiplier: %v", err)
+	}
+	if err := app.db.QueryRow(`SELECT priority_multiplier FROM model_prices WHERE source = 'litellm' AND model = 'gpt-invalid-negative'`).Scan(&negativeMultiplier); err != nil {
+		t.Fatalf("query negative priority multiplier: %v", err)
+	}
+	if err := app.db.QueryRow(`SELECT priority_multiplier FROM model_prices WHERE source = 'litellm' AND model = 'gpt-invalid-infinite'`).Scan(&infiniteMultiplier); err != nil {
+		t.Fatalf("query infinite priority multiplier: %v", err)
+	}
+	if zeroMultiplier != 0 || negativeMultiplier != -2 || !math.IsInf(infiniteMultiplier, 1) {
+		t.Fatalf("synced invalid priority multipliers = %v/%v/%v, want 0/-2/+Inf", zeroMultiplier, negativeMultiplier, infiniteMultiplier)
+	}
+	var unsafeDefaultInput float64
+	var unsafeDefaultMultiplier sql.NullFloat64
+	if err := app.db.QueryRow(`
+		SELECT input_usd_per_million, priority_multiplier
+		FROM model_prices
+		WHERE source = 'litellm' AND model = 'gpt-5.4'
+	`).Scan(&unsafeDefaultInput, &unsafeDefaultMultiplier); err != nil {
+		t.Fatalf("query unsafe default price: %v", err)
+	}
+	if unsafeDefaultInput != 1e300 || unsafeDefaultMultiplier.Valid {
+		t.Fatalf("unsafe default price = %v/%v, want 1e300/NULL", unsafeDefaultInput, unsafeDefaultMultiplier)
+	}
+	prices, err := app.priceMap(context.Background())
+	if err != nil {
+		t.Fatalf("load synced prices: %v", err)
+	}
+	provider, model, serviceTier := "openai", "gpt-5.5", "priority"
+	amount, unpriced := recordCost(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		ServiceTier: &serviceTier,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, prices)
+	if amount != 0 || !unpriced {
+		t.Fatalf("synced zero multiplier cost = %v/%v, want 0/true", amount, unpriced)
+	}
+	model = "gpt-5.4"
+	amount, unpriced = recordCost(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		ServiceTier: &serviceTier,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, prices)
+	if amount != 1e300 || unpriced {
+		t.Fatalf("synced unsafe-default Fast cost = %v/%v, want base 1e300/false", amount, unpriced)
 	}
 }
 
@@ -803,4 +1414,31 @@ func requestJSONForPricingTest(
 		}
 	}
 	return append(cookies, recorder.Result().Cookies()...)
+}
+
+func requestJSONForPricingTestExpectStatus(
+	t *testing.T,
+	handler http.Handler,
+	method string,
+	path string,
+	body any,
+	cookies []*http.Cookie,
+	wantStatus int,
+) {
+	t.Helper()
+
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+	request := httptest.NewRequest(method, path, bytes.NewReader(encoded))
+	request.Header.Set("Content-Type", "application/json")
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != wantStatus {
+		t.Fatalf("%s %s returned %d: %s", method, path, recorder.Code, recorder.Body.String())
+	}
 }

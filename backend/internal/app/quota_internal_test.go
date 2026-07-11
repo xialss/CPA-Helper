@@ -111,6 +111,89 @@ func TestQuotaChargesImageUsageByRequestPrice(t *testing.T) {
 	}
 }
 
+func TestQuotaChargesFastUsageWithConfiguredMultiplier(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	userID := seedQuotaTestUser(t, app, "member")
+	apiKey := "sk-quota-fast"
+	seedQuotaTestAPIKey(t, app, userID, apiKey)
+	seedQuotaTestPrice(t, app, "openai", "gpt-quota-fast", 1)
+	if _, err := app.db.Exec(`UPDATE model_prices SET priority_multiplier = 2 WHERE provider = 'openai' AND model = 'gpt-quota-fast'`); err != nil {
+		t.Fatalf("configure Fast multiplier: %v", err)
+	}
+	lifetime := 5.0
+	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
+		t.Fatalf("update quota: %v", err)
+	}
+
+	raw := `{"api_key":"` + apiKey + `","provider":"openai","model":"gpt-quota-fast","service_tier":"priority","input_tokens":1000000,"request_id":"quota-fast"}`
+	if _, created, err := app.saveUsageMessage(ctx, []byte(raw)); err != nil || !created {
+		t.Fatalf("fast usage created=%v err=%v", created, err)
+	}
+	user, err := app.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != 3 {
+		t.Fatalf("quota after Fast charge lifetime=%v, want 3", user.QuotaLifetimeUSD)
+	}
+	var amount float64
+	if err := app.db.QueryRow(`SELECT amount_usd FROM user_quota_charges WHERE usage_username = 'member'`).Scan(&amount); err != nil {
+		t.Fatal(err)
+	}
+	if amount != 2 {
+		t.Fatalf("Fast charge amount=%v, want 2", amount)
+	}
+}
+
+func TestQuotaDoesNotChargeUnroundableFastCost(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	userID := seedQuotaTestUser(t, app, "member")
+	apiKey := "sk-quota-fast-overflow"
+	seedQuotaTestAPIKey(t, app, userID, apiKey)
+	seedQuotaTestPrice(t, app, "openai", "gpt-quota-fast-overflow", 1)
+	if _, err := app.db.Exec(`UPDATE model_prices SET priority_multiplier = 1e308 WHERE provider = 'openai' AND model = 'gpt-quota-fast-overflow'`); err != nil {
+		t.Fatalf("configure unroundable Fast multiplier: %v", err)
+	}
+	lifetime := 5.0
+	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
+		t.Fatalf("update quota: %v", err)
+	}
+
+	raw := `{"api_key":"` + apiKey + `","provider":"openai","model":"gpt-quota-fast-overflow","service_tier":"priority","input_tokens":1000000,"request_id":"quota-fast-overflow"}`
+	if _, created, err := app.saveUsageMessage(ctx, []byte(raw)); err != nil || !created {
+		t.Fatalf("overflow Fast usage created=%v err=%v", created, err)
+	}
+	user, err := app.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != 5 || user.QuotaUnpricedRecords != 1 {
+		t.Fatalf("quota after unroundable Fast charge lifetime=%v unpriced=%d, want 5/1", user.QuotaLifetimeUSD, user.QuotaUnpricedRecords)
+	}
+	var amount float64
+	var unpriced bool
+	if err := app.db.QueryRow(`SELECT amount_usd, unpriced FROM user_quota_charges WHERE usage_username = 'member'`).Scan(&amount, &unpriced); err != nil {
+		t.Fatal(err)
+	}
+	if amount != 0 || !unpriced {
+		t.Fatalf("unroundable Fast charge amount=%v unpriced=%v, want 0/true", amount, unpriced)
+	}
+}
+
 func TestQuotaUnpricedUsageDoesNotDeductBalance(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()
