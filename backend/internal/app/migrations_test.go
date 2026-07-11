@@ -51,6 +51,17 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if !testColumnExists(t, app.db, "model_prices", "priority_multiplier") {
 		t.Fatal("model_prices.priority_multiplier was not created")
 	}
+	for _, column := range []string{
+		"long_context_threshold_tokens",
+		"long_context_input_usd_per_million",
+		"long_context_output_usd_per_million",
+		"long_context_cache_read_usd_per_million",
+		"long_context_cache_creation_usd_per_million",
+	} {
+		if !testColumnExists(t, app.db, "model_prices", column) {
+			t.Fatalf("model_prices.%s was not created", column)
+		}
+	}
 	if testColumnExists(t, app.db, "model_prices", "cached_usd_per_million") {
 		t.Fatal("old model_prices.cached_usd_per_million should not exist")
 	}
@@ -225,7 +236,10 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 			cached_usd_per_million, reasoning_usd_per_million, updated_at
 		) VALUES
 			('openai', 'gpt-5.5', 1, 2, 0.5, 9, '2026-05-04 00:00:00'),
-			('openai', 'gpt-5.4', 1e308, 0, 0, 0, '2026-05-04 00:00:00')
+			('openai', 'gpt-5.4', 1e308, 0, 0, 0, '2026-05-04 00:00:00'),
+			('openai', 'gpt-5.6-terra', 2.5, 15, 0.25, 0, '2026-05-04 00:00:00'),
+			('openai', 'gpt-5.6-terra-preview', 2.5, 15, 0.25, 0, '2026-05-04 00:00:00'),
+			('gemini', 'gemini-2.5-pro', 1.25, 10, 0.125, 0, '2026-05-04 00:00:00')
 	`); err != nil {
 		_ = db.Close()
 		t.Fatal(err)
@@ -332,6 +346,33 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 	}
 	if priorityMultiplier.Valid {
 		t.Fatalf("unsafe migrated priority_multiplier = %v, want NULL", priorityMultiplier.Float64)
+	}
+	var threshold sql.NullInt64
+	var longInput, longOutput, longCacheRead, longCacheCreation sql.NullFloat64
+	if err := app.db.QueryRow(`
+		SELECT long_context_threshold_tokens, long_context_input_usd_per_million,
+		       long_context_output_usd_per_million, long_context_cache_read_usd_per_million,
+		       long_context_cache_creation_usd_per_million
+		FROM model_prices WHERE provider = 'openai' AND model = 'gpt-5.6-terra'
+	`).Scan(&threshold, &longInput, &longOutput, &longCacheRead, &longCacheCreation); err != nil {
+		t.Fatalf("migrated long-context price not found: %v", err)
+	}
+	if !threshold.Valid || threshold.Int64 != 272000 || !longInput.Valid || longInput.Float64 != 5 ||
+		!longOutput.Valid || longOutput.Float64 != 22.5 || !longCacheRead.Valid || longCacheRead.Float64 != 0.5 ||
+		!longCacheCreation.Valid || longCacheCreation.Float64 != 6.25 {
+		t.Fatalf("migrated OpenAI long-context price = %#v/%#v/%#v/%#v/%#v", threshold, longInput, longOutput, longCacheRead, longCacheCreation)
+	}
+	if err := app.db.QueryRow(`SELECT long_context_threshold_tokens FROM model_prices WHERE provider = 'openai' AND model = 'gpt-5.6-terra-preview'`).Scan(&threshold); err != nil {
+		t.Fatalf("prefix model long-context lookup failed: %v", err)
+	}
+	if threshold.Valid {
+		t.Fatalf("prefix model long-context threshold = %d, want NULL", threshold.Int64)
+	}
+	if err := app.db.QueryRow(`SELECT long_context_threshold_tokens, long_context_input_usd_per_million, long_context_output_usd_per_million FROM model_prices WHERE provider = 'gemini' AND model = 'gemini-2.5-pro'`).Scan(&threshold, &longInput, &longOutput); err != nil {
+		t.Fatalf("migrated Gemini long-context price not found: %v", err)
+	}
+	if !threshold.Valid || threshold.Int64 != 200000 || !longInput.Valid || longInput.Float64 != 2.5 || !longOutput.Valid || longOutput.Float64 != 15 {
+		t.Fatalf("migrated Gemini long-context price = %#v/%#v/%#v", threshold, longInput, longOutput)
 	}
 }
 

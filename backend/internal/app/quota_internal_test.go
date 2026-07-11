@@ -152,6 +152,152 @@ func TestQuotaChargesFastUsageWithConfiguredMultiplier(t *testing.T) {
 	}
 }
 
+func TestQuotaChargesLongContextOnceAndHistoricalAnalysisRepricesWithoutLedgerRewrite(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	userID := seedQuotaTestUser(t, app, "member")
+	apiKey := "sk-quota-long-context"
+	seedQuotaTestAPIKey(t, app, userID, apiKey)
+	seedQuotaTestPrice(t, app, "openai", "gpt-quota-long-context", 1)
+	if _, err := app.db.Exec(`
+		UPDATE model_prices
+		SET long_context_threshold_tokens = 200000,
+		    long_context_input_usd_per_million = 3,
+		    long_context_output_usd_per_million = 0,
+		    long_context_cache_read_usd_per_million = 0,
+		    long_context_cache_creation_usd_per_million = 0
+		WHERE provider = 'openai' AND model = 'gpt-quota-long-context'
+	`); err != nil {
+		t.Fatalf("configure long-context price: %v", err)
+	}
+	lifetime := 5.0
+	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
+		t.Fatalf("update quota: %v", err)
+	}
+
+	raw := `{"api_key":"` + apiKey + `","provider":"openai","model":"gpt-quota-long-context","input_tokens":1000000,"request_id":"quota-long-context"}`
+	record, created, err := app.saveUsageMessage(ctx, []byte(raw))
+	if err != nil || !created {
+		t.Fatalf("long-context usage created=%v err=%v", created, err)
+	}
+	user, err := app.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != 2 {
+		t.Fatalf("quota after long-context charge lifetime=%v, want 2", user.QuotaLifetimeUSD)
+	}
+	var ledgerAmount float64
+	if err := app.db.QueryRow(`SELECT amount_usd FROM user_quota_charges WHERE usage_username = 'member'`).Scan(&ledgerAmount); err != nil {
+		t.Fatal(err)
+	}
+	if ledgerAmount != 3 {
+		t.Fatalf("long-context ledger amount=%v, want 3", ledgerAmount)
+	}
+	if _, created, err := app.saveUsageMessage(ctx, []byte(raw)); err != nil || created {
+		t.Fatalf("duplicate long-context usage created=%v err=%v", created, err)
+	}
+	var chargeCount int
+	if err := app.db.QueryRow(`SELECT COUNT(*) FROM user_quota_charges`).Scan(&chargeCount); err != nil {
+		t.Fatal(err)
+	}
+	if chargeCount != 1 {
+		t.Fatalf("long-context charge count=%d, want 1", chargeCount)
+	}
+
+	if _, err := app.db.Exec(`
+		UPDATE model_prices
+		SET long_context_input_usd_per_million = 4
+		WHERE provider = 'openai' AND model = 'gpt-quota-long-context'
+	`); err != nil {
+		t.Fatalf("reprice long-context analysis: %v", err)
+	}
+	prices, err := app.priceMap(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := usageSummaryFromRecords(UsageFilters{}, []UsageRecord{record}, prices)
+	if summary["estimated_cost_usd"].(float64) != 4 {
+		t.Fatalf("repriced historical analysis=%v, want 4", summary["estimated_cost_usd"])
+	}
+	if err := app.db.QueryRow(`SELECT amount_usd FROM user_quota_charges WHERE usage_username = 'member'`).Scan(&ledgerAmount); err != nil {
+		t.Fatal(err)
+	}
+	user, err = app.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ledgerAmount != 3 || user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != 2 {
+		t.Fatalf("historical ledger/balance changed to %v/%v, want 3/2", ledgerAmount, user.QuotaLifetimeUSD)
+	}
+}
+
+func TestQuotaChargesClaudeLongContextUsingCachedPromptTokens(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	userID := seedQuotaTestUser(t, app, "member")
+	apiKey := "sk-quota-claude-long-context"
+	model := "claude-quota-long-context"
+	seedQuotaTestAPIKey(t, app, userID, apiKey)
+	seedQuotaTestPrice(t, app, "anthropic", model, 1)
+	if _, err := app.db.Exec(`
+		UPDATE model_prices
+		SET long_context_threshold_tokens = 2000000,
+		    long_context_input_usd_per_million = 3,
+		    long_context_output_usd_per_million = 0,
+		    long_context_cache_read_usd_per_million = 2,
+		    long_context_cache_creation_usd_per_million = 4
+		WHERE provider = 'anthropic' AND model = ?
+	`, model); err != nil {
+		t.Fatalf("configure Claude long-context price: %v", err)
+	}
+	lifetime := 20.0
+	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
+		t.Fatalf("update quota: %v", err)
+	}
+
+	raw := `{"api_key":"` + apiKey + `","provider":"anthropic","model":"` + model + `","request_id":"quota-claude-long-context","tokens":{"input_tokens":1000000,"cache_read_tokens":1000000,"cache_creation_tokens":1000000,"total_tokens":1000000}}`
+	record, created, err := app.saveUsageMessage(ctx, []byte(raw))
+	if err != nil || !created {
+		t.Fatalf("Claude long-context usage created=%v err=%v", created, err)
+	}
+	prices, err := app.priceMap(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	breakdown := calculateRecordCostBreakdown(record, prices)
+	if breakdown.Unpriced || !breakdown.LongContextApplied || breakdown.ContextInputTokens != 3_000_000 || breakdown.TotalUSD != 9 {
+		t.Fatalf("Claude long-context breakdown = %#v, want applied 3M prompt and $9", breakdown)
+	}
+
+	user, err := app.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != 11 {
+		t.Fatalf("quota after Claude long-context charge lifetime=%v, want 11", user.QuotaLifetimeUSD)
+	}
+	var ledgerAmount float64
+	if err := app.db.QueryRow(`SELECT amount_usd FROM user_quota_charges WHERE usage_username = 'member'`).Scan(&ledgerAmount); err != nil {
+		t.Fatal(err)
+	}
+	if ledgerAmount != 9 {
+		t.Fatalf("Claude long-context ledger amount=%v, want 9", ledgerAmount)
+	}
+}
+
 func TestQuotaDoesNotChargeUnroundableFastCost(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()
