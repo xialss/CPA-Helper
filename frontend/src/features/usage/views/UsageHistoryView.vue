@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NDatePicker, NSelect, NSpin, useMessage } from 'naive-ui'
+import { NButton, NDatePicker, NIcon, NSelect, NSpin, NTooltip, useMessage } from 'naive-ui'
 import {
   CircleDollarSign,
   ClipboardList,
   Gauge,
+  Info,
   Layers3,
   ShieldCheck,
   Timer,
@@ -684,6 +685,13 @@ function formatPercent(value: number): string {
   }).format(value)
 }
 
+function formatCacheHitRate(value: number): string {
+  return new Intl.NumberFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
+    style: 'percent',
+    maximumFractionDigits: 1,
+  }).format(value)
+}
+
 function formatRate(value: number): string {
   if (!Number.isFinite(value) || value <= 0) {
     return '0'
@@ -941,10 +949,10 @@ const trendOption = computed<ChartOption>(() => {
 const tokenBreakdownItems = computed<TokenBreakdownItem[]>(() => {
   const currentSummary = summary.value
   const values = [
-    { key: 'input', label: t('输入 Token', 'Input tokens'), value: currentSummary?.input_tokens ?? 0 },
+    { key: 'input', label: t('普通输入 Token', 'Normal input tokens'), value: currentSummary?.normal_input_tokens ?? 0 },
+    { key: 'cache-read', label: t('缓存读 Token', 'Cache read tokens'), value: currentSummary?.cache_read_tokens ?? 0 },
+    { key: 'cache-write', label: t('缓存写 Token', 'Cache write tokens'), value: currentSummary?.cache_creation_tokens ?? 0 },
     { key: 'output', label: t('输出 Token', 'Output tokens'), value: currentSummary?.output_tokens ?? 0 },
-    { key: 'cached', label: t('缓存 Token', 'Cached tokens'), value: currentSummary?.cached_tokens ?? 0 },
-    { key: 'reasoning', label: t('推理 Token', 'Reasoning tokens'), value: currentSummary?.reasoning_tokens ?? 0 },
   ]
   const total = values.reduce((sum, item) => sum + item.value, 0)
   return values.map((item, index) => ({
@@ -959,11 +967,36 @@ const tokenBreakdownTotal = computed(() =>
   tokenBreakdownItems.value.reduce((sum, item) => sum + item.value, 0),
 )
 
+const cacheHitRate = computed<number | null>(() => {
+  const currentSummary = summary.value
+  if (!currentSummary) {
+    return null
+  }
+  const cacheInputTokens =
+    currentSummary.normal_input_tokens +
+    currentSummary.cache_read_tokens +
+    currentSummary.cache_creation_tokens
+  return cacheInputTokens > 0 ? currentSummary.cache_read_tokens / cacheInputTokens : null
+})
+
+const cacheHitRateText = computed(() =>
+  cacheHitRate.value === null ? '—' : formatCacheHitRate(cacheHitRate.value),
+)
+
+const cacheHitRateFormula = computed(() =>
+  t(
+    '按 Token 计算：缓存读 Token / (普通输入 Token + 缓存读 Token + 缓存写 Token) x 100%',
+    'Token-weighted: cache read tokens / (normal input tokens + cache read tokens + cache write tokens) x 100%',
+  ),
+)
+
+const reasoningTokenText = computed(() => formatCompact(summary.value?.reasoning_tokens ?? 0))
+
 const tokenBreakdownOption = computed<ChartOption>(() =>
   breakdownPieOption(
     tokenBreakdownItems.value.map((item) => ({ label: item.label, value: item.value })),
     'Token',
-    formatCompact(summary.value?.total_tokens ?? 0),
+    formatCompact(tokenBreakdownTotal.value),
   ),
 )
 
@@ -1332,6 +1365,28 @@ onBeforeUnmount(() => {
             :loading="isLoading"
             :compact-footer="tokenBreakdownItems.length <= 1"
           >
+            <template #header-extra>
+              <div class="cache-hit-rate">
+                <span class="cache-hit-rate-label">{{ t('缓存命中率', 'Cache hit rate') }}</span>
+                <strong class="cache-hit-rate-value">{{ cacheHitRateText }}</strong>
+                <NTooltip placement="bottom-end">
+                  <template #trigger>
+                    <NButton
+                      class="cache-hit-rate-help"
+                      size="tiny"
+                      quaternary
+                      circle
+                      :aria-label="cacheHitRateFormula"
+                    >
+                      <template #icon>
+                        <NIcon :component="Info" />
+                      </template>
+                    </NButton>
+                  </template>
+                  <span class="cache-hit-rate-formula">{{ cacheHitRateFormula }}</span>
+                </NTooltip>
+              </div>
+            </template>
             <ol class="distribution-legend token-legend" :aria-label="t('Token 构成图例', 'Token breakdown legend')">
               <li
                 v-for="item in tokenBreakdownItems"
@@ -1348,6 +1403,11 @@ onBeforeUnmount(() => {
                 <span class="distribution-percent">{{ item.percentText }}</span>
               </li>
             </ol>
+            <div class="token-reasoning-summary">
+              <span class="token-reasoning-label">{{ t('推理 Token', 'Reasoning tokens') }}</span>
+              <strong class="token-reasoning-value">{{ reasoningTokenText }}</strong>
+              <span class="token-reasoning-meta">{{ t('不计入构成占比', 'Excluded from composition') }}</span>
+            </div>
           </ChartPanel>
         </div>
 
@@ -2438,6 +2498,59 @@ onBeforeUnmount(() => {
   text-align: right;
 }
 
+.cache-hit-rate {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.cache-hit-rate-label,
+.token-reasoning-meta {
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+}
+
+.cache-hit-rate-value,
+.token-reasoning-value {
+  color: var(--cpa-text-strong);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 760;
+}
+
+.cache-hit-rate-help {
+  flex: 0 0 auto;
+}
+
+.cache-hit-rate-formula {
+  display: block;
+  max-width: 360px;
+  line-height: 1.5;
+}
+
+.token-reasoning-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  margin-top: 6px;
+  padding: 4px 7px;
+  border: 1px dashed color-mix(in srgb, var(--cpa-border) 76%, transparent);
+  border-radius: 6px;
+}
+
+.token-reasoning-label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--cpa-text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .empty-inline {
   display: grid;
   min-height: 48px;
@@ -2695,6 +2808,14 @@ onBeforeUnmount(() => {
     grid-template-columns: 1fr;
     max-height: none;
     overflow: visible;
+  }
+
+  .token-reasoning-summary {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .token-reasoning-meta {
+    grid-column: 1 / -1;
   }
 }
 </style>

@@ -11,6 +11,8 @@ import {
   NInput,
   NInputNumber,
   NModal,
+  NRadioButton,
+  NRadioGroup,
   NSelect,
   NSpace,
   NSwitch,
@@ -19,6 +21,7 @@ import {
   useDialog,
   useMessage,
   type DataTableColumns,
+  type DataTableRowKey,
 } from 'naive-ui'
 import { Database, Layers3, RefreshCw, Search, Server, Settings2, Zap } from 'lucide-vue-next'
 
@@ -36,6 +39,7 @@ import {
 import type {
   LiteLLMProxySettingsPayload,
   ModelPrice,
+  ModelPriceCatalogItem,
   ModelPriceCatalogResponse,
   ModelPriceLongContext,
   ModelPricePayload,
@@ -50,6 +54,7 @@ type PriceTableLayoutProps =
 type PriceRowStatus = 'missing' | 'litellm' | 'manual'
 type PriceStatusFilter = 'cpa' | 'missing' | 'litellm' | 'manual' | 'library'
 type BillingUnit = 'token' | 'request'
+type PriceGroupingMode = 'model' | 'provider'
 type PriceFieldName = keyof Pick<
   ModelPrice,
   | 'input_usd_per_million'
@@ -58,7 +63,15 @@ type PriceFieldName = keyof Pick<
   | 'cache_creation_usd_per_million'
 >
 
+interface CatalogModelReference {
+  id: string
+  name: string
+  owner: string | null
+  suggestedProvider: string
+}
+
 interface PriceDisplayRow {
+  rowType: 'detail'
   key: string
   in_cpa: boolean
   id: string
@@ -68,11 +81,34 @@ interface PriceDisplayRow {
   price: ModelPrice | null
   provider: string
   model: string
+  comparisonModelKey: string
+  catalogModels: CatalogModelReference[]
   billing_unit: BillingUnit
   status: PriceRowStatus
 }
 
+interface PriceGroupRow {
+  rowType: 'group'
+  key: string
+  mode: PriceGroupingMode
+  label: string
+  children: PriceDisplayRow[]
+  providerCount: number
+  modelCount: number
+  pricedCount: number
+  unpricedCount: number
+  billingUnits: BillingUnit[]
+  longContextConfiguredCount: number
+  longContextEligibleCount: number
+  priorityConfiguredCount: number
+  priorityEligibleCount: number
+  latestUpdatedAt: string | null
+}
+
+type PriceTableRow = PriceDisplayRow | PriceGroupRow
+
 const PRICE_TABLE_FALLBACK_MAX_HEIGHT = 'max(240px, calc(100dvh - 360px))'
+const MODEL_PRICE_GROUPING_STORAGE_KEY = 'cpa-helper-model-price-grouping-mode'
 const priceModalStyle: CSSProperties = { width: 'min(720px, calc(100vw - 32px))' }
 const priorityModalStyle: CSSProperties = { width: 'min(420px, calc(100vw - 32px))' }
 const proxyModalStyle: CSSProperties = { width: 'min(460px, calc(100vw - 32px))' }
@@ -99,6 +135,8 @@ const catalog = ref<ModelPriceCatalogResponse | null>(null)
 const selectedProvider = ref<string | null>(null)
 const selectedStatus = ref<PriceStatusFilter | null>(null)
 const searchQuery = ref('')
+const groupingMode = ref<PriceGroupingMode>(readPriceGroupingMode())
+const expandedRowKeys = ref<DataTableRowKey[]>([])
 const longContextEnabled = ref(false)
 const isDesktopPriceLayout = ref(desktopPriceLayoutQuery.matches)
 const pagination = reactive({
@@ -128,46 +166,97 @@ const proxyForm = reactive<LiteLLMProxySettingsPayload>({
   proxy_url: '',
 })
 
+function catalogModelReference(model: ModelPriceCatalogItem): CatalogModelReference {
+  return {
+    id: model.id,
+    name: model.name || model.id,
+    owner: model.owner,
+    suggestedProvider: model.suggested_provider,
+  }
+}
+
+function pricedDisplayRow(
+  price: ModelPrice,
+  catalogModels: CatalogModelReference[],
+): PriceDisplayRow {
+  const catalogModel = catalogModels.length === 1 ? catalogModels[0] : null
+  return {
+    rowType: 'detail',
+    key: `price:${price.id}`,
+    in_cpa: catalogModels.length > 0,
+    id: price.model,
+    name: catalogModel?.name || price.model,
+    owner: catalogModel?.owner ?? null,
+    suggested_provider: catalogModel?.suggestedProvider ?? '',
+    price,
+    provider: price.provider,
+    model: price.model,
+    comparisonModelKey: price.model,
+    catalogModels,
+    billing_unit: billingUnitForPrice(price, price.model),
+    status: priceStatus(price, price.model),
+  }
+}
+
+function unpricedCatalogDisplayRow(model: ModelPriceCatalogItem): PriceDisplayRow {
+  const provider = model.suggested_provider || model.owner || providerFromModelId(model.id)
+  return {
+    rowType: 'detail',
+    key: `catalog:${model.id}`,
+    in_cpa: true,
+    id: model.id,
+    name: model.name || model.id,
+    owner: model.owner,
+    suggested_provider: model.suggested_provider,
+    price: null,
+    provider,
+    model: model.id,
+    comparisonModelKey: model.id,
+    catalogModels: [catalogModelReference(model)],
+    billing_unit: billingUnitForPrice(null, model.id),
+    status: 'missing',
+  }
+}
+
 const priceRows = computed<PriceDisplayRow[]>(() => {
   const rows: PriceDisplayRow[] = []
-  const catalogPriceIds = new Set<number>()
-  for (const model of catalog.value?.models ?? []) {
-    if (model.price) {
-      catalogPriceIds.add(model.price.id)
-    }
-    const provider = model.price?.provider || model.suggested_provider || model.owner || providerFromModelId(model.id)
-    const billingUnit = billingUnitForPrice(model.price, model.id)
-    rows.push({
-      key: `catalog:${model.id}`,
-      in_cpa: true,
-      id: model.id,
-      name: model.name || model.id,
-      owner: model.owner,
-      suggested_provider: model.suggested_provider,
-      price: model.price,
-      provider,
-      model: model.price?.model || model.id,
-      billing_unit: billingUnit,
-      status: model.price ? priceStatus(model.price, model.id) : 'missing',
-    })
-  }
-  for (const price of prices.value) {
-    if (catalogPriceIds.has(price.id)) {
+  const catalogModels = catalog.value?.models ?? []
+  const catalogModelsByPriceId = new Map<number, CatalogModelReference[]>()
+  const renderedPriceIds = new Set<number>()
+
+  for (const model of catalogModels) {
+    if (!model.price) {
       continue
     }
-    rows.push({
-      key: `price:${price.id}`,
-      in_cpa: false,
-      id: price.model,
-      name: price.model,
-      owner: null,
-      suggested_provider: '',
-      price,
-      provider: price.provider,
-      model: price.model,
-      billing_unit: billingUnitForPrice(price, price.model),
-      status: priceStatus(price, price.model),
-    })
+    const references = catalogModelsByPriceId.get(model.price.id)
+    if (references) {
+      references.push(catalogModelReference(model))
+    } else {
+      catalogModelsByPriceId.set(model.price.id, [catalogModelReference(model)])
+    }
+  }
+
+  for (const model of catalogModels) {
+    if (!model.price) {
+      rows.push(unpricedCatalogDisplayRow(model))
+      continue
+    }
+    if (renderedPriceIds.has(model.price.id)) {
+      continue
+    }
+    const references = catalogModelsByPriceId.get(model.price.id)
+    if (!references) {
+      throw new Error(`Catalog price ${model.price.id} is missing its model references`)
+    }
+    rows.push(pricedDisplayRow(model.price, references))
+    renderedPriceIds.add(model.price.id)
+  }
+
+  for (const price of prices.value) {
+    if (renderedPriceIds.has(price.id)) {
+      continue
+    }
+    rows.push(pricedDisplayRow(price, []))
   }
   return rows
 })
@@ -193,6 +282,11 @@ const statusOptions = computed<Array<{ label: string; value: PriceStatusFilter }
   { label: t('仅有价格', 'Prices only'), value: 'library' },
 ])
 
+const groupingOptions = computed<Array<{ label: string; value: PriceGroupingMode }>>(() => [
+  { label: t('按模型', 'By model'), value: 'model' },
+  { label: t('按渠道', 'By provider'), value: 'provider' },
+])
+
 const filteredPrices = computed(() => {
   return priceRows.value.filter((row) => {
     if (selectedProvider.value && row.provider !== selectedProvider.value) {
@@ -205,8 +299,19 @@ const filteredPrices = computed(() => {
   })
 })
 
+const priceTableRows = computed<PriceGroupRow[]>(() =>
+  groupPriceRows(filteredPrices.value, groupingMode.value),
+)
+
 watch([selectedProvider, selectedStatus, searchQuery], () => {
   pagination.page = 1
+  expandedRowKeys.value = []
+})
+
+watch(groupingMode, (value) => {
+  pagination.page = 1
+  expandedRowKeys.value = []
+  savePriceGroupingMode(value)
 })
 
 function renderSearchIcon() {
@@ -219,6 +324,121 @@ function updatePricePage(page: number) {
 
 function normalizePriceSearch(value: string) {
   return value.trim().toLowerCase()
+}
+
+function isPriceGroupingMode(value: string | null): value is PriceGroupingMode {
+  return value === 'model' || value === 'provider'
+}
+
+function readPriceGroupingMode(): PriceGroupingMode {
+  try {
+    const storage = window.localStorage
+    const value = storage.getItem(MODEL_PRICE_GROUPING_STORAGE_KEY)
+    return isPriceGroupingMode(value) ? value : 'model'
+  } catch {
+    return 'model'
+  }
+}
+
+function savePriceGroupingMode(value: PriceGroupingMode) {
+  try {
+    const storage = window.localStorage
+    storage.setItem(MODEL_PRICE_GROUPING_STORAGE_KEY, value)
+  } catch {
+    // Keep the price page usable when local storage is unavailable.
+  }
+}
+
+function uniqueNormalizedCount(values: string[]): number {
+  return new Set(values.map((value) => normalizePriceSearch(value) || '__unknown__')).size
+}
+
+function latestPriceUpdate(children: PriceDisplayRow[]): string | null {
+  let latest: string | null = null
+  let latestTimestamp = Number.NEGATIVE_INFINITY
+  for (const child of children) {
+    const value = child.price?.updated_at
+    if (!value) {
+      continue
+    }
+    const timestamp = Date.parse(value)
+    if (Number.isFinite(timestamp) && timestamp > latestTimestamp) {
+      latest = value
+      latestTimestamp = timestamp
+    } else if (latest === null) {
+      latest = value
+    }
+  }
+  return latest
+}
+
+function createPriceGroupRow(
+  mode: PriceGroupingMode,
+  normalizedValue: string,
+  label: string,
+  children: PriceDisplayRow[],
+): PriceGroupRow {
+  const longContextEligibleRows = children.filter(
+    (row) => row.billing_unit === 'token' && row.price !== null,
+  )
+  const priorityEligibleRows = children.filter((row) => supportsPriorityMultiplier(row.price))
+  return {
+    rowType: 'group',
+    key: `group:${mode}:${normalizedValue}`,
+    mode,
+    label,
+    children,
+    providerCount: uniqueNormalizedCount(children.map((row) => row.provider)),
+    modelCount: uniqueNormalizedCount(
+      children.flatMap((row) =>
+        row.catalogModels.length > 0
+          ? row.catalogModels.map((model) => model.id)
+          : [row.comparisonModelKey],
+      ),
+    ),
+    pricedCount: children.filter((row) => row.status !== 'missing').length,
+    unpricedCount: children.filter((row) => row.status === 'missing').length,
+    billingUnits: [...new Set(children.map((row) => row.billing_unit))],
+    longContextConfiguredCount: longContextEligibleRows.filter((row) => row.price?.long_context).length,
+    longContextEligibleCount: longContextEligibleRows.length,
+    priorityConfiguredCount: priorityEligibleRows.filter(
+      (row) => typeof row.price?.priority_multiplier === 'number',
+    ).length,
+    priorityEligibleCount: priorityEligibleRows.length,
+    latestUpdatedAt: latestPriceUpdate(children),
+  }
+}
+
+function groupPriceRows(rows: PriceDisplayRow[], mode: PriceGroupingMode): PriceGroupRow[] {
+  const groups = new Map<string, { label: string; children: PriceDisplayRow[] }>()
+  for (const row of rows) {
+    const rawValue = mode === 'model' ? row.comparisonModelKey : row.provider
+    const normalizedValue = normalizePriceSearch(rawValue) || '__unknown__'
+    const existing = groups.get(normalizedValue)
+    if (existing) {
+      existing.children.push(row)
+      continue
+    }
+    groups.set(normalizedValue, {
+      label:
+        mode === 'provider' && !rawValue.trim()
+          ? t('未识别服务商', 'Unknown provider')
+          : rawValue,
+      children: [row],
+    })
+  }
+  return [...groups.entries()].map(([normalizedValue, group]) =>
+    createPriceGroupRow(mode, normalizedValue, group.label, group.children),
+  )
+}
+
+function isPriceGroupRow(row: PriceTableRow): row is PriceGroupRow {
+  return row.rowType === 'group'
+}
+
+function pruneExpandedRowKeys() {
+  const validKeys = new Set(priceTableRows.value.map((row) => row.key))
+  expandedRowKeys.value = expandedRowKeys.value.filter((key) => validKeys.has(String(key)))
 }
 
 function providerFromModelId(modelId: string) {
@@ -265,6 +485,7 @@ function rowMatchesStatus(row: PriceDisplayRow, status: PriceStatusFilter) {
 const normalizedSearchQuery = computed(() => normalizePriceSearch(searchQuery.value))
 
 const filteredPriceCount = computed(() => filteredPrices.value.length)
+const filteredGroupCount = computed(() => priceTableRows.value.length)
 
 const totalPriceCount = computed(() => priceRows.value.length)
 const cpaModelCount = computed(() => catalog.value?.models.length ?? 0)
@@ -381,7 +602,14 @@ function priceMatchesSearch(row: PriceDisplayRow) {
     row.id.toLowerCase().includes(normalizedSearchQuery.value) ||
     row.name.toLowerCase().includes(normalizedSearchQuery.value) ||
     (row.owner ?? '').toLowerCase().includes(normalizedSearchQuery.value) ||
-    row.suggested_provider.toLowerCase().includes(normalizedSearchQuery.value)
+    row.suggested_provider.toLowerCase().includes(normalizedSearchQuery.value) ||
+    row.catalogModels.some(
+      (model) =>
+        model.id.toLowerCase().includes(normalizedSearchQuery.value) ||
+        model.name.toLowerCase().includes(normalizedSearchQuery.value) ||
+        (model.owner ?? '').toLowerCase().includes(normalizedSearchQuery.value) ||
+        model.suggestedProvider.toLowerCase().includes(normalizedSearchQuery.value),
+    )
   )
 }
 
@@ -409,6 +637,7 @@ async function refresh() {
     const [nextPrices, nextCatalog] = await Promise.all([listModelPrices(), listModelPriceCatalog()])
     prices.value = nextPrices
     catalog.value = nextCatalog
+    pruneExpandedRowKeys()
   } catch (error) {
     message.error(errorText(error, '加载模型价格失败', 'Failed to load model prices'))
   } finally {
@@ -630,16 +859,33 @@ function handleDesktopPriceLayoutChange(event: MediaQueryListEvent) {
   isDesktopPriceLayout.value = event.matches
 }
 
-function rowKey(row: PriceDisplayRow) {
+function rowKey(row: PriceTableRow): DataTableRowKey {
   return row.key
+}
+
+function priceRowClassName(row: PriceTableRow) {
+  return isPriceGroupRow(row) ? 'price-group-row' : 'price-detail-row'
 }
 
 function formatPriceValue(value: number | null | undefined) {
   return typeof value === 'number' ? String(value) : '-'
 }
 
-function renderBillingUnitCell(row: PriceDisplayRow) {
-  const isRequest = row.billing_unit === 'request'
+function summarizePriceValues(values: number[]): string {
+  const finiteValues = values.filter((value) => Number.isFinite(value))
+  if (finiteValues.length === 0) {
+    return '-'
+  }
+  const minimum = Math.min(...finiteValues)
+  const maximum = Math.max(...finiteValues)
+  return minimum === maximum
+    ? formatPriceValue(minimum)
+    : `${formatPriceValue(minimum)} - ${formatPriceValue(maximum)}`
+}
+
+function renderBillingUnitBadge(unit: BillingUnit | 'mixed') {
+  const isRequest = unit === 'request'
+  const isMixed = unit === 'mixed'
   return h(
     'span',
     {
@@ -649,25 +895,58 @@ function renderBillingUnitCell(row: PriceDisplayRow) {
         minHeight: '22px',
         padding: '2px 8px',
         borderRadius: '6px',
-        background: isRequest ? 'rgba(16, 185, 129, 0.13)' : 'rgba(124, 58, 237, 0.12)',
-        color: isRequest ? '#047857' : '#6d28d9',
+        background: isMixed
+          ? 'color-mix(in srgb, var(--cpa-text-muted) 12%, transparent)'
+          : isRequest
+            ? 'rgba(16, 185, 129, 0.13)'
+            : 'rgba(124, 58, 237, 0.12)',
+        color: isMixed ? 'var(--cpa-text-muted)' : isRequest ? '#047857' : '#6d28d9',
         fontSize: '12px',
         fontWeight: '600',
         lineHeight: '1.2',
       },
     },
-    isRequest ? t('按次', 'Per call') : t('按 Token', 'Per token'),
+    isMixed ? t('混合', 'Mixed') : isRequest ? t('按次', 'Per call') : t('按 Token', 'Per token'),
   )
 }
 
-function renderTokenPriceValue(row: PriceDisplayRow, field: PriceFieldName) {
+function renderBillingUnitCell(row: PriceTableRow) {
+  if (isPriceGroupRow(row)) {
+    return row.billingUnits.length === 1 && row.billingUnits[0]
+      ? renderBillingUnitBadge(row.billingUnits[0])
+      : renderBillingUnitBadge('mixed')
+  }
+  return renderBillingUnitBadge(row.billing_unit)
+}
+
+function renderTokenPriceValue(row: PriceTableRow, field: PriceFieldName) {
+  if (isPriceGroupRow(row)) {
+    if (row.mode === 'provider') {
+      return h('span', { class: 'price-muted' }, '-')
+    }
+    const values = row.children
+      .filter((child) => child.billing_unit === 'token' && child.price !== null)
+      .map((child) => child.price?.[field])
+      .filter((value): value is number => typeof value === 'number')
+    return h('span', { class: 'price-group-range' }, summarizePriceValues(values))
+  }
   if (row.billing_unit === 'request') {
     return h('span', { class: 'price-muted' }, '-')
   }
   return formatPriceValue(row.price?.[field])
 }
 
-function renderRequestPriceValue(row: PriceDisplayRow) {
+function renderRequestPriceValue(row: PriceTableRow) {
+  if (isPriceGroupRow(row)) {
+    if (row.mode === 'provider') {
+      return h('span', { class: 'price-muted' }, '-')
+    }
+    const values = row.children
+      .filter((child) => child.billing_unit === 'request')
+      .map((child) => child.price?.request_usd)
+      .filter((value): value is number => typeof value === 'number')
+    return h('span', { class: 'price-group-range' }, summarizePriceValues(values))
+  }
   if (row.billing_unit !== 'request') {
     return h('span', { class: 'price-muted' }, '-')
   }
@@ -677,7 +956,40 @@ function renderRequestPriceValue(row: PriceDisplayRow) {
   return formatPriceValue(row.price.request_usd)
 }
 
-function renderPriorityMultiplier(row: PriceDisplayRow) {
+function renderConfigurationSummary(
+  configured: number,
+  eligible: number,
+  chineseLabel: string,
+  englishLabel: string,
+) {
+  if (eligible === 0) {
+    return h('span', { class: 'price-muted' }, '-')
+  }
+  const value = `${formatInteger(configured)}/${formatInteger(eligible)}`
+  return h(
+    NTooltip,
+    null,
+    {
+      trigger: () =>
+        h(
+          NTag,
+          { size: 'small', type: configured > 0 ? 'info' : 'default', bordered: false },
+          { default: () => value },
+        ),
+      default: () => t(`${chineseLabel}：${value}`, `${englishLabel}: ${value}`),
+    },
+  )
+}
+
+function renderPriorityMultiplier(row: PriceTableRow) {
+  if (isPriceGroupRow(row)) {
+    return renderConfigurationSummary(
+      row.priorityConfiguredCount,
+      row.priorityEligibleCount,
+      '已配置 Fast 倍率',
+      'Fast multipliers configured',
+    )
+  }
   if (!supportsPriorityMultiplier(row.price)) {
     return h('span', { class: 'price-muted' }, '-')
   }
@@ -706,7 +1018,15 @@ function formatThreshold(value: number): string {
   return formatInteger(value)
 }
 
-function renderLongContextPrice(row: PriceDisplayRow) {
+function renderLongContextPrice(row: PriceTableRow) {
+  if (isPriceGroupRow(row)) {
+    return renderConfigurationSummary(
+      row.longContextConfiguredCount,
+      row.longContextEligibleCount,
+      '已配置长上下文价格',
+      'Long-context prices configured',
+    )
+  }
   const longContext = row.price?.long_context
   if (row.billing_unit === 'request' || !longContext) {
     return h('span', { class: 'price-muted' }, '-')
@@ -750,7 +1070,43 @@ function renderPriorityMultiplierAction(price: ModelPrice) {
   )
 }
 
-function renderModelCell(row: PriceDisplayRow) {
+function modelDetailSubline(row: PriceDisplayRow): string {
+  const catalogModelIds = row.catalogModels.map((model) => model.id)
+  const hasDistinctCatalogIdentity =
+    row.price !== null &&
+    (catalogModelIds.length > 1 ||
+      (catalogModelIds.length === 1 && catalogModelIds[0] !== row.id))
+  if (hasDistinctCatalogIdentity) {
+    return t(
+      `CPA 模型：${catalogModelIds.join('、')}`,
+      `CPA models: ${catalogModelIds.join(', ')}`,
+    )
+  }
+  return row.name && row.name !== row.id ? row.name : ''
+}
+
+function renderModelCell(row: PriceTableRow) {
+  if (isPriceGroupRow(row)) {
+    const title =
+      row.mode === 'model'
+        ? row.label
+        : t(`${formatInteger(row.modelCount)} 个模型`, `${formatInteger(row.modelCount)} models`)
+    const details =
+      row.mode === 'model'
+        ? t(
+            `${formatInteger(row.providerCount)} 个服务商 · ${formatInteger(row.children.length)} 条明细`,
+            `${formatInteger(row.providerCount)} providers · ${formatInteger(row.children.length)} details`,
+          )
+        : t(
+            `${formatInteger(row.children.length)} 条价格明细`,
+            `${formatInteger(row.children.length)} price details`,
+          )
+    return h('div', { class: 'price-group-cell' }, [
+      h('div', { class: 'price-group-title' }, title),
+      h('div', { class: 'price-group-sub' }, details),
+    ])
+  }
+  const subline = modelDetailSubline(row)
   return h('div', { class: 'model-cell' }, [
     h('div', { class: 'model-title-row' }, [
       h('span', { class: 'model-name' }, row.id),
@@ -768,11 +1124,28 @@ function renderModelCell(row: PriceDisplayRow) {
           )
         : null,
     ]),
-    row.name && row.name !== row.id ? h('div', { class: 'model-sub' }, row.name) : null,
+    subline ? h('div', { class: 'model-sub' }, subline) : null,
   ])
 }
 
-function renderProviderCell(row: PriceDisplayRow) {
+function renderProviderCell(row: PriceTableRow) {
+  if (isPriceGroupRow(row)) {
+    const title =
+      row.mode === 'provider'
+        ? row.label
+        : t(`${formatInteger(row.providerCount)} 个服务商`, `${formatInteger(row.providerCount)} providers`)
+    const details =
+      row.mode === 'provider'
+        ? t(
+            `${formatInteger(row.modelCount)} 个模型`,
+            `${formatInteger(row.modelCount)} models`,
+          )
+        : null
+    return h('div', { class: 'price-group-cell' }, [
+      h('div', { class: 'price-group-title' }, title),
+      details ? h('div', { class: 'price-group-sub' }, details) : null,
+    ])
+  }
   return h('div', { class: 'provider-cell' }, [
     h('div', { class: 'provider-main' }, row.provider || '-'),
     row.owner && row.owner !== row.provider
@@ -781,7 +1154,27 @@ function renderProviderCell(row: PriceDisplayRow) {
   ])
 }
 
-function renderStatusCell(row: PriceDisplayRow) {
+function renderStatusCell(row: PriceTableRow) {
+  if (isPriceGroupRow(row)) {
+    return h('div', { class: 'price-group-status' }, [
+      h(
+        'strong',
+        t(
+          `${formatInteger(row.pricedCount)} 已定价`,
+          `${formatInteger(row.pricedCount)} priced`,
+        ),
+      ),
+      h(
+        'span',
+        row.unpricedCount > 0
+          ? t(
+              `${formatInteger(row.unpricedCount)} 未定价`,
+              `${formatInteger(row.unpricedCount)} unpriced`,
+            )
+          : t('全部完成', 'Complete'),
+      ),
+    ])
+  }
   const label = row.status === 'missing' ? t('未定价', 'Unpriced') : row.status === 'litellm' ? 'LiteLLM' : t('手动', 'Manual')
   const type = row.status === 'missing' ? 'warning' : row.status === 'litellm' ? 'info' : 'default'
   return h(
@@ -791,7 +1184,47 @@ function renderStatusCell(row: PriceDisplayRow) {
   )
 }
 
-const columns = computed<DataTableColumns<PriceDisplayRow>>(() => [
+function renderUpdatedCell(row: PriceTableRow) {
+  const updatedAt = isPriceGroupRow(row) ? row.latestUpdatedAt : row.price?.updated_at
+  return updatedAt ? formatDateTime(updatedAt) : '-'
+}
+
+function renderActionsCell(row: PriceTableRow) {
+  if (isPriceGroupRow(row)) {
+    return null
+  }
+  return h(
+    NSpace,
+    { size: 4 },
+    {
+      default: () => [
+        ...(row.price && supportsPriorityMultiplier(row.price)
+          ? [renderPriorityMultiplierAction(row.price)]
+          : []),
+        row.price
+          ? h(
+              NButton,
+              { size: 'small', quaternary: true, onClick: () => openEdit(row.price as ModelPrice) },
+              { default: () => t('改价', 'Edit') },
+            )
+          : h(
+              NButton,
+              { size: 'small', type: 'primary', secondary: true, onClick: () => openCreateForRow(row) },
+              { default: () => t('设价', 'Set price') },
+            ),
+        row.price
+          ? h(
+              NButton,
+              { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDelete(row.price as ModelPrice) },
+              { default: () => t('删除', 'Delete') },
+            )
+          : null,
+      ],
+    },
+  )
+}
+
+const columns = computed<DataTableColumns<PriceTableRow>>(() => [
   {
     title: t('模型', 'Model'),
     key: 'id',
@@ -809,7 +1242,7 @@ const columns = computed<DataTableColumns<PriceDisplayRow>>(() => [
   {
     title: t('定价', 'Pricing'),
     key: 'status',
-    width: 96,
+    width: 120,
     render: renderStatusCell,
   },
   {
@@ -864,43 +1297,14 @@ const columns = computed<DataTableColumns<PriceDisplayRow>>(() => [
     title: t('更新', 'Updated'),
     key: 'updated_at',
     width: 140,
-    render: (row) => (row.price ? formatDateTime(row.price.updated_at) : '-'),
+    render: renderUpdatedCell,
   },
   {
     title: '',
     key: 'actions',
     width: 168,
     fixed: 'right',
-    render: (row) =>
-      h(
-        NSpace,
-        { size: 4 },
-        {
-          default: () => [
-            ...(row.price && supportsPriorityMultiplier(row.price)
-              ? [renderPriorityMultiplierAction(row.price)]
-              : []),
-            row.price
-              ? h(
-                  NButton,
-                  { size: 'small', quaternary: true, onClick: () => openEdit(row.price as ModelPrice) },
-                  { default: () => t('改价', 'Edit') },
-                )
-              : h(
-                  NButton,
-                  { size: 'small', type: 'primary', secondary: true, onClick: () => openCreateForRow(row) },
-                  { default: () => t('设价', 'Set price') },
-                ),
-            row.price
-              ? h(
-                  NButton,
-                  { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDelete(row.price as ModelPrice) },
-                  { default: () => t('删除', 'Delete') },
-                )
-              : null,
-          ],
-        },
-      ),
+    render: renderActionsCell,
   },
 ])
 
@@ -959,6 +1363,18 @@ onBeforeUnmount(() => {
         <div class="table-toolbar">
           <NSpace class="price-toolbar-layout" justify="space-between" align="center">
             <NSpace class="price-filters" align="center" :size="8">
+              <div class="price-grouping-control">
+                <span class="price-grouping-label">{{ t('视角', 'View') }}</span>
+                <NRadioGroup v-model:value="groupingMode" size="small">
+                  <NRadioButton
+                    v-for="option in groupingOptions"
+                    :key="option.value"
+                    :value="option.value"
+                  >
+                    {{ option.label }}
+                  </NRadioButton>
+                </NRadioGroup>
+              </div>
               <span class="filter-label">{{ t('服务商', 'Provider') }}</span>
               <NSelect
                 v-model:value="selectedProvider"
@@ -984,21 +1400,27 @@ onBeforeUnmount(() => {
               />
             </NSpace>
             <span class="result-count">
-              {{ t(`共 ${filteredPriceCount} / ${totalPriceCount} 条`, `${filteredPriceCount} / ${totalPriceCount} items`) }}
+              {{ t(
+                `共 ${filteredGroupCount} 组 · ${filteredPriceCount} / ${totalPriceCount} 条明细`,
+                `${filteredGroupCount} groups · ${filteredPriceCount} / ${totalPriceCount} details`,
+              ) }}
             </span>
           </NSpace>
         </div>
       </div>
       <NDataTable
+        v-model:expanded-row-keys="expandedRowKeys"
         class="price-table"
         v-bind="priceTableLayoutProps"
         size="small"
         :loading="isLoading"
         :columns="columns"
-        :data="filteredPrices"
+        :data="priceTableRows"
         :pagination="pagination"
         :row-key="rowKey"
-        :scroll-x="1920"
+        :row-class-name="priceRowClassName"
+        :indent="18"
+        :scroll-x="2040"
       />
     </section>
 
@@ -1250,10 +1672,18 @@ onBeforeUnmount(() => {
 }
 
 .filter-label,
+.price-grouping-label,
 .result-count {
   color: var(--cpa-text-muted);
   font-size: 13px;
   white-space: nowrap;
+}
+
+.price-grouping-control {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
 }
 
 .provider-filter {
@@ -1273,25 +1703,75 @@ onBeforeUnmount(() => {
   width: 280px;
 }
 
-.model-cell,
-.provider-cell {
+.price-table :deep(.price-group-row td) {
+  background: color-mix(in srgb, var(--cpa-surface-muted) 82%, var(--cpa-surface));
+}
+
+.price-table :deep(.price-group-row:hover td) {
+  background: color-mix(in srgb, var(--cpa-primary) 7%, var(--cpa-surface-muted));
+}
+
+.price-table :deep(.price-group-cell) {
   min-width: 0;
 }
 
-.model-title-row {
+.price-table :deep(.price-group-title) {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--cpa-text-strong);
+  font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.price-table :deep(.price-group-sub) {
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.price-table :deep(.price-group-status) {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.price-table :deep(.price-group-status strong),
+.price-table :deep(.price-group-range) {
+  color: var(--cpa-text-strong);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.price-table :deep(.price-group-status span) {
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+}
+
+.price-table :deep(.model-cell),
+.price-table :deep(.provider-cell) {
+  min-width: 0;
+}
+
+.price-table :deep(.model-title-row) {
   display: flex;
   align-items: center;
   gap: 0;
   min-width: 0;
 }
 
-.model-availability-tag {
+.price-table :deep(.model-availability-tag) {
   flex: 0 0 auto;
   margin-left: 2px;
 }
 
-.model-name,
-.provider-main {
+.price-table :deep(.model-name),
+.price-table :deep(.provider-main) {
   min-width: 0;
   overflow: hidden;
   color: var(--cpa-text);
@@ -1300,7 +1780,7 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.model-sub {
+.price-table :deep(.model-sub) {
   margin-top: 2px;
   overflow: hidden;
   color: var(--cpa-text-muted);
@@ -1309,7 +1789,7 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.price-muted {
+.price-table :deep(.price-muted) {
   color: var(--cpa-text-muted);
 }
 
@@ -1388,6 +1868,15 @@ onBeforeUnmount(() => {
     display: none;
   }
 
+  .price-grouping-control,
+  .price-search {
+    grid-column: 1 / -1;
+  }
+
+  .price-grouping-control {
+    justify-content: space-between;
+  }
+
   .provider-filter,
   .status-filter,
   .price-search {
@@ -1396,6 +1885,7 @@ onBeforeUnmount(() => {
 
   .result-count {
     justify-self: start;
+    white-space: normal;
   }
 }
 </style>
