@@ -149,7 +149,11 @@ onBeforeUnmount(() => {
   >
     <div class="chart-heading">
       <h2>{{ title }}</h2>
-      <span class="chart-more" aria-hidden="true">...</span>
+      <div class="chart-heading-extra">
+        <slot name="header-extra">
+          <span class="chart-more" aria-hidden="true">...</span>
+        </slot>
+      </div>
     </div>
     <NSpin :show="loading ?? false">
       <div class="chart-body">
@@ -182,15 +186,24 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   padding: 18px 18px 12px;
   border-bottom: 1px solid var(--cpa-border);
 }
 
 h2 {
+  min-width: 0;
   margin: 0;
   color: var(--cpa-text-strong);
   font-size: 15px;
   font-weight: 750;
+}
+
+.chart-heading-extra {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
 }
 
 .chart-more {

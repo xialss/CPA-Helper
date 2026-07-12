@@ -860,6 +860,7 @@ func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices ma
 func usageSummaryFromRecords(filters UsageFilters, records []UsageRecord, prices map[[2]string]ModelPrice) map[string]any {
 	failed := 0
 	input, output, cached, reasoning, total := 0, 0, 0, 0, 0
+	normalInput, cacheRead, cacheCreation := 0, 0, 0
 	estimated := 0.0
 	unpriced := 0
 	ttftTotal := 0.0
@@ -873,6 +874,10 @@ func usageSummaryFromRecords(filters UsageFilters, records []UsageRecord, prices
 		cached += record.CachedTokens
 		reasoning += record.ReasoningTokens
 		total += usageAggregateTotalTokens(record)
+		tokens := normalizedUsageTokenBreakdown(record)
+		normalInput += tokens.NormalInputTokens
+		cacheRead += tokens.CacheReadTokens
+		cacheCreation += tokens.CacheCreationTokens
 		amount, isUnpriced := recordCost(record, prices)
 		estimated = mathRound(estimated+amount, 8)
 		if isUnpriced {
@@ -889,19 +894,22 @@ func usageSummaryFromRecords(filters UsageFilters, records []UsageRecord, prices
 		filters.End = &end
 	}
 	return map[string]any{
-		"start":              usageAPITimePtr(filters.Start),
-		"end":                usageAPITimePtr(filters.End),
-		"total_records":      len(records),
-		"failed_records":     failed,
-		"success_records":    len(records) - failed,
-		"input_tokens":       input,
-		"output_tokens":      output,
-		"cached_tokens":      cached,
-		"reasoning_tokens":   reasoning,
-		"total_tokens":       total,
-		"estimated_cost_usd": estimated,
-		"unpriced_records":   unpriced,
-		"average_ttft_ms":    averageTTFTMS(ttftTotal, ttftCount),
+		"start":                 usageAPITimePtr(filters.Start),
+		"end":                   usageAPITimePtr(filters.End),
+		"total_records":         len(records),
+		"failed_records":        failed,
+		"success_records":       len(records) - failed,
+		"input_tokens":          input,
+		"output_tokens":         output,
+		"cached_tokens":         cached,
+		"normal_input_tokens":   normalInput,
+		"cache_read_tokens":     cacheRead,
+		"cache_creation_tokens": cacheCreation,
+		"reasoning_tokens":      reasoning,
+		"total_tokens":          total,
+		"estimated_cost_usd":    estimated,
+		"unpriced_records":      unpriced,
+		"average_ttft_ms":       averageTTFTMS(ttftTotal, ttftCount),
 	}
 }
 

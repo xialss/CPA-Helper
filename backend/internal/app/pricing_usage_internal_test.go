@@ -1243,6 +1243,15 @@ func TestUsageAggregatesClaudeCacheReadAndCreationTokens(t *testing.T) {
 	if summary["input_tokens"].(int) != 60 {
 		t.Fatalf("summary input = %v, want 60", summary["input_tokens"])
 	}
+	if summary["normal_input_tokens"].(int) != 10 {
+		t.Fatalf("summary normal input = %v, want 10", summary["normal_input_tokens"])
+	}
+	if summary["cache_read_tokens"].(int) != 20 {
+		t.Fatalf("summary cache read = %v, want 20", summary["cache_read_tokens"])
+	}
+	if summary["cache_creation_tokens"].(int) != 30 {
+		t.Fatalf("summary cache creation = %v, want 30", summary["cache_creation_tokens"])
+	}
 	if summary["total_tokens"].(int) != 72 {
 		t.Fatalf("summary total = %v, want 72", summary["total_tokens"])
 	}
@@ -1259,6 +1268,53 @@ func TestUsageAggregatesClaudeCacheReadAndCreationTokens(t *testing.T) {
 	models := distributions["models"].([]map[string]any)
 	if len(models) != 1 || models[0]["total_tokens"].(int) != 72 {
 		t.Fatalf("distribution totals = %#v, want one item with total 72", models)
+	}
+}
+
+func TestUsageSummaryAggregatesNormalizedTokensAcrossProviders(t *testing.T) {
+	openAIProvider := "openai"
+	codexProvider := "codex"
+	claudeProvider := "anthropic"
+	records := []UsageRecord{
+		{
+			Provider:            &openAIProvider,
+			InputTokens:         100,
+			CachedTokens:        90,
+			CacheReadTokens:     30,
+			CacheCreationTokens: 40,
+			TotalTokens:         100,
+		},
+		{
+			Provider:            &codexProvider,
+			InputTokens:         50,
+			CachedTokens:        70,
+			CacheCreationTokens: 20,
+			TotalTokens:         50,
+		},
+		{
+			Provider:            &claudeProvider,
+			InputTokens:         10,
+			CacheReadTokens:     20,
+			CacheCreationTokens: 30,
+			TotalTokens:         10,
+		},
+	}
+
+	summary := usageSummaryFromRecords(UsageFilters{}, records, nil)
+	if summary["normal_input_tokens"].(int) != 40 {
+		t.Fatalf("summary normal input = %v, want 40", summary["normal_input_tokens"])
+	}
+	if summary["cache_read_tokens"].(int) != 100 {
+		t.Fatalf("summary cache read = %v, want 100", summary["cache_read_tokens"])
+	}
+	if summary["cache_creation_tokens"].(int) != 70 {
+		t.Fatalf("summary cache creation = %v, want 70", summary["cache_creation_tokens"])
+	}
+	if summary["input_tokens"].(int) != 210 {
+		t.Fatalf("legacy summary input = %v, want 210", summary["input_tokens"])
+	}
+	if summary["cached_tokens"].(int) != 160 {
+		t.Fatalf("legacy summary cached = %v, want 160", summary["cached_tokens"])
 	}
 }
 

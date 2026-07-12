@@ -39,9 +39,12 @@ type usageRecordDetailResponse struct {
 }
 
 type usageSummaryResponse struct {
-	Start         string   `json:"start"`
-	End           string   `json:"end"`
-	AverageTTFTMS *float64 `json:"average_ttft_ms"`
+	Start               string   `json:"start"`
+	End                 string   `json:"end"`
+	NormalInputTokens   int      `json:"normal_input_tokens"`
+	CacheReadTokens     int      `json:"cache_read_tokens"`
+	CacheCreationTokens int      `json:"cache_creation_tokens"`
+	AverageTTFTMS       *float64 `json:"average_ttft_ms"`
 }
 
 type usageOverviewDistributionsResponse struct {
@@ -220,11 +223,17 @@ func TestUsageRecordsExposeReasoningEffortTTFTAndSummaryAverage(t *testing.T) {
 	if summary.AverageTTFTMS == nil || *summary.AverageTTFTMS != 500 {
 		t.Fatalf("average_ttft_ms = %#v, want 500", summary.AverageTTFTMS)
 	}
+	if summary.NormalInputTokens != 30 || summary.CacheReadTokens != 0 || summary.CacheCreationTokens != 0 {
+		t.Fatalf("summary normalized tokens = %d/%d/%d, want 30/0/0", summary.NormalInputTokens, summary.CacheReadTokens, summary.CacheCreationTokens)
+	}
 
 	overview := usageOverviewDistributionsResponse{}
 	requestJSON(t, handler, http.MethodGet, "/api/usage/overview?scope=admin&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00", nil, cookies, &overview)
 	if overview.Summary.AverageTTFTMS == nil || *overview.Summary.AverageTTFTMS != 500 {
 		t.Fatalf("overview average_ttft_ms = %#v, want 500", overview.Summary.AverageTTFTMS)
+	}
+	if overview.Summary.NormalInputTokens != 30 || overview.Summary.CacheReadTokens != 0 || overview.Summary.CacheCreationTokens != 0 {
+		t.Fatalf("overview normalized tokens = %d/%d/%d, want 30/0/0", overview.Summary.NormalInputTokens, overview.Summary.CacheReadTokens, overview.Summary.CacheCreationTokens)
 	}
 }
 
