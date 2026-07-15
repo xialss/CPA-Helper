@@ -4,6 +4,7 @@ import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from 'v
 import {
   NAlert,
   NButton,
+  NCheckbox,
   NDataTable,
   NForm,
   NFormItem,
@@ -27,10 +28,14 @@ import { Database, Layers3, RefreshCw, Search, Server, Settings2, Zap } from 'lu
 
 import {
   createModelPrice,
+  deleteModelPriceLibraryConflict,
   deleteModelPrice,
   getLiteLLMProxySettings,
   listModelPriceCatalog,
+  listModelPriceLibraryConflicts,
   listModelPrices,
+  promoteModelPriceLibraryConflict,
+  replaceActiveModelPriceLibraryConflict,
   syncLitellmModelPrices,
   updateLiteLLMProxySettings,
   updateModelPrice,
@@ -41,6 +46,8 @@ import type {
   ModelPrice,
   ModelPriceCatalogItem,
   ModelPriceCatalogResponse,
+  ModelPriceLibraryConflict,
+  ModelPriceLibraryConflictLongContext,
   ModelPriceLongContext,
   ModelPricePayload,
 } from '@/shared/types/api'
@@ -52,9 +59,11 @@ type PriceTableLayoutProps =
   | { flexHeight: false; maxHeight: string }
 
 type PriceRowStatus = 'missing' | 'litellm' | 'manual'
-type PriceStatusFilter = 'cpa' | 'missing' | 'litellm' | 'manual' | 'library'
+type PriceStatusFilter = 'cpa' | 'missing' | 'litellm' | 'manual' | 'library' | 'migration_conflict'
 type BillingUnit = 'token' | 'request'
 type PriceGroupingMode = 'model' | 'provider'
+type PriceScope = 'library' | 'channel'
+type UnmatchedChannelStatus = 'conflict' | 'model_removed' | 'orphan' | 'unavailable'
 type PriceFieldName = keyof Pick<
   ModelPrice,
   | 'input_usd_per_million'
@@ -66,8 +75,11 @@ type PriceFieldName = keyof Pick<
 interface CatalogModelReference {
   id: string
   name: string
+  alias: string | null
   owner: string | null
   suggestedProvider: string
+  channelBrand: string
+  channelLabel: string
 }
 
 interface PriceDisplayRow {
@@ -80,11 +92,21 @@ interface PriceDisplayRow {
   suggested_provider: string
   price: ModelPrice | null
   provider: string
+  channelFilterKey: string
+  channelBrand: string | null
+  channelKey: string | null
+  channelIdentityHash: string | null
+  channelStatus: string
+  channelDisabled: boolean
+  channelLabelFallback: boolean
+  priceScope: PriceScope
   model: string
   comparisonModelKey: string
   catalogModels: CatalogModelReference[]
+  templatePrice: ModelPrice | null
   billing_unit: BillingUnit
   status: PriceRowStatus
+  migrationConflict: ModelPriceLibraryConflict | null
 }
 
 interface PriceGroupRow {
@@ -93,7 +115,8 @@ interface PriceGroupRow {
   mode: PriceGroupingMode
   label: string
   children: PriceDisplayRow[]
-  providerCount: number
+  channelCount: number
+  libraryPriceCount: number
   modelCount: number
   pricedCount: number
   unpricedCount: number
@@ -110,6 +133,7 @@ type PriceTableRow = PriceDisplayRow | PriceGroupRow
 const PRICE_TABLE_FALLBACK_MAX_HEIGHT = 'max(240px, calc(100dvh - 360px))'
 const MODEL_PRICE_GROUPING_STORAGE_KEY = 'cpa-helper-model-price-grouping-mode'
 const priceModalStyle: CSSProperties = { width: 'min(720px, calc(100vw - 32px))' }
+const conflictModalStyle: CSSProperties = { width: 'min(520px, calc(100vw - 32px))' }
 const priorityModalStyle: CSSProperties = { width: 'min(420px, calc(100vw - 32px))' }
 const proxyModalStyle: CSSProperties = { width: 'min(460px, calc(100vw - 32px))' }
 const proxyModalContentStyle: CSSProperties = { padding: '16px 22px 4px' }
@@ -123,14 +147,21 @@ const isSyncing = ref(false)
 const modalOpen = ref(false)
 const proxyModalOpen = ref(false)
 const priorityModalOpen = ref(false)
+const conflictModalOpen = ref(false)
 const isProxyLoading = ref(false)
 const isProxySaving = ref(false)
 const isPrioritySaving = ref(false)
 const isPriceSaving = ref(false)
+const isConflictSaving = ref(false)
 const editingId = ref<number | null>(null)
+const editingChannelLabel = ref('')
 const priorityEditingPrice = ref<ModelPrice | null>(null)
 const priorityMultiplier = ref<number | null>(null)
 const prices = ref<ModelPrice[]>([])
+const libraryConflicts = ref<ModelPriceLibraryConflict[]>([])
+const resolvingConflict = ref<ModelPriceLibraryConflict | null>(null)
+const conflictProvider = ref('')
+const conflictModel = ref('')
 const catalog = ref<ModelPriceCatalogResponse | null>(null)
 const selectedProvider = ref<string | null>(null)
 const selectedStatus = ref<PriceStatusFilter | null>(null)
@@ -138,6 +169,8 @@ const searchQuery = ref('')
 const groupingMode = ref<PriceGroupingMode>(readPriceGroupingMode())
 const expandedRowKeys = ref<DataTableRowKey[]>([])
 const longContextEnabled = ref(false)
+const preservedLongContext = ref<ModelPriceLibraryConflictLongContext | null>(null)
+const preserveInvalidLongContext = ref(false)
 const isDesktopPriceLayout = ref(desktopPriceLayoutQuery.matches)
 const pagination = reactive({
   page: 1,
@@ -147,6 +180,10 @@ const pagination = reactive({
 const form = reactive<ModelPricePayload>({
   provider: '',
   model: '',
+  price_scope: 'library',
+  channel_brand: null,
+  channel_key: null,
+  channel_identity_hash: null,
   input_usd_per_million: 0,
   output_usd_per_million: 0,
   cache_read_usd_per_million: 0,
@@ -166,74 +203,223 @@ const proxyForm = reactive<LiteLLMProxySettingsPayload>({
   proxy_url: '',
 })
 
+const preservedLongContextSummary = computed(() => {
+  const value = preservedLongContext.value
+  if (!value) {
+    return ''
+  }
+  const nullablePrice = (price: number | null) => price === null ? t('未设置', 'Not set') : formatPriceValue(price)
+  return [
+    `${t('阈值', 'Threshold')} ${value.threshold_input_tokens === null ? t('未设置', 'Not set') : formatInteger(value.threshold_input_tokens)}`,
+    `${t('输入', 'Input')} ${nullablePrice(value.input_usd_per_million)}`,
+    `${t('输出', 'Output')} ${nullablePrice(value.output_usd_per_million)}`,
+    `${t('缓存读', 'Cache read')} ${nullablePrice(value.cache_read_usd_per_million)}`,
+    `${t('缓存写', 'Cache write')} ${nullablePrice(value.cache_creation_usd_per_million)}`,
+  ].join(' · ')
+})
+
 function catalogModelReference(model: ModelPriceCatalogItem): CatalogModelReference {
   return {
     id: model.id,
-    name: model.name || model.id,
+    name: model.name,
+    alias: model.alias,
     owner: model.owner,
     suggestedProvider: model.suggested_provider,
+    channelBrand: model.channel_brand,
+    channelLabel: model.channel_label,
   }
+}
+
+function channelFilterKey(
+  scope: PriceScope,
+  brand: string | null,
+  key: string | null,
+  identityHash: string | null,
+  provider: string,
+) {
+  if (scope === 'channel') {
+    const selector = key?.trim() ?? ''
+    if (selector) {
+      const canonicalSelector = brand === 'openai_compatibility' ? selector.toLowerCase() : selector
+      return `channel:${brand ?? 'unknown'}:selector:${canonicalSelector}`
+    }
+    return `channel:${brand ?? 'unknown'}:identity:${identityHash?.trim() || 'unknown'}`
+  }
+  return `library:${provider.trim().toLowerCase()}`
+}
+
+function channelPriceIdentityKey(
+  brand: string | null,
+  key: string | null,
+  model: string,
+): string | null {
+  const channelIdentity = channelIdentityKey(brand, key)
+  const normalizedModel = model.trim().toLowerCase()
+  if (!channelIdentity || !normalizedModel) {
+    return null
+  }
+  return JSON.stringify([channelIdentity, normalizedModel])
+}
+
+function channelIdentityKey(
+  brand: string | null,
+  key: string | null,
+): string | null {
+  const normalizedBrand = brand?.trim().toLowerCase() ?? ''
+  const selector = key?.trim() ?? ''
+  if (!normalizedBrand || !selector) {
+    return null
+  }
+  const canonicalSelector = normalizedBrand === 'openai_compatibility' ? selector.toLowerCase() : selector
+  return JSON.stringify([normalizedBrand, canonicalSelector])
+}
+
+function channelBrandLabel(brand: string | null): string {
+  switch (brand) {
+    case 'gemini':
+      return 'Gemini'
+    case 'codex':
+      return 'Codex'
+    case 'claude':
+      return 'Claude'
+    case 'vertex':
+      return 'Vertex'
+    case 'openai_compatibility':
+      return t('OpenAI 兼容', 'OpenAI-compatible')
+    default:
+      return t('未知渠道', 'Unknown channel')
+  }
+}
+
+function maskedChannelReference(value: string | null): string {
+  const normalized = value?.trim() ?? ''
+  if (!normalized) {
+    return t('已移除渠道', 'Removed channel')
+  }
+  if (normalized.length <= 8) {
+    return `${normalized.slice(0, 2)}...`
+  }
+  return `${normalized.slice(0, 4)}...${normalized.slice(-3)}`
+}
+
+function orphanPriceChannelLabel(price: ModelPrice): string {
+  if (price.price_scope === 'library') {
+    return price.provider
+  }
+  if (price.channel_brand === 'openai_compatibility') {
+    return price.channel_key || price.provider
+  }
+  return `${channelBrandLabel(price.channel_brand)} · ${maskedChannelReference(price.channel_key)}`
 }
 
 function pricedDisplayRow(
   price: ModelPrice,
-  catalogModels: CatalogModelReference[],
+  catalogModel: ModelPriceCatalogItem | null,
+  unmatchedChannelStatus: UnmatchedChannelStatus = 'orphan',
 ): PriceDisplayRow {
-  const catalogModel = catalogModels.length === 1 ? catalogModels[0] : null
+  const scope: PriceScope = price.price_scope === 'channel' ? 'channel' : 'library'
+  const provider = catalogModel?.channel_label || orphanPriceChannelLabel(price)
+  const catalogModels = catalogModel ? [catalogModelReference(catalogModel)] : []
   return {
     rowType: 'detail',
     key: `price:${price.id}`,
-    in_cpa: catalogModels.length > 0,
+    in_cpa: catalogModel !== null,
     id: price.model,
-    name: catalogModel?.name || price.model,
+    name: catalogModel?.alias || catalogModel?.name || price.model,
     owner: catalogModel?.owner ?? null,
-    suggested_provider: catalogModel?.suggestedProvider ?? '',
+    suggested_provider: catalogModel?.suggested_provider ?? '',
     price,
-    provider: price.provider,
+    provider,
+    channelFilterKey: channelFilterKey(
+      scope,
+      price.channel_brand,
+      price.channel_key,
+      catalogModel?.channel_identity_hash ?? null,
+      provider,
+    ),
+    channelBrand: price.channel_brand,
+    channelKey: price.channel_key,
+    channelIdentityHash: catalogModel?.channel_identity_hash ?? null,
+    channelStatus: catalogModel?.channel_status ?? (scope === 'channel' ? unmatchedChannelStatus : 'ready'),
+    channelDisabled: catalogModel?.channel_disabled ?? false,
+    channelLabelFallback: catalogModel?.channel_label_fallback ?? scope === 'channel',
+    priceScope: scope,
     model: price.model,
-    comparisonModelKey: price.model,
+    comparisonModelKey: normalizeModelComparisonKey(price.model),
     catalogModels,
+    templatePrice: catalogModel?.template_price ?? null,
     billing_unit: billingUnitForPrice(price, price.model),
     status: priceStatus(price, price.model),
+    migrationConflict: null,
+  }
+}
+
+function migrationConflictDisplayRow(conflict: ModelPriceLibraryConflict): PriceDisplayRow {
+  const row = pricedDisplayRow(conflict.price, null)
+  return {
+    ...row,
+    key: `migration-conflict:${conflict.original_id}`,
+    in_cpa: false,
+    channelStatus: 'migration_conflict',
+    migrationConflict: conflict,
   }
 }
 
 function unpricedCatalogDisplayRow(model: ModelPriceCatalogItem): PriceDisplayRow {
-  const provider = model.suggested_provider || model.owner || providerFromModelId(model.id)
+  const provider = model.channel_label || channelBrandLabel(model.channel_brand)
   return {
     rowType: 'detail',
     key: `catalog:${model.id}`,
     in_cpa: true,
-    id: model.id,
-    name: model.name || model.id,
+    id: model.name,
+    name: model.alias || model.name,
     owner: model.owner,
     suggested_provider: model.suggested_provider,
     price: null,
     provider,
-    model: model.id,
-    comparisonModelKey: model.id,
+    channelFilterKey: channelFilterKey(
+      'channel',
+      model.channel_brand,
+      model.channel_key,
+      model.channel_identity_hash,
+      provider,
+    ),
+    channelBrand: model.channel_brand,
+    channelKey: model.channel_key,
+    channelIdentityHash: model.channel_identity_hash,
+    channelStatus: model.channel_status,
+    channelDisabled: model.channel_disabled,
+    channelLabelFallback: model.channel_label_fallback,
+    priceScope: 'channel',
+    model: model.name,
+    comparisonModelKey: normalizeModelComparisonKey(model.name),
     catalogModels: [catalogModelReference(model)],
-    billing_unit: billingUnitForPrice(null, model.id),
+    templatePrice: model.template_price,
+    billing_unit: billingUnitForPrice(null, model.name),
     status: 'missing',
+    migrationConflict: null,
   }
 }
 
 const priceRows = computed<PriceDisplayRow[]>(() => {
   const rows: PriceDisplayRow[] = []
   const catalogModels = catalog.value?.models ?? []
-  const catalogModelsByPriceId = new Map<number, CatalogModelReference[]>()
   const renderedPriceIds = new Set<number>()
+  const catalogStatuses = new Map<string, Set<string>>()
+  const catalogChannelIdentities = new Set<string>()
 
   for (const model of catalogModels) {
-    if (!model.price) {
+    const channelIdentity = channelIdentityKey(model.channel_brand, model.channel_key)
+    if (channelIdentity) {
+      catalogChannelIdentities.add(channelIdentity)
+    }
+    const identity = channelPriceIdentityKey(model.channel_brand, model.channel_key, model.name)
+    if (!identity) {
       continue
     }
-    const references = catalogModelsByPriceId.get(model.price.id)
-    if (references) {
-      references.push(catalogModelReference(model))
-    } else {
-      catalogModelsByPriceId.set(model.price.id, [catalogModelReference(model)])
-    }
+    const statuses = catalogStatuses.get(identity) ?? new Set<string>()
+    statuses.add(model.channel_status)
+    catalogStatuses.set(identity, statuses)
   }
 
   for (const model of catalogModels) {
@@ -241,14 +427,10 @@ const priceRows = computed<PriceDisplayRow[]>(() => {
       rows.push(unpricedCatalogDisplayRow(model))
       continue
     }
-    if (renderedPriceIds.has(model.price.id)) {
-      continue
-    }
-    const references = catalogModelsByPriceId.get(model.price.id)
-    if (!references) {
-      throw new Error(`Catalog price ${model.price.id} is missing its model references`)
-    }
-    rows.push(pricedDisplayRow(model.price, references))
+    rows.push({
+      ...pricedDisplayRow(model.price, model),
+      key: `catalog:${model.id}`,
+    })
     renderedPriceIds.add(model.price.id)
   }
 
@@ -256,16 +438,34 @@ const priceRows = computed<PriceDisplayRow[]>(() => {
     if (renderedPriceIds.has(price.id)) {
       continue
     }
-    rows.push(pricedDisplayRow(price, []))
+    const identity = channelPriceIdentityKey(price.channel_brand, price.channel_key, price.model)
+    const channelIdentity = channelIdentityKey(price.channel_brand, price.channel_key)
+    const identityStatuses = identity ? catalogStatuses.get(identity) : undefined
+    let unmatchedStatus: UnmatchedChannelStatus = 'orphan'
+    if (catalog.value?.channels_available === false) {
+      unmatchedStatus = 'unavailable'
+    } else if (identityStatuses?.has('conflict')) {
+      unmatchedStatus = 'conflict'
+    } else if (!identityStatuses && channelIdentity && catalogChannelIdentities.has(channelIdentity)) {
+      unmatchedStatus = 'model_removed'
+    }
+    rows.push(pricedDisplayRow(price, null, unmatchedStatus))
+  }
+  for (const conflict of libraryConflicts.value) {
+    rows.push(migrationConflictDisplayRow(conflict))
   }
   return rows
 })
 
-const providerOptions = computed(() =>
-  [...new Set(priceRows.value.map((row) => row.provider).filter(Boolean))]
-    .sort((a, b) => a.localeCompare(b))
-    .map((provider) => ({ label: provider, value: provider })),
-)
+const providerOptions = computed(() => {
+  const options = new Map<string, string>()
+  for (const row of priceRows.value) {
+    options.set(row.channelFilterKey, row.provider)
+  }
+  return [...options.entries()]
+    .sort((left, right) => left[1].localeCompare(right[1]))
+    .map(([value, label]) => ({ label, value }))
+})
 
 const liteLLMProxyHint = computed(() =>
   t(
@@ -275,21 +475,22 @@ const liteLLMProxyHint = computed(() =>
 )
 
 const statusOptions = computed<Array<{ label: string; value: PriceStatusFilter }>>(() => [
-  { label: t('CPA 可用模型', 'CPA available models'), value: 'cpa' },
+  { label: t('渠道模型', 'Channel models'), value: 'cpa' },
   { label: t('未定价', 'Unpriced'), value: 'missing' },
   { label: 'LiteLLM', value: 'litellm' },
   { label: t('手动', 'Manual'), value: 'manual' },
-  { label: t('仅有价格', 'Prices only'), value: 'library' },
+  { label: t('通用价格', 'Library prices'), value: 'library' },
+  { label: t('迁移冲突', 'Migration conflicts'), value: 'migration_conflict' },
 ])
 
 const groupingOptions = computed<Array<{ label: string; value: PriceGroupingMode }>>(() => [
   { label: t('按模型', 'By model'), value: 'model' },
-  { label: t('按渠道', 'By provider'), value: 'provider' },
+  { label: t('按渠道', 'By channel'), value: 'provider' },
 ])
 
 const filteredPrices = computed(() => {
   return priceRows.value.filter((row) => {
-    if (selectedProvider.value && row.provider !== selectedProvider.value) {
+    if (selectedProvider.value && row.channelFilterKey !== selectedProvider.value) {
       return false
     }
     if (selectedStatus.value && !rowMatchesStatus(row, selectedStatus.value)) {
@@ -314,6 +515,18 @@ watch(groupingMode, (value) => {
   savePriceGroupingMode(value)
 })
 
+watch(longContextEnabled, (enabled) => {
+  if (enabled) {
+    preserveInvalidLongContext.value = false
+  }
+})
+
+watch(preserveInvalidLongContext, (preserve) => {
+  if (preserve) {
+    longContextEnabled.value = false
+  }
+})
+
 function renderSearchIcon() {
   return h(NIcon, { component: Search })
 }
@@ -324,6 +537,17 @@ function updatePricePage(page: number) {
 
 function normalizePriceSearch(value: string) {
   return value.trim().toLowerCase()
+}
+
+function normalizeModelComparisonKey(value: string): string {
+  const model = value.trim()
+  if (model.startsWith('models/')) {
+    return model.slice('models/'.length).trim()
+  }
+  if (model.startsWith('publishers/google/models/')) {
+    return model.slice('publishers/google/models/'.length).trim()
+  }
+  return model
 }
 
 function isPriceGroupingMode(value: string | null): value is PriceGroupingMode {
@@ -353,6 +577,10 @@ function uniqueNormalizedCount(values: string[]): number {
   return new Set(values.map((value) => normalizePriceSearch(value) || '__unknown__')).size
 }
 
+function uniqueStableCount(values: string[]): number {
+  return new Set(values.map((value) => value.trim() || '__unknown__')).size
+}
+
 function latestPriceUpdate(children: PriceDisplayRow[]): string | null {
   let latest: string | null = null
   let latestTimestamp = Number.NEGATIVE_INFINITY
@@ -372,6 +600,10 @@ function latestPriceUpdate(children: PriceDisplayRow[]): string | null {
   return latest
 }
 
+function rowIsOperationallyPriced(row: PriceDisplayRow): boolean {
+  return row.migrationConflict === null && row.status !== 'missing' && (row.priceScope === 'library' || row.channelStatus === 'ready')
+}
+
 function createPriceGroupRow(
   mode: PriceGroupingMode,
   normalizedValue: string,
@@ -379,25 +611,26 @@ function createPriceGroupRow(
   children: PriceDisplayRow[],
 ): PriceGroupRow {
   const longContextEligibleRows = children.filter(
-    (row) => row.billing_unit === 'token' && row.price !== null,
+    (row) => rowIsOperationallyPriced(row) && row.billing_unit === 'token' && row.price !== null,
   )
-  const priorityEligibleRows = children.filter((row) => supportsPriorityMultiplier(row.price))
+  const priorityEligibleRows = children.filter(
+    (row) => rowIsOperationallyPriced(row) && supportsPriorityMultiplier(row.price),
+  )
   return {
     rowType: 'group',
     key: `group:${mode}:${normalizedValue}`,
     mode,
     label,
     children,
-    providerCount: uniqueNormalizedCount(children.map((row) => row.provider)),
-    modelCount: uniqueNormalizedCount(
-      children.flatMap((row) =>
-        row.catalogModels.length > 0
-          ? row.catalogModels.map((model) => model.id)
-          : [row.comparisonModelKey],
-      ),
+    channelCount: uniqueStableCount(
+      children
+        .filter((row) => row.priceScope === 'channel')
+        .map((row) => row.channelFilterKey),
     ),
-    pricedCount: children.filter((row) => row.status !== 'missing').length,
-    unpricedCount: children.filter((row) => row.status === 'missing').length,
+    libraryPriceCount: children.filter((row) => row.priceScope === 'library').length,
+    modelCount: uniqueNormalizedCount(children.map((row) => row.comparisonModelKey)),
+    pricedCount: children.filter(rowIsOperationallyPriced).length,
+    unpricedCount: children.filter((row) => !rowIsOperationallyPriced(row)).length,
     billingUnits: [...new Set(children.map((row) => row.billing_unit))],
     longContextConfiguredCount: longContextEligibleRows.filter((row) => row.price?.long_context).length,
     longContextEligibleCount: longContextEligibleRows.length,
@@ -412,18 +645,18 @@ function createPriceGroupRow(
 function groupPriceRows(rows: PriceDisplayRow[], mode: PriceGroupingMode): PriceGroupRow[] {
   const groups = new Map<string, { label: string; children: PriceDisplayRow[] }>()
   for (const row of rows) {
-    const rawValue = mode === 'model' ? row.comparisonModelKey : row.provider
-    const normalizedValue = normalizePriceSearch(rawValue) || '__unknown__'
+    const rawValue = mode === 'model' ? row.comparisonModelKey : row.channelFilterKey
+    const label = mode === 'model' ? row.comparisonModelKey : row.provider
+    const normalizedValue = mode === 'model'
+      ? normalizePriceSearch(rawValue) || '__unknown__'
+      : rawValue.trim() || '__unknown__'
     const existing = groups.get(normalizedValue)
     if (existing) {
       existing.children.push(row)
       continue
     }
     groups.set(normalizedValue, {
-      label:
-        mode === 'provider' && !rawValue.trim()
-          ? t('未识别服务商', 'Unknown provider')
-          : rawValue,
+      label: mode === 'provider' && !label.trim() ? t('未识别渠道', 'Unknown channel') : label,
       children: [row],
     })
   }
@@ -439,11 +672,6 @@ function isPriceGroupRow(row: PriceTableRow): row is PriceGroupRow {
 function pruneExpandedRowKeys() {
   const validKeys = new Set(priceTableRows.value.map((row) => row.key))
   expandedRowKeys.value = expandedRowKeys.value.filter((key) => validKeys.has(String(key)))
-}
-
-function providerFromModelId(modelId: string) {
-  const separator = modelId.indexOf('/')
-  return separator > 0 ? modelId.slice(0, separator) : ''
 }
 
 function billingUnitForModel(model: string): BillingUnit {
@@ -476,7 +704,11 @@ function rowMatchesStatus(row: PriceDisplayRow, status: PriceStatusFilter) {
     case 'cpa':
       return row.in_cpa
     case 'library':
-      return !row.in_cpa
+      return row.priceScope === 'library'
+    case 'missing':
+      return !rowIsOperationallyPriced(row)
+    case 'migration_conflict':
+      return row.migrationConflict !== null
     default:
       return row.status === status
   }
@@ -489,6 +721,17 @@ const filteredGroupCount = computed(() => priceTableRows.value.length)
 
 const totalPriceCount = computed(() => priceRows.value.length)
 const cpaModelCount = computed(() => catalog.value?.models.length ?? 0)
+const channelCount = computed(
+  () => new Set(
+    (catalog.value?.models ?? []).map((model) => channelFilterKey(
+      'channel',
+      model.channel_brand,
+      model.channel_key,
+      model.channel_identity_hash,
+      model.channel_label,
+    )),
+  ).size,
+)
 const unpricedModelCount = computed(
   () => catalog.value?.unpriced_models ?? priceRows.value.filter((row) => row.in_cpa && row.status === 'missing').length,
 )
@@ -499,26 +742,16 @@ const catalogNotice = computed(() => {
   if (!current) {
     return ''
   }
-  if (!current.has_api_keys) {
-    return t('还没有本地绑定的 API Key，当前只显示已有价格库条目。', 'No local API keys are bound yet. Only existing price library entries are shown.')
-  }
-  if (current.queryable_api_key_count === 0) {
-    return t(
-      '本地 API Key 没有保存明文 Key，暂时无法查询 CPA 当前模型，只显示已有价格库条目。',
-      'Local API keys do not store plaintext keys, so CPA models cannot be queried for now. Only existing price library entries are shown.',
+  if (!current.channels_available) {
+    const detail = serverText(
+      current.channel_error || '',
+      '渠道配置暂时不可用',
+      'Channel configuration is unavailable',
     )
-  }
-  if (current.errors.length > 0) {
-    const details = current.errors
-      .slice(0, 3)
-      .map((item) =>
-        t(
-          `${item.description}：${serverText(item.message, '查询失败', 'Query failed')}`,
-          `${item.description}: ${serverText(item.message, '查询失败', 'Query failed')}`,
-        ),
-      )
-      .join(t('；', '; '))
-    return t(`部分 Key 查询 CPA 模型失败：${details}`, `Some keys failed to query CPA models: ${details}`)
+    return t(
+      `读取渠道配置失败：${detail}。当前仍可查看和维护通用价格。`,
+      `Failed to load channel configuration: ${detail}. Library prices remain available.`,
+    )
   }
   return ''
 })
@@ -528,8 +761,20 @@ const priceTableLayoutProps = computed<PriceTableLayoutProps>(() =>
     : { flexHeight: false, maxHeight: PRICE_TABLE_FALLBACK_MAX_HEIGHT },
 )
 const isRequestPriceForm = computed(() => billingUnitForModel(form.model) === 'request')
-const priceSaveHint = computed(() =>
-  isRequestPriceForm.value
+const isChannelPriceForm = computed(() => form.price_scope === 'channel')
+const priceSaveHint = computed(() => {
+  if (isChannelPriceForm.value) {
+    return isRequestPriceForm.value
+      ? t(
+          '此价格只用于当前渠道的该模型；image 模型按每次成功调用固定金额计费。',
+          'This price applies only to this channel and model. Image models are charged per successful call.',
+        )
+      : t(
+          '此价格只用于当前渠道的该模型，通用价格仅作为本次表单的预填参考。',
+          'This price applies only to this channel and model. The library price is used only as a form template.',
+        )
+  }
+  return isRequestPriceForm.value
     ? t(
         'image 模型按每次成功调用固定金额计费，保存后会作为手动价格优先保留。',
         'Image models are charged a fixed amount per successful call. Saved values are kept as manual prices with priority.',
@@ -537,8 +782,8 @@ const priceSaveHint = computed(() =>
     : t(
         '保存后会作为手动价格，后续 LiteLLM 同步会优先保留。',
         'Saved values are kept as manual prices and preserved by later LiteLLM syncs.',
-      ),
-)
+      )
+})
 
 interface PriceMetricCard {
   key: string
@@ -552,12 +797,12 @@ interface PriceMetricCard {
 const priceMetrics = computed<PriceMetricCard[]>(() => [
   {
     key: 'models',
-    label: t('CPA 模型', 'CPA models'),
+    label: t('渠道模型', 'Channel models'),
     value: formatInteger(cpaModelCount.value),
     footnote: catalog.value
       ? t(
-          `可查询 Key ${formatInteger(catalog.value.queryable_api_key_count)} / ${formatInteger(catalog.value.api_key_count)}`,
-          `Queryable keys ${formatInteger(catalog.value.queryable_api_key_count)} / ${formatInteger(catalog.value.api_key_count)}`,
+          `${formatInteger(channelCount.value)} 个渠道`,
+          `${formatInteger(channelCount.value)} channels`,
         )
       : t('等待刷新', 'Waiting for refresh'),
     tone: 'teal',
@@ -598,6 +843,7 @@ function priceMatchesSearch(row: PriceDisplayRow) {
   }
   return (
     row.provider.toLowerCase().includes(normalizedSearchQuery.value) ||
+    (row.channelBrand ?? '').toLowerCase().includes(normalizedSearchQuery.value) ||
     row.model.toLowerCase().includes(normalizedSearchQuery.value) ||
     row.id.toLowerCase().includes(normalizedSearchQuery.value) ||
     row.name.toLowerCase().includes(normalizedSearchQuery.value) ||
@@ -615,8 +861,13 @@ function priceMatchesSearch(row: PriceDisplayRow) {
 
 function resetForm() {
   editingId.value = null
+  editingChannelLabel.value = ''
   form.provider = ''
   form.model = ''
+  form.price_scope = 'library'
+  form.channel_brand = null
+  form.channel_key = null
+  form.channel_identity_hash = null
   form.input_usd_per_million = 0
   form.output_usd_per_million = 0
   form.cache_read_usd_per_million = 0
@@ -624,6 +875,8 @@ function resetForm() {
   form.request_usd = null
   form.long_context = null
   longContextEnabled.value = false
+  preservedLongContext.value = null
+  preserveInvalidLongContext.value = false
   longContextForm.threshold_input_tokens = 200000
   longContextForm.input_usd_per_million = 0
   longContextForm.output_usd_per_million = 0
@@ -634,9 +887,14 @@ function resetForm() {
 async function refresh() {
   isLoading.value = true
   try {
-    const [nextPrices, nextCatalog] = await Promise.all([listModelPrices(), listModelPriceCatalog()])
+    const [nextPrices, nextCatalog, nextConflicts] = await Promise.all([
+      listModelPrices(),
+      listModelPriceCatalog(),
+      listModelPriceLibraryConflicts(),
+    ])
     prices.value = nextPrices
     catalog.value = nextCatalog
+    libraryConflicts.value = nextConflicts
     pruneExpandedRowKeys()
   } catch (error) {
     message.error(errorText(error, '加载模型价格失败', 'Failed to load model prices'))
@@ -645,10 +903,15 @@ async function refresh() {
   }
 }
 
-function openCreate(prefill: Partial<ModelPricePayload> = {}) {
+function openCreate(prefill: Partial<ModelPricePayload> = {}, channelLabel = '') {
   resetForm()
+  editingChannelLabel.value = channelLabel
   form.provider = prefill.provider ?? ''
   form.model = prefill.model ?? ''
+  form.price_scope = prefill.price_scope ?? 'library'
+  form.channel_brand = prefill.channel_brand ?? null
+  form.channel_key = prefill.channel_key ?? null
+  form.channel_identity_hash = prefill.channel_identity_hash ?? null
   form.input_usd_per_million = prefill.input_usd_per_million ?? 0
   form.output_usd_per_million = prefill.output_usd_per_million ?? 0
   form.cache_read_usd_per_million = prefill.cache_read_usd_per_million ?? 0
@@ -661,24 +924,46 @@ function openCreate(prefill: Partial<ModelPricePayload> = {}) {
 }
 
 function openCreateForRow(row: PriceDisplayRow) {
+  const template = row.templatePrice
   openCreate({
-    provider: row.provider || row.suggested_provider || row.owner || '',
-    model: row.id,
-  })
+    provider: row.suggested_provider || row.channelBrand || row.provider,
+    model: row.model,
+    price_scope: 'channel',
+    channel_brand: row.channelBrand,
+    channel_key: row.channelKey,
+    channel_identity_hash: row.channelIdentityHash,
+    input_usd_per_million: template?.input_usd_per_million ?? 0,
+    output_usd_per_million: template?.output_usd_per_million ?? 0,
+    cache_read_usd_per_million: template?.cache_read_usd_per_million ?? 0,
+    cache_creation_usd_per_million: template?.cache_creation_usd_per_million ?? 0,
+    request_usd: template?.request_usd ?? null,
+    long_context: template?.long_context ?? null,
+  }, row.provider)
 }
 
-function openEdit(row: ModelPrice) {
+function openEdit(row: PriceDisplayRow) {
+  if (!row.price) {
+    return
+  }
+  const price = row.price
   resetForm()
-  editingId.value = row.id
-  form.provider = row.provider
-  form.model = row.model
-  form.input_usd_per_million = row.input_usd_per_million
-  form.output_usd_per_million = row.output_usd_per_million
-  form.cache_read_usd_per_million = row.cache_read_usd_per_million
-  form.cache_creation_usd_per_million = row.cache_creation_usd_per_million
-  form.request_usd = row.request_usd
-  if (row.long_context) {
-    setLongContextForm(row.long_context)
+  editingId.value = price.id
+  editingChannelLabel.value = row.provider
+  form.provider = price.provider
+  form.model = price.model
+  form.price_scope = price.price_scope
+  form.channel_brand = price.channel_brand
+  form.channel_key = price.channel_key
+  form.channel_identity_hash = row.channelIdentityHash
+  form.input_usd_per_million = price.input_usd_per_million
+  form.output_usd_per_million = price.output_usd_per_million
+  form.cache_read_usd_per_million = price.cache_read_usd_per_million
+  form.cache_creation_usd_per_million = price.cache_creation_usd_per_million
+  form.request_usd = price.request_usd
+  if (price.long_context) {
+    setLongContextForm(price.long_context)
+  } else if (price.preserved_long_context) {
+    setPreservedLongContextForm(price.preserved_long_context)
   }
   modalOpen.value = true
 }
@@ -690,6 +975,17 @@ function setLongContextForm(value: ModelPriceLongContext) {
   longContextForm.output_usd_per_million = value.output_usd_per_million
   longContextForm.cache_read_usd_per_million = value.cache_read_usd_per_million
   longContextForm.cache_creation_usd_per_million = value.cache_creation_usd_per_million
+}
+
+function setPreservedLongContextForm(value: ModelPriceLibraryConflictLongContext) {
+  preservedLongContext.value = value
+  preserveInvalidLongContext.value = true
+  longContextEnabled.value = false
+  longContextForm.threshold_input_tokens = value.threshold_input_tokens ?? 200000
+  longContextForm.input_usd_per_million = value.input_usd_per_million ?? 0
+  longContextForm.output_usd_per_million = value.output_usd_per_million ?? 0
+  longContextForm.cache_read_usd_per_million = value.cache_read_usd_per_million ?? 0
+  longContextForm.cache_creation_usd_per_million = value.cache_creation_usd_per_million ?? 0
 }
 
 function validLongContextForm(): boolean {
@@ -708,12 +1004,17 @@ function validLongContextForm(): boolean {
 async function savePrice() {
   const requestPriceMode = isRequestPriceForm.value
   const requestUSD = requestPriceMode && typeof form.request_usd === 'number' ? form.request_usd : null
-  const longContext = !requestPriceMode && longContextEnabled.value
+  const preservePartialLongContext = preservedLongContext.value !== null && preserveInvalidLongContext.value
+  const longContext = !requestPriceMode && !preservePartialLongContext && longContextEnabled.value
     ? { ...longContextForm }
     : null
   const payload: ModelPricePayload = {
     provider: form.provider.trim(),
     model: form.model.trim(),
+    price_scope: form.price_scope,
+    channel_brand: form.channel_brand,
+    channel_key: form.channel_key,
+    channel_identity_hash: form.channel_identity_hash,
     input_usd_per_million: form.input_usd_per_million,
     output_usd_per_million: form.output_usd_per_million,
     cache_read_usd_per_million: form.cache_read_usd_per_million,
@@ -721,8 +1022,18 @@ async function savePrice() {
     request_usd: requestUSD,
     long_context: longContext,
   }
+  if (preservedLongContext.value !== null) {
+    payload.preserve_invalid_long_context = preservePartialLongContext
+  }
   if (!payload.provider || !payload.model) {
     message.error(t('服务商和模型不能为空', 'Provider and model are required'))
+    return
+  }
+  if (
+    payload.price_scope === 'channel' &&
+    (!payload.channel_brand || !payload.channel_key || (editingId.value === null && !payload.channel_identity_hash))
+  ) {
+    message.error(t('渠道标识不完整，请刷新页面后重试', 'Channel identity is incomplete. Refresh and try again.'))
     return
   }
   if (requestPriceMode && requestUSD === null) {
@@ -755,8 +1066,10 @@ function supportsPriorityMultiplier(price: ModelPrice | null): boolean {
   if (!price) {
     return false
   }
-  const provider = price.provider.trim().toLowerCase()
-  return provider === 'openai' || provider === 'codex'
+  if (price.price_scope === 'channel') {
+    return price.channel_brand === 'codex' || price.channel_brand === 'openai_compatibility'
+  }
+  return ['openai', 'codex'].includes(price.provider.trim().toLowerCase())
 }
 
 function openPriorityMultiplierEditor(price: ModelPrice) {
@@ -841,16 +1154,91 @@ async function saveProxySettings() {
   }
 }
 
-function confirmDelete(row: ModelPrice) {
+function openConflictPromotion(conflict: ModelPriceLibraryConflict) {
+  resolvingConflict.value = conflict
+  conflictProvider.value = conflict.price.provider
+  conflictModel.value = conflict.price.model
+  conflictModalOpen.value = true
+}
+
+async function saveConflictPromotion() {
+  const conflict = resolvingConflict.value
+  const provider = conflictProvider.value.trim()
+  const model = conflictModel.value.trim()
+  if (!conflict || !provider || !model) {
+    message.error(t('服务商和模型不能为空', 'Provider and model are required'))
+    return
+  }
+  isConflictSaving.value = true
+  try {
+    await promoteModelPriceLibraryConflict(conflict.original_id, { provider, model })
+    conflictModalOpen.value = false
+    message.success(t('冲突价格已提升为通用价格', 'Conflict price promoted to a library price'))
+    await refresh()
+  } catch (error) {
+    message.error(errorText(error, '提升冲突价格失败', 'Failed to promote conflict price'))
+  } finally {
+    isConflictSaving.value = false
+  }
+}
+
+function confirmReplaceConflict(conflict: ModelPriceLibraryConflict) {
+  dialog.warning({
+    title: t('替换活动价格', 'Replace active price'),
+    content: t(
+      `将使用历史价格 ${conflict.price.provider} / ${conflict.price.model} 替换当前活动价格，当前活动价格会保留为迁移冲突。`,
+      `Use historical price ${conflict.price.provider} / ${conflict.price.model} as the active price. The current active price will remain as a migration conflict.`,
+    ),
+    positiveText: t('替换', 'Replace'),
+    negativeText: t('取消', 'Cancel'),
+    onPositiveClick: async () => {
+      try {
+        await replaceActiveModelPriceLibraryConflict(conflict.original_id)
+        message.success(t('活动价格已替换', 'Active price replaced'))
+        await refresh()
+      } catch (error) {
+        message.error(errorText(error, '替换活动价格失败', 'Failed to replace active price'))
+      }
+    },
+  })
+}
+
+function confirmDeleteConflict(conflict: ModelPriceLibraryConflict) {
+  dialog.warning({
+    title: t('删除迁移冲突', 'Delete migration conflict'),
+    content: `${conflict.price.provider} / ${conflict.price.model}`,
+    positiveText: t('删除', 'Delete'),
+    negativeText: t('取消', 'Cancel'),
+    onPositiveClick: async () => {
+      try {
+        await deleteModelPriceLibraryConflict(conflict.original_id)
+        message.success(t('迁移冲突已删除', 'Migration conflict deleted'))
+        await refresh()
+      } catch (error) {
+        message.error(errorText(error, '删除迁移冲突失败', 'Failed to delete migration conflict'))
+      }
+    },
+  })
+}
+
+function confirmDelete(row: PriceDisplayRow) {
+  if (!row.price) {
+    return
+  }
+  const price = row.price
   dialog.warning({
     title: t('删除价格', 'Delete price'),
     content: `${row.provider} / ${row.model}`,
     positiveText: t('删除', 'Delete'),
     negativeText: t('取消', 'Cancel'),
     onPositiveClick: async () => {
-      await deleteModelPrice(row.id)
-      message.success(t('模型价格已删除', 'Model price deleted'))
-      await refresh()
+      try {
+        await deleteModelPrice(price.id)
+        message.success(t('模型价格已删除', 'Model price deleted'))
+        await refresh()
+      } catch (error) {
+        message.error(errorText(error, '删除模型价格失败', 'Failed to delete model price'))
+      }
     },
   })
 }
@@ -921,9 +1309,6 @@ function renderBillingUnitCell(row: PriceTableRow) {
 
 function renderTokenPriceValue(row: PriceTableRow, field: PriceFieldName) {
   if (isPriceGroupRow(row)) {
-    if (row.mode === 'provider') {
-      return h('span', { class: 'price-muted' }, '-')
-    }
     const values = row.children
       .filter((child) => child.billing_unit === 'token' && child.price !== null)
       .map((child) => child.price?.[field])
@@ -938,9 +1323,6 @@ function renderTokenPriceValue(row: PriceTableRow, field: PriceFieldName) {
 
 function renderRequestPriceValue(row: PriceTableRow) {
   if (isPriceGroupRow(row)) {
-    if (row.mode === 'provider') {
-      return h('span', { class: 'price-muted' }, '-')
-    }
     const values = row.children
       .filter((child) => child.billing_unit === 'request')
       .map((child) => child.price?.request_usd)
@@ -1027,6 +1409,27 @@ function renderLongContextPrice(row: PriceTableRow) {
       'Long-context prices configured',
     )
   }
+  const archivedLongContext = row.migrationConflict?.archived_long_context ?? row.price?.preserved_long_context
+  if (archivedLongContext) {
+    const nullablePrice = (value: number | null) => value === null ? t('未设置', 'Not set') : formatPriceValue(value)
+    const threshold = archivedLongContext.threshold_input_tokens
+    const label = threshold === null ? t('部分配置', 'Partial') : `>${formatThreshold(threshold)}`
+    const details = [
+      `${t('阈值', 'Threshold')} ${threshold === null ? t('未设置', 'Not set') : formatInteger(threshold)}`,
+      `${t('输入', 'Input')} ${nullablePrice(archivedLongContext.input_usd_per_million)}`,
+      `${t('输出', 'Output')} ${nullablePrice(archivedLongContext.output_usd_per_million)}`,
+      `${t('缓存读', 'Cache read')} ${nullablePrice(archivedLongContext.cache_read_usd_per_million)}`,
+      `${t('缓存写', 'Cache write')} ${nullablePrice(archivedLongContext.cache_creation_usd_per_million)}`,
+    ].join(' · ')
+    return h(
+      NTooltip,
+      null,
+      {
+        trigger: () => h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => label }),
+        default: () => details,
+      },
+    )
+  }
   const longContext = row.price?.long_context
   if (row.billing_unit === 'request' || !longContext) {
     return h('span', { class: 'price-muted' }, '-')
@@ -1071,18 +1474,26 @@ function renderPriorityMultiplierAction(price: ModelPrice) {
 }
 
 function modelDetailSubline(row: PriceDisplayRow): string {
-  const catalogModelIds = row.catalogModels.map((model) => model.id)
-  const hasDistinctCatalogIdentity =
-    row.price !== null &&
-    (catalogModelIds.length > 1 ||
-      (catalogModelIds.length === 1 && catalogModelIds[0] !== row.id))
-  if (hasDistinctCatalogIdentity) {
-    return t(
-      `CPA 模型：${catalogModelIds.join('、')}`,
-      `CPA models: ${catalogModelIds.join(', ')}`,
+  if (row.name && row.name !== row.id) {
+    return t(`别名：${row.name}`, `Alias: ${row.name}`)
+  }
+  return ''
+}
+
+function priceGroupSourceSummary(row: PriceGroupRow): string {
+  const parts: string[] = []
+  if (row.channelCount > 0) {
+    parts.push(t(`${formatInteger(row.channelCount)} 个渠道`, `${formatInteger(row.channelCount)} channels`))
+  }
+  if (row.libraryPriceCount > 0) {
+    parts.push(
+      t(
+        `${formatInteger(row.libraryPriceCount)} 个通用价`,
+        `${formatInteger(row.libraryPriceCount)} library prices`,
+      ),
     )
   }
-  return row.name && row.name !== row.id ? row.name : ''
+  return parts.join(' · ')
 }
 
 function renderModelCell(row: PriceTableRow) {
@@ -1093,10 +1504,13 @@ function renderModelCell(row: PriceTableRow) {
         : t(`${formatInteger(row.modelCount)} 个模型`, `${formatInteger(row.modelCount)} models`)
     const details =
       row.mode === 'model'
-        ? t(
-            `${formatInteger(row.providerCount)} 个服务商 · ${formatInteger(row.children.length)} 条明细`,
-            `${formatInteger(row.providerCount)} providers · ${formatInteger(row.children.length)} details`,
-          )
+        ? [
+            priceGroupSourceSummary(row),
+            t(
+              `${formatInteger(row.children.length)} 条明细`,
+              `${formatInteger(row.children.length)} details`,
+            ),
+          ].filter(Boolean).join(' · ')
         : t(
             `${formatInteger(row.children.length)} 条价格明细`,
             `${formatInteger(row.children.length)} price details`,
@@ -1120,8 +1534,19 @@ function renderModelCell(row: PriceTableRow) {
               bordered: false,
               style: { marginLeft: '16px' },
             },
-            { default: () => t('CPA 可用模型', 'CPA available model') },
+            { default: () => t('渠道模型', 'Channel model') },
           )
+        : row.priceScope === 'library'
+          ? h(
+              NTag,
+              {
+                class: 'model-availability-tag',
+                size: 'small',
+                type: 'default',
+                bordered: false,
+              },
+              { default: () => t('通用价', 'Library') },
+            )
         : null,
     ]),
     subline ? h('div', { class: 'model-sub' }, subline) : null,
@@ -1130,10 +1555,13 @@ function renderModelCell(row: PriceTableRow) {
 
 function renderProviderCell(row: PriceTableRow) {
   if (isPriceGroupRow(row)) {
+    const isLibraryGroup = row.children.every((child) => child.priceScope === 'library')
     const title =
       row.mode === 'provider'
-        ? row.label
-        : t(`${formatInteger(row.providerCount)} 个服务商`, `${formatInteger(row.providerCount)} providers`)
+        ? isLibraryGroup
+          ? t(`${row.label} · 通用价`, `${row.label} · Library`)
+          : row.label
+        : priceGroupSourceSummary(row)
     const details =
       row.mode === 'provider'
         ? t(
@@ -1146,11 +1574,20 @@ function renderProviderCell(row: PriceTableRow) {
       details ? h('div', { class: 'price-group-sub' }, details) : null,
     ])
   }
+  const detailParts = row.migrationConflict
+    ? [t('待解决旧价格', 'Unresolved legacy price')]
+    : row.priceScope === 'library'
+      ? [t('通用价格库', 'Price library')]
+    : [channelBrandLabel(row.channelBrand)]
+  if (row.channelDisabled) {
+    detailParts.push(t('已停用', 'Disabled'))
+  }
+  if (row.channelLabelFallback) {
+    detailParts.push(t('标签回退', 'Fallback label'))
+  }
   return h('div', { class: 'provider-cell' }, [
     h('div', { class: 'provider-main' }, row.provider || '-'),
-    row.owner && row.owner !== row.provider
-      ? h('div', { class: 'model-sub' }, t('所有者', 'Owner') + `: ${row.owner}`)
-      : null,
+    h('div', { class: 'model-sub' }, detailParts.join(' · ')),
   ])
 }
 
@@ -1175,6 +1612,24 @@ function renderStatusCell(row: PriceTableRow) {
       ),
     ])
   }
+  if (row.channelStatus === 'conflict') {
+    return h(NTag, { size: 'small', type: 'error', bordered: false }, { default: () => t('渠道冲突', 'Channel conflict') })
+  }
+  if (row.channelStatus === 'migration_conflict') {
+    return h(NTag, { size: 'small', type: 'error', bordered: false }, { default: () => t('迁移冲突', 'Migration conflict') })
+  }
+  if (row.channelStatus === 'missing_selector') {
+    return h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => t('缺少标识', 'Missing identity') })
+  }
+  if (row.channelStatus === 'orphan') {
+    return h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => t('渠道已移除', 'Channel removed') })
+  }
+  if (row.channelStatus === 'model_removed') {
+    return h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => t('模型已移除', 'Model removed') })
+  }
+  if (row.channelStatus === 'unavailable') {
+    return h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => t('渠道配置不可用', 'Channel unavailable') })
+  }
   const label = row.status === 'missing' ? t('未定价', 'Unpriced') : row.status === 'litellm' ? 'LiteLLM' : t('手动', 'Manual')
   const type = row.status === 'missing' ? 'warning' : row.status === 'litellm' ? 'info' : 'default'
   return h(
@@ -1193,6 +1648,32 @@ function renderActionsCell(row: PriceTableRow) {
   if (isPriceGroupRow(row)) {
     return null
   }
+  if (row.migrationConflict) {
+    const conflict = row.migrationConflict
+    return h(
+      NSpace,
+      { size: 4 },
+      {
+        default: () => [
+          h(
+            NButton,
+            { size: 'small', type: 'primary', secondary: true, onClick: () => openConflictPromotion(conflict) },
+            { default: () => t('提升', 'Promote') },
+          ),
+          h(
+            NButton,
+            { size: 'small', quaternary: true, onClick: () => confirmReplaceConflict(conflict) },
+            { default: () => t('替换', 'Replace') },
+          ),
+          h(
+            NButton,
+            { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDeleteConflict(conflict) },
+            { default: () => t('删除', 'Delete') },
+          ),
+        ],
+      },
+    )
+  }
   return h(
     NSpace,
     { size: 4 },
@@ -1204,18 +1685,24 @@ function renderActionsCell(row: PriceTableRow) {
         row.price
           ? h(
               NButton,
-              { size: 'small', quaternary: true, onClick: () => openEdit(row.price as ModelPrice) },
+              { size: 'small', quaternary: true, onClick: () => openEdit(row) },
               { default: () => t('改价', 'Edit') },
             )
           : h(
               NButton,
-              { size: 'small', type: 'primary', secondary: true, onClick: () => openCreateForRow(row) },
+              {
+                size: 'small',
+                type: 'primary',
+                secondary: true,
+                disabled: row.channelStatus !== 'ready',
+                onClick: () => openCreateForRow(row),
+              },
               { default: () => t('设价', 'Set price') },
             ),
         row.price
           ? h(
               NButton,
-              { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDelete(row.price as ModelPrice) },
+              { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDelete(row) },
               { default: () => t('删除', 'Delete') },
             )
           : null,
@@ -1233,7 +1720,7 @@ const columns = computed<DataTableColumns<PriceTableRow>>(() => [
     render: renderModelCell,
   },
   {
-    title: t('服务商', 'Provider'),
+    title: t('渠道', 'Channel'),
     key: 'provider',
     width: 160,
     ellipsis: { tooltip: true },
@@ -1324,7 +1811,7 @@ onBeforeUnmount(() => {
       <div>
         <h1 class="page-title">{{ t('模型价格', 'Model prices') }}</h1>
         <p class="page-subtitle">
-          {{ t('Token 模型按 USD / 百万 Token 计费，image 模型按每次成功调用计费', 'Token models are charged in USD per million tokens. Image models are charged per successful call.') }}
+          {{ t('每个真实渠道独立定价；通用价格仅用于预填，不参与渠道账单', 'Each actual channel has independent prices. Library prices are templates and never bill channel usage.') }}
         </p>
       </div>
       <NSpace>
@@ -1340,7 +1827,7 @@ onBeforeUnmount(() => {
           </template>
           {{ t('代理配置', 'Proxy settings') }}
         </NButton>
-        <NButton type="primary" @click="() => openCreate()">{{ t('新增价格', 'Add price') }}</NButton>
+        <NButton type="primary" @click="() => openCreate()">{{ t('新增通用价', 'Add library price') }}</NButton>
       </NSpace>
     </div>
 
@@ -1375,14 +1862,14 @@ onBeforeUnmount(() => {
                   </NRadioButton>
                 </NRadioGroup>
               </div>
-              <span class="filter-label">{{ t('服务商', 'Provider') }}</span>
+              <span class="filter-label">{{ t('渠道', 'Channel') }}</span>
               <NSelect
                 v-model:value="selectedProvider"
                 class="provider-filter"
                 :options="providerOptions"
                 clearable
                 filterable
-                :placeholder="t('全部服务商', 'All providers')"
+                :placeholder="t('全部渠道', 'All channels')"
               />
               <NSelect
                 v-model:value="selectedStatus"
@@ -1395,7 +1882,7 @@ onBeforeUnmount(() => {
                 v-model:value="searchQuery"
                 class="price-search"
                 clearable
-                :placeholder="t('搜索模型或服务商', 'Search models or providers')"
+                :placeholder="t('搜索模型、别名或渠道', 'Search models, aliases, or channels')"
                 :render-prefix="renderSearchIcon"
               />
             </NSpace>
@@ -1425,20 +1912,71 @@ onBeforeUnmount(() => {
     </section>
 
     <NModal
+      v-model:show="conflictModalOpen"
+      preset="card"
+      :title="t('提升迁移冲突价格', 'Promote migration conflict price')"
+      :style="conflictModalStyle"
+    >
+      <NAlert type="warning" :show-icon="false">
+        {{ t(
+          '修改服务商或模型，使其不再与当前活动价格冲突。价格数值、Fast 倍率和长上下文字段会保留；同步来源会重置为手动，历史同步标记将被清除。',
+          'Change the provider or model so it no longer conflicts with the active price. Price values, Fast multiplier, and long-context fields are preserved. Sync ownership is reset to manual and historical sync metadata is cleared.',
+        ) }}
+      </NAlert>
+      <NForm label-placement="top" style="margin-top: 16px">
+        <NFormItem :label="t('服务商', 'Provider')">
+          <NInput v-model:value="conflictProvider" :disabled="isConflictSaving" />
+        </NFormItem>
+        <NFormItem :label="t('模型', 'Model')">
+          <NInput v-model:value="conflictModel" :disabled="isConflictSaving" />
+        </NFormItem>
+      </NForm>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton :disabled="isConflictSaving" @click="conflictModalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
+          <NButton type="primary" :loading="isConflictSaving" @click="saveConflictPromotion">{{ t('提升', 'Promote') }}</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <NModal
       v-model:show="modalOpen"
       preset="card"
-      :title="editingId === null ? t('新增价格', 'Add price') : t('编辑价格', 'Edit price')"
+      :title="editingId === null
+        ? (isChannelPriceForm ? t('设置渠道价格', 'Set channel price') : t('新增通用价', 'Add library price'))
+        : (isChannelPriceForm ? t('编辑渠道价格', 'Edit channel price') : t('编辑通用价', 'Edit library price'))"
       :style="priceModalStyle"
       class="price-modal"
     >
       <NForm :model="form" label-placement="top">
         <div class="form-grid">
-          <NFormItem :label="t('服务商', 'Provider')">
-            <NInput v-model:value="form.provider" />
+          <NFormItem :label="isChannelPriceForm ? t('渠道', 'Channel') : t('服务商', 'Provider')">
+            <NInput v-if="isChannelPriceForm" :value="editingChannelLabel" disabled />
+            <NInput v-else v-model:value="form.provider" />
           </NFormItem>
           <NFormItem :label="t('模型', 'Model')">
-            <NInput v-model:value="form.model" />
+            <NInput v-model:value="form.model" :disabled="isChannelPriceForm" />
           </NFormItem>
+          <NAlert
+            v-if="preservedLongContext"
+            class="wide-form-item"
+            type="warning"
+            :show-icon="false"
+          >
+            <NSpace vertical size="small">
+              <strong>{{ t('保留的历史部分长上下文配置', 'Preserved partial long-context configuration') }}</strong>
+              <span>{{ preservedLongContextSummary }}</span>
+              <NCheckbox v-model:checked="preserveInvalidLongContext" :disabled="isPriceSaving">
+                {{ t('保存时保持这些原始字段不变', 'Keep these raw fields unchanged when saving') }}
+              </NCheckbox>
+              <span>
+                {{ t(
+                  '取消保留后，开启下方阶梯将用完整配置替换；保持关闭则会清除这些历史字段。',
+                  'After clearing this option, enable the tier below to replace it with a complete configuration, or leave it disabled to clear the historical fields.',
+                ) }}
+              </span>
+            </NSpace>
+          </NAlert>
           <NFormItem v-if="isRequestPriceForm" :label="t('每次调用价格 USD', 'Per-call price USD')" class="wide-form-item">
             <NInputNumber v-model:value="form.request_usd" :min="0" :placeholder="t('例如：0.04', 'Example: 0.04')" />
           </NFormItem>

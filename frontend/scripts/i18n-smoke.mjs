@@ -80,6 +80,14 @@ try {
     'Codex Keeper automatic inspection stopped',
   )
   assert.equal(
+    localizedServerMessage(
+      'CLIProxyAPI 管理请求失败：HTTP 502',
+      '渠道配置暂时不可用',
+      'Channel configuration is unavailable',
+    ),
+    'CLIProxyAPI management request failed: HTTP 502',
+  )
+  assert.equal(
     localizedServerMessage('codex@example.com-plus.json: 降为低优先级：额度使用率达到阈值 100%'),
     'codex@example.com-plus.json: Lowered priority: quota usage reached the 100% threshold',
   )

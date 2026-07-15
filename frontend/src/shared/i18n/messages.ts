@@ -52,6 +52,7 @@ const serverCodeFallbackMessages = new Map<string, MessagePair>([
 
 const serverTermTranslations: MessagePair[] = [
   ['CLIProxyAPI 管理请求', 'CLIProxyAPI management request'],
+  ['CLIProxyAPI 管理', 'CLIProxyAPI management'],
   ['CLIProxyAPI 地址和管理密钥', 'CLIProxyAPI URL and management key'],
   ['CLIProxyAPI 地址', 'CLIProxyAPI URL'],
   ['管理密钥', 'management key'],

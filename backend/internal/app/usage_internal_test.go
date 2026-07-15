@@ -16,7 +16,7 @@ func TestSaveUsageMessageStoresReasoningEffortAndTTFT(t *testing.T) {
 	defer app.Close()
 
 	raw := `{"api_key":"sk-usage-ttft","provider":"openai","model":"gpt-5.5","request_id":"usage-ttft","reasoning_effort":"xhigh","ttft_ms":710,"input_tokens":10,"output_tokens":2}`
-	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw))
+	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw), modelPriceBillingIndex{})
 	if err != nil || !created {
 		t.Fatalf("saveUsageMessage created=%v err=%v", created, err)
 	}
@@ -46,7 +46,7 @@ func TestSaveUsageMessageIgnoresZeroTTFT(t *testing.T) {
 	defer app.Close()
 
 	raw := `{"api_key":"sk-usage-ttft-zero","provider":"openai","model":"gpt-5.5","request_id":"usage-ttft-zero","ttft_ms":0,"input_tokens":10,"output_tokens":2}`
-	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw))
+	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw), modelPriceBillingIndex{})
 	if err != nil || !created {
 		t.Fatalf("saveUsageMessage created=%v err=%v", created, err)
 	}
@@ -72,7 +72,7 @@ func TestSaveUsageMessageStoresServiceTier(t *testing.T) {
 	defer app.Close()
 
 	raw := `{"api_key":"sk-usage-tier","provider":"codex","model":"gpt-5.5","request_id":"usage-tier","service_tier":"priority","input_tokens":10,"output_tokens":2}`
-	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw))
+	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw), modelPriceBillingIndex{})
 	if err != nil || !created {
 		t.Fatalf("saveUsageMessage created=%v err=%v", created, err)
 	}
@@ -88,7 +88,7 @@ func TestSaveUsageMessageStoresServiceTier(t *testing.T) {
 		t.Fatalf("stored service_tier = %#v, want priority", serviceTier)
 	}
 
-	withoutTier, created, err := app.saveUsageMessage(context.Background(), []byte(`{"api_key":"sk-usage-tier","provider":"codex","model":"gpt-5.5","request_id":"usage-tier-unreported","input_tokens":1}`))
+	withoutTier, created, err := app.saveUsageMessage(context.Background(), []byte(`{"api_key":"sk-usage-tier","provider":"codex","model":"gpt-5.5","request_id":"usage-tier-unreported","input_tokens":1}`), modelPriceBillingIndex{})
 	if err != nil || !created {
 		t.Fatalf("saveUsageMessage without tier created=%v err=%v", created, err)
 	}
@@ -106,7 +106,7 @@ func TestSaveUsageMessageExposesCodexCacheCostBreakdown(t *testing.T) {
 	defer app.Close()
 
 	raw := `{"api_key":"sk-usage-cache","provider":"codex","model":"gpt-test","request_id":"usage-cache","tokens":{"input_tokens":100,"output_tokens":20,"cached_tokens":30,"cache_read_tokens":0,"cache_creation_tokens":40,"reasoning_tokens":5,"total_tokens":120}}`
-	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw))
+	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw), modelPriceBillingIndex{})
 	if err != nil || !created {
 		t.Fatalf("saveUsageMessage created=%v err=%v", created, err)
 	}
@@ -170,7 +170,7 @@ func TestUsageItemExposesLongContextSelectionAndSelectedPrices(t *testing.T) {
 	defer app.Close()
 
 	raw := `{"api_key":"sk-usage-long-context","provider":"openai","model":"gpt-long-usage","request_id":"usage-long-context","input_tokens":300000,"output_tokens":100000}`
-	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw))
+	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw), modelPriceBillingIndex{})
 	if err != nil || !created {
 		t.Fatalf("saveUsageMessage created=%v err=%v", created, err)
 	}

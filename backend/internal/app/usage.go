@@ -260,11 +260,11 @@ func (a *App) usageSummary(w http.ResponseWriter, r *http.Request, filters Usage
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	pricing, err := a.billingPriceIndex(r.Context())
 	if err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, usageSummaryFromRecords(scoped, records, prices))
+	writeJSON(w, http.StatusOK, usageSummaryFromRecords(scoped, records, pricing.Prices, pricing.MatchContext))
 	return nil
 }
 
@@ -278,11 +278,11 @@ func (a *App) usageTrends(w http.ResponseWriter, r *http.Request, filters UsageF
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	pricing, err := a.billingPriceIndex(r.Context())
 	if err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, trendPointsFromRecords(scoped, records, prices))
+	writeJSON(w, http.StatusOK, trendPointsFromRecords(scoped, records, pricing.Prices, pricing.MatchContext))
 	return nil
 }
 
@@ -307,7 +307,7 @@ func (a *App) usageRankings(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	pricing, err := a.billingPriceIndex(r.Context())
 	if err != nil {
 		return err
 	}
@@ -315,7 +315,7 @@ func (a *App) usageRankings(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, rankingFromRecords(records, prices, groupBy, users))
+	writeJSON(w, http.StatusOK, rankingFromRecords(records, pricing.Prices, groupBy, users, pricing.MatchContext))
 	return nil
 }
 
@@ -329,11 +329,11 @@ func (a *App) usageDistributions(w http.ResponseWriter, r *http.Request, filters
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	pricing, err := a.billingPriceIndex(r.Context())
 	if err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, distributionsFromRecords(records, prices))
+	writeJSON(w, http.StatusOK, distributionsFromRecords(records, pricing.Prices, pricing.MatchContext))
 	return nil
 }
 
@@ -347,7 +347,7 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	pricing, err := a.billingPriceIndex(r.Context())
 	if err != nil {
 		return err
 	}
@@ -355,23 +355,23 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	apiKeyRanking := rankingFromRecords(records, prices, "api_key_description", users)
+	apiKeyRanking := rankingFromRecords(records, pricing.Prices, "api_key_description", users, pricing.MatchContext)
 	userRanking := map[string]any{"group_by": "user", "items": []any{}}
 	if scope.IsAdmin {
-		userRanking = rankingFromRecords(records, prices, "user", users)
+		userRanking = rankingFromRecords(records, pricing.Prices, "user", users, pricing.MatchContext)
 	}
 	options, err := a.usageOptionsResponse(r.Context(), user, usageOptionFilters(filters))
 	if err != nil {
 		return err
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"summary":                     usageSummaryFromRecords(scoped, records, prices),
-		"trends":                      trendPointsFromRecords(scoped, records, prices),
+		"summary":                     usageSummaryFromRecords(scoped, records, pricing.Prices, pricing.MatchContext),
+		"trends":                      trendPointsFromRecords(scoped, records, pricing.Prices, pricing.MatchContext),
 		"user_ranking":                userRanking,
 		"api_key_description_ranking": apiKeyRanking,
 		"api_key_ranking":             apiKeyRanking,
-		"model_ranking":               rankingFromRecords(records, prices, "model", users),
-		"distributions":               distributionsFromRecords(records, prices),
+		"model_ranking":               rankingFromRecords(records, pricing.Prices, "model", users, pricing.MatchContext),
+		"distributions":               distributionsFromRecords(records, pricing.Prices, pricing.MatchContext),
 		"options":                     options,
 	})
 	return nil
@@ -400,14 +400,14 @@ func (a *App) usageRecords(w http.ResponseWriter, r *http.Request, filters Usage
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	pricing, err := a.billingPriceIndex(r.Context())
 	if err != nil {
 		return err
 	}
 	items := make([]map[string]any, 0, len(records))
 	redaction := usageRedactionOptions{MaskAuthIndex: !scope.IsAdmin}
 	for _, record := range records {
-		items = append(items, listItemFromRecord(record, users, prices, redaction))
+		items = append(items, listItemFromRecord(record, users, pricing.Prices, redaction, pricing.MatchContext))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items":     items,
@@ -433,12 +433,12 @@ func (a *App) usageRecordDetail(w http.ResponseWriter, r *http.Request, recordID
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	pricing, err := a.billingPriceIndex(r.Context())
 	if err != nil {
 		return err
 	}
 	redaction := usageRedactionOptions{MaskSource: !scope.IsAdmin, MaskAuthIndex: !scope.IsAdmin}
-	item := listItemFromRecord(record, users, prices, redaction)
+	item := listItemFromRecord(record, users, pricing.Prices, redaction, pricing.MatchContext)
 	item["raw_json"] = redactedRawJSON(record.RawJSON, usageRecordAuth(record), redaction)
 	writeJSON(w, http.StatusOK, item)
 	return nil
@@ -807,8 +807,8 @@ func (a *App) userLookup(ctx context.Context, scope usageAccessScope) (map[strin
 	return lookup, nil
 }
 
-func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices map[[2]string]ModelPrice, redaction usageRedactionOptions) map[string]any {
-	costBreakdown := calculateRecordCostBreakdown(record, prices)
+func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices map[[2]string]ModelPrice, redaction usageRedactionOptions, matchContexts ...modelPriceMatchContext) map[string]any {
+	costBreakdown := calculateRecordCostBreakdown(record, prices, matchContexts...)
 	userID := (*int)(nil)
 	userLabel := "未绑定"
 	if record.UsageUsername != nil {
@@ -857,7 +857,7 @@ func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices ma
 	}
 }
 
-func usageSummaryFromRecords(filters UsageFilters, records []UsageRecord, prices map[[2]string]ModelPrice) map[string]any {
+func usageSummaryFromRecords(filters UsageFilters, records []UsageRecord, prices map[[2]string]ModelPrice, matchContexts ...modelPriceMatchContext) map[string]any {
 	failed := 0
 	input, output, cached, reasoning, total := 0, 0, 0, 0, 0
 	normalInput, cacheRead, cacheCreation := 0, 0, 0
@@ -866,19 +866,21 @@ func usageSummaryFromRecords(filters UsageFilters, records []UsageRecord, prices
 	ttftTotal := 0.0
 	ttftCount := 0
 	for _, record := range records {
+		matchedPrice, _ := findMatchingChannelPrice(prices, record, matchContexts...)
+		matchedBrand := matchedModelPriceChannelBrand(matchedPrice, record, matchContexts...)
 		if record.Failed {
 			failed++
 		}
-		input += usageAggregateInputTokens(record)
+		input += usageAggregateInputTokens(record, matchedBrand)
 		output += record.OutputTokens
 		cached += record.CachedTokens
 		reasoning += record.ReasoningTokens
-		total += usageAggregateTotalTokens(record)
-		tokens := normalizedUsageTokenBreakdown(record)
+		total += usageAggregateTotalTokens(record, matchedBrand)
+		tokens := normalizedUsageTokenBreakdown(record, matchedBrand)
 		normalInput += tokens.NormalInputTokens
 		cacheRead += tokens.CacheReadTokens
 		cacheCreation += tokens.CacheCreationTokens
-		amount, isUnpriced := recordCost(record, prices)
+		amount, isUnpriced := recordCost(record, prices, matchContexts...)
 		estimated = mathRound(estimated+amount, 8)
 		if isUnpriced {
 			unpriced++
@@ -921,7 +923,7 @@ func averageTTFTMS(total float64, count int) *float64 {
 	return &average
 }
 
-func trendPointsFromRecords(filters UsageFilters, records []UsageRecord, prices map[[2]string]ModelPrice) []map[string]any {
+func trendPointsFromRecords(filters UsageFilters, records []UsageRecord, prices map[[2]string]ModelPrice, matchContexts ...modelPriceMatchContext) []map[string]any {
 	buckets := map[string][]UsageRecord{}
 	duration := 24 * time.Hour
 	if filters.Start != nil && filters.End != nil {
@@ -945,11 +947,13 @@ func trendPointsFromRecords(filters UsageFilters, records []UsageRecord, prices 
 		group := buckets[key]
 		failed, tokens, cost := 0, 0, 0.0
 		for _, record := range group {
+			matchedPrice, _ := findMatchingChannelPrice(prices, record, matchContexts...)
+			matchedBrand := matchedModelPriceChannelBrand(matchedPrice, record, matchContexts...)
 			if record.Failed {
 				failed++
 			}
-			tokens += usageAggregateTotalTokens(record)
-			amount, _ := recordCost(record, prices)
+			tokens += usageAggregateTotalTokens(record, matchedBrand)
+			amount, _ := recordCost(record, prices, matchContexts...)
 			cost = mathRound(cost+amount, 8)
 		}
 		points = append(points, map[string]any{
@@ -963,7 +967,7 @@ func trendPointsFromRecords(filters UsageFilters, records []UsageRecord, prices 
 	return points
 }
 
-func rankingFromRecords(records []UsageRecord, prices map[[2]string]ModelPrice, groupBy string, users map[string]userInfo) map[string]any {
+func rankingFromRecords(records []UsageRecord, prices map[[2]string]ModelPrice, groupBy string, users map[string]userInfo, matchContexts ...modelPriceMatchContext) map[string]any {
 	grouped := map[string][]UsageRecord{}
 	labels := map[string]string{}
 	userIDs := map[string]*int{}
@@ -1013,11 +1017,13 @@ func rankingFromRecords(records []UsageRecord, prices map[[2]string]ModelPrice, 
 	for key, group := range grouped {
 		failed, tokens, cost := 0, 0, 0.0
 		for _, record := range group {
+			matchedPrice, _ := findMatchingChannelPrice(prices, record, matchContexts...)
+			matchedBrand := matchedModelPriceChannelBrand(matchedPrice, record, matchContexts...)
 			if record.Failed {
 				failed++
 			}
-			tokens += usageAggregateTotalTokens(record)
-			amount, _ := recordCost(record, prices)
+			tokens += usageAggregateTotalTokens(record, matchedBrand)
+			amount, _ := recordCost(record, prices, matchContexts...)
 			cost = mathRound(cost+amount, 8)
 		}
 		items = append(items, rankingItem(key, labels[key], len(group), failed, tokens, cost, userIDs[key], descriptions[key]))
@@ -1049,15 +1055,15 @@ func rankingItem(key, label string, records, failed, tokens int, cost float64, u
 	}
 }
 
-func distributionsFromRecords(records []UsageRecord, prices map[[2]string]ModelPrice) map[string]any {
+func distributionsFromRecords(records []UsageRecord, prices map[[2]string]ModelPrice, matchContexts ...modelPriceMatchContext) map[string]any {
 	return map[string]any{
-		"providers": distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Provider, "unknown") }),
-		"models":    distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Model, "unknown") }),
-		"endpoints": distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Endpoint, "unknown") }),
+		"providers": distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Provider, "unknown") }, matchContexts...),
+		"models":    distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Model, "unknown") }, matchContexts...),
+		"endpoints": distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Endpoint, "unknown") }, matchContexts...),
 	}
 }
 
-func distributionItems(records []UsageRecord, prices map[[2]string]ModelPrice, keyFn func(UsageRecord) string) []map[string]any {
+func distributionItems(records []UsageRecord, prices map[[2]string]ModelPrice, keyFn func(UsageRecord) string, matchContexts ...modelPriceMatchContext) []map[string]any {
 	grouped := map[string][]UsageRecord{}
 	for _, record := range records {
 		key := keyFn(record)
@@ -1067,8 +1073,10 @@ func distributionItems(records []UsageRecord, prices map[[2]string]ModelPrice, k
 	for key, group := range grouped {
 		tokens, cost := 0, 0.0
 		for _, record := range group {
-			tokens += usageAggregateTotalTokens(record)
-			amount, _ := recordCost(record, prices)
+			matchedPrice, _ := findMatchingChannelPrice(prices, record, matchContexts...)
+			matchedBrand := matchedModelPriceChannelBrand(matchedPrice, record, matchContexts...)
+			tokens += usageAggregateTotalTokens(record, matchedBrand)
+			amount, _ := recordCost(record, prices, matchContexts...)
 			cost = mathRound(cost+amount, 8)
 		}
 		items = append(items, map[string]any{
@@ -1263,7 +1271,7 @@ func shouldRedactJSONField(key string, authType *string, redaction usageRedactio
 		strings.Contains(lower, "token")
 }
 
-func (a *App) saveUsageMessage(ctx context.Context, raw []byte) (UsageRecord, bool, error) {
+func (a *App) saveUsageMessage(ctx context.Context, raw []byte, pricing modelPriceBillingIndex) (UsageRecord, bool, error) {
 	normalized, err := normalizeUsage(raw)
 	if err != nil {
 		return UsageRecord{}, false, err
@@ -1292,7 +1300,7 @@ func (a *App) saveUsageMessage(ctx context.Context, raw []byte) (UsageRecord, bo
 	if err != nil {
 		return UsageRecord{}, false, err
 	}
-	if err := a.applyQuotaCharge(ctx, record); err != nil {
+	if err := a.applyQuotaCharge(ctx, record, pricing); err != nil {
 		return UsageRecord{}, false, err
 	}
 	return record, true, nil

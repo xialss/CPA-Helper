@@ -351,22 +351,13 @@ func (a *App) aiProvidersSnapshot(ctx context.Context) (aiProvidersResponse, err
 	if err != nil {
 		return aiProvidersResponse{}, err
 	}
-	response := aiProvidersResponse{
-		Providers: []aiProviderItem{},
-		Usage:     []aiProviderUsage{},
+	providers, err := a.aiProviderConfigSnapshotForConfig(ctx, cfg)
+	if err != nil {
+		return aiProvidersResponse{}, err
 	}
-	for _, brandConfig := range aiProviderBrandConfigs {
-		payload, err := a.aiProviderManagementPayload(ctx, cfg, http.MethodGet, brandConfig.UpstreamPath, nil, aiProviderManagementTimeout)
-		if err != nil {
-			return aiProvidersResponse{}, err
-		}
-		providers, err := parseAIProviderList(payload, brandConfig.ConfigKey)
-		if err != nil {
-			return aiProvidersResponse{}, validationError(brandConfig.Label + " provider 响应不是有效列表")
-		}
-		for index, raw := range providers {
-			response.Providers = append(response.Providers, aiProviderItemFromRaw(brandConfig, index, raw))
-		}
+	response := aiProvidersResponse{
+		Providers: providers,
+		Usage:     []aiProviderUsage{},
 	}
 	usagePayload, err := a.aiProviderManagementPayload(ctx, cfg, http.MethodGet, "/v0/management/api-key-usage", nil, aiProviderManagementTimeout)
 	if err != nil {
@@ -384,6 +375,45 @@ func (a *App) aiProvidersSnapshot(ctx context.Context) (aiProvidersResponse, err
 	}
 	response.Summary = aiProviderSummaryFromItems(response.Providers)
 	return response, nil
+}
+
+func (a *App) aiProviderConfigSnapshot(ctx context.Context) ([]aiProviderItem, error) {
+	cfg, err := a.aiProviderManagementConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return a.aiProviderConfigSnapshotForConfig(ctx, cfg)
+}
+
+func (a *App) aiProviderConfigSnapshotForConfig(ctx context.Context, cfg AppConfig) ([]aiProviderItem, error) {
+	startedAt := time.Now()
+	generation, cacheable := a.priceSelectors.currentGeneration(modelPriceSelectorConfigKey(cfg))
+	providers, err := a.aiProviderConfigSnapshotWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if cacheable {
+		a.storeModelPriceSelectorSnapshot(cfg, generation, providers, startedAt)
+	}
+	return providers, nil
+}
+
+func (a *App) aiProviderConfigSnapshotWithConfig(ctx context.Context, cfg AppConfig) ([]aiProviderItem, error) {
+	providers := []aiProviderItem{}
+	for _, brandConfig := range aiProviderBrandConfigs {
+		payload, err := a.aiProviderManagementPayload(ctx, cfg, http.MethodGet, brandConfig.UpstreamPath, nil, aiProviderManagementTimeout)
+		if err != nil {
+			return nil, err
+		}
+		items, err := parseAIProviderList(payload, brandConfig.ConfigKey)
+		if err != nil {
+			return nil, validationError(brandConfig.Label + " provider 响应不是有效列表")
+		}
+		for index, raw := range items {
+			providers = append(providers, aiProviderItemFromRaw(brandConfig, index, raw))
+		}
+	}
+	return providers, nil
 }
 
 func (a *App) createAIProvider(ctx context.Context, brandConfig aiProviderBrandConfig, payload aiProviderItem) (aiProvidersResponse, error) {
@@ -659,9 +689,13 @@ func (a *App) aiProviderManagementPayload(ctx context.Context, cfg AppConfig, me
 }
 
 func (a *App) aiProviderManagementResponse(ctx context.Context, cfg AppConfig, method, path string, body any, timeout time.Duration) (*http.Response, []byte, error) {
+	managementURL, err := collectorManagementHTTPURL(cfg.Collector.CLIProxyURL)
+	if err != nil {
+		return nil, nil, validationError("CLIProxyAPI 管理地址无效：" + err.Error())
+	}
 	requestCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	response, payload, err := doJSON(requestCtx, httpClient(timeout), method, makeURL(cfg.Collector.CLIProxyURL, path, nil), managementHeaders(cfg.Collector.ManagementKey), body)
+	response, payload, err := doJSON(requestCtx, httpClient(timeout), method, makeURL(managementURL, path, nil), managementHeaders(cfg.Collector.ManagementKey), body)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 			return nil, nil, validationError("CLIProxyAPI 管理请求超时，请检查地址和管理密钥")
@@ -679,6 +713,7 @@ func (a *App) putAIProviderList(ctx context.Context, cfg AppConfig, brandConfig 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return validationError(fmt.Sprintf("写入 %s provider 失败：HTTP %d", brandConfig.Label, response.StatusCode))
 	}
+	a.invalidateModelPriceSelectorSnapshot(cfg)
 	return nil
 }
 

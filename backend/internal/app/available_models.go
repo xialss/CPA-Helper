@@ -113,7 +113,7 @@ func (a *App) availableModelsForUser(ctx context.Context, userID int) (Available
 	if err != nil {
 		return AvailableModelsResponse{}, err
 	}
-	prices, err := a.priceMap(ctx)
+	prices, err := a.libraryPriceMap(ctx)
 	if err != nil {
 		return AvailableModelsResponse{}, err
 	}
@@ -155,7 +155,7 @@ func (a *App) availableModelsForUser(ctx context.Context, userID int) (Available
 		return AvailableModelsResponse{}, validationError("查询 CPA 可用模型失败：" + strings.Join(messages, "；"))
 	}
 	for _, model := range modelsByID {
-		if price := findMatchingPrice(prices, model.Owner, &model.ID); price != nil {
+		if price := findMatchingLibraryPrice(prices, model.Owner, &model.ID); price != nil {
 			model.Price = availableModelPriceFromPrice(price)
 		}
 		response.Models = append(response.Models, model)

@@ -4,6 +4,8 @@ import type {
   LiteLLMProxySettingsPayload,
   ModelPrice,
   ModelPriceCatalogResponse,
+  ModelPriceLibraryConflict,
+  ModelPriceLibraryConflictPromotePayload,
   ModelPricePayload,
   ModelPriceSyncResponse,
   PriorityMultiplierPayload,
@@ -23,6 +25,25 @@ export function createModelPrice(payload: ModelPricePayload): Promise<ModelPrice
 
 export function updateModelPrice(id: number, payload: ModelPricePayload): Promise<ModelPrice> {
   return apiClient.put<ModelPrice>(`/model-prices/${id}`, payload)
+}
+
+export function listModelPriceLibraryConflicts(): Promise<ModelPriceLibraryConflict[]> {
+  return apiClient.get<ModelPriceLibraryConflict[]>('/model-prices/library-conflicts')
+}
+
+export function promoteModelPriceLibraryConflict(
+  id: number,
+  payload: ModelPriceLibraryConflictPromotePayload,
+): Promise<ModelPrice> {
+  return apiClient.put<ModelPrice>(`/model-prices/library-conflicts/${id}/promote`, payload)
+}
+
+export function replaceActiveModelPriceLibraryConflict(id: number): Promise<ModelPrice> {
+  return apiClient.put<ModelPrice>(`/model-prices/library-conflicts/${id}/replace-active`, {})
+}
+
+export function deleteModelPriceLibraryConflict(id: number): Promise<void> {
+  return apiClient.delete(`/model-prices/library-conflicts/${id}`)
 }
 
 export function updateModelPricePriorityMultiplier(

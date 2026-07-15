@@ -1197,7 +1197,7 @@ func (a *App) computeKeeperQuotaWindowUsages(ctx context.Context, accounts []kee
 	if err != nil {
 		return nil, err
 	}
-	prices, err := a.priceMap(ctx)
+	pricing, err := a.billingPriceIndex(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1211,10 +1211,10 @@ func (a *App) computeKeeperQuotaWindowUsages(ctx context.Context, accounts []kee
 			continue
 		}
 		if keeperRecordInQuotaWindow(record, pair.Primary) {
-			addRecordToKeeperQuotaWindowUsage(pair.Primary, record, prices)
+			addRecordToKeeperQuotaWindowUsage(pair.Primary, record, pricing.Prices, pricing.MatchContext)
 		}
 		if keeperRecordInQuotaWindow(record, pair.Secondary) {
-			addRecordToKeeperQuotaWindowUsage(pair.Secondary, record, prices)
+			addRecordToKeeperQuotaWindowUsage(pair.Secondary, record, pricing.Prices, pricing.MatchContext)
 		}
 	}
 	return usages, nil
@@ -1390,22 +1390,24 @@ func keeperRecordInQuotaWindow(record UsageRecord, usage *keeperQuotaWindowUsage
 	return !record.Timestamp.Before(usage.WindowStart) && record.Timestamp.Before(usage.WindowEnd)
 }
 
-func addRecordToKeeperQuotaWindowUsage(usage *keeperQuotaWindowUsage, record UsageRecord, prices map[[2]string]ModelPrice) {
+func addRecordToKeeperQuotaWindowUsage(usage *keeperQuotaWindowUsage, record UsageRecord, prices map[[2]string]ModelPrice, matchContexts ...modelPriceMatchContext) {
 	if usage == nil {
 		return
 	}
+	matchedPrice, _ := findMatchingChannelPrice(prices, record, matchContexts...)
+	matchedBrand := matchedModelPriceChannelBrand(matchedPrice, record, matchContexts...)
 	usage.Records++
 	if record.Failed {
 		usage.FailedRecords++
 	} else {
 		usage.SuccessRecords++
 	}
-	usage.InputTokens += usageAggregateInputTokens(record)
+	usage.InputTokens += usageAggregateInputTokens(record, matchedBrand)
 	usage.OutputTokens += record.OutputTokens
 	usage.CachedTokens += record.CachedTokens
 	usage.ReasoningTokens += record.ReasoningTokens
-	usage.TotalTokens += usageAggregateTotalTokens(record)
-	amount, unpriced := recordCost(record, prices)
+	usage.TotalTokens += usageAggregateTotalTokens(record, matchedBrand)
+	amount, unpriced := recordCost(record, prices, matchContexts...)
 	if unpriced {
 		usage.UnpricedRecords++
 		return

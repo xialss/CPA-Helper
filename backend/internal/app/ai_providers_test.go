@@ -2,16 +2,147 @@ package app_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	backendApp "cpa-helper/backend/internal/app"
 )
+
+func TestAIProvidersSnapshotReusesOneManagementConfig(t *testing.T) {
+	providerPaths := map[string]bool{
+		"/v0/management/gemini-api-key":       true,
+		"/v0/management/codex-api-key":        true,
+		"/v0/management/claude-api-key":       true,
+		"/v0/management/openai-compatibility": true,
+		"/v0/management/vertex-api-key":       true,
+	}
+	providerStarted := make(chan struct{})
+	releaseProvider := make(chan struct{})
+	var releaseProviderOnce sync.Once
+	releaseProviderRequest := func() {
+		releaseProviderOnce.Do(func() { close(releaseProvider) })
+	}
+	var blockProvider sync.Once
+	var oldUsageCalls atomic.Int32
+	oldServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-management-key" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if providerPaths[r.URL.Path] && r.Method == http.MethodGet {
+			blockProvider.Do(func() {
+				close(providerStarted)
+				<-releaseProvider
+			})
+			if r.URL.Path == "/v0/management/gemini-api-key" {
+				_ = json.NewEncoder(w).Encode([]map[string]any{{
+					"auth-index": "old-auth",
+					"models":     []map[string]any{{"name": "old-model"}},
+				}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		}
+		if r.URL.Path == "/v0/management/api-key-usage" && r.Method == http.MethodGet {
+			oldUsageCalls.Add(1)
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer oldServer.Close()
+
+	var newUsageCalls atomic.Int32
+	newServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-management-key" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if providerPaths[r.URL.Path] && r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		}
+		if r.URL.Path == "/v0/management/api-key-usage" && r.Method == http.MethodGet {
+			newUsageCalls.Add(1)
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer newServer.Close()
+	defer releaseProviderRequest()
+
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := backendApp.NewWithOptions(context.Background(), backendApp.NewOptions{
+		Migrate:         true,
+		StartBackground: false,
+	})
+	if err != nil {
+		t.Fatalf("NewWithOptions failed: %v", err)
+	}
+	defer app.Close()
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+	requestJSON(t, handler, http.MethodPut, "/api/settings", map[string]any{
+		"cliaproxy_url":     oldServer.URL,
+		"management_key":    "test-management-key",
+		"collector_enabled": false,
+	}, cookies, nil)
+
+	type responseResult struct {
+		status int
+		body   []byte
+	}
+	resultCh := make(chan responseResult, 1)
+	go func() {
+		request := httptest.NewRequest(http.MethodGet, "/api/ai-providers", nil)
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		resultCh <- responseResult{status: recorder.Code, body: append([]byte(nil), recorder.Body.Bytes()...)}
+	}()
+	select {
+	case <-providerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider snapshot did not start")
+	}
+
+	requestJSON(t, handler, http.MethodPut, "/api/settings", map[string]any{
+		"cliaproxy_url":     newServer.URL,
+		"management_key":    "test-management-key",
+		"collector_enabled": false,
+	}, cookies, nil)
+	releaseProviderRequest()
+	var result responseResult
+	select {
+	case result = <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("AI provider request did not finish")
+	}
+	if result.status != http.StatusOK {
+		t.Fatalf("GET /api/ai-providers returned %d: %s", result.status, string(result.body))
+	}
+	if oldUsageCalls.Load() != 1 || newUsageCalls.Load() != 0 {
+		t.Fatalf("usage requests old/new = %d/%d, want 1/0", oldUsageCalls.Load(), newUsageCalls.Load())
+	}
+}
 
 type aiProvidersTestResponse struct {
 	Providers []struct {

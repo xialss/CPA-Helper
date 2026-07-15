@@ -521,11 +521,34 @@ func TestKeeperQuotaWindowUsageInfersAccountWindows(t *testing.T) {
 
 func TestKeeperQuotaWindowUsageUsesCurrentWindowBoundariesAndPricing(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/codex-api-key": []map[string]any{
+			{
+				"api-key":    "codex-priced-key",
+				"auth-index": "priced.json",
+				"models":     []map[string]any{{"name": "gpt-test"}},
+			},
+		},
+	})
+	defer cpa.Close()
 	app, err := New()
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
 	defer app.Close()
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(ctx, cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+	if err := app.refreshModelPriceSelectorsIfStale(ctx, cfg); err != nil {
+		t.Fatalf("refresh selectors failed: %v", err)
+	}
 
 	insertKeeperTestPrice(t, app)
 	now := time.Date(2026, 5, 18, 12, 30, 0, 0, appTimeLocation)
@@ -546,6 +569,7 @@ func TestKeeperQuotaWindowUsageUsesCurrentWindowBoundariesAndPricing(t *testing.
 		Dedupe:       "at-start",
 		Timestamp:    windowStart,
 		Source:       "priced@example.com",
+		AuthIndex:    "priced.json",
 		InputTokens:  10,
 		OutputTokens: 5,
 		RawJSON:      `{"source":"priced@example.com"}`,
@@ -554,6 +578,7 @@ func TestKeeperQuotaWindowUsageUsesCurrentWindowBoundariesAndPricing(t *testing.
 		Dedupe:       "near-before-start",
 		Timestamp:    windowStart.Add(-3 * time.Second),
 		Source:       "priced@example.com",
+		AuthIndex:    "priced.json",
 		InputTokens:  4,
 		OutputTokens: 1,
 		RawJSON:      `{"source":"priced@example.com"}`,
@@ -562,6 +587,7 @@ func TestKeeperQuotaWindowUsageUsesCurrentWindowBoundariesAndPricing(t *testing.
 		Dedupe:       "before-end",
 		Timestamp:    resetAt.Add(-time.Second),
 		Source:       "priced@example.com",
+		AuthIndex:    "priced.json",
 		Failed:       true,
 		InputTokens:  20,
 		OutputTokens: 10,
@@ -571,6 +597,7 @@ func TestKeeperQuotaWindowUsageUsesCurrentWindowBoundariesAndPricing(t *testing.
 		Dedupe:       "at-end",
 		Timestamp:    resetAt,
 		Source:       "priced@example.com",
+		AuthIndex:    "priced.json",
 		InputTokens:  100,
 		OutputTokens: 100,
 		RawJSON:      `{"source":"priced@example.com"}`,
@@ -579,12 +606,13 @@ func TestKeeperQuotaWindowUsageUsesCurrentWindowBoundariesAndPricing(t *testing.
 		Dedupe:       "before-start",
 		Timestamp:    windowStart.Add(-time.Minute),
 		Source:       "priced@example.com",
+		AuthIndex:    "priced.json",
 		InputTokens:  100,
 		OutputTokens: 100,
 		RawJSON:      `{"source":"priced@example.com"}`,
 	})
 
-	usages, err := app.computeKeeperQuotaWindowUsages(context.Background(), accounts, now)
+	usages, err := app.computeKeeperQuotaWindowUsages(ctx, accounts, now)
 	if err != nil {
 		t.Fatalf("compute window usages: %v", err)
 	}
@@ -1689,13 +1717,10 @@ func insertKeeperTestPrice(t *testing.T, app *App) {
 	t.Helper()
 	_, err := app.db.Exec(`
 		INSERT INTO model_prices (
-			provider, model, input_usd_per_million, output_usd_per_million,
+			provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
 			cache_read_usd_per_million, cache_creation_usd_per_million, source, updated_at
-		) VALUES ('codex', 'gpt-test', 1, 2, 0, 0, 'manual', ?)
-		ON CONFLICT(provider, model) DO UPDATE SET
-			input_usd_per_million = excluded.input_usd_per_million,
-			output_usd_per_million = excluded.output_usd_per_million,
-			updated_at = excluded.updated_at
+		) VALUES ('codex', 'gpt-test', 'channel', 'codex', 'priced.json', 1, 2, 0, 0, 'manual', ?)
 	`, dbTime(time.Now().In(appTimeLocation)))
 	if err != nil {
 		t.Fatalf("insert test price: %v", err)

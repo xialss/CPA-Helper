@@ -926,7 +926,7 @@ func emptyUserUsageSummary() userUsageSummary {
 }
 
 func (a *App) userUsageSummaries(ctx context.Context) (map[string]userUsageSummary, error) {
-	prices, err := a.priceMap(ctx)
+	pricing, err := a.billingPriceIndex(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -944,6 +944,8 @@ func (a *App) userUsageSummaries(ctx context.Context) (map[string]userUsageSumma
 			continue
 		}
 		username := *record.UsageUsername
+		matchedPrice, _ := findMatchingChannelPrice(pricing.Prices, record, pricing.MatchContext)
+		matchedBrand := matchedModelPriceChannelBrand(matchedPrice, record, pricing.MatchContext)
 		summary := result[username]
 		if summary.Providers == nil {
 			summary = emptyUserUsageSummary()
@@ -956,7 +958,7 @@ func (a *App) userUsageSummaries(ctx context.Context) (map[string]userUsageSumma
 		} else {
 			summary.SuccessRecords++
 		}
-		summary.TotalTokens += usageAggregateTotalTokens(record)
+		summary.TotalTokens += usageAggregateTotalTokens(record, matchedBrand)
 		if summary.FirstSeenAt == nil || record.Timestamp.Before(*summary.FirstSeenAt) {
 			t := record.Timestamp
 			summary.FirstSeenAt = &t
@@ -970,18 +972,18 @@ func (a *App) userUsageSummaries(ctx context.Context) (map[string]userUsageSumma
 		appendUniqueString(&summary.Providers, providerSeen[username], record.Provider)
 		appendUniqueString(&summary.Models, modelSeen[username], record.Model)
 		if !record.Timestamp.Before(todayStart) && record.Timestamp.Before(todayEnd) {
-			amount, unpriced := recordCost(record, prices)
+			amount, unpriced := recordCost(record, pricing.Prices, pricing.MatchContext)
 			summary.TodayRecords++
 			if record.Failed {
 				summary.TodayFailedRecords++
 			} else {
 				summary.TodaySuccessRecords++
 			}
-			summary.TodayInputTokens += usageAggregateInputTokens(record)
+			summary.TodayInputTokens += usageAggregateInputTokens(record, matchedBrand)
 			summary.TodayOutputTokens += record.OutputTokens
 			summary.TodayCachedTokens += record.CachedTokens
 			summary.TodayReasoningTokens += record.ReasoningTokens
-			summary.TodayTotalTokens += usageAggregateTotalTokens(record)
+			summary.TodayTotalTokens += usageAggregateTotalTokens(record, matchedBrand)
 			summary.TodayEstimatedCostUSD = mathRound(summary.TodayEstimatedCostUSD+amount, 8)
 			if unpriced {
 				summary.TodayUnpricedRecords++

@@ -55,6 +55,7 @@ type App struct {
 	collector        *CollectorRunner
 	keeper           *KeeperRunner
 	keeperUsageCache keeperWindowUsageCache
+	priceSelectors   modelPriceSelectorSnapshotCache
 }
 
 type AppError struct {
@@ -138,10 +139,12 @@ func NewWithOptions(ctx context.Context, options NewOptions) (*App, error) {
 			return nil, err
 		}
 	}
-	if _, err := app.loadConfig(ctx); err != nil {
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
 		db.Close()
 		return nil, err
 	}
+	app.priceSelectors.retainConfig(modelPriceSelectorConfigKey(cfg))
 	if options.StartBackground {
 		app.startBackground(ctx)
 	}
@@ -648,7 +651,11 @@ func (a *App) saveConfig(ctx context.Context, cfg AppConfig) error {
 		    model_request_url = ?, session_secret = ?, updated_at = ?
 		WHERE id = 1
 	`, cfg.Collector.Enabled, strings.TrimRight(strings.TrimSpace(cfg.Collector.CLIProxyURL), "/"), strings.TrimSpace(cfg.Collector.ManagementKey), strings.TrimSpace(cfg.Collector.QueueName), cfg.Collector.BatchSize, cfg.Collector.PollIntervalSeconds, cfg.Collector.RetryIntervalSeconds, string(keeperBytes), string(rulesBytes), cfg.LiteLLMProxy.Enabled, strings.TrimSpace(cfg.LiteLLMProxy.ProxyURL), strings.TrimRight(strings.TrimSpace(cfg.ModelRequestURL), "/"), cfg.SessionSecret, dbTime(time.Now()))
-	return err
+	if err != nil {
+		return err
+	}
+	a.priceSelectors.retainConfig(modelPriceSelectorConfigKey(cfg))
+	return nil
 }
 
 func (a *App) runMigrations(ctx context.Context) error {
