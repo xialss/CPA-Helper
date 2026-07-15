@@ -63,6 +63,7 @@ type PriceStatusFilter = 'cpa' | 'missing' | 'litellm' | 'manual' | 'library' | 
 type BillingUnit = 'token' | 'request'
 type PriceGroupingMode = 'model' | 'provider'
 type PriceScope = 'library' | 'channel'
+type ChannelAuthType = 'apikey' | 'oauth'
 type UnmatchedChannelStatus = 'conflict' | 'model_removed' | 'orphan' | 'unavailable'
 type PriceFieldName = keyof Pick<
   ModelPrice,
@@ -80,6 +81,7 @@ interface CatalogModelReference {
   suggestedProvider: string
   channelBrand: string
   channelLabel: string
+  channelAuthType: ChannelAuthType
 }
 
 interface PriceDisplayRow {
@@ -93,12 +95,14 @@ interface PriceDisplayRow {
   price: ModelPrice | null
   provider: string
   channelFilterKey: string
+  channelAuthType: ChannelAuthType | null
   channelBrand: string | null
   channelKey: string | null
   channelIdentityHash: string | null
   channelStatus: string
   channelDisabled: boolean
   channelLabelFallback: boolean
+  channelAccountCount: number
   priceScope: PriceScope
   model: string
   comparisonModelKey: string
@@ -181,6 +185,7 @@ const form = reactive<ModelPricePayload>({
   provider: '',
   model: '',
   price_scope: 'library',
+  channel_auth_type: null,
   channel_brand: null,
   channel_key: null,
   channel_identity_hash: null,
@@ -227,11 +232,13 @@ function catalogModelReference(model: ModelPriceCatalogItem): CatalogModelRefere
     suggestedProvider: model.suggested_provider,
     channelBrand: model.channel_brand,
     channelLabel: model.channel_label,
+    channelAuthType: model.channel_auth_type,
   }
 }
 
 function channelFilterKey(
   scope: PriceScope,
+  authType: ChannelAuthType | null,
   brand: string | null,
   key: string | null,
   identityHash: string | null,
@@ -241,19 +248,20 @@ function channelFilterKey(
     const selector = key?.trim() ?? ''
     if (selector) {
       const canonicalSelector = brand === 'openai_compatibility' ? selector.toLowerCase() : selector
-      return `channel:${brand ?? 'unknown'}:selector:${canonicalSelector}`
+      return `channel:${authType ?? 'apikey'}:${brand ?? 'unknown'}:selector:${canonicalSelector}`
     }
-    return `channel:${brand ?? 'unknown'}:identity:${identityHash?.trim() || 'unknown'}`
+    return `channel:${authType ?? 'apikey'}:${brand ?? 'unknown'}:identity:${identityHash?.trim() || 'unknown'}`
   }
   return `library:${provider.trim().toLowerCase()}`
 }
 
 function channelPriceIdentityKey(
+  authType: ChannelAuthType | null,
   brand: string | null,
   key: string | null,
   model: string,
 ): string | null {
-  const channelIdentity = channelIdentityKey(brand, key)
+  const channelIdentity = channelIdentityKey(authType, brand, key)
   const normalizedModel = model.trim().toLowerCase()
   if (!channelIdentity || !normalizedModel) {
     return null
@@ -262,6 +270,7 @@ function channelPriceIdentityKey(
 }
 
 function channelIdentityKey(
+  authType: ChannelAuthType | null,
   brand: string | null,
   key: string | null,
 ): string | null {
@@ -271,7 +280,25 @@ function channelIdentityKey(
     return null
   }
   const canonicalSelector = normalizedBrand === 'openai_compatibility' ? selector.toLowerCase() : selector
-  return JSON.stringify([normalizedBrand, canonicalSelector])
+  return JSON.stringify([authType ?? 'apikey', normalizedBrand, canonicalSelector])
+}
+
+function channelDisplayLabel(
+  authType: ChannelAuthType | null,
+  brand: string | null,
+  fallback: string,
+  accountCount = 0,
+): string {
+  if (authType !== 'oauth') {
+    return fallback || channelBrandLabel(brand)
+  }
+  const base = t(
+    `${channelBrandLabel(brand)} OAuth 账号池`,
+    `${channelBrandLabel(brand)} OAuth account pool`,
+  )
+  return accountCount > 0
+    ? t(`${base} (${accountCount} 个账号)`, `${base} (${accountCount} accounts)`)
+    : base
 }
 
 function channelBrandLabel(brand: string | null): string {
@@ -309,6 +336,9 @@ function orphanPriceChannelLabel(price: ModelPrice): string {
   if (price.channel_brand === 'openai_compatibility') {
     return price.channel_key || price.provider
   }
+  if (price.channel_auth_type === 'oauth') {
+    return channelDisplayLabel('oauth', price.channel_brand, '')
+  }
   return `${channelBrandLabel(price.channel_brand)} · ${maskedChannelReference(price.channel_key)}`
 }
 
@@ -318,7 +348,9 @@ function pricedDisplayRow(
   unmatchedChannelStatus: UnmatchedChannelStatus = 'orphan',
 ): PriceDisplayRow {
   const scope: PriceScope = price.price_scope === 'channel' ? 'channel' : 'library'
-  const provider = catalogModel?.channel_label || orphanPriceChannelLabel(price)
+  const provider = catalogModel
+    ? channelDisplayLabel(catalogModel.channel_auth_type, catalogModel.channel_brand, catalogModel.channel_label, catalogModel.channel_account_count)
+    : orphanPriceChannelLabel(price)
   const catalogModels = catalogModel ? [catalogModelReference(catalogModel)] : []
   return {
     rowType: 'detail',
@@ -332,17 +364,20 @@ function pricedDisplayRow(
     provider,
     channelFilterKey: channelFilterKey(
       scope,
+      price.channel_auth_type,
       price.channel_brand,
       price.channel_key,
       catalogModel?.channel_identity_hash ?? null,
       provider,
     ),
+    channelAuthType: price.channel_auth_type,
     channelBrand: price.channel_brand,
     channelKey: price.channel_key,
     channelIdentityHash: catalogModel?.channel_identity_hash ?? null,
     channelStatus: catalogModel?.channel_status ?? (scope === 'channel' ? unmatchedChannelStatus : 'ready'),
     channelDisabled: catalogModel?.channel_disabled ?? false,
     channelLabelFallback: catalogModel?.channel_label_fallback ?? scope === 'channel',
+    channelAccountCount: catalogModel?.channel_account_count ?? 0,
     priceScope: scope,
     model: price.model,
     comparisonModelKey: normalizeModelComparisonKey(price.model),
@@ -366,7 +401,7 @@ function migrationConflictDisplayRow(conflict: ModelPriceLibraryConflict): Price
 }
 
 function unpricedCatalogDisplayRow(model: ModelPriceCatalogItem): PriceDisplayRow {
-  const provider = model.channel_label || channelBrandLabel(model.channel_brand)
+  const provider = channelDisplayLabel(model.channel_auth_type, model.channel_brand, model.channel_label, model.channel_account_count)
   return {
     rowType: 'detail',
     key: `catalog:${model.id}`,
@@ -379,17 +414,20 @@ function unpricedCatalogDisplayRow(model: ModelPriceCatalogItem): PriceDisplayRo
     provider,
     channelFilterKey: channelFilterKey(
       'channel',
+      model.channel_auth_type,
       model.channel_brand,
       model.channel_key,
       model.channel_identity_hash,
       provider,
     ),
+    channelAuthType: model.channel_auth_type,
     channelBrand: model.channel_brand,
     channelKey: model.channel_key,
     channelIdentityHash: model.channel_identity_hash,
     channelStatus: model.channel_status,
     channelDisabled: model.channel_disabled,
     channelLabelFallback: model.channel_label_fallback,
+    channelAccountCount: model.channel_account_count,
     priceScope: 'channel',
     model: model.name,
     comparisonModelKey: normalizeModelComparisonKey(model.name),
@@ -409,11 +447,11 @@ const priceRows = computed<PriceDisplayRow[]>(() => {
   const catalogChannelIdentities = new Set<string>()
 
   for (const model of catalogModels) {
-    const channelIdentity = channelIdentityKey(model.channel_brand, model.channel_key)
+    const channelIdentity = channelIdentityKey(model.channel_auth_type, model.channel_brand, model.channel_key)
     if (channelIdentity) {
       catalogChannelIdentities.add(channelIdentity)
     }
-    const identity = channelPriceIdentityKey(model.channel_brand, model.channel_key, model.name)
+    const identity = channelPriceIdentityKey(model.channel_auth_type, model.channel_brand, model.channel_key, model.name)
     if (!identity) {
       continue
     }
@@ -438,11 +476,13 @@ const priceRows = computed<PriceDisplayRow[]>(() => {
     if (renderedPriceIds.has(price.id)) {
       continue
     }
-    const identity = channelPriceIdentityKey(price.channel_brand, price.channel_key, price.model)
-    const channelIdentity = channelIdentityKey(price.channel_brand, price.channel_key)
+    const identity = channelPriceIdentityKey(price.channel_auth_type, price.channel_brand, price.channel_key, price.model)
+    const channelIdentity = channelIdentityKey(price.channel_auth_type, price.channel_brand, price.channel_key)
     const identityStatuses = identity ? catalogStatuses.get(identity) : undefined
     let unmatchedStatus: UnmatchedChannelStatus = 'orphan'
-    if (catalog.value?.channels_available === false) {
+    if (price.channel_auth_type === 'oauth' && catalog.value?.oauth_channels_available === false) {
+      unmatchedStatus = 'unavailable'
+    } else if (price.channel_auth_type !== 'oauth' && catalog.value?.channels_available === false) {
       unmatchedStatus = 'unavailable'
     } else if (identityStatuses?.has('conflict')) {
       unmatchedStatus = 'conflict'
@@ -725,6 +765,7 @@ const channelCount = computed(
   () => new Set(
     (catalog.value?.models ?? []).map((model) => channelFilterKey(
       'channel',
+      model.channel_auth_type,
       model.channel_brand,
       model.channel_key,
       model.channel_identity_hash,
@@ -751,6 +792,17 @@ const catalogNotice = computed(() => {
     return t(
       `读取渠道配置失败：${detail}。当前仍可查看和维护通用价格。`,
       `Failed to load channel configuration: ${detail}. Library prices remain available.`,
+    )
+  }
+  if (!current.oauth_channels_available && current.oauth_channel_error) {
+    const detail = serverText(
+      current.oauth_channel_error,
+      'OAuth 账号池暂时不可用',
+      'OAuth account pools are unavailable',
+    )
+    return t(
+      `读取 OAuth 账号池失败：${detail}。API Key 渠道和通用价格仍可正常使用。`,
+      `Failed to load OAuth account pools: ${detail}. API key channels and library prices remain available.`,
     )
   }
   return ''
@@ -865,6 +917,7 @@ function resetForm() {
   form.provider = ''
   form.model = ''
   form.price_scope = 'library'
+  form.channel_auth_type = null
   form.channel_brand = null
   form.channel_key = null
   form.channel_identity_hash = null
@@ -909,6 +962,7 @@ function openCreate(prefill: Partial<ModelPricePayload> = {}, channelLabel = '')
   form.provider = prefill.provider ?? ''
   form.model = prefill.model ?? ''
   form.price_scope = prefill.price_scope ?? 'library'
+  form.channel_auth_type = prefill.channel_auth_type ?? null
   form.channel_brand = prefill.channel_brand ?? null
   form.channel_key = prefill.channel_key ?? null
   form.channel_identity_hash = prefill.channel_identity_hash ?? null
@@ -929,6 +983,7 @@ function openCreateForRow(row: PriceDisplayRow) {
     provider: row.suggested_provider || row.channelBrand || row.provider,
     model: row.model,
     price_scope: 'channel',
+    channel_auth_type: row.channelAuthType,
     channel_brand: row.channelBrand,
     channel_key: row.channelKey,
     channel_identity_hash: row.channelIdentityHash,
@@ -952,6 +1007,7 @@ function openEdit(row: PriceDisplayRow) {
   form.provider = price.provider
   form.model = price.model
   form.price_scope = price.price_scope
+  form.channel_auth_type = price.channel_auth_type
   form.channel_brand = price.channel_brand
   form.channel_key = price.channel_key
   form.channel_identity_hash = row.channelIdentityHash
@@ -1012,6 +1068,7 @@ async function savePrice() {
     provider: form.provider.trim(),
     model: form.model.trim(),
     price_scope: form.price_scope,
+    channel_auth_type: form.channel_auth_type,
     channel_brand: form.channel_brand,
     channel_key: form.channel_key,
     channel_identity_hash: form.channel_identity_hash,
@@ -1031,7 +1088,7 @@ async function savePrice() {
   }
   if (
     payload.price_scope === 'channel' &&
-    (!payload.channel_brand || !payload.channel_key || (editingId.value === null && !payload.channel_identity_hash))
+    (!payload.channel_auth_type || !payload.channel_brand || !payload.channel_key || (editingId.value === null && !payload.channel_identity_hash))
   ) {
     message.error(t('渠道标识不完整，请刷新页面后重试', 'Channel identity is incomplete. Refresh and try again.'))
     return
@@ -1532,7 +1589,6 @@ function renderModelCell(row: PriceTableRow) {
               size: 'small',
               type: 'success',
               bordered: false,
-              style: { marginLeft: '16px' },
             },
             { default: () => t('渠道模型', 'Channel model') },
           )

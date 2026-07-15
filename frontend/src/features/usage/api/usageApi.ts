@@ -5,11 +5,17 @@ import type {
   UsageFilters,
   UsageOptionsResponse,
   UsageOverviewResponse,
+  UsageRankingSort,
   UsageRankingsResponse,
   UsageRecordDetail,
   UsageRecordsResponse,
   UsageSummary,
 } from '@/shared/types/api'
+
+interface UsageOverviewRankingSorts {
+  primary: UsageRankingSort
+  model: UsageRankingSort
+}
 
 function filtersToParams(
   filters: UsageFilters,
@@ -40,10 +46,12 @@ export function getUsageTrends(filters: UsageFilters): Promise<TrendPoint[]> {
 export function getUsageRankings(
   filters: UsageFilters,
   groupBy: 'api_key_description' | 'model' | 'user',
+  sortBy: UsageRankingSort = 'tokens',
 ): Promise<UsageRankingsResponse> {
   return apiClient.get<UsageRankingsResponse>('/usage/rankings', {
     ...filtersToParams(filters),
     group_by: groupBy,
+    sort_by: sortBy,
   })
 }
 
@@ -53,8 +61,15 @@ export function getUsageDistributions(
   return apiClient.get<UsageDistributionsResponse>('/usage/distributions', filtersToParams(filters))
 }
 
-export function getUsageOverview(filters: UsageFilters): Promise<UsageOverviewResponse> {
-  return apiClient.get<UsageOverviewResponse>('/usage/overview', filtersToParams(filters))
+export function getUsageOverview(
+  filters: UsageFilters,
+  rankingSorts?: UsageOverviewRankingSorts,
+): Promise<UsageOverviewResponse> {
+  return apiClient.get<UsageOverviewResponse>('/usage/overview', {
+    ...filtersToParams(filters),
+    primary_ranking_sort: rankingSorts?.primary,
+    model_ranking_sort: rankingSorts?.model,
+  })
 }
 
 export function getUsageRecords(

@@ -631,6 +631,72 @@ func TestRecordCostTotalOnlySkipsBreakdownItems(t *testing.T) {
 	}
 }
 
+func TestRankingFromRecordsSortsBeforeTwentyItemLimit(t *testing.T) {
+	provider := "ranking-vendor"
+	brand := string(aiProviderBrandOpenAICompatibility)
+	authType := modelPriceChannelAuthTypeAPIKey
+	prices := modelPriceIndex{}
+	records := make([]UsageRecord, 0, 45)
+	for index := 0; index < 20; index++ {
+		model := fmt.Sprintf("token-heavy-image-%02d", index)
+		requestUSD := 1.0
+		prices[channelModelPriceKey(authType, brand, provider, model)] = ModelPrice{
+			ID:              index + 1,
+			Provider:        provider,
+			Model:           model,
+			PriceScope:      modelPriceScopeChannel,
+			ChannelAuthType: &authType,
+			ChannelBrand:    &brand,
+			ChannelKey:      &provider,
+			RequestUSD:      &requestUSD,
+		}
+		records = append(records, UsageRecord{
+			Provider:    &provider,
+			Model:       &model,
+			TotalTokens: 1_000 + index,
+		})
+	}
+	specialModel := "low-token-high-cost-and-records-image"
+	specialRequestUSD := 4.0
+	prices[channelModelPriceKey(authType, brand, provider, specialModel)] = ModelPrice{
+		ID:              100,
+		Provider:        provider,
+		Model:           specialModel,
+		PriceScope:      modelPriceScopeChannel,
+		ChannelAuthType: &authType,
+		ChannelBrand:    &brand,
+		ChannelKey:      &provider,
+		RequestUSD:      &specialRequestUSD,
+	}
+	for index := 0; index < 25; index++ {
+		records = append(records, UsageRecord{
+			Provider:    &provider,
+			Model:       &specialModel,
+			TotalTokens: 1,
+		})
+	}
+	specialKey := provider + "::" + specialModel
+
+	tokenItems := rankingFromRecords(records, prices, "model", nil)["items"].([]map[string]any)
+	if len(tokenItems) != 20 {
+		t.Fatalf("token ranking length = %d, want 20", len(tokenItems))
+	}
+	for _, item := range tokenItems {
+		if item["key"] == specialKey {
+			t.Fatalf("low-token group unexpectedly entered token top 20: %#v", item)
+		}
+	}
+	for _, sortBy := range []string{usageRankingSortCost, usageRankingSortRecords} {
+		items := rankingFromRecordsBySort(records, prices, "model", nil, sortBy)["items"].([]map[string]any)
+		if len(items) != 20 || items[0]["key"] != specialKey {
+			t.Fatalf("%s ranking = %#v, want special group first in capped top 20", sortBy, items)
+		}
+	}
+	if _, ok := usageRankingSort("invalid"); ok {
+		t.Fatal("invalid ranking sort was accepted")
+	}
+}
+
 func TestRecordCostBreakdownPrefersExplicitCacheReadTokens(t *testing.T) {
 	provider := "openai"
 	model := "gpt-test"
@@ -3713,6 +3779,135 @@ func TestModelPriceCatalogAllowsNativeNamedOpenAICompatibilityWithoutNativeCandi
 	}
 }
 
+func TestChannelCostItemsGroupConcreteChannelsAcrossModels(t *testing.T) {
+	provider := "codex"
+	apiKeyAuthType := modelPriceChannelAuthTypeAPIKey
+	oauthAuthType := modelPriceChannelAuthTypeOAuth
+	brand := string(aiProviderBrandCodex)
+	apiKeyChannel := "codex-api-key-auth-index"
+	oauthChannel := modelPriceOAuthPoolChannelKey
+	modelA := "gpt-channel-a"
+	modelB := "gpt-channel-b"
+	unpricedModel := "gpt-unpriced"
+	apiKeyPriceA := 1.0
+	apiKeyPriceB := 2.0
+	oauthPrice := 4.0
+
+	prices := modelPriceIndex{
+		channelModelPriceKey(apiKeyAuthType, brand, apiKeyChannel, modelA): {
+			ID:                 1,
+			Provider:           provider,
+			Model:              modelA,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelAuthType:    &apiKeyAuthType,
+			ChannelBrand:       &brand,
+			ChannelKey:         &apiKeyChannel,
+			InputUSDPerMillion: apiKeyPriceA,
+		},
+		channelModelPriceKey(apiKeyAuthType, brand, apiKeyChannel, modelB): {
+			ID:                 2,
+			Provider:           provider,
+			Model:              modelB,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelAuthType:    &apiKeyAuthType,
+			ChannelBrand:       &brand,
+			ChannelKey:         &apiKeyChannel,
+			InputUSDPerMillion: apiKeyPriceB,
+		},
+		channelModelPriceKey(oauthAuthType, brand, oauthChannel, modelA): {
+			ID:                 3,
+			Provider:           provider,
+			Model:              modelA,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelAuthType:    &oauthAuthType,
+			ChannelBrand:       &brand,
+			ChannelKey:         &oauthChannel,
+			InputUSDPerMillion: oauthPrice,
+		},
+	}
+	matchContext := modelPriceMatchContext{
+		Selectors: modelPriceChannelSelectorIndex{
+			modelPriceChannelIdentityKey(aiProviderBrandCodex, apiKeyChannel, modelA): 1,
+			modelPriceChannelIdentityKey(aiProviderBrandCodex, apiKeyChannel, modelB): 1,
+		},
+		ChannelLabels: modelPriceChannelLabelIndex{
+			modelPriceChannelGroupIdentityKey(apiKeyAuthType, aiProviderBrandCodex, apiKeyChannel): {
+				Label: "sk-...cafe",
+			},
+		},
+		SelectorsAvailable: true,
+	}
+	apiKeyAuth := "apikey"
+	oauthAuth := "oauth"
+	records := []UsageRecord{
+		{Provider: &provider, Model: &modelA, Auth: &apiKeyAuth, AuthIndex: &apiKeyChannel, InputTokens: 1_000_000, TotalTokens: 1_000_000},
+		{Provider: &provider, Model: &modelB, Auth: &apiKeyAuth, AuthIndex: &apiKeyChannel, InputTokens: 1_000_000, TotalTokens: 1_000_000},
+		{Provider: &provider, Model: &modelA, Auth: &oauthAuth, AuthIndex: &apiKeyChannel, InputTokens: 1_000_000, TotalTokens: 1_000_000},
+		{Provider: &provider, Model: &unpricedModel, Auth: &apiKeyAuth, AuthIndex: &apiKeyChannel, InputTokens: 1_000_000, TotalTokens: 1_000_000},
+	}
+
+	distributions := distributionsFromRecords(records, prices, matchContext)
+	items := distributions["channel_costs"].([]usageChannelCostItem)
+	if len(items) != 2 {
+		t.Fatalf("channel cost items = %#v, want OAuth and API Key groups", items)
+	}
+	if items[0].Label != "Codex OAuth" || items[0].EstimatedCostUSD != 4 {
+		t.Fatalf("first channel cost = %#v, want Codex OAuth cost 4", items[0])
+	}
+	if items[1].Label != "sk-...cafe" || items[1].EstimatedCostUSD != 3 {
+		t.Fatalf("second channel cost = %#v, want grouped API Key cost 3", items[1])
+	}
+	itemTotal := mathRound(items[0].EstimatedCostUSD+items[1].EstimatedCostUSD, 8)
+	summary := usageSummaryFromRecords(UsageFilters{}, records, prices, matchContext)
+	if itemTotal != summary["estimated_cost_usd"].(float64) {
+		t.Fatalf("channel cost total = %v, summary = %v", itemTotal, summary["estimated_cost_usd"])
+	}
+	if summary["unpriced_records"].(int) != 1 {
+		t.Fatalf("unpriced records = %v, want 1", summary["unpriced_records"])
+	}
+	for _, item := range items {
+		if strings.Contains(item.Key, apiKeyChannel) || strings.Contains(item.Label, apiKeyChannel) {
+			t.Fatalf("channel cost item exposed raw selector: %#v", item)
+		}
+	}
+	fallbackContext := matchContext
+	fallbackContext.ChannelLabels = modelPriceChannelLabelIndex{
+		modelPriceChannelGroupIdentityKey(apiKeyAuthType, aiProviderBrandCodex, apiKeyChannel): {
+			Label:         "密钥 identityhash",
+			LabelFallback: true,
+		},
+	}
+	fallbackItems := channelCostItems(records[:3], prices, fallbackContext)
+	var fallbackItem *usageChannelCostItem
+	for index := range fallbackItems {
+		if fallbackItems[index].ChannelAuthType == modelPriceChannelAuthTypeAPIKey {
+			fallbackItem = &fallbackItems[index]
+			break
+		}
+	}
+	if fallbackItem == nil || !fallbackItem.LabelFallback || fallbackItem.Label != "" || fallbackItem.ChannelBrand != brand {
+		t.Fatalf("unavailable channel cost item = %#v, want language-neutral Codex API Key fallback metadata", fallbackItem)
+	}
+	if emptyItems := channelCostItems(nil, prices, matchContext); len(emptyItems) != 0 {
+		t.Fatalf("empty channel cost items = %#v, want empty", emptyItems)
+	}
+	allUnpricedRecords := []UsageRecord{{
+		Provider:    &provider,
+		Model:       &unpricedModel,
+		Auth:        &apiKeyAuth,
+		AuthIndex:   &apiKeyChannel,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}}
+	if unpricedItems := channelCostItems(allUnpricedRecords, prices, matchContext); len(unpricedItems) != 0 {
+		t.Fatalf("all-unpriced channel cost items = %#v, want empty", unpricedItems)
+	}
+	allUnpricedSummary := usageSummaryFromRecords(UsageFilters{}, allUnpricedRecords, prices, matchContext)
+	if allUnpricedSummary["estimated_cost_usd"].(float64) != 0 || allUnpricedSummary["unpriced_records"].(int) != 1 {
+		t.Fatalf("all-unpriced summary = %#v, want zero cost and one unpriced record", allUnpricedSummary)
+	}
+}
+
 func TestModelPriceChannelSelectorUsesNameOnlyForOpenAICompatibility(t *testing.T) {
 	masked := "sk-...1234"
 	authIndex := "auth-index"
@@ -3733,8 +3928,8 @@ func TestModelPriceChannelSelectorUsesNameOnlyForOpenAICompatibility(t *testing.
 		IdentityHash: "identity",
 		AuthIndex:    &authIndex,
 	})
-	if key != authIndex || label != authIndex || !fallback {
-		t.Fatalf("auth-index-only selector = %q/%q/%v, want auth index fallback label", key, label, fallback)
+	if key != authIndex || label != "密钥 identity" || !fallback {
+		t.Fatalf("auth-index-only selector = %q/%q/%v, want non-secret identity fallback label", key, label, fallback)
 	}
 	key, label, fallback = modelPriceChannelSelector(aiProviderItem{
 		Brand:        aiProviderBrandOpenAICompatibility,
@@ -3856,6 +4051,235 @@ func newModelPriceCatalogManagementServer(t *testing.T, responses map[string]any
 			http.NotFound(w, r)
 		}
 	}))
+}
+
+func TestOAuthPoolCatalogAndBillingIgnoreAccountAuthIndex(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-management-key" {
+			t.Fatalf("management Authorization = %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		case "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": "codex-a.json", "type": "codex", "status": "active"},
+				{"name": "codex-b.json", "type": "codex", "status": "active"},
+			}})
+		case "/v0/management/auth-files/models":
+			if name := r.URL.Query().Get("name"); name != "codex-a.json" && name != "codex-b.json" {
+				t.Fatalf("auth file model query name = %q", name)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"models": []map[string]any{{"id": "gpt-oauth-test"}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(ctx, cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	var catalog ModelPriceCatalogResponse
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/catalog", nil, cookies, &catalog)
+	if !catalog.OAuthChannelsAvailable || catalog.OAuthChannelError != nil || len(catalog.Models) != 1 {
+		t.Fatalf("OAuth catalog = %#v", catalog)
+	}
+	item := catalog.Models[0]
+	if item.ChannelAuthType != modelPriceChannelAuthTypeOAuth || item.ChannelBrand != "codex" || item.ChannelKey != modelPriceOAuthPoolChannelKey || item.ChannelAccountCount != 2 {
+		t.Fatalf("OAuth catalog item = %#v", item)
+	}
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       item.SuggestedProvider,
+		"model":                          item.Name,
+		"price_scope":                    modelPriceScopeChannel,
+		"channel_auth_type":              "oauth2",
+		"channel_brand":                  item.ChannelBrand,
+		"channel_key":                    item.ChannelKey,
+		"channel_identity_hash":          item.ChannelIdentityHash,
+		"input_usd_per_million":          2,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+	}, cookies, http.StatusUnprocessableEntity)
+
+	var created ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       item.SuggestedProvider,
+		"model":                          item.Name,
+		"price_scope":                    modelPriceScopeChannel,
+		"channel_auth_type":              item.ChannelAuthType,
+		"channel_brand":                  item.ChannelBrand,
+		"channel_key":                    item.ChannelKey,
+		"channel_identity_hash":          item.ChannelIdentityHash,
+		"input_usd_per_million":          2,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+	}, cookies, &created)
+	if created.ChannelAuthType == nil || *created.ChannelAuthType != modelPriceChannelAuthTypeOAuth {
+		t.Fatalf("created OAuth price = %#v", created)
+	}
+
+	pricing, err := app.billingPriceIndexWithoutSelectors(ctx)
+	if err != nil {
+		t.Fatalf("billingPriceIndexWithoutSelectors failed: %v", err)
+	}
+	if pricing.MatchContext.SelectorsRequired {
+		t.Fatal("OAuth-only price index should not require API key selectors")
+	}
+	provider, model, authType, authIndex := "codex", item.Name, "oauth", "different-account.json"
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		Auth:        &authType,
+		AuthIndex:   &authIndex,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, pricing.Prices)
+	if breakdown.Unpriced || breakdown.TotalUSD != 2 {
+		t.Fatalf("OAuth pool breakdown = %#v, want priced total 2", breakdown)
+	}
+
+	apiKeyAuth := "apikey"
+	breakdown = calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		Auth:        &apiKeyAuth,
+		AuthIndex:   &authIndex,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, pricing.Prices)
+	if !breakdown.Unpriced {
+		t.Fatalf("API key record must not use OAuth pool price: %#v", breakdown)
+	}
+}
+
+func TestOAuthPoolBillingRejectsAmbiguousGoogleProviderAlias(t *testing.T) {
+	provider := "google"
+	model := "google-oauth-ambiguous"
+	authType := modelPriceChannelAuthTypeOAuth
+	poolKey := modelPriceOAuthPoolChannelKey
+
+	for _, brand := range []aiProviderBrand{aiProviderBrandGemini, aiProviderBrandVertex} {
+		t.Run(string(brand), func(t *testing.T) {
+			brandValue := string(brand)
+			prices := modelPriceIndex{
+				channelModelPriceKey(authType, brandValue, poolKey, model): {
+					ID:                 1,
+					Provider:           brandValue,
+					Model:              model,
+					PriceScope:         modelPriceScopeChannel,
+					ChannelAuthType:    &authType,
+					ChannelBrand:       &brandValue,
+					ChannelKey:         &poolKey,
+					InputUSDPerMillion: 2,
+				},
+			}
+			breakdown := calculateRecordCostBreakdown(UsageRecord{
+				Provider:    &provider,
+				Model:       &model,
+				Auth:        &authType,
+				InputTokens: 1_000_000,
+				TotalTokens: 1_000_000,
+			}, prices)
+			if !breakdown.Unpriced || breakdown.TotalUSD != 0 || breakdown.UnpricedReason == nil || *breakdown.UnpricedReason != priceMatchStatusChannelConflict {
+				t.Fatalf("ambiguous Google OAuth breakdown = %#v, want channel conflict with zero cost", breakdown)
+			}
+		})
+	}
+}
+
+func TestValidatePricePayloadDefaultsOnlyMissingOrBlankChannelAuthType(t *testing.T) {
+	brand := string(aiProviderBrandCodex)
+	channelKey := "api-key-channel"
+	basePayload := modelPricePayload{
+		Provider:     "codex",
+		Model:        "gpt-auth-type-test",
+		PriceScope:   modelPriceScopeChannel,
+		ChannelBrand: &brand,
+		ChannelKey:   &channelKey,
+	}
+
+	blank := "  "
+	for name, authType := range map[string]*string{"missing": nil, "blank": &blank} {
+		t.Run(name, func(t *testing.T) {
+			payload := basePayload
+			payload.ChannelAuthType = authType
+			validated, err := validatePricePayload(payload)
+			if err != nil {
+				t.Fatalf("validatePricePayload failed: %v", err)
+			}
+			if validated.ChannelAuthType == nil || *validated.ChannelAuthType != modelPriceChannelAuthTypeAPIKey {
+				t.Fatalf("channel auth type = %#v, want apikey", validated.ChannelAuthType)
+			}
+		})
+	}
+
+	unknown := "oauth2"
+	invalidPayload := basePayload
+	invalidPayload.ChannelAuthType = &unknown
+	if _, err := validatePricePayload(invalidPayload); err == nil {
+		t.Fatal("unknown channel auth type was accepted")
+	}
+}
+
+func TestModelPriceCatalogRejectsMalformedOAuthFileListItems(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/auth-files": map[string]any{
+			"files": []any{
+				map[string]any{"name": "codex-a.json", "type": "codex"},
+				"invalid-auth-file-item",
+			},
+		},
+	})
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(ctx, cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+
+	catalog, err := app.modelPriceCatalog(ctx)
+	if err != nil {
+		t.Fatalf("modelPriceCatalog failed: %v", err)
+	}
+	if catalog.OAuthChannelsAvailable || catalog.OAuthChannelError == nil || !strings.Contains(*catalog.OAuthChannelError, "auth-files 响应不是有效列表") {
+		t.Fatalf("OAuth catalog availability = %v/%v, want explicit malformed-list error", catalog.OAuthChannelsAvailable, catalog.OAuthChannelError)
+	}
 }
 
 func TestLiteLLMSyncUsesConfiguredHTTPProxy(t *testing.T) {

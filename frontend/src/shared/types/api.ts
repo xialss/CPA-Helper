@@ -395,6 +395,8 @@ export interface RankingItem {
   api_key_description: string | null
 }
 
+export type UsageRankingSort = 'tokens' | 'cost' | 'records'
+
 export interface UsageRankingsResponse {
   group_by: 'api_key_description' | 'model' | 'user'
   items: RankingItem[]
@@ -408,10 +410,20 @@ export interface DistributionItem {
   estimated_cost_usd: number
 }
 
+export interface UsageChannelCostItem {
+  key: string
+  label: string
+  label_fallback: boolean
+  channel_auth_type: 'apikey' | 'oauth'
+  channel_brand: string
+  estimated_cost_usd: number
+}
+
 export interface UsageDistributionsResponse {
   providers: DistributionItem[]
   models: DistributionItem[]
   endpoints: DistributionItem[]
+  channel_costs: UsageChannelCostItem[]
 }
 
 export interface UsageOptionsResponse {
@@ -529,6 +541,7 @@ export interface ModelPrice {
   provider: string
   model: string
   price_scope: 'library' | 'channel'
+  channel_auth_type: 'apikey' | 'oauth' | null
   channel_brand: string | null
   channel_key: string | null
   input_usd_per_million: number
@@ -551,6 +564,7 @@ export interface ModelPricePayload {
   provider: string
   model: string
   price_scope: 'library' | 'channel'
+  channel_auth_type: 'apikey' | 'oauth' | null
   channel_brand: string | null
   channel_key: string | null
   channel_identity_hash: string | null
@@ -608,6 +622,7 @@ export interface ModelPriceCatalogItem {
   created: number | null
   metadata: Record<string, string | number | boolean | null>
   suggested_provider: string
+  channel_auth_type: 'apikey' | 'oauth'
   channel_brand: string
   channel_key: string
   channel_label: string
@@ -615,6 +630,7 @@ export interface ModelPriceCatalogItem {
   channel_disabled: boolean
   channel_status: 'ready' | 'missing_selector' | 'conflict' | string
   channel_label_fallback: boolean
+  channel_account_count: number
   price: ModelPrice | null
   template_price: ModelPrice | null
   sources: AvailableModelSource[]
@@ -626,6 +642,8 @@ export interface ModelPriceCatalogResponse {
   queryable_api_key_count: number
   channels_available: boolean
   channel_error: string | null
+  oauth_channels_available: boolean
+  oauth_channel_error: string | null
   models: ModelPriceCatalogItem[]
   errors: AvailableModelKeyError[]
   priced_models: number

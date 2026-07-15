@@ -206,6 +206,7 @@ func requireSchemaShape(ctx context.Context, db *sql.DB) error {
 		{"model_prices", "request_usd"},
 		{"model_prices", "priority_multiplier"},
 		{"model_prices", "price_scope"},
+		{"model_prices", "channel_auth_type"},
 		{"model_prices", "channel_brand"},
 		{"model_prices", "channel_key"},
 		{"model_prices", "long_context_threshold_tokens"},

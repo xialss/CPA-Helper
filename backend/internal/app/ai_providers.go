@@ -678,7 +678,11 @@ func (a *App) aiProviderRemoteConfig(ctx context.Context) (AppConfig, map[string
 }
 
 func (a *App) aiProviderManagementPayload(ctx context.Context, cfg AppConfig, method, path string, body any, timeout time.Duration) ([]byte, error) {
-	response, payload, err := a.aiProviderManagementResponse(ctx, cfg, method, path, body, timeout)
+	return a.aiProviderManagementPayloadWithQuery(ctx, cfg, method, path, nil, body, timeout)
+}
+
+func (a *App) aiProviderManagementPayloadWithQuery(ctx context.Context, cfg AppConfig, method, path string, query url.Values, body any, timeout time.Duration) ([]byte, error) {
+	response, payload, err := a.aiProviderManagementResponseWithQuery(ctx, cfg, method, path, query, body, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -689,13 +693,17 @@ func (a *App) aiProviderManagementPayload(ctx context.Context, cfg AppConfig, me
 }
 
 func (a *App) aiProviderManagementResponse(ctx context.Context, cfg AppConfig, method, path string, body any, timeout time.Duration) (*http.Response, []byte, error) {
+	return a.aiProviderManagementResponseWithQuery(ctx, cfg, method, path, nil, body, timeout)
+}
+
+func (a *App) aiProviderManagementResponseWithQuery(ctx context.Context, cfg AppConfig, method, path string, query url.Values, body any, timeout time.Duration) (*http.Response, []byte, error) {
 	managementURL, err := collectorManagementHTTPURL(cfg.Collector.CLIProxyURL)
 	if err != nil {
 		return nil, nil, validationError("CLIProxyAPI 管理地址无效：" + err.Error())
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	response, payload, err := doJSON(requestCtx, httpClient(timeout), method, makeURL(managementURL, path, nil), managementHeaders(cfg.Collector.ManagementKey), body)
+	response, payload, err := doJSON(requestCtx, httpClient(timeout), method, makeURL(managementURL, path, query), managementHeaders(cfg.Collector.ManagementKey), body)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 			return nil, nil, validationError("CLIProxyAPI 管理请求超时，请检查地址和管理密钥")

@@ -18,6 +18,12 @@ import (
 
 var usageEmailPattern = regexp.MustCompile(`(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}`)
 
+const (
+	usageRankingSortTokens  = "tokens"
+	usageRankingSortCost    = "cost"
+	usageRankingSortRecords = "records"
+)
+
 type UsageFilters struct {
 	Scope             string
 	Start             *time.Time
@@ -60,6 +66,15 @@ type UsageRecord struct {
 	TotalTokens         int
 	DedupeKey           string
 	RawJSON             string
+}
+
+type usageChannelCostItem struct {
+	Key              string  `json:"key"`
+	Label            string  `json:"label"`
+	LabelFallback    bool    `json:"label_fallback"`
+	ChannelAuthType  string  `json:"channel_auth_type"`
+	ChannelBrand     string  `json:"channel_brand"`
+	EstimatedCostUSD float64 `json:"estimated_cost_usd"`
 }
 
 func usageAPITime(value time.Time) string {
@@ -294,6 +309,10 @@ func (a *App) usageRankings(w http.ResponseWriter, r *http.Request, filters Usag
 	if groupBy != "api_key_description" && groupBy != "model" && groupBy != "user" {
 		return validationError("group_by 参数无效")
 	}
+	sortBy, ok := usageRankingSort(r.URL.Query().Get("sort_by"))
+	if !ok {
+		return validationError("sort_by 参数无效")
+	}
 	scope := accessScope(user, filters.Scope)
 	if !scope.IsAdmin && groupBy == "user" {
 		writeJSON(w, http.StatusOK, map[string]any{"group_by": "user", "items": []any{}})
@@ -315,7 +334,7 @@ func (a *App) usageRankings(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, rankingFromRecords(records, pricing.Prices, groupBy, users, pricing.MatchContext))
+	writeJSON(w, http.StatusOK, rankingFromRecordsBySort(records, pricing.Prices, groupBy, users, sortBy, pricing.MatchContext))
 	return nil
 }
 
@@ -338,6 +357,14 @@ func (a *App) usageDistributions(w http.ResponseWriter, r *http.Request, filters
 }
 
 func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters UsageFilters, user *AuthUser) error {
+	primaryRankingSort, ok := usageRankingSort(r.URL.Query().Get("primary_ranking_sort"))
+	if !ok {
+		return validationError("primary_ranking_sort 参数无效")
+	}
+	modelRankingSort, ok := usageRankingSort(r.URL.Query().Get("model_ranking_sort"))
+	if !ok {
+		return validationError("model_ranking_sort 参数无效")
+	}
 	scope := accessScope(user, filters.Scope)
 	scoped, err := a.scopedFilters(r.Context(), normalizedUsageFilters(filters), scope)
 	if err != nil {
@@ -355,10 +382,10 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	apiKeyRanking := rankingFromRecords(records, pricing.Prices, "api_key_description", users, pricing.MatchContext)
+	apiKeyRanking := rankingFromRecordsBySort(records, pricing.Prices, "api_key_description", users, primaryRankingSort, pricing.MatchContext)
 	userRanking := map[string]any{"group_by": "user", "items": []any{}}
 	if scope.IsAdmin {
-		userRanking = rankingFromRecords(records, pricing.Prices, "user", users, pricing.MatchContext)
+		userRanking = rankingFromRecordsBySort(records, pricing.Prices, "user", users, primaryRankingSort, pricing.MatchContext)
 	}
 	options, err := a.usageOptionsResponse(r.Context(), user, usageOptionFilters(filters))
 	if err != nil {
@@ -370,7 +397,7 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 		"user_ranking":                userRanking,
 		"api_key_description_ranking": apiKeyRanking,
 		"api_key_ranking":             apiKeyRanking,
-		"model_ranking":               rankingFromRecords(records, pricing.Prices, "model", users, pricing.MatchContext),
+		"model_ranking":               rankingFromRecordsBySort(records, pricing.Prices, "model", users, modelRankingSort, pricing.MatchContext),
 		"distributions":               distributionsFromRecords(records, pricing.Prices, pricing.MatchContext),
 		"options":                     options,
 	})
@@ -968,6 +995,10 @@ func trendPointsFromRecords(filters UsageFilters, records []UsageRecord, prices 
 }
 
 func rankingFromRecords(records []UsageRecord, prices map[[2]string]ModelPrice, groupBy string, users map[string]userInfo, matchContexts ...modelPriceMatchContext) map[string]any {
+	return rankingFromRecordsBySort(records, prices, groupBy, users, usageRankingSortTokens, matchContexts...)
+}
+
+func rankingFromRecordsBySort(records []UsageRecord, prices map[[2]string]ModelPrice, groupBy string, users map[string]userInfo, sortBy string, matchContexts ...modelPriceMatchContext) map[string]any {
 	grouped := map[string][]UsageRecord{}
 	labels := map[string]string{}
 	userIDs := map[string]*int{}
@@ -1029,17 +1060,51 @@ func rankingFromRecords(records []UsageRecord, prices map[[2]string]ModelPrice, 
 		items = append(items, rankingItem(key, labels[key], len(group), failed, tokens, cost, userIDs[key], descriptions[key]))
 	}
 	sort.Slice(items, func(i, j int) bool {
+		leftMetric := rankingItemSortMetric(items[i], sortBy)
+		rightMetric := rankingItemSortMetric(items[j], sortBy)
+		if leftMetric != rightMetric {
+			return leftMetric > rightMetric
+		}
 		leftTokens := items[i]["total_tokens"].(int)
 		rightTokens := items[j]["total_tokens"].(int)
-		if leftTokens == rightTokens {
-			return items[i]["records"].(int) > items[j]["records"].(int)
+		if leftTokens != rightTokens {
+			return leftTokens > rightTokens
 		}
-		return leftTokens > rightTokens
+		leftRecords := items[i]["records"].(int)
+		rightRecords := items[j]["records"].(int)
+		if leftRecords != rightRecords {
+			return leftRecords > rightRecords
+		}
+		return items[i]["label"].(string) < items[j]["label"].(string)
 	})
 	if len(items) > 20 {
 		items = items[:20]
 	}
 	return map[string]any{"group_by": groupBy, "items": items}
+}
+
+func usageRankingSort(value string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if normalized == "" {
+		return usageRankingSortTokens, true
+	}
+	switch normalized {
+	case usageRankingSortTokens, usageRankingSortCost, usageRankingSortRecords:
+		return normalized, true
+	default:
+		return "", false
+	}
+}
+
+func rankingItemSortMetric(item map[string]any, sortBy string) float64 {
+	switch sortBy {
+	case usageRankingSortCost:
+		return item["estimated_cost_usd"].(float64)
+	case usageRankingSortRecords:
+		return float64(item["records"].(int))
+	default:
+		return float64(item["total_tokens"].(int))
+	}
 }
 
 func rankingItem(key, label string, records, failed, tokens int, cost float64, userID *int, description *string) map[string]any {
@@ -1057,10 +1122,64 @@ func rankingItem(key, label string, records, failed, tokens int, cost float64, u
 
 func distributionsFromRecords(records []UsageRecord, prices map[[2]string]ModelPrice, matchContexts ...modelPriceMatchContext) map[string]any {
 	return map[string]any{
-		"providers": distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Provider, "unknown") }, matchContexts...),
-		"models":    distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Model, "unknown") }, matchContexts...),
-		"endpoints": distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Endpoint, "unknown") }, matchContexts...),
+		"providers":     distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Provider, "unknown") }, matchContexts...),
+		"models":        distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Model, "unknown") }, matchContexts...),
+		"endpoints":     distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Endpoint, "unknown") }, matchContexts...),
+		"channel_costs": channelCostItems(records, prices, matchContexts...),
 	}
+}
+
+func channelCostItems(records []UsageRecord, prices map[[2]string]ModelPrice, matchContexts ...modelPriceMatchContext) []usageChannelCostItem {
+	matchContext := modelPriceMatchContext{}
+	if len(matchContexts) > 0 {
+		matchContext = matchContexts[0]
+	}
+	itemsByIdentity := map[modelPriceChannelGroupIdentity]usageChannelCostItem{}
+	for _, record := range records {
+		matchedPrice, status := findMatchingChannelPrice(prices, record, matchContext)
+		if status != priceMatchStatusMatched || matchedPrice == nil {
+			continue
+		}
+		amount, unpriced := recordCost(record, prices, matchContext)
+		if unpriced || amount <= 0 {
+			continue
+		}
+		identity, ok := modelPriceChannelGroupIdentityForPrice(*matchedPrice)
+		if !ok {
+			continue
+		}
+		display := modelPriceChannelDisplayForPrice(*matchedPrice, matchContext)
+		item := itemsByIdentity[identity]
+		if item.Key == "" {
+			label := display.Label
+			if display.LabelFallback {
+				label = ""
+			}
+			item = usageChannelCostItem{
+				Key:             hashAPIKey("usage-channel-cost\x00" + identity.AuthType + "\x00" + string(identity.Brand) + "\x00" + identity.ChannelKey),
+				Label:           label,
+				LabelFallback:   display.LabelFallback,
+				ChannelAuthType: identity.AuthType,
+				ChannelBrand:    string(identity.Brand),
+			}
+		}
+		item.EstimatedCostUSD = mathRound(item.EstimatedCostUSD+amount, 8)
+		itemsByIdentity[identity] = item
+	}
+	items := make([]usageChannelCostItem, 0, len(itemsByIdentity))
+	for _, item := range itemsByIdentity {
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].EstimatedCostUSD != items[j].EstimatedCostUSD {
+			return items[i].EstimatedCostUSD > items[j].EstimatedCostUSD
+		}
+		if items[i].Label != items[j].Label {
+			return items[i].Label < items[j].Label
+		}
+		return items[i].Key < items[j].Key
+	})
+	return items
 }
 
 func distributionItems(records []UsageRecord, prices map[[2]string]ModelPrice, keyFn func(UsageRecord) string, matchContexts ...modelPriceMatchContext) []map[string]any {
@@ -1191,6 +1310,16 @@ func isAPIKeyAuth(authType *string) bool {
 	normalized = strings.ReplaceAll(normalized, "-", "")
 	normalized = strings.ReplaceAll(normalized, "_", "")
 	return normalized == "apikey"
+}
+
+func isOAuthAuth(authType *string) bool {
+	if authType == nil {
+		return false
+	}
+	normalized := strings.ToLower(strings.TrimSpace(*authType))
+	normalized = strings.ReplaceAll(normalized, "-", "")
+	normalized = strings.ReplaceAll(normalized, "_", "")
+	return normalized == "oauth"
 }
 
 func redactedRawJSON(rawJSON string, authType *string, redaction usageRedactionOptions) any {
