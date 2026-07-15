@@ -111,6 +111,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceChannelColumns(t *testing.T) 
 		"request_usd",
 		"priority_multiplier",
 		"price_scope",
+		"channel_auth_type",
 		"channel_brand",
 		"channel_key",
 		"long_context_threshold_tokens",
@@ -119,7 +120,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceChannelColumns(t *testing.T) 
 		"long_context_cache_read_usd_per_million",
 		"long_context_cache_creation_usd_per_million",
 	}
-	for _, missing := range []string{"price_scope", "channel_brand", "channel_key"} {
+	for _, missing := range []string{"price_scope", "channel_auth_type", "channel_brand", "channel_key"} {
 		t.Run(missing, func(t *testing.T) {
 			db, err := sql.Open("sqlite", ":memory:")
 			if err != nil {
@@ -166,7 +167,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceLibraryConflictsTable(t *test
 		`CREATE TABLE users (username TEXT)`,
 		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
 		`CREATE TABLE model_prices (
-			request_usd TEXT, priority_multiplier TEXT, price_scope TEXT, channel_brand TEXT, channel_key TEXT,
+			request_usd TEXT, priority_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
 			long_context_threshold_tokens TEXT, long_context_input_usd_per_million TEXT,
 			long_context_output_usd_per_million TEXT, long_context_cache_read_usd_per_million TEXT,
 			long_context_cache_creation_usd_per_million TEXT

@@ -617,6 +617,118 @@ func TestQuotaDefaultsToUnlimited(t *testing.T) {
 	}
 }
 
+func TestQuotaChargesOAuthPoolWithoutUsingAccountAuthIndex(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	userID := seedQuotaTestUser(t, app, "member")
+	apiKey := "sk-quota-oauth-pool"
+	model := "gpt-oauth-quota"
+	seedQuotaTestAPIKey(t, app, userID, apiKey)
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million, updated_at
+		) VALUES ('codex', ?, 'channel', 'oauth', 'codex', 'oauth_pool', 2, 0, 0, 0, ?)
+	`, model, dbTime(time.Now())); err != nil {
+		t.Fatalf("seed OAuth pool price: %v", err)
+	}
+	lifetime := 5.0
+	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
+		t.Fatalf("update quota: %v", err)
+	}
+	pricing, err := app.billingPriceIndexWithoutSelectors(ctx)
+	if err != nil {
+		t.Fatalf("billingPriceIndexWithoutSelectors failed: %v", err)
+	}
+	if pricing.MatchContext.SelectorsRequired {
+		t.Fatal("OAuth-only pricing should not require API key selectors")
+	}
+
+	oauthRaw := `{"api_key":"` + apiKey + `","provider":"codex","model":"` + model + `","auth_type":"oauth","auth_index":"rotated-account.json","input_tokens":1000000,"request_id":"quota-oauth-pool"}`
+	if _, created, err := app.saveUsageMessage(ctx, []byte(oauthRaw), pricing); err != nil || !created {
+		t.Fatalf("OAuth usage created=%v err=%v", created, err)
+	}
+	user, err := app.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != 3 {
+		t.Fatalf("quota after OAuth pool charge lifetime=%v, want 3", user.QuotaLifetimeUSD)
+	}
+
+	apiKeyRaw := `{"api_key":"` + apiKey + `","provider":"codex","model":"` + model + `","auth_type":"apikey","auth_index":"rotated-account.json","input_tokens":1000000,"request_id":"quota-api-key-same-model"}`
+	if _, created, err := app.saveUsageMessage(ctx, []byte(apiKeyRaw), pricing); err != nil || !created {
+		t.Fatalf("API key usage created=%v err=%v", created, err)
+	}
+	user, err = app.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != 3 || user.QuotaUnpricedRecords != 1 {
+		t.Fatalf("quota after API key non-match lifetime=%v unpriced=%d, want 3/1", user.QuotaLifetimeUSD, user.QuotaUnpricedRecords)
+	}
+}
+
+func TestQuotaDoesNotChargeAmbiguousGoogleOAuthPool(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	userID := seedQuotaTestUser(t, app, "member")
+	apiKey := "sk-quota-google-oauth-conflict"
+	model := "google-oauth-conflict"
+	seedQuotaTestAPIKey(t, app, userID, apiKey)
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million, updated_at
+		) VALUES ('gemini', ?, 'channel', 'oauth', 'gemini', 'oauth_pool', 2, 0, 0, 0, ?)
+	`, model, dbTime(time.Now())); err != nil {
+		t.Fatalf("seed ambiguous OAuth pool price: %v", err)
+	}
+	lifetime := 5.0
+	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
+		t.Fatalf("update quota: %v", err)
+	}
+	pricing, err := app.billingPriceIndexWithoutSelectors(ctx)
+	if err != nil {
+		t.Fatalf("billingPriceIndexWithoutSelectors failed: %v", err)
+	}
+
+	raw := `{"api_key":"` + apiKey + `","provider":"google","model":"` + model + `","auth_type":"oauth","input_tokens":1000000,"request_id":"quota-google-oauth-conflict"}`
+	record, created, err := app.saveUsageMessage(ctx, []byte(raw), pricing)
+	if err != nil || !created {
+		t.Fatalf("ambiguous OAuth usage created=%v err=%v", created, err)
+	}
+	user, err := app.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != lifetime || user.QuotaUnpricedRecords != 1 {
+		t.Fatalf("quota after ambiguous OAuth usage lifetime=%v unpriced=%d, want %v/1", user.QuotaLifetimeUSD, user.QuotaUnpricedRecords, lifetime)
+	}
+	var amount float64
+	var unpriced bool
+	if err := app.db.QueryRow(`SELECT amount_usd, unpriced FROM user_quota_charges WHERE usage_record_id = ?`, record.ID).Scan(&amount, &unpriced); err != nil {
+		t.Fatalf("load ambiguous OAuth quota charge: %v", err)
+	}
+	if amount != 0 || !unpriced {
+		t.Fatalf("ambiguous OAuth quota charge = %v/%v, want 0/true", amount, unpriced)
+	}
+}
+
 func seedQuotaTestUser(t *testing.T, app *App, username string) int {
 	t.Helper()
 	now := dbTime(time.Now())

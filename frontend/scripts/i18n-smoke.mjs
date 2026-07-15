@@ -60,6 +60,7 @@ try {
     localizedApiErrorMessage,
     localizedKeeperStatusDetail,
     localizedServerMessage,
+    localizedUsageChannelFallbackLabel,
     setLanguage,
   } = await server.ssrLoadModule('/src/shared/i18n/index.ts')
 
@@ -96,11 +97,24 @@ try {
     'codex@example.com-plus.json: enabled WebSocket transport',
   )
   assert.equal(localizedKeeperStatusDetail('守护运行中'), 'Automatic inspection running')
+  assert.equal(
+    localizedUsageChannelFallbackLabel('codex', 'apikey'),
+    'Codex API Key (label unavailable)',
+  )
+  assert.equal(
+    localizedUsageChannelFallbackLabel('openai_compatibility', 'apikey'),
+    'OpenAI-compatible channel (label unavailable)',
+  )
 
   setLanguage('zh')
   assert.equal(localizedApiErrorMessage('validation_error', null), '请求参数无效')
   assert.equal(localizedApiErrorMessage(null, null), '请求失败')
   assert.equal(localizedKeeperStatusDetail('守护运行中'), '自动巡检运行中')
+  assert.equal(localizedUsageChannelFallbackLabel('codex', 'apikey'), 'Codex API Key（标签不可用）')
+  assert.equal(
+    localizedUsageChannelFallbackLabel('openai_compatibility', 'apikey'),
+    'OpenAI 兼容渠道（标签不可用）',
+  )
   const { formatCompact, formatMultiplier } = await server.ssrLoadModule('/src/shared/utils/format.ts')
   assert.equal(formatCompact(12_300), '12.3K')
   assert.equal(formatCompact(52_646_000), '52.6M')

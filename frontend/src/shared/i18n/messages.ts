@@ -381,6 +381,34 @@ export function localizedKeeperStatusDetail(message: string | null | undefined):
     : localizedServerMessage(normalized, '运行状态', 'Run status')
 }
 
+function channelBrandLabels(brand: string): readonly [zh: string, en: string] {
+  switch (brand) {
+    case 'gemini':
+      return ['Gemini', 'Gemini']
+    case 'codex':
+      return ['Codex', 'Codex']
+    case 'claude':
+      return ['Claude', 'Claude']
+    case 'vertex':
+      return ['Vertex', 'Vertex']
+    case 'openai_compatibility':
+      return ['OpenAI 兼容', 'OpenAI-compatible']
+    default:
+      return ['未知渠道', 'Unknown channel']
+  }
+}
+
+export function localizedUsageChannelFallbackLabel(brand: string, authType: string): string {
+  const [brandZh, brandEn] = channelBrandLabels(brand)
+  if (authType === 'oauth') {
+    return localize(`${brandZh} OAuth（标签不可用）`, `${brandEn} OAuth (label unavailable)`)
+  }
+  if (brand === 'openai_compatibility') {
+    return localize(`${brandZh}渠道（标签不可用）`, `${brandEn} channel (label unavailable)`)
+  }
+  return localize(`${brandZh} API Key（标签不可用）`, `${brandEn} API Key (label unavailable)`)
+}
+
 export function errorText(
   error: unknown,
   fallbackZh = '请求失败',

@@ -6,7 +6,13 @@ import {
   toggleLanguage,
   useLanguagePreference,
 } from './language'
-import { copiedText, errorText, localizedKeeperStatusDetail, localizedServerMessage } from './messages'
+import {
+  copiedText,
+  errorText,
+  localizedKeeperStatusDetail,
+  localizedServerMessage,
+  localizedUsageChannelFallbackLabel,
+} from './messages'
 
 export {
   currentLanguage,
@@ -17,7 +23,14 @@ export {
   useLanguagePreference,
   type AppLanguage,
 } from './language'
-export { copiedText, errorText, localizedApiErrorMessage, localizedKeeperStatusDetail, localizedServerMessage } from './messages'
+export {
+  copiedText,
+  errorText,
+  localizedApiErrorMessage,
+  localizedKeeperStatusDetail,
+  localizedServerMessage,
+  localizedUsageChannelFallbackLabel,
+} from './messages'
 
 export function useI18n() {
   return {
@@ -26,6 +39,7 @@ export function useI18n() {
     errorText,
     isEnglish,
     keeperStatusText: localizedKeeperStatusDetail,
+    usageChannelFallbackLabel: localizedUsageChannelFallbackLabel,
     language: currentLanguage,
     localize,
     serverText: localizedServerMessage,

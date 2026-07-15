@@ -28,6 +28,9 @@ const usageCostKindRequest = "request"
 const serviceTierPriority = "priority"
 const modelPriceScopeLibrary = "library"
 const modelPriceScopeChannel = "channel"
+const modelPriceChannelAuthTypeAPIKey = "apikey"
+const modelPriceChannelAuthTypeOAuth = "oauth"
+const modelPriceOAuthPoolChannelKey = "oauth_pool"
 const priceMatchStatusMatched = "matched"
 const priceMatchStatusMissingProvider = "missing_provider"
 const priceMatchStatusMissingModel = "missing_model"
@@ -58,6 +61,7 @@ type ModelPrice struct {
 	Provider                   string                                `json:"provider"`
 	Model                      string                                `json:"model"`
 	PriceScope                 string                                `json:"price_scope"`
+	ChannelAuthType            *string                               `json:"channel_auth_type"`
 	ChannelBrand               *string                               `json:"channel_brand"`
 	ChannelKey                 *string                               `json:"channel_key"`
 	InputUSDPerMillion         float64                               `json:"input_usd_per_million"`
@@ -159,6 +163,7 @@ type modelPricePayload struct {
 	Provider                   string                        `json:"provider"`
 	Model                      string                        `json:"model"`
 	PriceScope                 string                        `json:"price_scope"`
+	ChannelAuthType            *string                       `json:"channel_auth_type"`
 	ChannelBrand               *string                       `json:"channel_brand"`
 	ChannelKey                 *string                       `json:"channel_key"`
 	ChannelIdentityHash        *string                       `json:"channel_identity_hash"`
@@ -206,6 +211,7 @@ type ModelPriceCatalogItem struct {
 	Created              *int                   `json:"created"`
 	Metadata             map[string]any         `json:"metadata"`
 	SuggestedProvider    string                 `json:"suggested_provider"`
+	ChannelAuthType      string                 `json:"channel_auth_type"`
 	ChannelBrand         string                 `json:"channel_brand"`
 	ChannelKey           string                 `json:"channel_key"`
 	ChannelLabel         string                 `json:"channel_label"`
@@ -213,26 +219,35 @@ type ModelPriceCatalogItem struct {
 	ChannelDisabled      bool                   `json:"channel_disabled"`
 	ChannelStatus        string                 `json:"channel_status"`
 	ChannelLabelFallback bool                   `json:"channel_label_fallback"`
+	ChannelAccountCount  int                    `json:"channel_account_count"`
 	Price                *ModelPrice            `json:"price"`
 	TemplatePrice        *ModelPrice            `json:"template_price"`
 	Sources              []AvailableModelSource `json:"sources"`
 }
 
 type ModelPriceCatalogResponse struct {
-	HasAPIKeys           bool                     `json:"has_api_keys"`
-	APIKeyCount          int                      `json:"api_key_count"`
-	QueryableAPIKeyCount int                      `json:"queryable_api_key_count"`
-	ChannelsAvailable    bool                     `json:"channels_available"`
-	ChannelError         *string                  `json:"channel_error"`
-	Models               []ModelPriceCatalogItem  `json:"models"`
-	Errors               []AvailableModelKeyError `json:"errors"`
-	PricedModels         int                      `json:"priced_models"`
-	UnpricedModels       int                      `json:"unpriced_models"`
+	HasAPIKeys             bool                     `json:"has_api_keys"`
+	APIKeyCount            int                      `json:"api_key_count"`
+	QueryableAPIKeyCount   int                      `json:"queryable_api_key_count"`
+	ChannelsAvailable      bool                     `json:"channels_available"`
+	ChannelError           *string                  `json:"channel_error"`
+	OAuthChannelsAvailable bool                     `json:"oauth_channels_available"`
+	OAuthChannelError      *string                  `json:"oauth_channel_error"`
+	Models                 []ModelPriceCatalogItem  `json:"models"`
+	Errors                 []AvailableModelKeyError `json:"errors"`
+	PricedModels           int                      `json:"priced_models"`
+	UnpricedModels         int                      `json:"unpriced_models"`
 }
 
 type modelCatalogAPIKey struct {
 	UserAPIKey
 	UserLabel string
+}
+
+type modelPriceOAuthPool struct {
+	Brand        aiProviderBrand
+	AccountCount int
+	Models       []string
 }
 
 type modelPriceIndex map[[2]string]ModelPrice
@@ -247,8 +262,22 @@ type modelPriceChannelIdentity struct {
 
 type modelPriceChannelSelectorIndex map[modelPriceChannelIdentity]int
 
+type modelPriceChannelGroupIdentity struct {
+	AuthType   string
+	Brand      aiProviderBrand
+	ChannelKey string
+}
+
+type modelPriceChannelDisplay struct {
+	Label         string
+	LabelFallback bool
+}
+
+type modelPriceChannelLabelIndex map[modelPriceChannelGroupIdentity]modelPriceChannelDisplay
+
 type modelPriceMatchContext struct {
 	Selectors          modelPriceChannelSelectorIndex
+	ChannelLabels      modelPriceChannelLabelIndex
 	SelectorsRequired  bool
 	SelectorsAvailable bool
 }
@@ -262,6 +291,7 @@ type modelPriceSelectorSnapshotCache struct {
 	mu             sync.RWMutex
 	configKey      string
 	selectors      modelPriceChannelSelectorIndex
+	channelLabels  modelPriceChannelLabelIndex
 	available      bool
 	loadedAt       time.Time
 	expiresAt      time.Time
@@ -280,22 +310,40 @@ func cloneModelPriceChannelSelectors(source modelPriceChannelSelectorIndex) mode
 	return cloned
 }
 
+func cloneModelPriceChannelLabels(source modelPriceChannelLabelIndex) modelPriceChannelLabelIndex {
+	cloned := make(modelPriceChannelLabelIndex, len(source))
+	for identity, display := range source {
+		cloned[identity] = display
+	}
+	return cloned
+}
+
 func (cache *modelPriceSelectorSnapshotCache) snapshot() (modelPriceChannelSelectorIndex, bool) {
+	selectors, _, available := cache.snapshotWithLabels()
+	return selectors, available
+}
+
+func (cache *modelPriceSelectorSnapshotCache) snapshotWithLabels() (modelPriceChannelSelectorIndex, modelPriceChannelLabelIndex, bool) {
 	cache.mu.RLock()
 	defer cache.mu.RUnlock()
 	if !cache.available || !time.Now().Before(cache.expiresAt) {
-		return nil, false
+		return nil, nil, false
 	}
-	return cloneModelPriceChannelSelectors(cache.selectors), true
+	return cloneModelPriceChannelSelectors(cache.selectors), cloneModelPriceChannelLabels(cache.channelLabels), true
 }
 
 func (cache *modelPriceSelectorSnapshotCache) snapshotForConfig(configKey string) (modelPriceChannelSelectorIndex, bool) {
+	selectors, _, available := cache.snapshotForConfigWithLabels(configKey)
+	return selectors, available
+}
+
+func (cache *modelPriceSelectorSnapshotCache) snapshotForConfigWithLabels(configKey string) (modelPriceChannelSelectorIndex, modelPriceChannelLabelIndex, bool) {
 	cache.mu.RLock()
 	defer cache.mu.RUnlock()
 	if configKey == "" || cache.configKey != configKey || !cache.available || !time.Now().Before(cache.expiresAt) {
-		return nil, false
+		return nil, nil, false
 	}
-	return cloneModelPriceChannelSelectors(cache.selectors), true
+	return cloneModelPriceChannelSelectors(cache.selectors), cloneModelPriceChannelLabels(cache.channelLabels), true
 }
 
 func (cache *modelPriceSelectorSnapshotCache) retainConfig(configKey string) {
@@ -333,6 +381,7 @@ func (cache *modelPriceSelectorSnapshotCache) invalidate(configKey string) {
 func (cache *modelPriceSelectorSnapshotCache) resetLocked(configKey string) {
 	cache.configKey = configKey
 	cache.selectors = nil
+	cache.channelLabels = nil
 	cache.available = false
 	cache.loadedAt = time.Time{}
 	cache.expiresAt = time.Time{}
@@ -359,6 +408,10 @@ func (cache *modelPriceSelectorSnapshotCache) beginRefresh(configKey string, now
 }
 
 func (cache *modelPriceSelectorSnapshotCache) finishRefresh(configKey string, generation uint64, done chan struct{}, startedAt time.Time, selectors modelPriceChannelSelectorIndex, refreshErr error) {
+	cache.finishRefreshWithLabels(configKey, generation, done, startedAt, selectors, nil, refreshErr)
+}
+
+func (cache *modelPriceSelectorSnapshotCache) finishRefreshWithLabels(configKey string, generation uint64, done chan struct{}, startedAt time.Time, selectors modelPriceChannelSelectorIndex, channelLabels modelPriceChannelLabelIndex, refreshErr error) {
 	finishedAt := time.Now()
 	var closeDone chan struct{}
 	cache.mu.Lock()
@@ -370,6 +423,7 @@ func (cache *modelPriceSelectorSnapshotCache) finishRefresh(configKey string, ge
 	if cache.configKey == configKey && cache.generation == generation && !startedAt.Before(cache.loadedAt) {
 		if refreshErr == nil {
 			cache.selectors = cloneModelPriceChannelSelectors(selectors)
+			cache.channelLabels = cloneModelPriceChannelLabels(channelLabels)
 			cache.available = true
 			cache.loadedAt = startedAt
 			cache.expiresAt = finishedAt.Add(modelPriceSelectorSnapshotTTL)
@@ -387,12 +441,17 @@ func (cache *modelPriceSelectorSnapshotCache) finishRefresh(configKey string, ge
 }
 
 func (cache *modelPriceSelectorSnapshotCache) store(configKey string, generation uint64, startedAt time.Time, selectors modelPriceChannelSelectorIndex) bool {
+	return cache.storeWithLabels(configKey, generation, startedAt, selectors, nil)
+}
+
+func (cache *modelPriceSelectorSnapshotCache) storeWithLabels(configKey string, generation uint64, startedAt time.Time, selectors modelPriceChannelSelectorIndex, channelLabels modelPriceChannelLabelIndex) bool {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	if cache.configKey != configKey || cache.generation != generation || startedAt.Before(cache.loadedAt) {
 		return false
 	}
 	cache.selectors = cloneModelPriceChannelSelectors(selectors)
+	cache.channelLabels = cloneModelPriceChannelLabels(channelLabels)
 	cache.available = true
 	cache.loadedAt = startedAt
 	storedAt := time.Now()
@@ -633,6 +692,18 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 	payload.Provider = strings.TrimSpace(payload.Provider)
 	payload.Model = strings.TrimSpace(payload.Model)
 	payload.PriceScope = strings.ToLower(strings.TrimSpace(payload.PriceScope))
+	if payload.ChannelAuthType != nil {
+		rawValue := strings.TrimSpace(*payload.ChannelAuthType)
+		if rawValue == "" {
+			payload.ChannelAuthType = nil
+		} else {
+			value := normalizeModelPriceChannelAuthType(rawValue)
+			if value == "" {
+				return payload, validationError("渠道认证类型无效")
+			}
+			payload.ChannelAuthType = &value
+		}
+	}
 	if payload.PriceScope == "" {
 		payload.PriceScope = modelPriceScopeLibrary
 	}
@@ -646,16 +717,27 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 	}
 	switch payload.PriceScope {
 	case modelPriceScopeLibrary:
-		if strings.TrimSpace(aiProviderOptionalString(payload.ChannelBrand)) != "" || strings.TrimSpace(aiProviderOptionalString(payload.ChannelKey)) != "" {
+		if strings.TrimSpace(aiProviderOptionalString(payload.ChannelAuthType)) != "" || strings.TrimSpace(aiProviderOptionalString(payload.ChannelBrand)) != "" || strings.TrimSpace(aiProviderOptionalString(payload.ChannelKey)) != "" {
 			return payload, validationError("通用价格不能包含渠道标识")
 		}
+		payload.ChannelAuthType = nil
 		payload.ChannelBrand = nil
 		payload.ChannelKey = nil
 		payload.ChannelIdentityHash = nil
 	case modelPriceScopeChannel:
+		authType := normalizeModelPriceChannelAuthType(aiProviderOptionalString(payload.ChannelAuthType))
+		if authType == "" {
+			authType = modelPriceChannelAuthTypeAPIKey
+		}
+		if authType != modelPriceChannelAuthTypeAPIKey && authType != modelPriceChannelAuthTypeOAuth {
+			return payload, validationError("渠道认证类型无效")
+		}
 		brand := strings.ToLower(strings.TrimSpace(aiProviderOptionalString(payload.ChannelBrand)))
 		if !isModelPriceChannelBrand(brand) {
 			return payload, validationError("渠道品牌无效")
+		}
+		if authType == modelPriceChannelAuthTypeOAuth && aiProviderBrand(brand) == aiProviderBrandOpenAICompatibility {
+			return payload, validationError("OpenAI 兼容渠道不支持 OAuth 账号池计费")
 		}
 		key := canonicalModelPriceChannelKey(brand, aiProviderOptionalString(payload.ChannelKey))
 		if key == "" || strings.ContainsRune(key, '\x00') {
@@ -665,6 +747,7 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 		if model == "" {
 			return payload, validationError("模型不能为空")
 		}
+		payload.ChannelAuthType = &authType
 		payload.ChannelBrand = &brand
 		payload.ChannelKey = &key
 		payload.Model = model
@@ -698,6 +781,7 @@ func modelPriceFromPayload(payload modelPricePayload, priorityMultiplier *float6
 		Provider:                   payload.Provider,
 		Model:                      payload.Model,
 		PriceScope:                 payload.PriceScope,
+		ChannelAuthType:            payload.ChannelAuthType,
 		ChannelBrand:               payload.ChannelBrand,
 		ChannelKey:                 payload.ChannelKey,
 		InputUSDPerMillion:         payload.InputUSDPerMillion,
@@ -708,6 +792,31 @@ func modelPriceFromPayload(payload modelPricePayload, priorityMultiplier *float6
 		PriorityMultiplier:         priorityMultiplier,
 		LongContext:                longContext,
 	}
+}
+
+func normalizeModelPriceChannelAuthType(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	normalized = strings.ReplaceAll(normalized, "-", "")
+	normalized = strings.ReplaceAll(normalized, "_", "")
+	switch normalized {
+	case "apikey":
+		return modelPriceChannelAuthTypeAPIKey
+	case "oauth":
+		return modelPriceChannelAuthTypeOAuth
+	default:
+		return ""
+	}
+}
+
+func modelPriceChannelAuthType(price ModelPrice) string {
+	if price.PriceScope != modelPriceScopeChannel {
+		return ""
+	}
+	authType := normalizeModelPriceChannelAuthType(aiProviderOptionalString(price.ChannelAuthType))
+	if authType == "" {
+		return modelPriceChannelAuthTypeAPIKey
+	}
+	return authType
 }
 
 func isModelPriceChannelBrand(brand string) bool {
@@ -734,6 +843,9 @@ func normalizeModelPriceChannelModel(model string) string {
 func (a *App) validateChannelPriceCreate(ctx context.Context, payload modelPricePayload) (modelPricePayload, error) {
 	if payload.PriceScope != modelPriceScopeChannel {
 		return payload, nil
+	}
+	if normalizeModelPriceChannelAuthType(aiProviderOptionalString(payload.ChannelAuthType)) == modelPriceChannelAuthTypeOAuth {
+		return a.validateOAuthPoolPriceCreate(ctx, payload)
 	}
 	identityHash := strings.TrimSpace(aiProviderOptionalString(payload.ChannelIdentityHash))
 	if identityHash == "" {
@@ -798,6 +910,40 @@ func (a *App) validateChannelPriceCreate(ctx context.Context, payload modelPrice
 		payload.Provider = string(provider.Brand)
 	}
 	return payload, nil
+}
+
+func (a *App) validateOAuthPoolPriceCreate(ctx context.Context, payload modelPricePayload) (modelPricePayload, error) {
+	identityHash := strings.TrimSpace(aiProviderOptionalString(payload.ChannelIdentityHash))
+	brand := aiProviderBrand(aiProviderOptionalString(payload.ChannelBrand))
+	expectedIdentity := hashAPIKey("model-price:oauth-pool:" + string(brand))
+	if identityHash == "" || identityHash != expectedIdentity || aiProviderOptionalString(payload.ChannelKey) != modelPriceOAuthPoolChannelKey {
+		return payload, conflictError("OAuth 账号池配置已变化，请刷新页面后重试")
+	}
+	cfg, err := a.aiProviderManagementConfig(ctx)
+	if err != nil {
+		return payload, validationError("读取 OAuth 账号池失败：" + err.Error())
+	}
+	pools, err := a.modelPriceOAuthPools(ctx, cfg)
+	if err != nil {
+		return payload, validationError("读取 OAuth 账号池失败：" + err.Error())
+	}
+	requestedModel := normalizeModelPriceChannelModel(payload.Model)
+	for _, pool := range pools {
+		if pool.Brand != brand {
+			continue
+		}
+		for _, model := range pool.Models {
+			if strings.EqualFold(model, requestedModel) {
+				payload.Provider = string(brand)
+				payload.Model = model
+				key := modelPriceOAuthPoolChannelKey
+				payload.ChannelKey = &key
+				return payload, nil
+			}
+		}
+		return payload, validationError("该 OAuth 账号池未提供此模型，请刷新页面后重试")
+	}
+	return payload, conflictError("OAuth 账号池已移除，请刷新页面后重试")
 }
 
 func longContextFromPayload(payload *modelPriceLongContextPayload) (*ModelPriceLongContext, error) {
@@ -870,6 +1016,10 @@ func modelPriceForAPI(price ModelPrice) ModelPrice {
 	if price.PriceScope == "" {
 		price.PriceScope = modelPriceScopeLibrary
 	}
+	if price.PriceScope == modelPriceScopeChannel {
+		authType := modelPriceChannelAuthType(price)
+		price.ChannelAuthType = &authType
+	}
 	if price.PriorityMultiplier != nil && (math.IsNaN(*price.PriorityMultiplier) || math.IsInf(*price.PriorityMultiplier, 0)) {
 		price.PriorityMultiplier = nil
 	}
@@ -925,7 +1075,7 @@ func validatePriorityMultiplierForPrice(price ModelPrice) error {
 
 func (a *App) listPrices(ctx context.Context) ([]ModelPrice, error) {
 	rows, err := a.db.QueryContext(ctx, `
-		SELECT id, provider, model, price_scope, channel_brand, channel_key,
+		SELECT id, provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 		       input_usd_per_million, output_usd_per_million,
 		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
 		       priority_multiplier, long_context_threshold_tokens,
@@ -961,23 +1111,24 @@ func (a *App) billingPriceIndexWithoutSelectors(ctx context.Context) (modelPrice
 }
 
 func (a *App) attachCachedBillingPriceSelectors(result modelPriceBillingIndex) modelPriceBillingIndex {
-	selectors, available := a.priceSelectors.snapshot()
+	selectors, channelLabels, available := a.priceSelectors.snapshotWithLabels()
 	if !available {
 		return result
 	}
-	return attachBillingPriceSelectors(result, selectors)
+	return attachBillingPriceSelectors(result, selectors, channelLabels)
 }
 
 func (a *App) attachCachedBillingPriceSelectorsForConfig(result modelPriceBillingIndex, cfg AppConfig) (modelPriceBillingIndex, bool) {
-	selectors, available := a.priceSelectors.snapshotForConfig(modelPriceSelectorConfigKey(cfg))
+	selectors, channelLabels, available := a.priceSelectors.snapshotForConfigWithLabels(modelPriceSelectorConfigKey(cfg))
 	if !available {
 		return result, false
 	}
-	return attachBillingPriceSelectors(result, selectors), true
+	return attachBillingPriceSelectors(result, selectors, channelLabels), true
 }
 
-func attachBillingPriceSelectors(result modelPriceBillingIndex, selectors modelPriceChannelSelectorIndex) modelPriceBillingIndex {
+func attachBillingPriceSelectors(result modelPriceBillingIndex, selectors modelPriceChannelSelectorIndex, channelLabels modelPriceChannelLabelIndex) modelPriceBillingIndex {
 	result.MatchContext.Selectors = selectors
+	result.MatchContext.ChannelLabels = channelLabels
 	result.MatchContext.SelectorsAvailable = true
 	return result
 }
@@ -1020,10 +1171,12 @@ func (a *App) refreshModelPriceSelectorsIfStale(ctx context.Context, cfg AppConf
 		}
 		providers, err := a.aiProviderConfigSnapshotWithConfig(ctx, cfg)
 		selectors := modelPriceChannelSelectorIndex(nil)
+		channelLabels := modelPriceChannelLabelIndex(nil)
 		if err == nil {
 			selectors = modelPriceChannelSelectors(providers)
+			channelLabels = modelPriceChannelLabels(providers)
 		}
-		a.priceSelectors.finishRefresh(configKey, generation, done, startedAt, selectors, err)
+		a.priceSelectors.finishRefreshWithLabels(configKey, generation, done, startedAt, selectors, channelLabels, err)
 		return err
 	}
 }
@@ -1033,7 +1186,7 @@ func (a *App) storeModelPriceSelectorSnapshot(cfg AppConfig, generation uint64, 
 	if configKey == "" {
 		return false
 	}
-	return a.priceSelectors.store(configKey, generation, startedAt, modelPriceChannelSelectors(providers))
+	return a.priceSelectors.storeWithLabels(configKey, generation, startedAt, modelPriceChannelSelectors(providers), modelPriceChannelLabels(providers))
 }
 
 func (a *App) invalidateModelPriceSelectorSnapshot(cfg AppConfig) {
@@ -1047,23 +1200,20 @@ func channelPricesByKey(prices []ModelPrice) modelPriceIndex {
 			continue
 		}
 		brand := strings.TrimSpace(*price.ChannelBrand)
+		authType := modelPriceChannelAuthType(price)
 		channelKey := canonicalModelPriceChannelKey(brand, *price.ChannelKey)
 		model := normalizeModelPriceChannelModel(price.Model)
 		if channelKey == "" || model == "" {
 			continue
 		}
-		if aiProviderBrand(brand) == aiProviderBrandOpenAICompatibility {
-			result[priceKey(channelKey, model)] = price
-			continue
-		}
-		result[nativeModelPriceKey(brand, channelKey, model)] = price
+		result[channelModelPriceKey(authType, brand, channelKey, model)] = price
 	}
 	return result
 }
 
 func modelPriceIndexNeedsConfiguredSelectors(prices modelPriceIndex) bool {
 	for _, price := range prices {
-		if price.PriceScope == modelPriceScopeChannel {
+		if price.PriceScope == modelPriceScopeChannel && modelPriceChannelAuthType(price) == modelPriceChannelAuthTypeAPIKey {
 			return true
 		}
 	}
@@ -1079,7 +1229,24 @@ func (a *App) libraryPriceMap(ctx context.Context) (libraryPriceIndex, error) {
 }
 
 func nativeModelPriceKey(brand, channelKey, model string) [2]string {
-	return [2]string{strings.ToLower(strings.TrimSpace(brand)) + "\x00" + strings.TrimSpace(channelKey), strings.ToLower(normalizeModelPriceChannelModel(model))}
+	return channelModelPriceKey(modelPriceChannelAuthTypeAPIKey, brand, channelKey, model)
+}
+
+func channelModelPriceKey(authType, brand, channelKey, model string) [2]string {
+	authType = normalizeModelPriceChannelAuthType(authType)
+	if authType == "" {
+		authType = modelPriceChannelAuthTypeAPIKey
+	}
+	brand = strings.ToLower(strings.TrimSpace(brand))
+	channelKey = canonicalModelPriceChannelKey(brand, channelKey)
+	model = strings.ToLower(normalizeModelPriceChannelModel(model))
+	if authType == modelPriceChannelAuthTypeAPIKey {
+		if aiProviderBrand(brand) == aiProviderBrandOpenAICompatibility {
+			return priceKey(channelKey, model)
+		}
+		return [2]string{brand + "\x00" + channelKey, model}
+	}
+	return [2]string{authType + "\x00" + brand + "\x00" + channelKey, model}
 }
 
 func (a *App) modelPriceCatalog(ctx context.Context) (ModelPriceCatalogResponse, error) {
@@ -1091,18 +1258,25 @@ func (a *App) modelPriceCatalog(ctx context.Context) (ModelPriceCatalogResponse,
 	if err != nil {
 		return ModelPriceCatalogResponse{}, err
 	}
-	providers, err := a.aiProviderConfigSnapshot(ctx)
+	cfg, err := a.aiProviderManagementConfig(ctx)
 	if err != nil {
 		message := err.Error()
 		response.ChannelError = &message
+		response.OAuthChannelError = &message
 		return response, nil
 	}
-	response.ChannelsAvailable = true
-	response.HasAPIKeys = len(providers) > 0
-	response.APIKeyCount = len(providers)
-	response.QueryableAPIKeyCount = len(providers)
 	libraryLookup := libraryPricesByKey(prices)
 	channelLookup := channelPricesByKey(prices)
+	providers, providerErr := a.aiProviderConfigSnapshotForConfig(ctx, cfg)
+	if providerErr != nil {
+		message := providerErr.Error()
+		response.ChannelError = &message
+	} else {
+		response.ChannelsAvailable = true
+		response.HasAPIKeys = len(providers) > 0
+		response.APIKeyCount = len(providers)
+		response.QueryableAPIKeyCount = len(providers)
+	}
 	selectors := modelPriceChannelSelectors(providers)
 	for _, provider := range providers {
 		channelKey, channelLabel, labelFallback := modelPriceChannelSelector(provider)
@@ -1124,7 +1298,7 @@ func (a *App) modelPriceCatalog(ctx context.Context) (ModelPriceCatalogResponse,
 			}
 			alias := optionalCatalogModelAlias(configuredModel.Alias)
 			suggestedProvider := suggestedPriceProviderForChannel(provider.Brand, channelLabel, model)
-			price := findCatalogChannelPrice(channelLookup, provider.Brand, channelKey, model)
+			price := findCatalogChannelPrice(channelLookup, modelPriceChannelAuthTypeAPIKey, provider.Brand, channelKey, model)
 			templatePrice := findCatalogPrice(libraryLookup, prices, suggestedProvider, nil, configuredModel.Name)
 			item := ModelPriceCatalogItem{
 				ID:                   modelPriceCatalogItemID(provider, channelKey, modelKey),
@@ -1132,6 +1306,7 @@ func (a *App) modelPriceCatalog(ctx context.Context) (ModelPriceCatalogResponse,
 				Alias:                alias,
 				Metadata:             map[string]any{},
 				SuggestedProvider:    suggestedProvider,
+				ChannelAuthType:      modelPriceChannelAuthTypeAPIKey,
 				ChannelBrand:         string(provider.Brand),
 				ChannelKey:           channelKey,
 				ChannelLabel:         channelLabel,
@@ -1151,8 +1326,47 @@ func (a *App) modelPriceCatalog(ctx context.Context) (ModelPriceCatalogResponse,
 			response.Models = append(response.Models, item)
 		}
 	}
+	oauthPools, oauthErr := a.modelPriceOAuthPools(ctx, cfg)
+	if oauthErr != nil {
+		message := oauthErr.Error()
+		response.OAuthChannelError = &message
+	} else {
+		response.OAuthChannelsAvailable = true
+		for _, pool := range oauthPools {
+			for _, model := range pool.Models {
+				suggestedProvider := suggestedPriceProviderForChannel(pool.Brand, string(pool.Brand), model)
+				price := findCatalogChannelPrice(channelLookup, modelPriceChannelAuthTypeOAuth, pool.Brand, modelPriceOAuthPoolChannelKey, model)
+				templatePrice := findCatalogPrice(libraryLookup, prices, suggestedProvider, nil, model)
+				item := ModelPriceCatalogItem{
+					ID:                  fmt.Sprintf("oauth:%s:%s", pool.Brand, strings.ToLower(model)),
+					Name:                model,
+					Metadata:            map[string]any{},
+					SuggestedProvider:   suggestedProvider,
+					ChannelAuthType:     modelPriceChannelAuthTypeOAuth,
+					ChannelBrand:        string(pool.Brand),
+					ChannelKey:          modelPriceOAuthPoolChannelKey,
+					ChannelLabel:        modelPriceOAuthPoolLabel(pool.Brand),
+					ChannelIdentityHash: hashAPIKey("model-price:oauth-pool:" + string(pool.Brand)),
+					ChannelStatus:       modelPriceChannelStatusReady,
+					ChannelAccountCount: pool.AccountCount,
+					Price:               price,
+					TemplatePrice:       templatePrice,
+					Sources:             []AvailableModelSource{},
+				}
+				if !modelPriceReadyForBilling(item.Price, item.Name) {
+					response.UnpricedModels++
+				} else {
+					response.PricedModels++
+				}
+				response.Models = append(response.Models, item)
+			}
+		}
+	}
 	sort.Slice(response.Models, func(i, j int) bool {
 		left, right := response.Models[i], response.Models[j]
+		if left.ChannelAuthType != right.ChannelAuthType {
+			return left.ChannelAuthType < right.ChannelAuthType
+		}
 		if left.ChannelBrand != right.ChannelBrand {
 			return left.ChannelBrand < right.ChannelBrand
 		}
@@ -1162,6 +1376,146 @@ func (a *App) modelPriceCatalog(ctx context.Context) (ModelPriceCatalogResponse,
 		return strings.ToLower(left.Name) < strings.ToLower(right.Name)
 	})
 	return response, nil
+}
+
+func (a *App) modelPriceOAuthPools(ctx context.Context, cfg AppConfig) ([]modelPriceOAuthPool, error) {
+	payload, err := a.aiProviderManagementPayload(ctx, cfg, http.MethodGet, "/v0/management/auth-files", nil, aiProviderManagementTimeout)
+	if err != nil {
+		return nil, err
+	}
+	var raw any
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return nil, validationError("auth-files 响应不是有效 JSON")
+	}
+	files, ok := modelPriceOAuthFileList(raw)
+	if !ok {
+		return nil, validationError("auth-files 响应不是有效列表")
+	}
+	type poolBuilder struct {
+		accounts int
+		models   map[string]string
+	}
+	builders := map[aiProviderBrand]*poolBuilder{}
+	for _, file := range files {
+		brand, ok := modelPriceOAuthBrand(file)
+		if !ok || modelPriceOAuthFileDisabled(file) {
+			continue
+		}
+		name := strings.TrimSpace(modelPriceString(file, "name"))
+		if name == "" {
+			continue
+		}
+		modelsPayload, err := a.aiProviderManagementPayloadWithQuery(ctx, cfg, http.MethodGet, "/v0/management/auth-files/models", url.Values{"name": []string{name}}, nil, aiProviderManagementTimeout)
+		if err != nil {
+			return nil, validationError(fmt.Sprintf("读取 %s OAuth 模型失败：%s", brand, err.Error()))
+		}
+		models, ok := modelPriceOAuthModels(modelsPayload)
+		if !ok {
+			return nil, validationError(fmt.Sprintf("%s OAuth 模型响应不是有效列表", brand))
+		}
+		builder := builders[brand]
+		if builder == nil {
+			builder = &poolBuilder{models: map[string]string{}}
+			builders[brand] = builder
+		}
+		builder.accounts++
+		for _, model := range models {
+			normalized := normalizeModelPriceChannelModel(model)
+			if normalized != "" {
+				builder.models[strings.ToLower(normalized)] = normalized
+			}
+		}
+	}
+	result := make([]modelPriceOAuthPool, 0, len(builders))
+	for brand, builder := range builders {
+		models := make([]string, 0, len(builder.models))
+		for _, model := range builder.models {
+			models = append(models, model)
+		}
+		sort.Slice(models, func(i, j int) bool { return strings.ToLower(models[i]) < strings.ToLower(models[j]) })
+		result = append(result, modelPriceOAuthPool{Brand: brand, AccountCount: builder.accounts, Models: models})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Brand < result[j].Brand })
+	return result, nil
+}
+
+func modelPriceOAuthFileList(raw any) ([]map[string]any, bool) {
+	if object, ok := raw.(map[string]any); ok {
+		for _, key := range []string{"files", "auth_files", "items"} {
+			if value, exists := object[key]; exists {
+				raw = value
+				break
+			}
+		}
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, false
+	}
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		object, ok := item.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		result = append(result, object)
+	}
+	return result, true
+}
+
+func modelPriceOAuthBrand(file map[string]any) (aiProviderBrand, bool) {
+	value := strings.ToLower(strings.TrimSpace(modelPriceString(file, "provider", "type")))
+	for _, config := range aiProviderBrandConfigs {
+		if config.Brand == aiProviderBrandOpenAICompatibility {
+			continue
+		}
+		if aiProviderUsageLabelsEqual(value, string(config.Brand)) || aiProviderUsageLabelsEqual(value, config.ConfigKey) || aiProviderUsageLabelsEqual(value, config.Label) {
+			return config.Brand, true
+		}
+	}
+	return "", false
+}
+
+func modelPriceOAuthFileDisabled(file map[string]any) bool {
+	if disabled, ok := file["disabled"].(bool); ok && disabled {
+		return true
+	}
+	status := strings.ToLower(strings.TrimSpace(modelPriceString(file, "status")))
+	return status == "disabled" || status == "error"
+}
+
+func modelPriceOAuthModels(payload []byte) ([]string, bool) {
+	var raw any
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return nil, false
+	}
+	object, ok := raw.(map[string]any)
+	if ok {
+		raw = object["models"]
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, false
+	}
+	models := make([]string, 0, len(items))
+	for _, item := range items {
+		switch typed := item.(type) {
+		case string:
+			models = append(models, typed)
+		case map[string]any:
+			models = append(models, modelPriceString(typed, "id", "name"))
+		}
+	}
+	return models, true
+}
+
+func modelPriceString(object map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := object[key].(string); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func modelPriceCatalogItemID(provider aiProviderItem, channelKey, modelKey string) string {
@@ -1189,12 +1543,84 @@ func modelPriceChannelSelectors(providers []aiProviderItem) modelPriceChannelSel
 	return selectors
 }
 
+func modelPriceChannelLabels(providers []aiProviderItem) modelPriceChannelLabelIndex {
+	labels := modelPriceChannelLabelIndex{}
+	for _, provider := range providers {
+		channelKey, label, fallback := modelPriceChannelSelector(provider)
+		if channelKey == "" || strings.TrimSpace(label) == "" {
+			continue
+		}
+		identity := modelPriceChannelGroupIdentityKey(modelPriceChannelAuthTypeAPIKey, provider.Brand, channelKey)
+		existing, ok := labels[identity]
+		if ok && !existing.LabelFallback && fallback {
+			continue
+		}
+		labels[identity] = modelPriceChannelDisplay{Label: label, LabelFallback: fallback}
+	}
+	return labels
+}
+
 func modelPriceChannelIdentityKey(brand aiProviderBrand, channelKey, model string) modelPriceChannelIdentity {
 	return modelPriceChannelIdentity{
 		Brand:      brand,
 		ChannelKey: canonicalModelPriceChannelKey(string(brand), channelKey),
 		Model:      strings.ToLower(normalizeModelPriceChannelModel(model)),
 	}
+}
+
+func modelPriceChannelGroupIdentityKey(authType string, brand aiProviderBrand, channelKey string) modelPriceChannelGroupIdentity {
+	authType = normalizeModelPriceChannelAuthType(authType)
+	if authType == "" {
+		authType = modelPriceChannelAuthTypeAPIKey
+	}
+	return modelPriceChannelGroupIdentity{
+		AuthType:   authType,
+		Brand:      aiProviderBrand(strings.ToLower(strings.TrimSpace(string(brand)))),
+		ChannelKey: canonicalModelPriceChannelKey(string(brand), channelKey),
+	}
+}
+
+func modelPriceChannelGroupIdentityForPrice(price ModelPrice) (modelPriceChannelGroupIdentity, bool) {
+	if price.PriceScope != modelPriceScopeChannel || price.ChannelBrand == nil || price.ChannelKey == nil {
+		return modelPriceChannelGroupIdentity{}, false
+	}
+	identity := modelPriceChannelGroupIdentityKey(modelPriceChannelAuthType(price), aiProviderBrand(strings.TrimSpace(*price.ChannelBrand)), *price.ChannelKey)
+	return identity, identity.ChannelKey != ""
+}
+
+func modelPriceChannelBrandLabel(brand aiProviderBrand) string {
+	switch brand {
+	case aiProviderBrandGemini:
+		return "Gemini"
+	case aiProviderBrandCodex:
+		return "Codex"
+	case aiProviderBrandClaude:
+		return "Claude"
+	case aiProviderBrandVertex:
+		return "Vertex"
+	case aiProviderBrandOpenAICompatibility:
+		return "OpenAI 兼容"
+	default:
+		return strings.TrimSpace(string(brand))
+	}
+}
+
+func modelPriceOAuthPoolLabel(brand aiProviderBrand) string {
+	return modelPriceChannelBrandLabel(brand) + " OAuth"
+}
+
+func modelPriceChannelDisplayForPrice(price ModelPrice, matchContext modelPriceMatchContext) modelPriceChannelDisplay {
+	identity, ok := modelPriceChannelGroupIdentityForPrice(price)
+	if !ok {
+		return modelPriceChannelDisplay{LabelFallback: true}
+	}
+	if identity.AuthType == modelPriceChannelAuthTypeOAuth {
+		return modelPriceChannelDisplay{Label: modelPriceOAuthPoolLabel(identity.Brand)}
+	}
+	if display, exists := matchContext.ChannelLabels[identity]; exists && strings.TrimSpace(display.Label) != "" {
+		return display
+	}
+	return modelPriceChannelDisplay{LabelFallback: true}
 }
 
 func modelPriceChannelSelector(provider aiProviderItem) (string, string, bool) {
@@ -1207,7 +1633,14 @@ func modelPriceChannelSelector(provider aiProviderItem) (string, string, bool) {
 		return authIndex, label, false
 	}
 	if authIndex != "" {
-		return authIndex, authIndex, true
+		identity := strings.TrimSpace(provider.IdentityHash)
+		if identity == "" {
+			return authIndex, "未识别密钥", true
+		}
+		if len(identity) > 12 {
+			identity = identity[:12]
+		}
+		return authIndex, "密钥 " + identity, true
 	}
 	identity := strings.TrimSpace(provider.IdentityHash)
 	if identity == "" {
@@ -1310,12 +1743,12 @@ func suggestedPriceProviderForChannel(brand aiProviderBrand, channelLabel, model
 	}
 }
 
-func findCatalogChannelPrice(prices modelPriceIndex, brand aiProviderBrand, channelKey, model string) *ModelPrice {
+func findCatalogChannelPrice(prices modelPriceIndex, authType string, brand aiProviderBrand, channelKey, model string) *ModelPrice {
 	var key [2]string
 	if brand == aiProviderBrandOpenAICompatibility {
-		key = priceKey(channelKey, model)
+		key = channelModelPriceKey(authType, string(brand), channelKey, model)
 	} else {
-		key = nativeModelPriceKey(string(brand), channelKey, model)
+		key = channelModelPriceKey(authType, string(brand), channelKey, model)
 	}
 	price, ok := prices[key]
 	if !ok {
@@ -1510,11 +1943,11 @@ func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 	var prices []ModelPrice
 	for rows.Next() {
 		var price ModelPrice
-		var channelBrand, channelKey, sourceModel, lastSynced, updatedAt sql.NullString
+		var channelAuthType, channelBrand, channelKey, sourceModel, lastSynced, updatedAt sql.NullString
 		var requestUSD, priorityMultiplier sql.NullFloat64
 		var longContextThreshold sql.NullInt64
 		var longContextInput, longContextOutput, longContextCacheRead, longContextCacheCreation sql.NullFloat64
-		if err := rows.Scan(&price.ID, &price.Provider, &price.Model, &price.PriceScope, &channelBrand, &channelKey,
+		if err := rows.Scan(&price.ID, &price.Provider, &price.Model, &price.PriceScope, &channelAuthType, &channelBrand, &channelKey,
 			&price.InputUSDPerMillion, &price.OutputUSDPerMillion, &price.CacheReadUSDPerMillion, &price.CacheCreationUSDPerMillion, &requestUSD, &priorityMultiplier,
 			&longContextThreshold, &longContextInput, &longContextOutput, &longContextCacheRead, &longContextCacheCreation,
 			&price.Source, &sourceModel, &price.AutoSynced, &lastSynced, &updatedAt); err != nil {
@@ -1526,6 +1959,7 @@ func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 		if priorityMultiplier.Valid {
 			price.PriorityMultiplier = &priorityMultiplier.Float64
 		}
+		price.ChannelAuthType = nullableString(channelAuthType)
 		price.ChannelBrand = nullableString(channelBrand)
 		price.ChannelKey = nullableString(channelKey)
 		longContextConfigured := longContextThreshold.Valid || longContextInput.Valid || longContextOutput.Valid || longContextCacheRead.Valid || longContextCacheCreation.Valid
@@ -1683,7 +2117,7 @@ func modelPriceLibraryConflictReferencesPrice(ctx context.Context, querier price
 
 func getPriceWithQuerier(ctx context.Context, querier priceRowsQuerier, id int) (ModelPrice, error) {
 	rows, err := querier.QueryContext(ctx, `
-		SELECT id, provider, model, price_scope, channel_brand, channel_key,
+		SELECT id, provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 		       input_usd_per_million, output_usd_per_million,
 		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
 		       priority_multiplier, long_context_threshold_tokens,
@@ -1727,15 +2161,15 @@ func (a *App) createPrice(ctx context.Context, payload modelPricePayload) (Model
 	longContext := priceCandidate.LongContext
 	result, err := a.db.ExecContext(ctx, `
 		INSERT INTO model_prices (
-			provider, model, price_scope, channel_brand, channel_key,
+			provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 			input_usd_per_million, output_usd_per_million,
 			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
 			priority_multiplier, long_context_threshold_tokens,
 			long_context_input_usd_per_million, long_context_output_usd_per_million,
 			long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
 			source, source_model, auto_synced, last_synced_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
-	`, payload.Provider, payload.Model, payload.PriceScope, nullableStringArg(payload.ChannelBrand), nullableStringArg(payload.ChannelKey),
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
+	`, payload.Provider, payload.Model, payload.PriceScope, nullableStringArg(payload.ChannelAuthType), nullableStringArg(payload.ChannelBrand), nullableStringArg(payload.ChannelKey),
 		payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), nullableFloatArg(priorityMultiplier),
 		nullableLongContextThreshold(longContext), nullableLongContextInput(longContext), nullableLongContextOutput(longContext), nullableLongContextCacheRead(longContext), nullableLongContextCacheCreation(longContext), now)
 	if err != nil {
@@ -1778,6 +2212,7 @@ func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload
 	}
 	if existingScope == modelPriceScopeChannel {
 		if existing.ChannelBrand == nil || existing.ChannelKey == nil ||
+			modelPriceChannelAuthType(existing) != normalizeModelPriceChannelAuthType(aiProviderOptionalString(payload.ChannelAuthType)) ||
 			!strings.EqualFold(strings.TrimSpace(*existing.ChannelBrand), aiProviderOptionalString(payload.ChannelBrand)) ||
 			canonicalModelPriceChannelKey(*existing.ChannelBrand, *existing.ChannelKey) != canonicalModelPriceChannelKey(aiProviderOptionalString(payload.ChannelBrand), aiProviderOptionalString(payload.ChannelKey)) ||
 			!strings.EqualFold(normalizeModelPriceChannelModel(existing.Model), normalizeModelPriceChannelModel(payload.Model)) ||
@@ -1786,6 +2221,7 @@ func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload
 		}
 		payload.Provider = existing.Provider
 		payload.Model = existing.Model
+		payload.ChannelAuthType = existing.ChannelAuthType
 		payload.ChannelBrand = existing.ChannelBrand
 		payload.ChannelKey = existing.ChannelKey
 	}
@@ -1827,7 +2263,7 @@ func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload
 	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE model_prices
-		SET provider = ?, model = ?, price_scope = ?, channel_brand = ?, channel_key = ?,
+		SET provider = ?, model = ?, price_scope = ?, channel_auth_type = ?, channel_brand = ?, channel_key = ?,
 		    input_usd_per_million = ?, output_usd_per_million = ?,
 		    cache_read_usd_per_million = ?, cache_creation_usd_per_million = ?,
 		    request_usd = ?, priority_multiplier = ?, long_context_threshold_tokens = ?,
@@ -1835,7 +2271,7 @@ func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload
 		    long_context_cache_read_usd_per_million = ?, long_context_cache_creation_usd_per_million = ?, source = 'manual',
 		    source_model = NULL, auto_synced = 0, last_synced_at = NULL, updated_at = ?
 		WHERE id = ?
-	`, payload.Provider, payload.Model, payload.PriceScope, nullableStringArg(payload.ChannelBrand), nullableStringArg(payload.ChannelKey),
+	`, payload.Provider, payload.Model, payload.PriceScope, nullableStringArg(payload.ChannelAuthType), nullableStringArg(payload.ChannelBrand), nullableStringArg(payload.ChannelKey),
 		payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), nullableFloatArg(priorityMultiplier),
 		longContextThreshold, longContextInput, longContextOutput, longContextCacheRead, longContextCacheCreation, dbTime(time.Now()), id)
 	if err != nil {
@@ -2019,14 +2455,14 @@ func (a *App) replaceActiveModelPriceLibraryConflict(ctx context.Context, origin
 func insertModelPriceLibraryConflictAsActive(ctx context.Context, tx *sql.Tx, conflict ModelPriceLibraryConflict, provider, model string) (int, error) {
 	result, err := tx.ExecContext(ctx, `
 		INSERT INTO model_prices (
-			provider, model, price_scope, channel_brand, channel_key,
+			provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 			input_usd_per_million, output_usd_per_million,
 			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
 			priority_multiplier, long_context_threshold_tokens,
 			long_context_input_usd_per_million, long_context_output_usd_per_million,
 			long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
 			source, source_model, auto_synced, last_synced_at, updated_at
-		) VALUES (?, ?, 'library', NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
+		) VALUES (?, ?, 'library', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
 	`, provider, model,
 		conflict.Price.InputUSDPerMillion, conflict.Price.OutputUSDPerMillion,
 		conflict.Price.CacheReadUSDPerMillion, conflict.Price.CacheCreationUSDPerMillion,
@@ -2047,7 +2483,7 @@ func insertModelPriceLibraryConflictAsActive(ctx context.Context, tx *sql.Tx, co
 func updateActiveModelPriceFromLibraryConflict(ctx context.Context, tx *sql.Tx, activeID int, conflict ModelPriceLibraryConflict) error {
 	_, err := tx.ExecContext(ctx, `
 		UPDATE model_prices
-		SET provider = ?, model = ?, price_scope = 'library', channel_brand = NULL, channel_key = NULL,
+		SET provider = ?, model = ?, price_scope = 'library', channel_auth_type = NULL, channel_brand = NULL, channel_key = NULL,
 		    input_usd_per_million = ?, output_usd_per_million = ?,
 		    cache_read_usd_per_million = ?, cache_creation_usd_per_million = ?, request_usd = ?,
 		    priority_multiplier = ?, long_context_threshold_tokens = ?,
@@ -2209,14 +2645,14 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 		}
 		result, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO model_prices (
-				provider, model, price_scope, channel_brand, channel_key,
+				provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 				input_usd_per_million, output_usd_per_million,
 				cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
 				priority_multiplier, long_context_threshold_tokens,
 				long_context_input_usd_per_million, long_context_output_usd_per_million,
 				long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
 				source, source_model, auto_synced, last_synced_at, updated_at
-			) VALUES (?, ?, 'library', NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'litellm', ?, 1, ?, ?)
+			) VALUES (?, ?, 'library', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'litellm', ?, 1, ?, ?)
 		`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), nullableFloatArg(priorityMultiplier),
 			longContextThreshold, longContextInput, longContextOutput, longContextCacheRead, longContextCacheCreation, row.modelName, now, now)
 		if err != nil {
@@ -2369,6 +2805,7 @@ func pricesEqual(item ModelPrice, payload modelPricePayload) bool {
 		itemScope = modelPriceScopeLibrary
 	}
 	return itemScope == payload.PriceScope &&
+		modelPriceChannelAuthType(item) == normalizeModelPriceChannelAuthType(aiProviderOptionalString(payload.ChannelAuthType)) &&
 		item.Provider == payload.Provider &&
 		item.Model == payload.Model &&
 		item.InputUSDPerMillion == payload.InputUSDPerMillion &&
@@ -2416,6 +2853,9 @@ func findMatchingChannelPrice(prices modelPriceIndex, record UsageRecord, matchC
 	}
 	provider := strings.TrimSpace(*record.Provider)
 	model := normalizeModelPriceChannelModel(*record.Model)
+	if isOAuthAuth(usageRecordAuth(record)) {
+		return findMatchingOAuthPoolPrice(prices, provider, model)
+	}
 	if len(matchContexts) > 0 {
 		if matchContexts[0].SelectorsAvailable {
 			return findMatchingConfiguredChannelPrice(prices, matchContexts[0].Selectors, provider, model, record.AuthIndex)
@@ -2425,6 +2865,21 @@ func findMatchingChannelPrice(prices modelPriceIndex, record UsageRecord, matchC
 		}
 	}
 	return findMatchingStoredChannelPrice(prices, provider, model, record.AuthIndex)
+}
+
+func findMatchingOAuthPoolPrice(prices modelPriceIndex, provider, model string) (*ModelPrice, string) {
+	brands := matchingNativePriceBrands(provider)
+	if len(brands) == 0 {
+		return nil, priceMatchStatusChannelUnpriced
+	}
+	if len(brands) > 1 {
+		return nil, priceMatchStatusChannelConflict
+	}
+	price, ok := prices[channelModelPriceKey(modelPriceChannelAuthTypeOAuth, string(brands[0]), modelPriceOAuthPoolChannelKey, model)]
+	if !ok {
+		return nil, priceMatchStatusChannelUnpriced
+	}
+	return &price, priceMatchStatusMatched
 }
 
 func modelPriceRecordRequiresConfiguredSelectors(prices modelPriceIndex, provider, model string, authIndexValue *string) bool {
@@ -2455,10 +2910,7 @@ func findMatchingConfiguredChannelPrice(prices modelPriceIndex, selectors modelP
 		return nil, priceMatchStatusChannelUnpriced
 	}
 
-	key := priceKey(matchedIdentity.ChannelKey, matchedIdentity.Model)
-	if matchedIdentity.Brand != aiProviderBrandOpenAICompatibility {
-		key = nativeModelPriceKey(string(matchedIdentity.Brand), matchedIdentity.ChannelKey, matchedIdentity.Model)
-	}
+	key := channelModelPriceKey(modelPriceChannelAuthTypeAPIKey, string(matchedIdentity.Brand), matchedIdentity.ChannelKey, matchedIdentity.Model)
 	price, ok := prices[key]
 	if !ok {
 		return nil, priceMatchStatusChannelUnpriced
@@ -2543,9 +2995,9 @@ func findMatchingStoredChannelPrice(prices modelPriceIndex, provider, model stri
 		candidates = append(candidates, candidate{key: key, price: price})
 	}
 
-	appendCandidate(priceKey(provider, model), false)
+	appendCandidate(channelModelPriceKey(modelPriceChannelAuthTypeAPIKey, string(aiProviderBrandOpenAICompatibility), provider, model), false)
 	for _, fallback := range legacyPriceProviderCandidates(provider) {
-		appendCandidate(priceKey(fallback, model), true)
+		appendCandidate(channelModelPriceKey(modelPriceChannelAuthTypeAPIKey, string(aiProviderBrandOpenAICompatibility), fallback, model), true)
 	}
 
 	nativeBrands := matchingNativePriceBrands(provider)
@@ -2573,12 +3025,12 @@ func findMatchingStoredChannelPrice(prices modelPriceIndex, provider, model stri
 }
 
 func modelPriceIsOpenAICompatibleChannel(price ModelPrice) bool {
-	return price.PriceScope == modelPriceScopeChannel && price.ChannelBrand != nil &&
+	return price.PriceScope == modelPriceScopeChannel && modelPriceChannelAuthType(price) == modelPriceChannelAuthTypeAPIKey && price.ChannelBrand != nil &&
 		aiProviderBrand(strings.TrimSpace(*price.ChannelBrand)) == aiProviderBrandOpenAICompatibility
 }
 
 func modelPriceIsNativeChannel(price ModelPrice) bool {
-	return price.PriceScope == modelPriceScopeChannel && price.ChannelBrand != nil &&
+	return price.PriceScope == modelPriceScopeChannel && modelPriceChannelAuthType(price) == modelPriceChannelAuthTypeAPIKey && price.ChannelBrand != nil &&
 		aiProviderBrand(strings.TrimSpace(*price.ChannelBrand)) != aiProviderBrandOpenAICompatibility
 }
 
@@ -2920,6 +3372,14 @@ func matchedModelPriceChannelBrand(price *ModelPrice, record UsageRecord, matchC
 	if price != nil && price.PriceScope == modelPriceScopeChannel && price.ChannelBrand != nil {
 		brand := aiProviderBrand(strings.TrimSpace(*price.ChannelBrand))
 		return &brand
+	}
+	if isOAuthAuth(usageRecordAuth(record)) && record.Provider != nil {
+		brands := matchingNativePriceBrands(*record.Provider)
+		if len(brands) == 1 {
+			brand := brands[0]
+			return &brand
+		}
+		return nil
 	}
 	if len(matchContexts) == 0 || !matchContexts[0].SelectorsAvailable || record.Provider == nil || record.Model == nil {
 		return nil

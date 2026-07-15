@@ -148,7 +148,11 @@ onBeforeUnmount(() => {
     :class="{ 'has-chart-footer': $slots.default, 'has-compact-footer': props.compactFooter }"
   >
     <div class="chart-heading">
-      <h2>{{ title }}</h2>
+      <div class="chart-heading-title">
+        <slot name="title">
+          <h2>{{ title }}</h2>
+        </slot>
+      </div>
       <div class="chart-heading-extra">
         <slot name="header-extra">
           <span class="chart-more" aria-hidden="true">...</span>
@@ -189,6 +193,13 @@ onBeforeUnmount(() => {
   gap: 12px;
   padding: 18px 18px 12px;
   border-bottom: 1px solid var(--cpa-border);
+}
+
+.chart-heading-title {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  align-items: center;
 }
 
 h2 {

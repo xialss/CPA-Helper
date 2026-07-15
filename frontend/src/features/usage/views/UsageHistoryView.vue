@@ -1,7 +1,17 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, type Component } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NDatePicker, NIcon, NSelect, NSpin, NTooltip, useMessage } from 'naive-ui'
+import {
+  NButton,
+  NDatePicker,
+  NIcon,
+  NRadioButton,
+  NRadioGroup,
+  NSelect,
+  NSpin,
+  NTooltip,
+  useMessage,
+} from 'naive-ui'
 import {
   CircleDollarSign,
   ClipboardList,
@@ -23,6 +33,7 @@ import type {
   UsageFilters,
   UsageOptionsResponse,
   UsageOverviewResponse,
+  UsageRankingSort,
   UsageRankingsResponse,
   UsageSummary,
   UserQuotaStatus,
@@ -35,11 +46,12 @@ import {
   formatLocalDateTimeParam,
   formatUsd,
 } from '@/shared/utils/format'
-import { useI18n } from '@/shared/i18n'
+import { localizedUsageChannelFallbackLabel, useI18n } from '@/shared/i18n'
 
 type FailedFilter = 'all' | 'success' | 'failed'
 type QuickRangeKey = 'today' | 'last24h' | 'last3d' | 'last7d' | 'last30d'
 type UsageScope = 'admin' | 'account'
+type CompositionMode = 'tokens' | 'cost'
 
 interface RefreshOptions {
   silent?: boolean
@@ -69,6 +81,16 @@ interface DistributionLegendItem {
 interface TokenBreakdownItem {
   key: string
   label: string
+  value: number
+  valueText: string
+  percentText: string
+  colorIndex: number
+}
+
+interface ChannelCostBreakdownItem {
+  key: string
+  label: string
+  labelFallback: boolean
   value: number
   valueText: string
   percentText: string
@@ -118,7 +140,15 @@ const failedTrends = ref<TrendPoint[]>([])
 const trends = ref<TrendPoint[]>([])
 const userRanking = ref<RankingItem[]>([])
 const modelRanking = ref<RankingItem[]>([])
-const distributions = ref<UsageDistributionsResponse>({ providers: [], models: [], endpoints: [] })
+const primaryRankingSort = ref<UsageRankingSort>('tokens')
+const modelRankingSort = ref<UsageRankingSort>('tokens')
+const compositionMode = ref<CompositionMode>('tokens')
+const distributions = ref<UsageDistributionsResponse>({
+  providers: [],
+  models: [],
+  endpoints: [],
+  channel_costs: [],
+})
 const failedEndpointDistribution = ref<DistributionItem[]>([])
 const options = ref<UsageOptionsResponse>({
   users: [],
@@ -147,6 +177,7 @@ function normalizeUsageDistributions(
     providers: nextDistributions?.providers ?? [],
     models: nextDistributions?.models ?? [],
     endpoints: nextDistributions?.endpoints ?? [],
+    channel_costs: nextDistributions?.channel_costs ?? [],
   }
 }
 
@@ -490,6 +521,11 @@ function queueRefresh(options: RefreshOptions) {
   queuedRefresh = { silent: false }
 }
 
+async function refreshAfterRankingSortChange() {
+  await nextTick()
+  await refresh()
+}
+
 async function refresh({ silent = false }: RefreshOptions = {}) {
   if (isLoading.value || isAutoRefreshing.value) {
     queueRefresh({ silent })
@@ -525,7 +561,10 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
     const quotaRequest = isAccountScope.value ? getCurrentUserQuota() : Promise.resolve(null)
     const [overviewResult, todayResult, failedResult, realtimeResult, quotaResult] =
       await Promise.allSettled([
-        getUsageOverview(filters),
+        getUsageOverview(filters, {
+          primary: primaryRankingSort.value,
+          model: modelRankingSort.value,
+        }),
         getUsageOverview(todayFilters),
         getUsageOverview(failedFilters),
         realtimeRequest,
@@ -1000,10 +1039,69 @@ const tokenBreakdownOption = computed<ChartOption>(() =>
   ),
 )
 
+const channelCostBreakdownTotal = computed(() => summary.value?.estimated_cost_usd ?? 0)
+
+const channelCostBreakdownItems = computed<ChannelCostBreakdownItem[]>(() =>
+  distributions.value.channel_costs
+    .filter((item) => item.estimated_cost_usd > 0)
+    .slice()
+    .sort((left, right) => right.estimated_cost_usd - left.estimated_cost_usd)
+    .map((item, index) => ({
+      key: item.key,
+      label: item.label_fallback
+        ? localizedUsageChannelFallbackLabel(item.channel_brand, item.channel_auth_type)
+        : item.label,
+      labelFallback: item.label_fallback,
+      value: item.estimated_cost_usd,
+      valueText: formatUsd(item.estimated_cost_usd),
+      percentText:
+        channelCostBreakdownTotal.value > 0
+          ? `${Math.round((item.estimated_cost_usd / channelCostBreakdownTotal.value) * 100)}%`
+          : '0%',
+      colorIndex: index,
+    })),
+)
+
+const channelCostBreakdownOption = computed<ChartOption>(() =>
+  breakdownPieOption(
+    channelCostBreakdownItems.value.map((item) => ({ label: item.label, value: item.value })),
+    t('费用', 'Cost'),
+    formatUsd(channelCostBreakdownTotal.value),
+    '$',
+  ),
+)
+
+const compositionOption = computed<ChartOption>(() =>
+  compositionMode.value === 'tokens' ? tokenBreakdownOption.value : channelCostBreakdownOption.value,
+)
+
+const compositionEmpty = computed(() =>
+  compositionMode.value === 'tokens'
+    ? tokenBreakdownTotal.value === 0
+    : channelCostBreakdownTotal.value === 0,
+)
+
+const compositionCompactFooter = computed(() =>
+  compositionMode.value === 'tokens'
+    ? tokenBreakdownItems.value.length <= 1
+    : channelCostBreakdownItems.value.length <= 1,
+)
+
+const channelCostPricingStatusText = computed(() => {
+  const unpricedRecords = summary.value?.unpriced_records
+  if (unpricedRecords === undefined) {
+    return '—'
+  }
+  return unpricedRecords > 0
+    ? t(`未计价 ${formatInteger(unpricedRecords)} 条`, `${formatInteger(unpricedRecords)} unpriced`)
+    : t('全部已计价', 'All priced')
+})
+
 function breakdownPieOption(
   items: Array<{ label: string; value: number }>,
   name: string,
   centerValue: string,
+  valuePrefix = '',
 ): ChartOption {
   const surfaceColor = cssVar('--cpa-surface', '#ffffff')
   const textColor = cssVar('--cpa-text-strong', '#172026')
@@ -1012,7 +1110,7 @@ function breakdownPieOption(
   return {
     tooltip: {
       trigger: 'item',
-      formatter: `${name}<br/>{b}: {c} ({d}%)`,
+      formatter: `${name}<br/>{b}: ${valuePrefix}{c} ({d}%)`,
     },
     color: distributionChartColors(),
     legend: { show: false },
@@ -1139,13 +1237,31 @@ const todayTokenTotal = computed(() =>
   hourActivityItems.value.reduce((sum, item) => sum + item.tokens, 0),
 )
 
-const primaryRankingRows = computed(() => userRanking.value.slice(0, 5))
-const modelRankingRows = computed(() => modelRanking.value.slice(0, 5))
-const maxPrimaryRankingTokens = computed(() =>
-  Math.max(0, ...primaryRankingRows.value.map((item) => item.total_tokens)),
+const rankingSortOptions = computed(() => [
+  { label: t('按 Token 排序', 'Sort by tokens'), value: 'tokens' },
+  { label: t('按金额排序', 'Sort by cost'), value: 'cost' },
+  { label: t('按调用次数排序', 'Sort by requests'), value: 'records' },
+])
+
+function rankingMetricValue(item: RankingItem, sort: UsageRankingSort): number {
+  if (sort === 'cost') return item.estimated_cost_usd
+  if (sort === 'records') return item.records
+  return item.total_tokens
+}
+
+const primaryRankingRows = computed(() => userRanking.value)
+const modelRankingRows = computed(() => modelRanking.value)
+const maxPrimaryRankingValue = computed(() =>
+  Math.max(
+    0,
+    ...primaryRankingRows.value.map((item) => rankingMetricValue(item, primaryRankingSort.value)),
+  ),
 )
-const maxModelRankingTokens = computed(() =>
-  Math.max(0, ...modelRankingRows.value.map((item) => item.total_tokens)),
+const maxModelRankingValue = computed(() =>
+  Math.max(
+    0,
+    ...modelRankingRows.value.map((item) => rankingMetricValue(item, modelRankingSort.value)),
+  ),
 )
 
 function rankingBarStyle(value: number, maxValue: number): Record<string, string> {
@@ -1360,13 +1476,24 @@ onBeforeUnmount(() => {
           <ChartPanel
             class="token-panel area-token"
             :title="t('Token 构成', 'Token breakdown')"
-            :option="tokenBreakdownOption"
-            :empty="tokenBreakdownTotal === 0"
+            :option="compositionOption"
+            :empty="compositionEmpty"
             :loading="isLoading"
-            :compact-footer="tokenBreakdownItems.length <= 1"
+            :compact-footer="compositionCompactFooter"
           >
+            <template #title>
+              <NRadioGroup
+                v-model:value="compositionMode"
+                class="composition-mode-switch"
+                size="small"
+                :aria-label="t('构成类型', 'Composition type')"
+              >
+                <NRadioButton value="tokens">{{ t('Token 构成', 'Tokens') }}</NRadioButton>
+                <NRadioButton value="cost">{{ t('费用构成', 'Cost') }}</NRadioButton>
+              </NRadioGroup>
+            </template>
             <template #header-extra>
-              <div class="cache-hit-rate">
+              <div v-if="compositionMode === 'tokens'" class="cache-hit-rate">
                 <span class="cache-hit-rate-label">{{ t('缓存命中率', 'Cache hit rate') }}</span>
                 <strong class="cache-hit-rate-value">{{ cacheHitRateText }}</strong>
                 <NTooltip placement="bottom-end">
@@ -1386,8 +1513,19 @@ onBeforeUnmount(() => {
                   <span class="cache-hit-rate-formula">{{ cacheHitRateFormula }}</span>
                 </NTooltip>
               </div>
+              <div
+                v-else
+                class="channel-cost-pricing-status"
+                :class="{ 'has-unpriced': (summary?.unpriced_records ?? 0) > 0 }"
+              >
+                {{ channelCostPricingStatusText }}
+              </div>
             </template>
-            <ol class="distribution-legend token-legend" :aria-label="t('Token 构成图例', 'Token breakdown legend')">
+            <ol
+              v-if="compositionMode === 'tokens'"
+              class="distribution-legend token-legend"
+              :aria-label="t('Token 构成图例', 'Token breakdown legend')"
+            >
               <li
                 v-for="item in tokenBreakdownItems"
                 :key="item.key"
@@ -1403,11 +1541,33 @@ onBeforeUnmount(() => {
                 <span class="distribution-percent">{{ item.percentText }}</span>
               </li>
             </ol>
-            <div class="token-reasoning-summary">
+            <div v-if="compositionMode === 'tokens'" class="token-reasoning-summary">
               <span class="token-reasoning-label">{{ t('推理 Token', 'Reasoning tokens') }}</span>
               <strong class="token-reasoning-value">{{ reasoningTokenText }}</strong>
               <span class="token-reasoning-meta">{{ t('不计入构成占比', 'Excluded from composition') }}</span>
             </div>
+            <ol
+              v-else
+              class="distribution-legend channel-cost-legend"
+              :class="{ 'is-single': channelCostBreakdownItems.length === 1 }"
+              :aria-label="t('渠道费用构成图例', 'Channel cost breakdown legend')"
+            >
+              <li
+                v-for="item in channelCostBreakdownItems"
+                :key="item.key"
+                class="distribution-legend-item"
+                :class="{ 'is-label-fallback': item.labelFallback }"
+              >
+                <span
+                  class="distribution-marker"
+                  :style="distributionMarkerStyle(item.colorIndex)"
+                  aria-hidden="true"
+                />
+                <span class="distribution-label" :title="item.label">{{ item.label }}</span>
+                <span class="distribution-count">{{ item.valueText }}</span>
+                <span class="distribution-percent">{{ item.percentText }}</span>
+              </li>
+            </ol>
           </ChartPanel>
         </div>
 
@@ -1581,7 +1741,15 @@ onBeforeUnmount(() => {
               <div class="panel-inner compact-panel-inner">
                 <div class="panel-heading-row">
                   <h2 class="section-title">{{ rankingTitle }}</h2>
-                  <span class="panel-subtle-text">{{ t('按 Token 排序', 'Sorted by tokens') }}</span>
+                  <NSelect
+                    v-model:value="primaryRankingSort"
+                    class="ranking-sort-select"
+                    size="small"
+                    :options="rankingSortOptions"
+                    :consistent-menu-width="false"
+                    :aria-label="t('用户排行排序方式', 'User ranking sort order')"
+                    @update:value="refreshAfterRankingSortChange"
+                  />
                 </div>
                 <div class="ranking-list">
                   <div v-if="primaryRankingRows.length === 0" class="empty-inline">{{ t('暂无排行数据', 'No ranking data') }}</div>
@@ -1590,7 +1758,7 @@ onBeforeUnmount(() => {
                     v-else
                     :key="row.key"
                     class="ranking-row"
-                    :style="rankingBarStyle(row.total_tokens, maxPrimaryRankingTokens)"
+                    :style="rankingBarStyle(rankingMetricValue(row, primaryRankingSort), maxPrimaryRankingValue)"
                   >
                     <span class="ranking-index">{{ index + 1 }}</span>
                     <div class="ranking-main">
@@ -1616,7 +1784,15 @@ onBeforeUnmount(() => {
               <div class="panel-inner compact-panel-inner">
                 <div class="panel-heading-row">
                   <h2 class="section-title">{{ t('模型排行', 'Model ranking') }}</h2>
-                  <span class="panel-subtle-text">{{ t('按 Token 排序', 'Sorted by tokens') }}</span>
+                  <NSelect
+                    v-model:value="modelRankingSort"
+                    class="ranking-sort-select"
+                    size="small"
+                    :options="rankingSortOptions"
+                    :consistent-menu-width="false"
+                    :aria-label="t('模型排行排序方式', 'Model ranking sort order')"
+                    @update:value="refreshAfterRankingSortChange"
+                  />
                 </div>
                 <div class="ranking-list">
                   <div v-if="modelRankingRows.length === 0" class="empty-inline">{{ t('暂无模型数据', 'No model data') }}</div>
@@ -1625,7 +1801,7 @@ onBeforeUnmount(() => {
                     v-else
                     :key="row.key"
                     class="ranking-row"
-                    :style="rankingBarStyle(row.total_tokens, maxModelRankingTokens)"
+                    :style="rankingBarStyle(rankingMetricValue(row, modelRankingSort), maxModelRankingValue)"
                   >
                     <span class="ranking-index">{{ index + 1 }}</span>
                     <div class="ranking-main">
@@ -2023,6 +2199,11 @@ onBeforeUnmount(() => {
   color: var(--cpa-text-muted);
   font-size: 12px;
   white-space: nowrap;
+}
+
+.ranking-sort-select {
+  flex: 0 0 156px;
+  width: 156px;
 }
 
 .anomaly-stat-grid {
@@ -2444,6 +2625,14 @@ onBeforeUnmount(() => {
   scrollbar-width: thin;
 }
 
+.token-legend {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.channel-cost-legend {
+  max-height: 112px;
+}
+
 .distribution-legend.is-single {
   grid-template-columns: minmax(0, 300px);
   justify-content: center;
@@ -2504,6 +2693,22 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 5px;
   white-space: nowrap;
+}
+
+.composition-mode-switch {
+  flex: 0 0 auto;
+}
+
+.channel-cost-pricing-status {
+  color: var(--cpa-success);
+  font-size: 12px;
+  font-weight: 720;
+  white-space: nowrap;
+}
+
+.channel-cost-pricing-status.has-unpriced,
+.distribution-legend-item.is-label-fallback .distribution-label {
+  color: var(--cpa-warning);
 }
 
 .cache-hit-rate-label,
