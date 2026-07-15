@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -27,9 +29,10 @@ func TestQuotaChargesMonthlyBeforeLifetimeBalanceAndDedupesUsage(t *testing.T) {
 	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime, MonthlyQuotaUSD: &monthly}); err != nil {
 		t.Fatalf("update quota: %v", err)
 	}
+	pricing := quotaTestBillingPriceIndex(t, app)
 
 	raw := `{"api_key":"` + apiKey + `","provider":"openai","model":"gpt-quota","input_tokens":1500000,"request_id":"quota-1"}`
-	if _, created, err := app.saveUsageMessage(ctx, []byte(raw)); err != nil || !created {
+	if _, created, err := app.saveUsageMessage(ctx, []byte(raw), pricing); err != nil || !created {
 		t.Fatalf("first usage created=%v err=%v", created, err)
 	}
 	user, err := app.getUser(ctx, userID)
@@ -47,7 +50,7 @@ func TestQuotaChargesMonthlyBeforeLifetimeBalanceAndDedupesUsage(t *testing.T) {
 		t.Fatalf("deductions = monthly %.2f lifetime %.2f, want 1.00 and 0.50", monthlyDeducted, lifetimeDeducted)
 	}
 
-	if _, created, err := app.saveUsageMessage(ctx, []byte(raw)); err != nil || created {
+	if _, created, err := app.saveUsageMessage(ctx, []byte(raw), pricing); err != nil || created {
 		t.Fatalf("duplicate usage created=%v err=%v", created, err)
 	}
 	var charges int
@@ -59,7 +62,7 @@ func TestQuotaChargesMonthlyBeforeLifetimeBalanceAndDedupesUsage(t *testing.T) {
 	}
 
 	raw2 := `{"api_key":"` + apiKey + `","provider":"openai","model":"gpt-quota","input_tokens":1500000,"request_id":"quota-2"}`
-	if _, created, err := app.saveUsageMessage(ctx, []byte(raw2)); err != nil || !created {
+	if _, created, err := app.saveUsageMessage(ctx, []byte(raw2), pricing); err != nil || !created {
 		t.Fatalf("second usage created=%v err=%v", created, err)
 	}
 	user, err = app.getUser(ctx, userID)
@@ -89,9 +92,10 @@ func TestQuotaChargesImageUsageByRequestPrice(t *testing.T) {
 	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime, MonthlyQuotaUSD: &monthly}); err != nil {
 		t.Fatalf("update quota: %v", err)
 	}
+	pricing := quotaTestBillingPriceIndex(t, app)
 
 	raw := `{"api_key":"` + apiKey + `","provider":"openai","model":"gpt-image-2","request_id":"quota-image"}`
-	if _, created, err := app.saveUsageMessage(ctx, []byte(raw)); err != nil || !created {
+	if _, created, err := app.saveUsageMessage(ctx, []byte(raw), pricing); err != nil || !created {
 		t.Fatalf("image usage created=%v err=%v", created, err)
 	}
 	user, err := app.getUser(ctx, userID)
@@ -131,9 +135,10 @@ func TestQuotaChargesFastUsageWithConfiguredMultiplier(t *testing.T) {
 	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
 		t.Fatalf("update quota: %v", err)
 	}
+	pricing := quotaTestBillingPriceIndex(t, app)
 
 	raw := `{"api_key":"` + apiKey + `","provider":"openai","model":"gpt-quota-fast","service_tier":"priority","input_tokens":1000000,"request_id":"quota-fast"}`
-	if _, created, err := app.saveUsageMessage(ctx, []byte(raw)); err != nil || !created {
+	if _, created, err := app.saveUsageMessage(ctx, []byte(raw), pricing); err != nil || !created {
 		t.Fatalf("fast usage created=%v err=%v", created, err)
 	}
 	user, err := app.getUser(ctx, userID)
@@ -180,9 +185,10 @@ func TestQuotaChargesLongContextOnceAndHistoricalAnalysisRepricesWithoutLedgerRe
 	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
 		t.Fatalf("update quota: %v", err)
 	}
+	pricing := quotaTestBillingPriceIndex(t, app)
 
 	raw := `{"api_key":"` + apiKey + `","provider":"openai","model":"gpt-quota-long-context","input_tokens":1000000,"request_id":"quota-long-context"}`
-	record, created, err := app.saveUsageMessage(ctx, []byte(raw))
+	record, created, err := app.saveUsageMessage(ctx, []byte(raw), pricing)
 	if err != nil || !created {
 		t.Fatalf("long-context usage created=%v err=%v", created, err)
 	}
@@ -200,7 +206,7 @@ func TestQuotaChargesLongContextOnceAndHistoricalAnalysisRepricesWithoutLedgerRe
 	if ledgerAmount != 3 {
 		t.Fatalf("long-context ledger amount=%v, want 3", ledgerAmount)
 	}
-	if _, created, err := app.saveUsageMessage(ctx, []byte(raw)); err != nil || created {
+	if _, created, err := app.saveUsageMessage(ctx, []byte(raw), pricing); err != nil || created {
 		t.Fatalf("duplicate long-context usage created=%v err=%v", created, err)
 	}
 	var chargeCount int
@@ -218,11 +224,8 @@ func TestQuotaChargesLongContextOnceAndHistoricalAnalysisRepricesWithoutLedgerRe
 	`); err != nil {
 		t.Fatalf("reprice long-context analysis: %v", err)
 	}
-	prices, err := app.priceMap(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	summary := usageSummaryFromRecords(UsageFilters{}, []UsageRecord{record}, prices)
+	pricing = quotaTestBillingPriceIndex(t, app)
+	summary := usageSummaryFromRecords(UsageFilters{}, []UsageRecord{record}, pricing.Prices, pricing.MatchContext)
 	if summary["estimated_cost_usd"].(float64) != 4 {
 		t.Fatalf("repriced historical analysis=%v, want 4", summary["estimated_cost_usd"])
 	}
@@ -251,7 +254,7 @@ func TestQuotaChargesClaudeLongContextUsingCachedPromptTokens(t *testing.T) {
 	apiKey := "sk-quota-claude-long-context"
 	model := "claude-quota-long-context"
 	seedQuotaTestAPIKey(t, app, userID, apiKey)
-	seedQuotaTestPrice(t, app, "anthropic", model, 1)
+	seedQuotaTestNativePrice(t, app, "claude", "claude-auth-index", model, 1)
 	if _, err := app.db.Exec(`
 		UPDATE model_prices
 		SET long_context_threshold_tokens = 2000000,
@@ -259,7 +262,7 @@ func TestQuotaChargesClaudeLongContextUsingCachedPromptTokens(t *testing.T) {
 		    long_context_output_usd_per_million = 0,
 		    long_context_cache_read_usd_per_million = 2,
 		    long_context_cache_creation_usd_per_million = 4
-		WHERE provider = 'anthropic' AND model = ?
+		WHERE provider = 'claude' AND model = ?
 	`, model); err != nil {
 		t.Fatalf("configure Claude long-context price: %v", err)
 	}
@@ -267,17 +270,14 @@ func TestQuotaChargesClaudeLongContextUsingCachedPromptTokens(t *testing.T) {
 	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
 		t.Fatalf("update quota: %v", err)
 	}
+	pricing := quotaTestBillingPriceIndex(t, app)
 
-	raw := `{"api_key":"` + apiKey + `","provider":"anthropic","model":"` + model + `","request_id":"quota-claude-long-context","tokens":{"input_tokens":1000000,"cache_read_tokens":1000000,"cache_creation_tokens":1000000,"total_tokens":1000000}}`
-	record, created, err := app.saveUsageMessage(ctx, []byte(raw))
+	raw := `{"api_key":"` + apiKey + `","provider":"claude","model":"` + model + `","auth_index":"claude-auth-index","request_id":"quota-claude-long-context","tokens":{"input_tokens":1000000,"cache_read_tokens":1000000,"cache_creation_tokens":1000000,"total_tokens":1000000}}`
+	record, created, err := app.saveUsageMessage(ctx, []byte(raw), pricing)
 	if err != nil || !created {
 		t.Fatalf("Claude long-context usage created=%v err=%v", created, err)
 	}
-	prices, err := app.priceMap(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	breakdown := calculateRecordCostBreakdown(record, prices)
+	breakdown := calculateRecordCostBreakdown(record, pricing.Prices, pricing.MatchContext)
 	if breakdown.Unpriced || !breakdown.LongContextApplied || breakdown.ContextInputTokens != 3_000_000 || breakdown.TotalUSD != 9 {
 		t.Fatalf("Claude long-context breakdown = %#v, want applied 3M prompt and $9", breakdown)
 	}
@@ -318,9 +318,10 @@ func TestQuotaDoesNotChargeUnroundableFastCost(t *testing.T) {
 	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
 		t.Fatalf("update quota: %v", err)
 	}
+	pricing := quotaTestBillingPriceIndex(t, app)
 
 	raw := `{"api_key":"` + apiKey + `","provider":"openai","model":"gpt-quota-fast-overflow","service_tier":"priority","input_tokens":1000000,"request_id":"quota-fast-overflow"}`
-	if _, created, err := app.saveUsageMessage(ctx, []byte(raw)); err != nil || !created {
+	if _, created, err := app.saveUsageMessage(ctx, []byte(raw), pricing); err != nil || !created {
 		t.Fatalf("overflow Fast usage created=%v err=%v", created, err)
 	}
 	user, err := app.getUser(ctx, userID)
@@ -357,7 +358,7 @@ func TestQuotaUnpricedUsageDoesNotDeductBalance(t *testing.T) {
 		t.Fatalf("update quota: %v", err)
 	}
 	raw := `{"api_key":"` + apiKey + `","provider":"unknown","model":"missing","input_tokens":1000,"request_id":"quota-unpriced"}`
-	if _, created, err := app.saveUsageMessage(ctx, []byte(raw)); err != nil || !created {
+	if _, created, err := app.saveUsageMessage(ctx, []byte(raw), quotaTestBillingPriceIndex(t, app)); err != nil || !created {
 		t.Fatalf("usage created=%v err=%v", created, err)
 	}
 	user, err := app.getUser(ctx, userID)
@@ -374,6 +375,163 @@ func TestQuotaUnpricedUsageDoesNotDeductBalance(t *testing.T) {
 	}
 	if amount != 0 || !unpriced {
 		t.Fatalf("charge amount=%v unpriced=%v, want 0 true", amount, unpriced)
+	}
+}
+
+func TestQuotaUsesSuppliedBillingSnapshotWithoutReloadingProviders(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	model := "gpt-quota-snapshot"
+	var managementCalls atomic.Int32
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		managementCalls.Add(1)
+		if r.Header.Get("Authorization") != "Bearer test-management-key" {
+			t.Fatalf("management Authorization = %q", r.Header.Get("Authorization"))
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v0/management/openai-compatibility":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"name": "Vendor A", "models": []map[string]any{{"name": model}}},
+			})
+		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/vertex-api-key":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	app.collector.Stop()
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(ctx, cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+	userID := seedQuotaTestUser(t, app, "member")
+	apiKey := "sk-quota-snapshot"
+	seedQuotaTestAPIKey(t, app, userID, apiKey)
+	seedQuotaTestPrice(t, app, "Vendor A", model, 1)
+	lifetime := 5.0
+	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
+		t.Fatalf("update quota: %v", err)
+	}
+	if err := app.refreshModelPriceSelectorsIfStale(ctx, cfg); err != nil {
+		t.Fatalf("refresh selectors failed: %v", err)
+	}
+
+	pricing, err := app.billingPriceIndex(ctx)
+	if err != nil {
+		t.Fatalf("billingPriceIndex failed: %v", err)
+	}
+	snapshotCalls := managementCalls.Load()
+	if snapshotCalls == 0 || !pricing.MatchContext.SelectorsAvailable {
+		t.Fatalf("provider snapshot calls/availability = %d/%v, want loaded snapshot", snapshotCalls, pricing.MatchContext.SelectorsAvailable)
+	}
+	for index, requestID := range []string{"quota-snapshot-1", "quota-snapshot-2"} {
+		raw := `{"api_key":"` + apiKey + `","provider":"Vendor A","model":"` + model + `","input_tokens":1000000,"request_id":"` + requestID + `"}`
+		if _, created, err := app.saveUsageMessage(ctx, []byte(raw), pricing); err != nil || !created {
+			t.Fatalf("snapshot usage %d created=%v err=%v", index+1, created, err)
+		}
+	}
+	if calls := managementCalls.Load(); calls != snapshotCalls {
+		t.Fatalf("management calls after per-record billing = %d, want unchanged %d", calls, snapshotCalls)
+	}
+	user, err := app.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != 3 {
+		t.Fatalf("quota after snapshot charges lifetime=%v, want 3", user.QuotaLifetimeUSD)
+	}
+}
+
+func TestQuotaDoesNotChargeAmbiguousGoogleNativeUsage(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authIndex := "shared-google-auth"
+	model := "gemini-shared-quota"
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/gemini-api-key": []map[string]any{
+			{
+				"api-key":    "gemini-secret-key",
+				"auth-index": authIndex,
+				"models":     []map[string]any{{"name": model}},
+			},
+		},
+		"/v0/management/vertex-api-key": []map[string]any{
+			{
+				"api-key":    "vertex-secret-key",
+				"auth-index": authIndex,
+				"models":     []map[string]any{{"name": model}},
+			},
+		},
+	})
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	app.collector.Stop()
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(ctx, cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+
+	userID := seedQuotaTestUser(t, app, "member")
+	apiKey := "sk-quota-google-conflict"
+	seedQuotaTestAPIKey(t, app, userID, apiKey)
+	seedQuotaTestNativePrice(t, app, "gemini", authIndex, model, 2)
+	lifetime := 5.0
+	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
+		t.Fatalf("update quota: %v", err)
+	}
+	if err := app.refreshModelPriceSelectorsIfStale(ctx, cfg); err != nil {
+		t.Fatalf("refresh selectors failed: %v", err)
+	}
+	pricing, err := app.billingPriceIndex(ctx)
+	if err != nil {
+		t.Fatalf("billingPriceIndex failed: %v", err)
+	}
+
+	raw := `{"api_key":"` + apiKey + `","provider":"google","model":"` + model + `","auth_index":"` + authIndex + `","input_tokens":1000000,"request_id":"quota-google-conflict"}`
+	if _, created, err := app.saveUsageMessage(ctx, []byte(raw), pricing); err != nil || !created {
+		t.Fatalf("ambiguous Google usage created=%v err=%v", created, err)
+	}
+	user, err := app.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != 5 || user.QuotaUnpricedRecords != 1 {
+		t.Fatalf("quota after ambiguous Google usage lifetime=%v unpriced=%d, want 5/1", user.QuotaLifetimeUSD, user.QuotaUnpricedRecords)
+	}
+	var amount float64
+	var unpriced bool
+	if err := app.db.QueryRow(`SELECT amount_usd, unpriced FROM user_quota_charges`).Scan(&amount, &unpriced); err != nil {
+		t.Fatal(err)
+	}
+	if amount != 0 || !unpriced {
+		t.Fatalf("ambiguous Google charge amount=%v unpriced=%v, want 0/true", amount, unpriced)
 	}
 }
 
@@ -488,10 +646,11 @@ func seedQuotaTestPrice(t *testing.T, app *App, provider, model string, inputUSD
 	t.Helper()
 	if _, err := app.db.Exec(`
 		INSERT INTO model_prices (
-			provider, model, input_usd_per_million, output_usd_per_million,
+			provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
 			cache_read_usd_per_million, cache_creation_usd_per_million, updated_at
-		) VALUES (?, ?, ?, 0, 0, 0, ?)
-	`, provider, model, inputUSDPerMillion, dbTime(time.Now())); err != nil {
+		) VALUES (?, ?, 'channel', 'openai_compatibility', lower(?), ?, 0, 0, 0, ?)
+	`, provider, model, provider, inputUSDPerMillion, dbTime(time.Now())); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -500,10 +659,64 @@ func seedQuotaTestRequestPrice(t *testing.T, app *App, provider, model string, r
 	t.Helper()
 	if _, err := app.db.Exec(`
 		INSERT INTO model_prices (
-			provider, model, input_usd_per_million, output_usd_per_million,
+			provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
 			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, updated_at
-		) VALUES (?, ?, 0, 0, 0, 0, ?, ?)
-	`, provider, model, requestUSD, dbTime(time.Now())); err != nil {
+		) VALUES (?, ?, 'channel', 'openai_compatibility', lower(?), 0, 0, 0, 0, ?, ?)
+	`, provider, model, provider, requestUSD, dbTime(time.Now())); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func seedQuotaTestNativePrice(t *testing.T, app *App, brand, authIndex, model string, inputUSDPerMillion float64) {
+	t.Helper()
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million, updated_at
+		) VALUES (?, ?, 'channel', ?, ?, ?, 0, 0, 0, ?)
+	`, brand, model, brand, authIndex, inputUSDPerMillion, dbTime(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func quotaTestBillingPriceIndex(t *testing.T, app *App) modelPriceBillingIndex {
+	t.Helper()
+	prices, err := app.listPrices(context.Background())
+	if err != nil {
+		t.Fatalf("listPrices failed: %v", err)
+	}
+	result := modelPriceBillingIndex{Prices: channelPricesByKey(prices)}
+	if len(result.Prices) == 0 {
+		return result
+	}
+
+	providers := make([]aiProviderItem, 0, len(result.Prices))
+	for _, price := range prices {
+		if price.PriceScope != modelPriceScopeChannel || price.ChannelBrand == nil || price.ChannelKey == nil {
+			continue
+		}
+		brand := aiProviderBrand(strings.TrimSpace(*price.ChannelBrand))
+		if !isModelPriceChannelBrand(string(brand)) {
+			continue
+		}
+		channelKey := strings.TrimSpace(*price.ChannelKey)
+		provider := aiProviderItem{
+			Brand:  brand,
+			Models: []aiProviderModel{{Name: price.Model}},
+		}
+		if brand == aiProviderBrandOpenAICompatibility {
+			provider.Name = &channelKey
+		} else {
+			provider.AuthIndex = &channelKey
+		}
+		providers = append(providers, provider)
+	}
+	result.MatchContext = modelPriceMatchContext{
+		Selectors:          modelPriceChannelSelectors(providers),
+		SelectorsRequired:  true,
+		SelectorsAvailable: true,
+	}
+	return result
 }

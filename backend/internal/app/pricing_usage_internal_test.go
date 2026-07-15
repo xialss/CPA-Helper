@@ -10,6 +10,8 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -645,6 +647,373 @@ func TestRecordCostBreakdownPrefersExplicitCacheReadTokens(t *testing.T) {
 	}
 }
 
+func TestNamedOpenAICompatibleClaudeUsesMatchedChannelTokenSemantics(t *testing.T) {
+	provider := "claude"
+	model := "oai-claude-model"
+	brand := string(aiProviderBrandOpenAICompatibility)
+	channelKey := "claude"
+	price := ModelPrice{
+		ID:                         1,
+		Provider:                   provider,
+		Model:                      model,
+		PriceScope:                 modelPriceScopeChannel,
+		ChannelBrand:               &brand,
+		ChannelKey:                 &channelKey,
+		InputUSDPerMillion:         1,
+		OutputUSDPerMillion:        0,
+		CacheReadUSDPerMillion:     0,
+		CacheCreationUSDPerMillion: 0,
+		LongContext: &ModelPriceLongContext{
+			ThresholdInputTokens:       120,
+			InputUSDPerMillion:         10,
+			OutputUSDPerMillion:        0,
+			CacheReadUSDPerMillion:     0,
+			CacheCreationUSDPerMillion: 0,
+		},
+	}
+	prices := channelPricesByKey([]ModelPrice{price})
+	record := UsageRecord{
+		Provider:            &provider,
+		Model:               &model,
+		InputTokens:         100,
+		CacheReadTokens:     20,
+		CacheCreationTokens: 30,
+		TotalTokens:         100,
+	}
+
+	breakdown := calculateRecordCostBreakdown(record, prices)
+	if breakdown.Unpriced || breakdown.TotalUSD != 0.00008 {
+		t.Fatalf("OpenAI-compatible Claude cost = %#v, want base total 0.00008", breakdown)
+	}
+	if breakdown.NormalInputTokens != 50 || breakdown.CacheReadTokens != 20 || breakdown.CacheCreationTokens != 30 {
+		t.Fatalf("OpenAI-compatible Claude normalized tokens = %d/%d/%d, want 50/20/30", breakdown.NormalInputTokens, breakdown.CacheReadTokens, breakdown.CacheCreationTokens)
+	}
+	if breakdown.ContextInputTokens != 100 || breakdown.LongContextApplied {
+		t.Fatalf("OpenAI-compatible Claude context = %d applied=%v, want 100/false", breakdown.ContextInputTokens, breakdown.LongContextApplied)
+	}
+
+	summary := usageSummaryFromRecords(UsageFilters{}, []UsageRecord{record}, prices)
+	if summary["input_tokens"] != 100 || summary["total_tokens"] != 100 || summary["normal_input_tokens"] != 50 {
+		t.Fatalf("OpenAI-compatible Claude summary = %#v", summary)
+	}
+	keeperUsage := keeperQuotaWindowUsage{}
+	addRecordToKeeperQuotaWindowUsage(&keeperUsage, record, prices)
+	if keeperUsage.InputTokens != 100 || keeperUsage.TotalTokens != 100 || keeperUsage.EstimatedCostUSD != 0.00008 || keeperUsage.UnpricedRecords != 0 {
+		t.Fatalf("OpenAI-compatible Claude keeper usage = %#v", keeperUsage)
+	}
+
+	matchContext := modelPriceMatchContext{
+		Selectors: modelPriceChannelSelectors([]aiProviderItem{{
+			Brand:  aiProviderBrandOpenAICompatibility,
+			Name:   &provider,
+			Models: []aiProviderModel{{Name: model}},
+		}}),
+		SelectorsRequired:  true,
+		SelectorsAvailable: true,
+	}
+	unpriced := calculateRecordCostBreakdown(record, modelPriceIndex{}, matchContext)
+	if !unpriced.Unpriced || unpriced.UnpricedReason == nil || *unpriced.UnpricedReason != priceMatchStatusChannelUnpriced {
+		t.Fatalf("unpriced OpenAI-compatible Claude breakdown = %#v", unpriced)
+	}
+	if unpriced.NormalInputTokens != 50 || unpriced.ContextInputTokens != 100 {
+		t.Fatalf("unpriced OpenAI-compatible Claude token semantics = %#v, want normal/context 50/100", unpriced)
+	}
+}
+
+func TestBillingPriceIndexUsesCachedSelectorsWithoutChannelPrices(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	sharedAuthIndex := "shared-google-auth"
+	sharedModel := "shared-google-model"
+	openAIModel := "openai-claude-model"
+	managementCalls := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		managementCalls++
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v0/management/gemini-api-key":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"auth-index": sharedAuthIndex,
+				"models":     []map[string]any{{"name": sharedModel}},
+			}})
+		case "/v0/management/vertex-api-key":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"auth-index": sharedAuthIndex,
+				"models":     []map[string]any{{"name": sharedModel}},
+			}})
+		case "/v0/management/openai-compatibility":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"name":   "claude",
+				"models": []map[string]any{{"name": openAIModel}},
+			}})
+		case "/v0/management/codex-api-key", "/v0/management/claude-api-key":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	app.collector.Stop()
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(ctx, cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+	if err := app.refreshModelPriceSelectorsIfStale(ctx, cfg); err != nil {
+		t.Fatalf("refresh selectors failed: %v", err)
+	}
+	if managementCalls != len(aiProviderBrandConfigs) {
+		t.Fatalf("management calls after refresh = %d, want %d", managementCalls, len(aiProviderBrandConfigs))
+	}
+
+	pricing, err := app.billingPriceIndex(ctx)
+	if err != nil {
+		t.Fatalf("billingPriceIndex failed: %v", err)
+	}
+	if len(pricing.Prices) != 0 || !pricing.MatchContext.SelectorsAvailable {
+		t.Fatalf("empty-price selector context = %#v prices=%d, want available selectors", pricing.MatchContext, len(pricing.Prices))
+	}
+	if _, err := app.billingPriceIndex(ctx); err != nil {
+		t.Fatalf("second billingPriceIndex failed: %v", err)
+	}
+	if managementCalls != len(aiProviderBrandConfigs) {
+		t.Fatalf("management calls after billing indexes = %d, want cached %d", managementCalls, len(aiProviderBrandConfigs))
+	}
+
+	googleProvider := "google"
+	conflict := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &googleProvider,
+		Model:       &sharedModel,
+		AuthIndex:   &sharedAuthIndex,
+		InputTokens: 1,
+		TotalTokens: 1,
+	}, pricing.Prices, pricing.MatchContext)
+	if !conflict.Unpriced || conflict.UnpricedReason == nil || *conflict.UnpricedReason != priceMatchStatusChannelConflict {
+		t.Fatalf("empty-price Google breakdown = %#v, want channel_conflict", conflict)
+	}
+
+	claudeProvider := "claude"
+	openAICompatible := calculateRecordCostBreakdown(UsageRecord{
+		Provider:            &claudeProvider,
+		Model:               &openAIModel,
+		InputTokens:         100,
+		CacheReadTokens:     20,
+		CacheCreationTokens: 30,
+		TotalTokens:         100,
+	}, pricing.Prices, pricing.MatchContext)
+	if !openAICompatible.Unpriced || openAICompatible.UnpricedReason == nil || *openAICompatible.UnpricedReason != priceMatchStatusChannelUnpriced {
+		t.Fatalf("empty-price OpenAI-compatible Claude breakdown = %#v, want channel_unpriced", openAICompatible)
+	}
+	if openAICompatible.NormalInputTokens != 50 || openAICompatible.CacheReadTokens != 20 || openAICompatible.CacheCreationTokens != 30 || openAICompatible.ContextInputTokens != 100 {
+		t.Fatalf("empty-price OpenAI-compatible Claude tokens = %#v, want 50/20/30 context 100", openAICompatible)
+	}
+}
+
+func TestAIProviderConfigSnapshotRejectsInvalidatedInFlightStore(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	oldAuthIndex := "old-auth"
+	oldModel := "old-model"
+	newAuthIndex := "new-auth"
+	newModel := "new-model"
+	var providerMu sync.Mutex
+	geminiProviders := []map[string]any{{
+		"auth-index": oldAuthIndex,
+		"models":     []map[string]any{{"name": oldModel}},
+	}}
+	snapshotStarted := make(chan struct{})
+	releaseSnapshot := make(chan struct{})
+	var releaseSnapshotOnce sync.Once
+	releaseSnapshotRequest := func() {
+		releaseSnapshotOnce.Do(func() { close(releaseSnapshot) })
+	}
+	var blockSnapshot sync.Once
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v0/management/gemini-api-key":
+			switch r.Method {
+			case http.MethodGet:
+				providerMu.Lock()
+				payload := append([]map[string]any(nil), geminiProviders...)
+				providerMu.Unlock()
+				blockSnapshot.Do(func() {
+					close(snapshotStarted)
+					<-releaseSnapshot
+				})
+				_ = json.NewEncoder(w).Encode(payload)
+			case http.MethodPut:
+				var payload []map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				providerMu.Lock()
+				geminiProviders = payload
+				providerMu.Unlock()
+				_ = json.NewEncoder(w).Encode(payload)
+			default:
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			}
+		case "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+	defer releaseSnapshotRequest()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	app.collector.Stop()
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(ctx, cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+
+	type snapshotResult struct {
+		providers []aiProviderItem
+		err       error
+	}
+	resultCh := make(chan snapshotResult, 1)
+	go func() {
+		providers, snapshotErr := app.aiProviderConfigSnapshot(ctx)
+		resultCh <- snapshotResult{providers: providers, err: snapshotErr}
+	}()
+	select {
+	case <-snapshotStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider snapshot did not start")
+	}
+
+	brandConfig, err := aiProviderConfigFor(string(aiProviderBrandGemini))
+	if err != nil {
+		releaseSnapshotRequest()
+		t.Fatalf("aiProviderConfigFor failed: %v", err)
+	}
+	putErr := app.putAIProviderList(ctx, cfg, brandConfig, []map[string]any{{
+		"auth-index": newAuthIndex,
+		"models":     []map[string]any{{"name": newModel}},
+	}})
+	releaseSnapshotRequest()
+	if putErr != nil {
+		t.Fatalf("putAIProviderList failed: %v", putErr)
+	}
+	var staleResult snapshotResult
+	select {
+	case staleResult = <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider snapshot did not finish")
+	}
+	if staleResult.err != nil {
+		t.Fatalf("stale provider snapshot failed: %v", staleResult.err)
+	}
+	if _, available := app.priceSelectors.snapshot(); available {
+		t.Fatal("invalidated in-flight snapshot repopulated the selector cache")
+	}
+
+	if err := app.refreshModelPriceSelectorsIfStale(ctx, cfg); err != nil {
+		t.Fatalf("refresh selectors failed: %v", err)
+	}
+	selectors, available := app.priceSelectors.snapshot()
+	if !available {
+		t.Fatal("selector cache is unavailable after refresh")
+	}
+	if selectors[modelPriceChannelIdentityKey(aiProviderBrandGemini, oldAuthIndex, oldModel)] != 0 {
+		t.Fatalf("stale selector remained after refresh: %#v", selectors)
+	}
+	if selectors[modelPriceChannelIdentityKey(aiProviderBrandGemini, newAuthIndex, newModel)] != 1 {
+		t.Fatalf("new selector missing after refresh: %#v", selectors)
+	}
+}
+
+func TestModelPriceSelectorSnapshotCacheRejectsPreviousConfigWriters(t *testing.T) {
+	cache := modelPriceSelectorSnapshotCache{}
+	cache.retainConfig("old-config")
+	generation, current := cache.currentGeneration("old-config")
+	if !current {
+		t.Fatal("old config generation is not current")
+	}
+	cache.retainConfig("new-config")
+	selectors := modelPriceChannelSelectorIndex{
+		modelPriceChannelIdentityKey(aiProviderBrandGemini, "old-auth", "old-model"): 1,
+	}
+	if cache.store("old-config", generation, time.Now(), selectors) {
+		t.Fatal("previous config store unexpectedly succeeded")
+	}
+	cache.invalidate("old-config")
+	if _, current := cache.currentGeneration("new-config"); !current {
+		t.Fatal("previous config invalidation replaced the current config")
+	}
+	load, _, wait, _ := cache.beginRefresh("old-config", time.Now())
+	if load || wait != nil {
+		t.Fatalf("previous config refresh was accepted: load=%v wait=%v", load, wait != nil)
+	}
+}
+
+func TestModelPriceSelectorSnapshotCacheRefreshesBeforeExpiry(t *testing.T) {
+	assertRefreshWindow := func(t *testing.T, cache *modelPriceSelectorSnapshotCache) {
+		t.Helper()
+		cache.mu.RLock()
+		refreshAfter := cache.refreshAfter
+		expiresAt := cache.expiresAt
+		cache.mu.RUnlock()
+		if !refreshAfter.Before(expiresAt) {
+			t.Fatalf("refresh_after = %v, expires_at = %v, want proactive refresh", refreshAfter, expiresAt)
+		}
+		refreshWindow := expiresAt.Sub(refreshAfter)
+		if want := modelPriceSelectorSnapshotTTL - modelPriceSelectorSnapshotRefreshInterval; refreshWindow != want {
+			t.Fatalf("refresh window = %v, want %v", refreshWindow, want)
+		}
+		maxSequentialRefreshDuration := time.Duration(len(aiProviderBrandConfigs)) * aiProviderManagementTimeout
+		maxRenewalDuration := modelPriceSelectorSnapshotRefreshInterval + maxSequentialRefreshDuration
+		if refreshWindow <= maxRenewalDuration {
+			t.Fatalf("refresh window = %v, want greater than heartbeat delay plus max sequential refresh duration %v", refreshWindow, maxRenewalDuration)
+		}
+	}
+
+	t.Run("store", func(t *testing.T) {
+		cache := modelPriceSelectorSnapshotCache{}
+		cache.retainConfig("config")
+		generation, current := cache.currentGeneration("config")
+		if !current || !cache.store("config", generation, time.Now(), modelPriceChannelSelectorIndex{}) {
+			t.Fatal("failed to store selector snapshot")
+		}
+		assertRefreshWindow(t, &cache)
+	})
+
+	t.Run("refresh", func(t *testing.T) {
+		cache := modelPriceSelectorSnapshotCache{}
+		cache.retainConfig("config")
+		startedAt := time.Now()
+		load, generation, wait, done := cache.beginRefresh("config", startedAt)
+		if !load || wait != nil || done == nil {
+			t.Fatalf("beginRefresh = load:%v wait:%v done:%v", load, wait != nil, done != nil)
+		}
+		cache.finishRefresh("config", generation, done, startedAt, modelPriceChannelSelectorIndex{}, nil)
+		assertRefreshWindow(t, &cache)
+	})
+}
+
 func TestRecordCostTruncatesGenericCachedTokens(t *testing.T) {
 	provider := "openai"
 	model := "gpt-test"
@@ -767,6 +1136,518 @@ func TestRecordCostBreakdownTreatsMissingTokenPriceAsUnpriced(t *testing.T) {
 	}, nil)
 	if !breakdown.Unpriced || breakdown.TotalUSD != 0 || len(breakdown.Items) != 0 {
 		t.Fatalf("unpriced token breakdown = unpriced %v total %v items %d, want true/0/0", breakdown.Unpriced, breakdown.TotalUSD, len(breakdown.Items))
+	}
+}
+
+func TestRecordCostUsesExactNativeChannelAuthIndex(t *testing.T) {
+	provider := "gemini"
+	model := "gemini-channel-test"
+	authIndexA := "auth-a"
+	authIndexB := "auth-b"
+	brand := string(aiProviderBrandGemini)
+	prices := modelPriceIndex{
+		nativeModelPriceKey(brand, authIndexA, model): {
+			ID:                 1,
+			Provider:           provider,
+			Model:              model,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelBrand:       &brand,
+			ChannelKey:         &authIndexA,
+			InputUSDPerMillion: 1,
+		},
+		nativeModelPriceKey(brand, authIndexB, model): {
+			ID:                 2,
+			Provider:           provider,
+			Model:              model,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelBrand:       &brand,
+			ChannelKey:         &authIndexB,
+			InputUSDPerMillion: 4,
+		},
+	}
+
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		AuthIndex:   &authIndexB,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, prices)
+	if breakdown.Unpriced || breakdown.TotalUSD != 4 {
+		t.Fatalf("exact channel breakdown = %#v, want priced total 4", breakdown)
+	}
+
+	missingAuth := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		InputTokens: 1,
+		TotalTokens: 1,
+	}, prices)
+	if !missingAuth.Unpriced || missingAuth.UnpricedReason == nil || *missingAuth.UnpricedReason != priceMatchStatusMissingAuthIndex {
+		t.Fatalf("missing auth breakdown = %#v, want missing_auth_index", missingAuth)
+	}
+}
+
+func TestRecordCostDoesNotUseSameNamedCompatibleChannelWhenNativeAuthIndexIsMissing(t *testing.T) {
+	provider := "gemini"
+	model := "gemini-missing-auth-compatible-conflict"
+	authIndex := "native-auth"
+	nativeBrand := string(aiProviderBrandGemini)
+	compatibleBrand := string(aiProviderBrandOpenAICompatibility)
+	prices := modelPriceIndex{
+		priceKey(provider, model): {
+			ID:                 1,
+			Provider:           provider,
+			Model:              model,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelBrand:       &compatibleBrand,
+			ChannelKey:         &provider,
+			InputUSDPerMillion: 9,
+		},
+		nativeModelPriceKey(nativeBrand, authIndex, model): {
+			ID:                 2,
+			Provider:           provider,
+			Model:              model,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelBrand:       &nativeBrand,
+			ChannelKey:         &authIndex,
+			InputUSDPerMillion: 2,
+		},
+	}
+	nativeIdentity := modelPriceChannelIdentityKey(aiProviderBrandGemini, authIndex, model)
+	compatibleIdentity := modelPriceChannelIdentityKey(aiProviderBrandOpenAICompatibility, provider, model)
+	matchContext := modelPriceMatchContext{
+		Selectors: modelPriceChannelSelectorIndex{
+			nativeIdentity:     1,
+			compatibleIdentity: 1,
+		},
+		SelectorsRequired:  true,
+		SelectorsAvailable: true,
+	}
+	record := UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}
+
+	breakdown := calculateRecordCostBreakdown(record, prices, matchContext)
+	if !breakdown.Unpriced || breakdown.TotalUSD != 0 || breakdown.UnpricedReason == nil || *breakdown.UnpricedReason != priceMatchStatusChannelConflict {
+		t.Fatalf("missing auth with native and compatible channels = %#v, want channel_conflict", breakdown)
+	}
+
+	matchContext.Selectors = modelPriceChannelSelectorIndex{nativeIdentity: 1}
+	breakdown = calculateRecordCostBreakdown(record, prices, matchContext)
+	if !breakdown.Unpriced || breakdown.UnpricedReason == nil || *breakdown.UnpricedReason != priceMatchStatusMissingAuthIndex {
+		t.Fatalf("missing auth with native channel = %#v, want missing_auth_index", breakdown)
+	}
+
+	matchContext.Selectors = modelPriceChannelSelectorIndex{compatibleIdentity: 1}
+	breakdown = calculateRecordCostBreakdown(record, prices, matchContext)
+	if breakdown.Unpriced || breakdown.TotalUSD != 9 {
+		t.Fatalf("compatible-only channel breakdown = %#v, want priced total 9", breakdown)
+	}
+}
+
+func TestSelectorlessNativeCandidateBlocksCompatibleBillingAndTokenSemantics(t *testing.T) {
+	provider := "claude"
+	model := "claude-selectorless-native-conflict"
+	compatibleBrand := string(aiProviderBrandOpenAICompatibility)
+	providers := []aiProviderItem{
+		{
+			Brand:  aiProviderBrandClaude,
+			Models: []aiProviderModel{{Name: model}},
+		},
+		{
+			Brand:  aiProviderBrandOpenAICompatibility,
+			Name:   &provider,
+			Models: []aiProviderModel{{Name: model}},
+		},
+	}
+	selectors := modelPriceChannelSelectors(providers)
+	nativeIdentity := modelPriceChannelIdentityKey(aiProviderBrandClaude, "", model)
+	if selectors[nativeIdentity] != 1 {
+		t.Fatalf("selectorless native count = %d, want 1", selectors[nativeIdentity])
+	}
+	prices := modelPriceIndex{
+		priceKey(provider, model): {
+			ID:                 1,
+			Provider:           provider,
+			Model:              model,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelBrand:       &compatibleBrand,
+			ChannelKey:         &provider,
+			InputUSDPerMillion: 9,
+		},
+	}
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:            &provider,
+		Model:               &model,
+		InputTokens:         100,
+		CacheReadTokens:     20,
+		CacheCreationTokens: 30,
+		TotalTokens:         150,
+	}, prices, modelPriceMatchContext{
+		Selectors:          selectors,
+		SelectorsRequired:  true,
+		SelectorsAvailable: true,
+	})
+	if !breakdown.Unpriced || breakdown.UnpricedReason == nil || *breakdown.UnpricedReason != priceMatchStatusChannelConflict {
+		t.Fatalf("selectorless native conflict breakdown = %#v, want channel_conflict", breakdown)
+	}
+	if breakdown.NormalInputTokens != 100 || breakdown.CacheReadTokens != 20 || breakdown.CacheCreationTokens != 30 || breakdown.ContextInputTokens != 150 {
+		t.Fatalf("selectorless native token semantics = %#v, want runtime Claude semantics", breakdown)
+	}
+}
+
+func TestRecordCostRejectsAmbiguousGoogleNativeSelectorBeforePriceLookup(t *testing.T) {
+	provider := "google"
+	model := "gemini-shared-model"
+	authIndex := "shared-auth-index"
+	geminiBrand := string(aiProviderBrandGemini)
+	prices := modelPriceIndex{
+		nativeModelPriceKey(geminiBrand, authIndex, model): {
+			ID:                 1,
+			Provider:           "gemini",
+			Model:              model,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelBrand:       &geminiBrand,
+			ChannelKey:         &authIndex,
+			InputUSDPerMillion: 2,
+		},
+	}
+	providers := []aiProviderItem{
+		{
+			Brand:     aiProviderBrandGemini,
+			AuthIndex: &authIndex,
+			Models:    []aiProviderModel{{Name: model}},
+		},
+		{
+			Brand:     aiProviderBrandVertex,
+			AuthIndex: &authIndex,
+			Models:    []aiProviderModel{{Name: model}},
+		},
+	}
+	matchContext := modelPriceMatchContext{
+		Selectors:          modelPriceChannelSelectors(providers),
+		SelectorsRequired:  true,
+		SelectorsAvailable: true,
+	}
+
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		AuthIndex:   &authIndex,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, prices, matchContext)
+	if !breakdown.Unpriced || breakdown.TotalUSD != 0 || breakdown.UnpricedReason == nil || *breakdown.UnpricedReason != priceMatchStatusChannelConflict {
+		t.Fatalf("ambiguous Google breakdown = %#v, want channel_conflict", breakdown)
+	}
+
+	matchContext.Selectors = modelPriceChannelSelectors(providers[:1])
+	breakdown = calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		AuthIndex:   &authIndex,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, prices, matchContext)
+	if breakdown.Unpriced || breakdown.TotalUSD != 2 {
+		t.Fatalf("unique Google breakdown = %#v, want priced total 2", breakdown)
+	}
+
+	unavailable := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		AuthIndex:   &authIndex,
+		InputTokens: 1,
+		TotalTokens: 1,
+	}, prices, modelPriceMatchContext{SelectorsRequired: true})
+	if !unavailable.Unpriced || unavailable.UnpricedReason == nil || *unavailable.UnpricedReason != priceMatchStatusChannelConfigUnavailable {
+		t.Fatalf("unavailable selector breakdown = %#v, want channel_config_unavailable", unavailable)
+	}
+}
+
+func TestRecordCostRejectsStoredChannelPricesWhenSelectorsUnavailable(t *testing.T) {
+	model := "exact-selector-model"
+	tests := []struct {
+		name       string
+		brand      aiProviderBrand
+		provider   string
+		channelKey string
+		authIndex  *string
+	}{
+		{
+			name:       "named OpenAI-compatible",
+			brand:      aiProviderBrandOpenAICompatibility,
+			provider:   "Vendor Exact",
+			channelKey: "vendor exact",
+		},
+		{
+			name:       "native Codex",
+			brand:      aiProviderBrandCodex,
+			provider:   "codex",
+			channelKey: "Codex-Auth.json",
+			authIndex:  stringPtr("Codex-Auth.json"),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			brand := string(test.brand)
+			price := ModelPrice{
+				ID:                 1,
+				Provider:           test.provider,
+				Model:              model,
+				PriceScope:         modelPriceScopeChannel,
+				ChannelBrand:       &brand,
+				ChannelKey:         &test.channelKey,
+				InputUSDPerMillion: 2,
+			}
+			key := priceKey(test.channelKey, model)
+			if test.brand != aiProviderBrandOpenAICompatibility {
+				key = nativeModelPriceKey(brand, test.channelKey, model)
+			}
+			prices := modelPriceIndex{key: price}
+			if !modelPriceIndexNeedsConfiguredSelectors(prices) {
+				t.Fatalf("channel price index must require configured selectors: %#v", prices)
+			}
+
+			breakdown := calculateRecordCostBreakdown(UsageRecord{
+				Provider:    &test.provider,
+				Model:       &model,
+				AuthIndex:   test.authIndex,
+				InputTokens: 1_000_000,
+				TotalTokens: 1_000_000,
+			}, prices, modelPriceMatchContext{SelectorsRequired: true})
+			if !breakdown.Unpriced || breakdown.TotalUSD != 0 || breakdown.UnpricedReason == nil ||
+				*breakdown.UnpricedReason != priceMatchStatusChannelConfigUnavailable {
+				t.Fatalf("selector-unavailable breakdown = %#v, want channel_config_unavailable", breakdown)
+			}
+		})
+	}
+}
+
+func TestBillingPriceIndexRejectsExactPriceWhenProviderSnapshotFails(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	provider := "Vendor Exact"
+	channelKey := "vendor exact"
+	model := "exact-snapshot-model"
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million, updated_at
+		) VALUES (?, ?, 'channel', 'openai_compatibility', ?, 2, 0, 0, 0, ?)
+	`, provider, model, channelKey, dbTime(time.Now())); err != nil {
+		t.Fatalf("seed exact channel price: %v", err)
+	}
+
+	pricing, err := app.billingPriceIndex(context.Background())
+	if err != nil {
+		t.Fatalf("billingPriceIndex failed: %v", err)
+	}
+	if !pricing.MatchContext.SelectorsRequired || pricing.MatchContext.SelectorsAvailable {
+		t.Fatalf("exact selector context = %#v, want required unavailable snapshot", pricing.MatchContext)
+	}
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, pricing.Prices, pricing.MatchContext)
+	if !breakdown.Unpriced || breakdown.TotalUSD != 0 || breakdown.UnpricedReason == nil ||
+		*breakdown.UnpricedReason != priceMatchStatusChannelConfigUnavailable {
+		t.Fatalf("exact snapshot-failure breakdown = %#v, want channel_config_unavailable", breakdown)
+	}
+}
+
+func TestRecordCostRejectsDuplicateConfiguredChannelSelectorsBeforePriceLookup(t *testing.T) {
+	tests := []struct {
+		name       string
+		brand      aiProviderBrand
+		provider   string
+		channelKey string
+	}{
+		{name: "gemini", brand: aiProviderBrandGemini, provider: "gemini", channelKey: "gemini-auth"},
+		{name: "codex", brand: aiProviderBrandCodex, provider: "codex", channelKey: "codex-auth"},
+		{name: "claude", brand: aiProviderBrandClaude, provider: "claude", channelKey: "claude-auth"},
+		{name: "vertex", brand: aiProviderBrandVertex, provider: "vertex", channelKey: "vertex-auth"},
+		{name: "openai-compatible", brand: aiProviderBrandOpenAICompatibility, provider: "Vendor Duplicate", channelKey: "vendor duplicate"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			model := "duplicate-selector-model"
+			brand := string(test.brand)
+			price := ModelPrice{
+				ID:                 1,
+				Provider:           test.provider,
+				Model:              model,
+				PriceScope:         modelPriceScopeChannel,
+				ChannelBrand:       &brand,
+				ChannelKey:         &test.channelKey,
+				InputUSDPerMillion: 2,
+			}
+			var key [2]string
+			if test.brand == aiProviderBrandOpenAICompatibility {
+				key = priceKey(test.channelKey, model)
+			} else {
+				key = nativeModelPriceKey(brand, test.channelKey, model)
+			}
+			prices := modelPriceIndex{key: price}
+			providers := make([]aiProviderItem, 2)
+			for index := range providers {
+				providers[index] = aiProviderItem{
+					Brand:  test.brand,
+					Models: []aiProviderModel{{Name: model}},
+				}
+				if test.brand == aiProviderBrandOpenAICompatibility {
+					name := test.provider
+					providers[index].Name = &name
+				} else {
+					authIndex := test.channelKey
+					providers[index].AuthIndex = &authIndex
+				}
+			}
+			matchContext := modelPriceMatchContext{
+				Selectors:          modelPriceChannelSelectors(providers),
+				SelectorsRequired:  true,
+				SelectorsAvailable: true,
+			}
+			record := UsageRecord{
+				Provider:    &test.provider,
+				Model:       &model,
+				InputTokens: 1_000_000,
+				TotalTokens: 1_000_000,
+			}
+			if test.brand != aiProviderBrandOpenAICompatibility {
+				record.AuthIndex = &test.channelKey
+			}
+
+			breakdown := calculateRecordCostBreakdown(record, prices, matchContext)
+			if !breakdown.Unpriced || breakdown.TotalUSD != 0 || breakdown.UnpricedReason == nil || *breakdown.UnpricedReason != priceMatchStatusChannelConflict {
+				t.Fatalf("duplicate selector breakdown = %#v, want channel_conflict", breakdown)
+			}
+		})
+	}
+}
+
+func TestBillingPriceIndexLoadsDuplicateCodexSelectors(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authIndex := "shared-codex-auth"
+	model := "gpt-shared-codex"
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/codex-api-key": []map[string]any{
+			{
+				"api-key":    "codex-secret-a",
+				"auth-index": authIndex,
+				"models":     []map[string]any{{"name": model}},
+			},
+			{
+				"api-key":    "codex-secret-b",
+				"auth-index": authIndex,
+				"models":     []map[string]any{{"name": model}},
+			},
+		},
+	})
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(ctx, cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+	if err := app.refreshModelPriceSelectorsIfStale(ctx, cfg); err != nil {
+		t.Fatalf("refresh selectors failed: %v", err)
+	}
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million, updated_at
+		) VALUES ('codex', ?, 'channel', 'codex', ?, 2, 0, 0, 0, ?)
+	`, model, authIndex, dbTime(time.Now())); err != nil {
+		t.Fatalf("seed Codex channel price: %v", err)
+	}
+
+	pricing, err := app.billingPriceIndex(ctx)
+	if err != nil {
+		t.Fatalf("billingPriceIndex failed: %v", err)
+	}
+	selector := modelPriceChannelIdentityKey(aiProviderBrandCodex, authIndex, model)
+	if !pricing.MatchContext.SelectorsRequired || !pricing.MatchContext.SelectorsAvailable || pricing.MatchContext.Selectors[selector] != 2 {
+		t.Fatalf("Codex selector snapshot = %#v, want available count 2", pricing.MatchContext)
+	}
+	provider := "codex"
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		AuthIndex:   &authIndex,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, pricing.Prices, pricing.MatchContext)
+	if !breakdown.Unpriced || breakdown.UnpricedReason == nil || *breakdown.UnpricedReason != priceMatchStatusChannelConflict {
+		t.Fatalf("duplicate Codex breakdown = %#v, want channel_conflict", breakdown)
+	}
+}
+
+func TestChannelPriceIndexExcludesLibraryPrices(t *testing.T) {
+	provider := "vendor-a"
+	model := "shared-model"
+	brand := string(aiProviderBrandOpenAICompatibility)
+	channelKey := provider
+	prices := channelPricesByKey([]ModelPrice{
+		{
+			ID:                 1,
+			Provider:           provider,
+			Model:              model,
+			PriceScope:         modelPriceScopeLibrary,
+			InputUSDPerMillion: 1,
+		},
+		{
+			ID:                 2,
+			Provider:           provider,
+			Model:              model,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelBrand:       &brand,
+			ChannelKey:         &channelKey,
+			InputUSDPerMillion: 7,
+		},
+	})
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, prices)
+	if breakdown.Unpriced || breakdown.TotalUSD != 7 {
+		t.Fatalf("channel breakdown = %#v, want exact channel total 7", breakdown)
+	}
+
+	otherProvider := "vendor-b"
+	unpriced := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &otherProvider,
+		Model:       &model,
+		InputTokens: 1,
+		TotalTokens: 1,
+	}, prices)
+	if !unpriced.Unpriced || unpriced.UnpricedReason == nil || *unpriced.UnpricedReason != priceMatchStatusChannelUnpriced {
+		t.Fatalf("other channel breakdown = %#v, want channel_unpriced", unpriced)
 	}
 }
 
@@ -951,6 +1832,134 @@ func TestModelPriceAPIUpdatesPriorityMultiplierWithoutChangingSyncSource(t *test
 	}, cookies, &updated)
 	if updated.PriorityMultiplier == nil || *updated.PriorityMultiplier != 3 || updated.Source != "litellm" || !updated.AutoSynced {
 		t.Fatalf("updated priority price = %#v, want multiplier 3 and retained LiteLLM source", updated)
+	}
+}
+
+func TestNamedOpenAICompatibleChannelSupportsPriorityMultiplier(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	brand := string(aiProviderBrandOpenAICompatibility)
+	channelKey := "vendor a"
+	result, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million, updated_at
+		) VALUES ('Vendor A', 'gpt-vendor-fast', 'channel', ?, ?, 2, 4, 0, 0, ?)
+	`, brand, channelKey, dbTime(time.Now()))
+	if err != nil {
+		t.Fatalf("seed named channel price: %v", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("price id: %v", err)
+	}
+
+	var updated ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPut, fmt.Sprintf("/api/model-prices/%d/priority-multiplier", id), map[string]any{
+		"priority_multiplier": 3,
+	}, cookies, &updated)
+	if updated.PriorityMultiplier == nil || *updated.PriorityMultiplier != 3 || !modelPriceSupportsPriority(updated) {
+		t.Fatalf("updated named channel price = %#v, want supported multiplier 3", updated)
+	}
+
+	provider := "Vendor A"
+	model := "gpt-vendor-fast"
+	tier := "priority"
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:     &provider,
+		Model:        &model,
+		ServiceTier:  &tier,
+		InputTokens:  1_000_000,
+		OutputTokens: 1_000_000,
+		TotalTokens:  2_000_000,
+	}, channelPricesByKey([]ModelPrice{updated}))
+	if breakdown.Unpriced || breakdown.TotalUSD != 18 || breakdown.TierMultiplier == nil || *breakdown.TierMultiplier != 3 {
+		t.Fatalf("named channel Fast breakdown = %#v, want total 18 with multiplier 3", breakdown)
+	}
+}
+
+func TestNamedOpenAICompatibleChannelDoesNotSeedPriorityMultiplier(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	model := "gpt-5.5"
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/openai-compatibility": []map[string]any{
+			{"name": "openai", "models": []map[string]any{{"name": model}}},
+		},
+	})
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(ctx, cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	var catalog ModelPriceCatalogResponse
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/catalog", nil, cookies, &catalog)
+	if len(catalog.Models) != 1 || catalog.Models[0].ChannelStatus != modelPriceChannelStatusReady {
+		t.Fatalf("catalog models = %#v, want one ready OpenAI-compatible model", catalog.Models)
+	}
+	item := catalog.Models[0]
+	var created ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       item.SuggestedProvider,
+		"model":                          item.Name,
+		"price_scope":                    modelPriceScopeChannel,
+		"channel_brand":                  item.ChannelBrand,
+		"channel_key":                    item.ChannelKey,
+		"channel_identity_hash":          item.ChannelIdentityHash,
+		"input_usd_per_million":          1,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+	}, cookies, &created)
+	if created.PriorityMultiplier != nil || !modelPriceSupportsPriority(created) {
+		t.Fatalf("created named OpenAI channel = %#v, want supported Fast pricing with no default multiplier", created)
+	}
+
+	pricing, err := app.billingPriceIndex(ctx)
+	if err != nil {
+		t.Fatalf("billingPriceIndex failed: %v", err)
+	}
+	provider := "openai"
+	tier := serviceTierPriority
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		ServiceTier: &tier,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, pricing.Prices, pricing.MatchContext)
+	if breakdown.Unpriced || breakdown.TotalUSD != 1 || breakdown.TierMultiplier != nil {
+		t.Fatalf("named OpenAI priority breakdown = %#v, want base cost 1 without multiplier", breakdown)
 	}
 }
 
@@ -1468,9 +2477,12 @@ func TestSyncLiteLLMPricesReplacesLiteLLMSource(t *testing.T) {
 	if unsafeDefaultInput != 1e300 || unsafeDefaultMultiplier.Valid {
 		t.Fatalf("unsafe default price = %v/%v, want 1e300/NULL", unsafeDefaultInput, unsafeDefaultMultiplier)
 	}
-	prices, err := app.priceMap(context.Background())
+	pricing, err := app.billingPriceIndex(context.Background())
 	if err != nil {
 		t.Fatalf("load synced prices: %v", err)
+	}
+	if len(pricing.Prices) != 0 {
+		t.Fatalf("billing price map length = %d, want LiteLLM library prices excluded", len(pricing.Prices))
 	}
 	provider, model, serviceTier := "openai", "gpt-5.5", "priority"
 	amount, unpriced := recordCost(UsageRecord{
@@ -1479,7 +2491,7 @@ func TestSyncLiteLLMPricesReplacesLiteLLMSource(t *testing.T) {
 		ServiceTier: &serviceTier,
 		InputTokens: 1_000_000,
 		TotalTokens: 1_000_000,
-	}, prices)
+	}, pricing.Prices, pricing.MatchContext)
 	if amount != 0 || !unpriced {
 		t.Fatalf("synced zero multiplier cost = %v/%v, want 0/true", amount, unpriced)
 	}
@@ -1490,9 +2502,68 @@ func TestSyncLiteLLMPricesReplacesLiteLLMSource(t *testing.T) {
 		ServiceTier: &serviceTier,
 		InputTokens: 1_000_000,
 		TotalTokens: 1_000_000,
-	}, prices)
-	if amount != 1e300 || unpriced {
-		t.Fatalf("synced unsafe-default Fast cost = %v/%v, want base 1e300/false", amount, unpriced)
+	}, pricing.Prices, pricing.MatchContext)
+	if amount != 0 || !unpriced {
+		t.Fatalf("synced library Fast cost = %v/%v, want 0/true", amount, unpriced)
+	}
+}
+
+func TestSyncLiteLLMPricesPreservesUnresolvedConflictSelectedPrice(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	const selectedID = 910001
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			id, provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			source, source_model, auto_synced, last_synced_at, updated_at
+		) VALUES (?, 'OpenAI', 'Conflict-Sync-Model', 'library', NULL, NULL,
+			1, 2, 0.1, 0, 'litellm', 'conflict-sync-model', 1,
+			'2026-07-14T10:00:00Z', '2026-07-14T10:00:00Z')
+	`, selectedID); err != nil {
+		t.Fatalf("seed selected LiteLLM price: %v", err)
+	}
+	if _, err := app.db.Exec(`
+		INSERT INTO model_price_library_conflicts (
+			original_id, selected_price_id, conflict_reason, provider, model,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			source, source_model, auto_synced, last_synced_at, updated_at
+		) VALUES (910002, ?, 'case_insensitive_library_identity', 'openai', 'conflict-sync-model',
+			3, 4, 0.3, 0, 'litellm', 'conflict-sync-model-legacy', 1,
+			'2026-07-14T09:00:00Z', '2026-07-14T09:00:00Z')
+	`, selectedID); err != nil {
+		t.Fatalf("seed unresolved conflict: %v", err)
+	}
+
+	if _, err := app.syncLiteLLMPrices(context.Background(), "https://example.com/prices.json", map[string]any{
+		"conflict-sync-model": map[string]any{
+			"litellm_provider":     "openai",
+			"input_cost_per_token": 0.000009,
+		},
+	}); err != nil {
+		t.Fatalf("syncLiteLLMPrices failed: %v", err)
+	}
+	selected, err := app.getPrice(context.Background(), selectedID)
+	if err != nil {
+		t.Fatalf("selected conflict price was removed: %v", err)
+	}
+	if selected.Source != "litellm" || selected.InputUSDPerMillion != 1 {
+		t.Fatalf("selected conflict price = %#v, want pinned original row", selected)
+	}
+
+	replaced, err := app.replaceActiveModelPriceLibraryConflict(context.Background(), 910002)
+	if err != nil {
+		t.Fatalf("replaceActiveModelPriceLibraryConflict failed after sync: %v", err)
+	}
+	if replaced.ID != selectedID || replaced.Source != "manual" || replaced.InputUSDPerMillion != 3 {
+		t.Fatalf("replaced conflict price = %#v, want active ID %d and archived values", replaced, selectedID)
 	}
 }
 
@@ -1650,23 +2721,21 @@ func TestListPricesOrdersManualBeforeSynced(t *testing.T) {
 	}
 }
 
-func TestModelPriceCatalogListsCPAModelsWithMatchedPrices(t *testing.T) {
+func TestModelPriceCatalogListsConfiguredChannelsWithExactPrices(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
-	var seenAuth string
-	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/models" {
-			http.NotFound(w, r)
-			return
-		}
-		seenAuth = r.Header.Get("Authorization")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": []map[string]any{
-				{"id": "gpt-priced", "name": "GPT Priced", "owner": "openai", "object": "model"},
-				{"id": "missing/model", "object": "model"},
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/openai-compatibility": []map[string]any{
+			{
+				"name": "Vendor A",
+				"models": []map[string]any{
+					{"name": "gpt-priced", "alias": "GPT Priced"},
+					{"name": "missing/model"},
+					{"name": "models/gpt-prefixed"},
+					{"name": "publishers/google/models/gpt-publisher"},
+				},
 			},
-		})
-	}))
+		},
+	})
 	defer cpa.Close()
 
 	app, err := New()
@@ -1680,6 +2749,7 @@ func TestModelPriceCatalogListsCPAModelsWithMatchedPrices(t *testing.T) {
 		t.Fatalf("loadConfig failed: %v", err)
 	}
 	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
 	if err := app.saveConfig(context.Background(), cfg); err != nil {
 		t.Fatalf("saveConfig failed: %v", err)
 	}
@@ -1692,51 +2762,989 @@ func TestModelPriceCatalogListsCPAModelsWithMatchedPrices(t *testing.T) {
 	}, nil, nil)
 
 	now := dbTime(time.Now().In(appTimeLocation))
-	apiKey := "sk-catalog-test"
-	if _, err := app.db.Exec(`
-		INSERT INTO user_api_keys (api_key_hash, user_id, api_key, description, created_at, updated_at)
-		VALUES (?, 1, ?, 'Admin Key', ?, ?)
-	`, hashAPIKey(apiKey), apiKey, now, now); err != nil {
-		t.Fatalf("seed api key: %v", err)
-	}
 	if _, err := app.db.Exec(`
 		INSERT INTO model_prices (
-			provider, model, input_usd_per_million, output_usd_per_million,
+			provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
 			cache_read_usd_per_million, cache_creation_usd_per_million,
 			long_context_threshold_tokens, long_context_input_usd_per_million,
 			long_context_output_usd_per_million, long_context_cache_read_usd_per_million,
 			long_context_cache_creation_usd_per_million, source,
 			source_model, auto_synced, last_synced_at, updated_at
-		) VALUES ('openai', 'gpt-priced', 1, 2, 0.1, 0, 200000, 3, 6, 0.3, 0, 'litellm', 'gpt-priced', 1, ?, ?)
-	`, now, now); err != nil {
+		) VALUES
+			('openai', 'gpt-priced', 'library', NULL, NULL, 1, 2, 0.1, 0, 200000, 3, 6, 0.3, 0, 'litellm', 'gpt-priced', 1, ?, ?),
+			('Vendor A', 'gpt-priced', 'channel', 'openai_compatibility', 'vendor a', 4, 8, 0.4, 0, 200000, 5, 10, 0.5, 0, 'manual', NULL, 0, NULL, ?),
+			('openai', 'models/gpt-prefixed', 'library', NULL, NULL, 6, 12, 0.6, 0, NULL, NULL, NULL, NULL, NULL, 'manual', NULL, 0, NULL, ?),
+			('openai', 'gpt-publisher', 'library', NULL, NULL, 7, 14, 0.7, 0, NULL, NULL, NULL, NULL, NULL, 'manual', NULL, 0, NULL, ?)
+	`, now, now, now, now, now); err != nil {
 		t.Fatalf("seed model price: %v", err)
 	}
 
 	var catalog ModelPriceCatalogResponse
 	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/catalog", nil, cookies, &catalog)
-	if seenAuth != "Bearer "+apiKey {
-		t.Fatalf("Authorization = %q, want bearer api key", seenAuth)
-	}
 	if catalog.APIKeyCount != 1 || catalog.QueryableAPIKeyCount != 1 {
 		t.Fatalf("key counts = %d/%d, want 1/1", catalog.APIKeyCount, catalog.QueryableAPIKeyCount)
 	}
-	if catalog.PricedModels != 1 || catalog.UnpricedModels != 1 {
-		t.Fatalf("priced/unpriced = %d/%d, want 1/1", catalog.PricedModels, catalog.UnpricedModels)
+	if !catalog.ChannelsAvailable || catalog.ChannelError != nil {
+		t.Fatalf("channel availability = %v/%v, want available", catalog.ChannelsAvailable, catalog.ChannelError)
 	}
+	if catalog.PricedModels != 1 || catalog.UnpricedModels != 3 {
+		t.Fatalf("priced/unpriced = %d/%d, want 1/3", catalog.PricedModels, catalog.UnpricedModels)
+	}
+	if len(catalog.Models) != 4 {
+		t.Fatalf("models length = %d, want 4", len(catalog.Models))
+	}
+	var priced, missing, prefixed, publisher *ModelPriceCatalogItem
+	for index := range catalog.Models {
+		item := &catalog.Models[index]
+		switch item.Name {
+		case "gpt-priced":
+			priced = item
+		case "missing/model":
+			missing = item
+		case "gpt-prefixed":
+			prefixed = item
+		case "gpt-publisher":
+			publisher = item
+		}
+	}
+	if missing == nil || missing.Price != nil || missing.ChannelLabel != "Vendor A" || missing.ChannelKey != "vendor a" {
+		t.Fatalf("missing model = %#v, want unpriced Vendor A channel", missing)
+	}
+	if priced == nil || priced.Price == nil || priced.Price.PriceScope != modelPriceScopeChannel || priced.Price.InputUSDPerMillion != 4 {
+		t.Fatalf("priced model = %#v, want exact channel price", priced)
+	}
+	if priced.TemplatePrice == nil || priced.TemplatePrice.PriceScope != modelPriceScopeLibrary || priced.TemplatePrice.Source != "litellm" {
+		t.Fatalf("template price = %#v, want library LiteLLM price", priced.TemplatePrice)
+	}
+	if prefixed == nil || prefixed.TemplatePrice == nil || prefixed.TemplatePrice.Model != "models/gpt-prefixed" {
+		t.Fatalf("prefixed template price = %#v, want preserved models/ library price", prefixed)
+	}
+	if publisher == nil || publisher.TemplatePrice == nil || publisher.TemplatePrice.Model != "gpt-publisher" {
+		t.Fatalf("publisher template price = %#v, want normalized library price", publisher)
+	}
+	if priced.Alias == nil || *priced.Alias != "GPT Priced" {
+		t.Fatalf("catalog alias = %#v, want GPT Priced", priced.Alias)
+	}
+}
+
+func TestModelPriceLibraryConflictsAreVisibleAndResolvable(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			id, provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			source, auto_synced, updated_at
+		) VALUES
+			(900001, 'OpenAI', 'Case-Model', 'library', NULL, NULL, 10, 11, 1, 2, 'manual', 0, '2026-07-13T15:00:00Z'),
+			(900002, 'Other', 'Reserved-ID', 'library', NULL, NULL, 1, 1, 0, 0, 'manual', 0, '2026-07-13T15:00:00Z')
+	`); err != nil {
+		t.Fatalf("seed active library price: %v", err)
+	}
+	if _, err := app.db.Exec(`
+		INSERT INTO model_price_library_conflicts (
+			original_id, selected_price_id, conflict_reason, provider, model,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+			priority_multiplier, long_context_threshold_tokens,
+			long_context_input_usd_per_million, long_context_output_usd_per_million,
+			long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
+			source, source_model, auto_synced, last_synced_at, updated_at
+		) VALUES
+			(900002, 900001, 'case_insensitive_library_identity', 'openai', 'case-model',
+			 20, 21, 2, 3, 0.5, 2.5, 300000, 30, 31, 3, 4,
+			 'litellm', 'legacy-source', 1, '2026-07-13T14:00:00Z', '2026-07-13T16:00:00Z'),
+			(900003, 900001, 'case_insensitive_library_identity', 'OPENAI', 'CASE-MODEL',
+			 30, 31, 3, 4, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+			 'litellm', 'replacement-source', 1, '2026-07-13T14:30:00Z', '2026-07-13T17:00:00Z')
+	`); err != nil {
+		t.Fatalf("seed library conflicts: %v", err)
+	}
+
+	var conflicts []ModelPriceLibraryConflict
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/library-conflicts", nil, cookies, &conflicts)
+	if len(conflicts) != 2 {
+		t.Fatalf("library conflicts = %#v, want two rows", conflicts)
+	}
+	first := conflicts[0]
+	if first.OriginalID != 900002 || first.SelectedPriceID != 900001 || first.Price.RequestUSD == nil || *first.Price.RequestUSD != 0.5 || first.Price.PriorityMultiplier == nil || *first.Price.PriorityMultiplier != 2.5 || first.Price.LongContext == nil || first.Price.LongContext.ThresholdInputTokens != 300000 {
+		t.Fatalf("first library conflict = %#v, want complete archived price", first)
+	}
+
+	var promoted ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPut, "/api/model-prices/library-conflicts/900002/promote", map[string]any{
+		"provider": "OpenAI Legacy",
+		"model":    "case-model",
+	}, cookies, &promoted)
+	if promoted.ID == 900002 || promoted.Provider != "OpenAI Legacy" || promoted.Source != "manual" || promoted.AutoSynced || promoted.SourceModel != nil || promoted.LastSyncedAt != nil || promoted.RequestUSD == nil || *promoted.RequestUSD != 0.5 || promoted.LongContext == nil || promoted.LongContext.ThresholdInputTokens != 300000 {
+		t.Fatalf("promoted library price = %#v, want preserved archived row", promoted)
+	}
+
+	var replacement ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPut, "/api/model-prices/library-conflicts/900003/replace-active", nil, cookies, &replacement)
+	if replacement.ID != 900001 || replacement.InputUSDPerMillion != 30 || replacement.Provider != "OPENAI" || replacement.Source != "manual" || replacement.AutoSynced || replacement.SourceModel != nil || replacement.LastSyncedAt != nil {
+		t.Fatalf("replacement price = %#v, want selected conflict active", replacement)
+	}
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/library-conflicts", nil, cookies, &conflicts)
+	if len(conflicts) != 1 || conflicts[0].OriginalID != 900003 || conflicts[0].SelectedPriceID != 900001 || conflicts[0].Price.InputUSDPerMillion != 10 {
+		t.Fatalf("post-replacement conflicts = %#v, want displaced active row", conflicts)
+	}
+	if _, err := app.syncLiteLLMPrices(context.Background(), "https://example.com/prices.json", map[string]any{
+		"unrelated-sync-model": map[string]any{
+			"litellm_provider":     "openai",
+			"input_cost_per_token": 0.000001,
+		},
+	}); err != nil {
+		t.Fatalf("syncLiteLLMPrices failed: %v", err)
+	}
+	for _, id := range []int{promoted.ID, replacement.ID} {
+		price, err := app.getPrice(context.Background(), id)
+		if err != nil {
+			t.Fatalf("resolved price %d was removed by LiteLLM sync: %v", id, err)
+		}
+		if price.Source != "manual" || price.AutoSynced {
+			t.Fatalf("resolved price %d ownership = %#v, want manual", id, price)
+		}
+	}
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/library-conflicts", nil, cookies, &conflicts)
+	if len(conflicts) != 1 || conflicts[0].SelectedPriceID != replacement.ID {
+		t.Fatalf("post-sync conflicts = %#v, want selected manual price preserved", conflicts)
+	}
+	requestJSONForPricingTest(t, handler, http.MethodDelete, "/api/model-prices/library-conflicts/900003", nil, cookies, nil)
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/library-conflicts", nil, cookies, &conflicts)
+	if len(conflicts) != 0 {
+		t.Fatalf("library conflicts after delete = %#v, want empty", conflicts)
+	}
+}
+
+func TestModelPriceLibraryConflictProtectsSelectedActivePrice(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			id, provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			source, auto_synced, updated_at
+		) VALUES (920001, 'OpenAI', 'Protected-Model', 'library', NULL, NULL,
+			10, 11, 1, 2, 'manual', 0, '2026-07-15T10:00:00Z')
+	`); err != nil {
+		t.Fatalf("seed selected price: %v", err)
+	}
+	if _, err := app.db.Exec(`
+		INSERT INTO model_price_library_conflicts (
+			original_id, selected_price_id, conflict_reason, provider, model,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			source, auto_synced, updated_at
+		) VALUES (920002, 920001, 'case_insensitive_library_identity', 'openai', 'protected-model',
+			20, 21, 2, 3, 'manual', 0, '2026-07-15T11:00:00Z')
+	`); err != nil {
+		t.Fatalf("seed library conflict: %v", err)
+	}
+
+	ctx := context.Background()
+	updated, err := app.updatePrice(ctx, 920001, modelPricePayload{
+		Provider:                   "OpenAI",
+		Model:                      "Protected-Model",
+		PriceScope:                 modelPriceScopeLibrary,
+		InputUSDPerMillion:         12,
+		OutputUSDPerMillion:        13,
+		CacheReadUSDPerMillion:     1,
+		CacheCreationUSDPerMillion: 2,
+	})
+	if err != nil {
+		t.Fatalf("numeric update failed: %v", err)
+	}
+	if updated.InputUSDPerMillion != 12 || updated.OutputUSDPerMillion != 13 {
+		t.Fatalf("numeric update = %#v, want updated values", updated)
+	}
+
+	_, err = app.updatePrice(ctx, 920001, modelPricePayload{
+		Provider:                   "OpenAI Legacy",
+		Model:                      "Protected-Model",
+		PriceScope:                 modelPriceScopeLibrary,
+		InputUSDPerMillion:         12,
+		OutputUSDPerMillion:        13,
+		CacheReadUSDPerMillion:     1,
+		CacheCreationUSDPerMillion: 2,
+	})
+	if appErr, ok := err.(*AppError); !ok || appErr.Status != http.StatusConflict {
+		t.Fatalf("identity update error = %#v, want conflict", err)
+	}
+	if err := app.deletePrice(ctx, 920001); err == nil {
+		t.Fatal("referenced price delete unexpectedly succeeded")
+	} else if appErr, ok := err.(*AppError); !ok || appErr.Status != http.StatusConflict {
+		t.Fatalf("referenced price delete error = %#v, want conflict", err)
+	}
+	if err := app.deleteModelPriceLibraryConflict(ctx, 920002); err != nil {
+		t.Fatalf("delete conflict failed: %v", err)
+	}
+	if err := app.deletePrice(ctx, 920001); err != nil {
+		t.Fatalf("delete price after resolving conflict failed: %v", err)
+	}
+}
+
+func TestModelPriceLibraryConflictAPIPreservesPartialLongContextFields(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			id, provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			source, auto_synced, updated_at
+		) VALUES (930001, 'OpenAI', 'Partial-Context', 'library', NULL, NULL,
+			10, 11, 1, 2, 'manual', 0, '2026-07-15T10:00:00Z')
+	`); err != nil {
+		t.Fatalf("seed selected price: %v", err)
+	}
+	if _, err := app.db.Exec(`
+		INSERT INTO model_price_library_conflicts (
+			original_id, selected_price_id, conflict_reason, provider, model,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			long_context_threshold_tokens, long_context_input_usd_per_million,
+			long_context_output_usd_per_million, long_context_cache_read_usd_per_million,
+			long_context_cache_creation_usd_per_million,
+			source, auto_synced, updated_at
+		) VALUES (930002, 930001, 'case_insensitive_library_identity', 'openai', 'partial-context',
+			20, 21, 2, 3, 250000, NULL, 31, NULL, 4, 'manual', 0, '2026-07-15T11:00:00Z')
+	`); err != nil {
+		t.Fatalf("seed partial long-context conflict: %v", err)
+	}
+
+	var conflicts []ModelPriceLibraryConflict
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/library-conflicts", nil, cookies, &conflicts)
+	if len(conflicts) != 1 {
+		t.Fatalf("library conflicts = %#v, want one row", conflicts)
+	}
+	conflict := conflicts[0]
+	if conflict.Price.LongContext != nil {
+		t.Fatalf("sanitized price long context = %#v, want nil for incomplete config", conflict.Price.LongContext)
+	}
+	raw := conflict.ArchivedLongContext
+	if raw == nil || raw.ThresholdInputTokens == nil || *raw.ThresholdInputTokens != 250000 || raw.InputUSDPerMillion != nil || raw.OutputUSDPerMillion == nil || *raw.OutputUSDPerMillion != 31 || raw.CacheReadUSDPerMillion != nil || raw.CacheCreationUSDPerMillion == nil || *raw.CacheCreationUSDPerMillion != 4 {
+		t.Fatalf("archived long context = %#v, want exact nullable fields", raw)
+	}
+
+	var promoted ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPut, "/api/model-prices/library-conflicts/930002/promote", map[string]any{
+		"provider": "openai-manual",
+		"model":    "partial-context-promoted",
+	}, cookies, &promoted)
+	if promoted.LongContext != nil {
+		t.Fatalf("promoted long context = %#v, want JSON-safe nil", promoted.LongContext)
+	}
+	preserved := promoted.PreservedLongContext
+	if preserved == nil || preserved.ThresholdInputTokens == nil || *preserved.ThresholdInputTokens != 250000 || preserved.InputUSDPerMillion != nil || preserved.OutputUSDPerMillion == nil || *preserved.OutputUSDPerMillion != 31 || preserved.CacheReadUSDPerMillion != nil || preserved.CacheCreationUSDPerMillion == nil || *preserved.CacheCreationUSDPerMillion != 4 {
+		t.Fatalf("promoted preserved long context = %#v, want exact nullable fields", preserved)
+	}
+
+	updatePayload := map[string]any{
+		"provider":                       promoted.Provider,
+		"model":                          promoted.Model,
+		"price_scope":                    modelPriceScopeLibrary,
+		"channel_brand":                  nil,
+		"channel_key":                    nil,
+		"channel_identity_hash":          nil,
+		"input_usd_per_million":          22,
+		"output_usd_per_million":         23,
+		"cache_read_usd_per_million":     2,
+		"cache_creation_usd_per_million": 3,
+		"request_usd":                    nil,
+		"long_context":                   nil,
+		"preserve_invalid_long_context":  true,
+	}
+	var updated ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPut, fmt.Sprintf("/api/model-prices/%d", promoted.ID), updatePayload, cookies, &updated)
+	if updated.PreservedLongContext == nil || updated.PreservedLongContext.OutputUSDPerMillion == nil || *updated.PreservedLongContext.OutputUSDPerMillion != 31 {
+		t.Fatalf("updated preserved long context = %#v, want explicit preserve flag to retain raw fields", updated.PreservedLongContext)
+	}
+
+	updatePayload["preserve_invalid_long_context"] = false
+	requestJSONForPricingTest(t, handler, http.MethodPut, fmt.Sprintf("/api/model-prices/%d", promoted.ID), updatePayload, cookies, &updated)
+	if updated.PreservedLongContext != nil || updated.LongContext != nil {
+		t.Fatalf("cleared long context = %#v/%#v, want explicit clear", updated.LongContext, updated.PreservedLongContext)
+	}
+	var threshold sql.NullInt64
+	var input, output, cacheRead, cacheCreation sql.NullFloat64
+	if err := app.db.QueryRow(`
+		SELECT long_context_threshold_tokens, long_context_input_usd_per_million,
+		       long_context_output_usd_per_million, long_context_cache_read_usd_per_million,
+		       long_context_cache_creation_usd_per_million
+		FROM model_prices WHERE id = ?
+	`, promoted.ID).Scan(&threshold, &input, &output, &cacheRead, &cacheCreation); err != nil {
+		t.Fatalf("query cleared promoted long context: %v", err)
+	}
+	if threshold.Valid || input.Valid || output.Valid || cacheRead.Valid || cacheCreation.Valid {
+		t.Fatalf("cleared promoted long context = %#v/%#v/%#v/%#v/%#v, want all NULL", threshold, input, output, cacheRead, cacheCreation)
+	}
+}
+
+func TestReplaceActiveModelPriceLibraryConflictPreservesPartialLongContextFields(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			id, provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			source, auto_synced, updated_at
+		) VALUES (940001, 'OpenAI', 'Partial-Replace', 'library', NULL, NULL,
+			10, 11, 1, 2, 'manual', 0, '2026-07-15T10:00:00Z')
+	`); err != nil {
+		t.Fatalf("seed selected price: %v", err)
+	}
+	if _, err := app.db.Exec(`
+		INSERT INTO model_price_library_conflicts (
+			original_id, selected_price_id, conflict_reason, provider, model,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			long_context_threshold_tokens, long_context_input_usd_per_million,
+			long_context_output_usd_per_million, long_context_cache_read_usd_per_million,
+			long_context_cache_creation_usd_per_million,
+			source, auto_synced, updated_at
+		) VALUES (940002, 940001, 'case_insensitive_library_identity', 'openai', 'partial-replace',
+			20, 21, 2, 3, NULL, 30, NULL, 4, NULL, 'manual', 0, '2026-07-15T11:00:00Z')
+	`); err != nil {
+		t.Fatalf("seed partial replacement conflict: %v", err)
+	}
+
+	var replaced ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPut, "/api/model-prices/library-conflicts/940002/replace-active", map[string]any{}, cookies, &replaced)
+	if replaced.ID != 940001 || replaced.LongContext != nil {
+		t.Fatalf("replaced price = %#v, want active ID and JSON-safe nil long context", replaced)
+	}
+	preserved := replaced.PreservedLongContext
+	if preserved == nil || preserved.ThresholdInputTokens != nil || preserved.InputUSDPerMillion == nil || *preserved.InputUSDPerMillion != 30 || preserved.OutputUSDPerMillion != nil || preserved.CacheReadUSDPerMillion == nil || *preserved.CacheReadUSDPerMillion != 4 || preserved.CacheCreationUSDPerMillion != nil {
+		t.Fatalf("replacement preserved long context = %#v, want exact nullable fields", preserved)
+	}
+}
+
+func TestNativeLibraryTemplatePrefersExactProviderBeforeFallback(t *testing.T) {
+	model := "shared-template-model"
+	tests := []struct {
+		name     string
+		brand    aiProviderBrand
+		exact    string
+		fallback string
+	}{
+		{name: "Codex", brand: aiProviderBrandCodex, exact: "codex", fallback: "openai"},
+		{name: "Claude", brand: aiProviderBrandClaude, exact: "claude", fallback: "anthropic"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			exact := ModelPrice{ID: 1, Provider: test.exact, Model: model, PriceScope: modelPriceScopeLibrary, InputUSDPerMillion: 1}
+			fallback := ModelPrice{ID: 2, Provider: test.fallback, Model: model, PriceScope: modelPriceScopeLibrary, InputUSDPerMillion: 2}
+			allPrices := []ModelPrice{fallback, exact}
+			prices := libraryPricesByKey(allPrices)
+			suggested := suggestedPriceProviderForChannel(test.brand, "", model)
+			if suggested != test.exact {
+				t.Fatalf("suggested provider = %q, want exact %q", suggested, test.exact)
+			}
+			matched := findCatalogPrice(prices, allPrices, suggested, nil, model)
+			if matched == nil || matched.ID != exact.ID {
+				t.Fatalf("exact template = %#v, want %#v", matched, exact)
+			}
+
+			fallbackOnly := []ModelPrice{fallback}
+			matched = findCatalogPrice(libraryPricesByKey(fallbackOnly), fallbackOnly, suggested, nil, model)
+			if matched == nil || matched.ID != fallback.ID {
+				t.Fatalf("fallback template = %#v, want %#v", matched, fallback)
+			}
+		})
+	}
+}
+
+func TestGeminiLibraryTemplatePrefersPrefixedGeminiPriceOverVertex(t *testing.T) {
+	model := "gemini-2.0-flash-001"
+	gemini := ModelPrice{
+		ID:                 1,
+		Provider:           "gemini",
+		Model:              "gemini/" + model,
+		PriceScope:         modelPriceScopeLibrary,
+		InputUSDPerMillion: 1,
+	}
+	vertex := ModelPrice{
+		ID:                 2,
+		Provider:           "vertex_ai",
+		Model:              model,
+		PriceScope:         modelPriceScopeLibrary,
+		InputUSDPerMillion: 2,
+	}
+	google := ModelPrice{
+		ID:                 3,
+		Provider:           "google",
+		Model:              model,
+		PriceScope:         modelPriceScopeLibrary,
+		InputUSDPerMillion: 3,
+	}
+
+	suggested := suggestedPriceProviderForChannel(aiProviderBrandGemini, "", model)
+	if suggested != "gemini" {
+		t.Fatalf("Gemini suggested provider = %q, want gemini", suggested)
+	}
+	allPrices := []ModelPrice{vertex, gemini, google}
+	matched := findCatalogPrice(libraryPricesByKey(allPrices), allPrices, suggested, nil, model)
+	if matched == nil || matched.ID != gemini.ID {
+		t.Fatalf("Gemini template = %#v, want prefixed exact price %#v", matched, gemini)
+	}
+
+	vertexOnly := []ModelPrice{vertex}
+	if matched := findCatalogPrice(libraryPricesByKey(vertexOnly), vertexOnly, suggested, nil, model); matched != nil {
+		t.Fatalf("Gemini template = %#v, want no cross-provider Vertex fallback", matched)
+	}
+
+	googleOnly := []ModelPrice{google}
+	matched = findCatalogPrice(libraryPricesByKey(googleOnly), googleOnly, suggested, nil, model)
+	if matched == nil || matched.ID != google.ID {
+		t.Fatalf("Gemini fallback template = %#v, want explicit Google fallback %#v", matched, google)
+	}
+}
+
+func TestCreateNativeChannelPriceResolvesExactConfiguredAuthIndex(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/gemini-api-key": []map[string]any{
+			{
+				"api-key":    "gemini-secret-key",
+				"auth-index": "gemini-auth-index",
+				"models":     []map[string]any{{"name": "models/gemini-2.5-pro"}},
+			},
+		},
+	})
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	cfg, err := app.loadConfig(context.Background())
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(context.Background(), cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	var catalog ModelPriceCatalogResponse
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/catalog", nil, cookies, &catalog)
+	if len(catalog.Models) != 1 {
+		t.Fatalf("catalog models = %#v, want one Gemini model", catalog.Models)
+	}
+	item := catalog.Models[0]
+	if item.ChannelBrand != string(aiProviderBrandGemini) || item.ChannelKey != "gemini-auth-index" || !strings.Contains(item.ChannelLabel, "...") {
+		t.Fatalf("catalog channel identity = %#v", item)
+	}
+
+	createPayload := map[string]any{
+		"provider":                       "google",
+		"model":                          "gemini-2.5-pro",
+		"price_scope":                    modelPriceScopeChannel,
+		"channel_brand":                  string(aiProviderBrandGemini),
+		"channel_key":                    "stale-browser-value",
+		"channel_identity_hash":          item.ChannelIdentityHash,
+		"input_usd_per_million":          2,
+		"output_usd_per_million":         8,
+		"cache_read_usd_per_million":     0.2,
+		"cache_creation_usd_per_million": 0,
+	}
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices", createPayload, cookies, http.StatusConflict)
+
+	createPayload["channel_key"] = item.ChannelKey
+	var created ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPost, "/api/model-prices", createPayload, cookies, &created)
+	if created.Provider != "gemini" || created.Model != "gemini-2.5-pro" || created.ChannelKey == nil || *created.ChannelKey != "gemini-auth-index" {
+		t.Fatalf("created channel price = %#v, want live configured identity", created)
+	}
+
+	pricing, err := app.billingPriceIndex(context.Background())
+	if err != nil {
+		t.Fatalf("billingPriceIndex failed: %v", err)
+	}
+	provider, model, authIndex := "gemini", "gemini-2.5-pro", "gemini-auth-index"
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		AuthIndex:   &authIndex,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, pricing.Prices, pricing.MatchContext)
+	if breakdown.Unpriced || breakdown.TotalUSD != 2 {
+		t.Fatalf("created channel cost = %#v, want exact total 2", breakdown)
+	}
+}
+
+func TestModelPriceCatalogDistinguishesSharedNativeIdentityBySelector(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	model := "shared-native-model"
+	authUpper := "Auth.json"
+	authLower := "auth.json"
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/gemini-api-key": []map[string]any{
+			{
+				"api-key":    "shared-native-secret",
+				"auth-index": authUpper,
+				"models":     []map[string]any{{"name": model}},
+			},
+			{
+				"api-key":    "shared-native-secret",
+				"auth-index": authLower,
+				"models":     []map[string]any{{"name": model}},
+			},
+		},
+	})
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(ctx, cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	var catalog ModelPriceCatalogResponse
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/catalog", nil, cookies, &catalog)
 	if len(catalog.Models) != 2 {
-		t.Fatalf("models length = %d, want 2", len(catalog.Models))
+		t.Fatalf("catalog models = %#v, want two selector-distinct rows", catalog.Models)
 	}
-	if catalog.Models[0].ID != "missing/model" || catalog.Models[0].Price != nil || catalog.Models[0].SuggestedProvider != "missing" {
-		t.Fatalf("first model = %#v, want missing/model unpriced with suggested provider", catalog.Models[0])
+	items := map[string]ModelPriceCatalogItem{}
+	for _, item := range catalog.Models {
+		items[item.ChannelKey] = item
+		if item.ChannelStatus != modelPriceChannelStatusReady {
+			t.Fatalf("catalog item = %#v, want ready", item)
+		}
 	}
-	if catalog.Models[1].ID != "gpt-priced" || catalog.Models[1].Price == nil || catalog.Models[1].Price.Source != "litellm" {
-		t.Fatalf("second model = %#v, want gpt-priced with litellm price", catalog.Models[1])
+	upper, upperOK := items[authUpper]
+	lower, lowerOK := items[authLower]
+	if !upperOK || !lowerOK {
+		t.Fatalf("catalog selectors = %#v, want %q and %q", items, authUpper, authLower)
 	}
-	if catalog.Models[1].Price.LongContext == nil || catalog.Models[1].Price.LongContext.ThresholdInputTokens != 200000 || catalog.Models[1].Price.LongContext.OutputUSDPerMillion != 6 {
-		t.Fatalf("catalog long-context price = %#v", catalog.Models[1].Price.LongContext)
+	if upper.ChannelIdentityHash != lower.ChannelIdentityHash {
+		t.Fatalf("shared API key identity hashes differ: %q != %q", upper.ChannelIdentityHash, lower.ChannelIdentityHash)
 	}
-	if len(catalog.Models[1].Sources) != 1 || catalog.Models[1].Sources[0].Description != "Admin Key" || catalog.Models[1].Sources[0].UserLabel != "管理员" {
-		t.Fatalf("sources = %#v, want key description and user label", catalog.Models[1].Sources)
+	if upper.ID == lower.ID {
+		t.Fatalf("selector-distinct catalog IDs collided: %q", upper.ID)
+	}
+
+	var created ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       lower.SuggestedProvider,
+		"model":                          lower.Name,
+		"price_scope":                    modelPriceScopeChannel,
+		"channel_brand":                  lower.ChannelBrand,
+		"channel_key":                    lower.ChannelKey,
+		"channel_identity_hash":          lower.ChannelIdentityHash,
+		"input_usd_per_million":          2,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+	}, cookies, &created)
+	if created.ChannelKey == nil || *created.ChannelKey != authLower {
+		t.Fatalf("created channel price = %#v, want selector %q", created, authLower)
+	}
+}
+
+func TestModelPriceCatalogRejectsAmbiguousGoogleNativeSelectors(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authIndex := "shared-google-auth"
+	model := "gemini-shared-model"
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/gemini-api-key": []map[string]any{
+			{
+				"api-key":    "gemini-secret-key",
+				"auth-index": authIndex,
+				"models":     []map[string]any{{"name": model}},
+			},
+		},
+		"/v0/management/vertex-api-key": []map[string]any{
+			{
+				"api-key":    "vertex-secret-key",
+				"auth-index": authIndex,
+				"models":     []map[string]any{{"name": model}},
+			},
+		},
+	})
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	cfg, err := app.loadConfig(context.Background())
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(context.Background(), cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			source, auto_synced, updated_at
+		) VALUES ('gemini', ?, 'channel', 'gemini', ?, 1, 2, 0, 0, 'manual', 0, ?)
+	`, model, authIndex, dbTime(time.Now())); err != nil {
+		t.Fatalf("seed conflicted channel price: %v", err)
+	}
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	var catalog ModelPriceCatalogResponse
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/catalog", nil, cookies, &catalog)
+	if len(catalog.Models) != 2 {
+		t.Fatalf("catalog models = %#v, want Gemini and Vertex rows", catalog.Models)
+	}
+	if catalog.PricedModels != 0 || catalog.UnpricedModels != 2 {
+		t.Fatalf("priced/unpriced = %d/%d, want 0/2 conflicted rows", catalog.PricedModels, catalog.UnpricedModels)
+	}
+	pricedConflictCount := 0
+	for _, item := range catalog.Models {
+		if item.ChannelStatus != modelPriceChannelStatusConflict {
+			t.Fatalf("catalog item = %#v, want conflict status", item)
+		}
+		if item.Price != nil {
+			pricedConflictCount++
+			if item.ChannelBrand != string(aiProviderBrandGemini) || item.Price.ChannelBrand == nil || *item.Price.ChannelBrand != string(aiProviderBrandGemini) {
+				t.Fatalf("attached conflicted price = %#v, want exact Gemini channel price", item)
+			}
+		}
+	}
+	if pricedConflictCount != 1 {
+		t.Fatalf("conflicted catalog prices = %d, want one exact attached price", pricedConflictCount)
+	}
+
+	item := catalog.Models[0]
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       item.SuggestedProvider,
+		"model":                          item.Name,
+		"price_scope":                    modelPriceScopeChannel,
+		"channel_brand":                  item.ChannelBrand,
+		"channel_key":                    item.ChannelKey,
+		"channel_identity_hash":          item.ChannelIdentityHash,
+		"input_usd_per_million":          1,
+		"output_usd_per_million":         2,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+	}, cookies, http.StatusConflict)
+}
+
+func TestModelPriceCatalogUsesBillingLabelNormalizationForNativeConflicts(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authIndex := "shared-gemini-auth"
+	model := "shared-gemini-model"
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/gemini-api-key": []map[string]any{
+			{
+				"api-key":    "gemini-secret-key",
+				"auth-index": authIndex,
+				"models":     []map[string]any{{"name": model}},
+			},
+		},
+		"/v0/management/openai-compatibility": []map[string]any{
+			{"name": "gemini_api_key", "models": []map[string]any{{"name": model}}},
+			{"name": "geminiapikey", "models": []map[string]any{{"name": model}}},
+		},
+	})
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(ctx, cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	var catalog ModelPriceCatalogResponse
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/catalog", nil, cookies, &catalog)
+	var native *ModelPriceCatalogItem
+	for index := range catalog.Models {
+		if catalog.Models[index].ChannelBrand == string(aiProviderBrandGemini) {
+			native = &catalog.Models[index]
+			break
+		}
+	}
+	if native == nil || native.ChannelStatus != modelPriceChannelStatusConflict {
+		t.Fatalf("native Gemini catalog item = %#v, want normalized-name conflict", native)
+	}
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       native.SuggestedProvider,
+		"model":                          native.Name,
+		"price_scope":                    modelPriceScopeChannel,
+		"channel_brand":                  native.ChannelBrand,
+		"channel_key":                    native.ChannelKey,
+		"channel_identity_hash":          native.ChannelIdentityHash,
+		"input_usd_per_million":          1,
+		"output_usd_per_million":         2,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+	}, cookies, http.StatusConflict)
+}
+
+func TestModelPriceCatalogRejectsMissingAuthCompatibleNativeAmbiguity(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	model := "shared-missing-auth-model"
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/gemini-api-key": []map[string]any{
+			{
+				"api-key": "gemini-secret-key",
+				"models":  []map[string]any{{"name": model}},
+			},
+		},
+		"/v0/management/openai-compatibility": []map[string]any{
+			{"name": "gemini", "models": []map[string]any{{"name": model}}},
+		},
+	})
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(ctx, cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	var catalog ModelPriceCatalogResponse
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/catalog", nil, cookies, &catalog)
+	var compatible *ModelPriceCatalogItem
+	for index := range catalog.Models {
+		item := &catalog.Models[index]
+		if item.ChannelBrand == string(aiProviderBrandOpenAICompatibility) {
+			compatible = item
+			if item.ChannelStatus != modelPriceChannelStatusConflict {
+				t.Fatalf("compatible catalog item = %#v, want conflict status", item)
+			}
+		} else if item.ChannelStatus != modelPriceChannelStatusMissingSelector {
+			t.Fatalf("selectorless native catalog item = %#v, want missing_selector", item)
+		}
+	}
+	if compatible == nil {
+		t.Fatal("missing OpenAI-compatible catalog row")
+	}
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       compatible.SuggestedProvider,
+		"model":                          compatible.Name,
+		"price_scope":                    modelPriceScopeChannel,
+		"channel_brand":                  compatible.ChannelBrand,
+		"channel_key":                    compatible.ChannelKey,
+		"channel_identity_hash":          compatible.ChannelIdentityHash,
+		"input_usd_per_million":          1,
+		"output_usd_per_million":         2,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+	}, cookies, http.StatusConflict)
+}
+
+func TestModelPriceCatalogAllowsNativeNamedOpenAICompatibilityWithoutNativeCandidates(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/openai-compatibility": []map[string]any{
+			{"name": "google", "models": []map[string]any{{"name": "oai-google-model"}}},
+			{"name": "gemini", "models": []map[string]any{{"name": "oai-gemini-model"}}},
+			{"name": "claude", "models": []map[string]any{{"name": "oai-claude-model"}}},
+		},
+	})
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(ctx, cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	var catalog ModelPriceCatalogResponse
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/catalog", nil, cookies, &catalog)
+	if len(catalog.Models) != 3 {
+		t.Fatalf("catalog models = %#v, want three OpenAI-compatible rows", catalog.Models)
+	}
+	for _, item := range catalog.Models {
+		if item.ChannelBrand != string(aiProviderBrandOpenAICompatibility) || item.ChannelStatus != modelPriceChannelStatusReady {
+			t.Fatalf("catalog item = %#v, want ready OpenAI-compatible channel", item)
+		}
+		var created ModelPrice
+		requestJSONForPricingTest(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+			"provider":                       item.SuggestedProvider,
+			"model":                          item.Name,
+			"price_scope":                    modelPriceScopeChannel,
+			"channel_brand":                  item.ChannelBrand,
+			"channel_key":                    item.ChannelKey,
+			"channel_identity_hash":          item.ChannelIdentityHash,
+			"input_usd_per_million":          1,
+			"output_usd_per_million":         0,
+			"cache_read_usd_per_million":     0,
+			"cache_creation_usd_per_million": 0,
+		}, cookies, &created)
+		if created.ChannelBrand == nil || *created.ChannelBrand != string(aiProviderBrandOpenAICompatibility) || created.ChannelKey == nil || *created.ChannelKey != strings.ToLower(item.ChannelLabel) {
+			t.Fatalf("created native-named OpenAI-compatible price = %#v", created)
+		}
+	}
+
+	pricing, err := app.billingPriceIndex(ctx)
+	if err != nil {
+		t.Fatalf("billingPriceIndex failed: %v", err)
+	}
+	for _, item := range catalog.Models {
+		provider := item.ChannelLabel
+		model := item.Name
+		breakdown := calculateRecordCostBreakdown(UsageRecord{
+			Provider:    &provider,
+			Model:       &model,
+			InputTokens: 1_000_000,
+			TotalTokens: 1_000_000,
+		}, pricing.Prices, pricing.MatchContext)
+		if breakdown.Unpriced || breakdown.TotalUSD != 1 {
+			t.Fatalf("native-named OpenAI-compatible breakdown for %q = %#v, want priced total 1", provider, breakdown)
+		}
+	}
+}
+
+func TestModelPriceChannelSelectorUsesNameOnlyForOpenAICompatibility(t *testing.T) {
+	masked := "sk-...1234"
+	authIndex := "auth-index"
+	name := "Named Vendor"
+	for _, brand := range []aiProviderBrand{aiProviderBrandGemini, aiProviderBrandCodex, aiProviderBrandClaude, aiProviderBrandVertex} {
+		key, label, fallback := modelPriceChannelSelector(aiProviderItem{
+			Brand:        brand,
+			IdentityHash: "identity",
+			AuthIndex:    &authIndex,
+			APIKeyMasked: &masked,
+		})
+		if key != authIndex || label != masked || fallback {
+			t.Fatalf("%s selector = %q/%q/%v, want auth index and masked key", brand, key, label, fallback)
+		}
+	}
+	key, label, fallback := modelPriceChannelSelector(aiProviderItem{
+		Brand:        aiProviderBrandGemini,
+		IdentityHash: "identity",
+		AuthIndex:    &authIndex,
+	})
+	if key != authIndex || label != authIndex || !fallback {
+		t.Fatalf("auth-index-only selector = %q/%q/%v, want auth index fallback label", key, label, fallback)
+	}
+	key, label, fallback = modelPriceChannelSelector(aiProviderItem{
+		Brand:        aiProviderBrandOpenAICompatibility,
+		IdentityHash: "identity",
+		Name:         &name,
+		AuthIndex:    &authIndex,
+		APIKeyMasked: &masked,
+	})
+	if key != "named vendor" || label != name || fallback {
+		t.Fatalf("OpenAI-compatible selector = %q/%q/%v, want normalized name/original name", key, label, fallback)
 	}
 }
 
@@ -1771,18 +3779,11 @@ func TestAvailableModelPriceProjectionIncludesJSONSafeLongContext(t *testing.T) 
 
 func TestModelPriceCatalogTreatsImageWithoutRequestPriceAsUnpriced(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
-	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/models" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": []map[string]any{
-				{"id": "gpt-image-2", "name": "GPT Image", "owner": "openai", "object": "model"},
-			},
-		})
-	}))
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/openai-compatibility": []map[string]any{
+			{"name": "Image Vendor", "models": []map[string]any{{"name": "gpt-image-2"}}},
+		},
+	})
 	defer cpa.Close()
 
 	app, err := New()
@@ -1796,6 +3797,7 @@ func TestModelPriceCatalogTreatsImageWithoutRequestPriceAsUnpriced(t *testing.T)
 		t.Fatalf("loadConfig failed: %v", err)
 	}
 	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
 	if err := app.saveConfig(context.Background(), cfg); err != nil {
 		t.Fatalf("saveConfig failed: %v", err)
 	}
@@ -1808,20 +3810,14 @@ func TestModelPriceCatalogTreatsImageWithoutRequestPriceAsUnpriced(t *testing.T)
 	}, nil, nil)
 
 	now := dbTime(time.Now().In(appTimeLocation))
-	apiKey := "sk-catalog-image-test"
-	if _, err := app.db.Exec(`
-		INSERT INTO user_api_keys (api_key_hash, user_id, api_key, description, created_at, updated_at)
-		VALUES (?, 1, ?, 'Admin Key', ?, ?)
-	`, hashAPIKey(apiKey), apiKey, now, now); err != nil {
-		t.Fatalf("seed api key: %v", err)
-	}
 	if _, err := app.db.Exec(`
 		INSERT INTO model_prices (
-			provider, model, input_usd_per_million, output_usd_per_million,
+			provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
 			cache_read_usd_per_million, cache_creation_usd_per_million, source,
 			source_model, auto_synced, last_synced_at, updated_at
-		) VALUES ('openai', 'gpt-image-2', 5, 10, 1.25, 0, 'litellm', 'gpt-image-2', 1, ?, ?)
-	`, now, now); err != nil {
+		) VALUES ('Image Vendor', 'gpt-image-2', 'channel', 'openai_compatibility', 'image vendor', 5, 10, 1.25, 0, 'manual', NULL, 0, NULL, ?)
+	`, now); err != nil {
 		t.Fatalf("seed model price: %v", err)
 	}
 
@@ -1836,6 +3832,30 @@ func TestModelPriceCatalogTreatsImageWithoutRequestPriceAsUnpriced(t *testing.T)
 	if catalog.Models[0].Price.BillingUnit != modelBillingUnitRequest || catalog.Models[0].Price.RequestUSD != nil {
 		t.Fatalf("image price = %#v, want request billing with nil request_usd", catalog.Models[0].Price)
 	}
+}
+
+func newModelPriceCatalogManagementServer(t *testing.T, responses map[string]any) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-management-key" {
+			t.Fatalf("management Authorization = %q", r.Header.Get("Authorization"))
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if response, ok := responses[r.URL.Path]; ok {
+			_ = json.NewEncoder(w).Encode(response)
+			return
+		}
+		switch r.URL.Path {
+		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
 }
 
 func TestLiteLLMSyncUsesConfiguredHTTPProxy(t *testing.T) {

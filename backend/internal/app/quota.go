@@ -140,7 +140,7 @@ func (a *App) ensureUserQuotaReadyForKeys(ctx context.Context, userID int) error
 	return nil
 }
 
-func (a *App) applyQuotaCharge(ctx context.Context, record UsageRecord) error {
+func (a *App) applyQuotaCharge(ctx context.Context, record UsageRecord, pricing modelPriceBillingIndex) error {
 	if record.UsageUsername == nil || strings.TrimSpace(*record.UsageUsername) == "" {
 		return nil
 	}
@@ -171,11 +171,7 @@ func (a *App) applyQuotaCharge(ctx context.Context, record UsageRecord) error {
 		return err
 	}
 
-	prices, err := a.priceMap(ctx)
-	if err != nil {
-		return err
-	}
-	amount, unpriced := recordCost(record, prices)
+	amount, unpriced := recordCost(record, pricing.Prices, pricing.MatchContext)
 	amount = mathRound(amount, 8)
 	monthlyDeducted, lifetimeDeducted := 0.0, 0.0
 	remaining := amount

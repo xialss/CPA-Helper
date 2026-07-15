@@ -466,6 +466,7 @@ export interface UsageCostBreakdown {
   items: UsageCostBreakdownItem[]
   total_usd: number
   unpriced: boolean
+  unpriced_reason: string | null
   tier_multiplier?: number
   context_input_tokens: number
   long_context_threshold_tokens: number | null
@@ -527,6 +528,9 @@ export interface ModelPrice {
   id: number
   provider: string
   model: string
+  price_scope: 'library' | 'channel'
+  channel_brand: string | null
+  channel_key: string | null
   input_usd_per_million: number
   output_usd_per_million: number
   cache_read_usd_per_million: number
@@ -534,6 +538,7 @@ export interface ModelPrice {
   request_usd: number | null
   priority_multiplier: number | null
   long_context: ModelPriceLongContext | null
+  preserved_long_context: ModelPriceLibraryConflictLongContext | null
   billing_unit: 'token' | 'request' | string
   source: 'manual' | 'litellm' | string
   source_model: string | null
@@ -545,12 +550,38 @@ export interface ModelPrice {
 export interface ModelPricePayload {
   provider: string
   model: string
+  price_scope: 'library' | 'channel'
+  channel_brand: string | null
+  channel_key: string | null
+  channel_identity_hash: string | null
   input_usd_per_million: number
   output_usd_per_million: number
   cache_read_usd_per_million: number
   cache_creation_usd_per_million: number
   request_usd: number | null
   long_context: ModelPriceLongContext | null
+  preserve_invalid_long_context?: boolean
+}
+
+export interface ModelPriceLibraryConflict {
+  original_id: number
+  selected_price_id: number
+  conflict_reason: string
+  price: ModelPrice
+  archived_long_context: ModelPriceLibraryConflictLongContext | null
+}
+
+export interface ModelPriceLibraryConflictLongContext {
+  threshold_input_tokens: number | null
+  input_usd_per_million: number | null
+  output_usd_per_million: number | null
+  cache_read_usd_per_million: number | null
+  cache_creation_usd_per_million: number | null
+}
+
+export interface ModelPriceLibraryConflictPromotePayload {
+  provider: string
+  model: string
 }
 
 export interface PriorityMultiplierPayload {
@@ -571,12 +602,21 @@ export interface ModelPriceSyncResponse {
 export interface ModelPriceCatalogItem {
   id: string
   name: string
+  alias: string | null
   object: string | null
   owner: string | null
   created: number | null
   metadata: Record<string, string | number | boolean | null>
   suggested_provider: string
+  channel_brand: string
+  channel_key: string
+  channel_label: string
+  channel_identity_hash: string
+  channel_disabled: boolean
+  channel_status: 'ready' | 'missing_selector' | 'conflict' | string
+  channel_label_fallback: boolean
   price: ModelPrice | null
+  template_price: ModelPrice | null
   sources: AvailableModelSource[]
 }
 
@@ -584,6 +624,8 @@ export interface ModelPriceCatalogResponse {
   has_api_keys: boolean
   api_key_count: number
   queryable_api_key_count: number
+  channels_available: boolean
+  channel_error: string | null
   models: ModelPriceCatalogItem[]
   errors: AvailableModelKeyError[]
   priced_models: number

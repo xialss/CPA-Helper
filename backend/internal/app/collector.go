@@ -17,11 +17,14 @@ import (
 )
 
 type CollectorRunner struct {
-	app              *App
-	mu               sync.Mutex
-	stop             chan struct{}
-	done             chan struct{}
-	lastRemoteSyncAt time.Time
+	app                     *App
+	mu                      sync.Mutex
+	stop                    chan struct{}
+	done                    chan struct{}
+	selectorDone            chan struct{}
+	cancel                  context.CancelFunc
+	selectorRefreshInterval time.Duration
+	lastRemoteSyncAt        time.Time
 }
 
 type collectorPatch struct {
@@ -40,8 +43,13 @@ func (e respError) Error() string {
 	return string(e)
 }
 
+var errCollectorSelectorConfigMismatch = errors.New("采集器 provider 选择器快照与当前管理配置不一致")
+
 func NewCollectorRunner(app *App) *CollectorRunner {
-	return &CollectorRunner{app: app}
+	return &CollectorRunner{
+		app:                     app,
+		selectorRefreshInterval: modelPriceSelectorSnapshotRefreshInterval,
+	}
 }
 
 func (r *CollectorRunner) Start() {
@@ -56,13 +64,19 @@ func (r *CollectorRunner) Start() {
 	}
 	r.stop = make(chan struct{})
 	r.done = make(chan struct{})
-	go r.loop()
+	r.selectorDone = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	r.cancel = cancel
+	go r.loop(ctx)
+	go r.selectorRefreshLoop(ctx, r.selectorDone)
 }
 
 func (r *CollectorRunner) Stop() {
 	r.mu.Lock()
 	stop := r.stop
 	done := r.done
+	selectorDone := r.selectorDone
+	cancel := r.cancel
 	if stop == nil || done == nil {
 		r.mu.Unlock()
 		return
@@ -72,11 +86,17 @@ func (r *CollectorRunner) Stop() {
 	default:
 		close(stop)
 	}
+	if cancel != nil {
+		cancel()
+	}
 	r.mu.Unlock()
 	<-done
+	if selectorDone != nil {
+		<-selectorDone
+	}
 }
 
-func (r *CollectorRunner) loop() {
+func (r *CollectorRunner) loop(ctx context.Context) {
 	defer func() {
 		_ = r.updateState(context.Background(), collectorPatch{Running: boolPtr(false)})
 		r.mu.Lock()
@@ -93,7 +113,6 @@ func (r *CollectorRunner) loop() {
 		default:
 		}
 
-		ctx := context.Background()
 		cfg, err := r.app.loadConfig(ctx)
 		if err != nil {
 			r.setCollectorError(err, 10*time.Second)
@@ -113,14 +132,14 @@ func (r *CollectorRunner) loop() {
 
 		now := time.Now()
 		_ = r.updateState(ctx, collectorPatch{Running: boolPtr(true), LastPollAt: &now})
-		messages, err := consumeRespQueue(ctx, collector)
+		pricing, messages, err := r.loadCollectorBatch(ctx, collector)
 		if err != nil {
 			r.setCollectorError(err, durationSeconds(collector.RetryIntervalSeconds))
 			continue
 		}
 		inserted := 0
 		for _, message := range messages {
-			_, created, err := r.app.saveUsageMessage(ctx, []byte(message))
+			_, created, err := r.app.saveUsageMessage(ctx, []byte(message), pricing)
 			if err != nil {
 				r.setCollectorError(err, durationSeconds(collector.RetryIntervalSeconds))
 				continue
@@ -141,6 +160,61 @@ func (r *CollectorRunner) loop() {
 			return
 		}
 	}
+}
+
+func (r *CollectorRunner) selectorRefreshLoop(ctx context.Context, done chan struct{}) {
+	defer close(done)
+	interval := r.selectorRefreshInterval
+	if interval <= 0 {
+		interval = modelPriceSelectorSnapshotRefreshInterval
+	}
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		cfg, err := r.app.loadConfig(ctx)
+		if err == nil {
+			// The cache retains refresh failures so billing can fail closed after expiry.
+			_ = r.app.refreshModelPriceSelectorsIfStale(ctx, cfg)
+		}
+		timer.Reset(interval)
+	}
+}
+
+func (r *CollectorRunner) loadCollectorBatch(ctx context.Context, collector CollectorConfig) (modelPriceBillingIndex, []string, error) {
+	cfg := AppConfig{Collector: collector}
+	configKey := modelPriceSelectorConfigKey(cfg)
+	pricing, err := r.app.billingPriceIndexWithoutSelectors(ctx)
+	if err != nil {
+		return modelPriceBillingIndex{}, nil, err
+	}
+	pricing, selectorsCurrent := r.app.attachCachedBillingPriceSelectorsForConfig(pricing, cfg)
+	var refreshErr error
+	if !selectorsCurrent {
+		refreshErr = r.app.refreshModelPriceSelectorsIfStale(ctx, cfg)
+		if refreshErr != nil && (ctx.Err() != nil || pricing.MatchContext.SelectorsRequired) {
+			return modelPriceBillingIndex{}, nil, refreshErr
+		}
+		pricing, selectorsCurrent = r.app.attachCachedBillingPriceSelectorsForConfig(pricing, cfg)
+	}
+	if !selectorsCurrent {
+		if refreshErr != nil {
+			if pricing.MatchContext.SelectorsRequired {
+				return modelPriceBillingIndex{}, nil, refreshErr
+			}
+		} else if configKey != "" || pricing.MatchContext.SelectorsRequired {
+			return modelPriceBillingIndex{}, nil, errCollectorSelectorConfigMismatch
+		}
+	}
+	messages, err := consumeRespQueue(ctx, collector)
+	if err != nil {
+		return modelPriceBillingIndex{}, nil, err
+	}
+	return pricing, messages, nil
 }
 
 func (r *CollectorRunner) setCollectorError(err error, delay time.Duration) {
@@ -289,6 +363,36 @@ func usesRespQueueProtocol(rawURL string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func collectorManagementHTTPURL(rawURL string) (string, error) {
+	value := strings.TrimRight(strings.TrimSpace(rawURL), "/")
+	if value == "" {
+		return "", errors.New("CLIProxyAPI 地址不能为空")
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "", errors.New("CLIProxyAPI 地址无效")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		if parsed.Hostname() == "" {
+			return "", errors.New("CLIProxyAPI 地址缺少主机名")
+		}
+		return value, nil
+	case "redis", "resp", "tcp":
+		host := parsed.Hostname()
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		port := parsed.Port()
+		if port == "" {
+			port = "8317"
+		}
+		return (&url.URL{Scheme: "http", Host: net.JoinHostPort(host, port)}).String(), nil
+	default:
+		return "", errors.New("CLIProxyAPI 地址必须使用 http、https、tcp、redis 或 resp 协议")
 	}
 }
 
