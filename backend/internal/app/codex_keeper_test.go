@@ -276,6 +276,7 @@ func TestKeeperRunMaintainsSystemPriorityRules(t *testing.T) {
 	authNames := []string{
 		"free-null.json",
 		"free-quota-null.json",
+		"k12-wrong.json",
 		"plus-wrong.json",
 		"manual-quota-high.json",
 		"manual-high.json",
@@ -302,6 +303,17 @@ func TestKeeperRunMaintainsSystemPriorityRules(t *testing.T) {
 			"account_type": "free",
 			"disabled":     false,
 			"priority":     nil,
+			"access_token": "test-token",
+		},
+		"k12-wrong.json": {
+			"name":         "k12-wrong.json",
+			"type":         "codex",
+			"email":        "user007@example.com",
+			"auth_index":   "k12-auth",
+			"account_type": "oauth",
+			"id_token":     map[string]any{"plan_type": "k12"},
+			"disabled":     false,
+			"priority":     0,
 			"access_token": "test-token",
 		},
 		"plus-wrong.json": {
@@ -436,6 +448,7 @@ func TestKeeperRunMaintainsSystemPriorityRules(t *testing.T) {
 	expectedPriorities := map[string]int{
 		"free-null.json":         0,
 		"free-quota-null.json":   -1,
+		"k12-wrong.json":         2,
 		"plus-wrong.json":        4,
 		"manual-quota-high.json": -1,
 		"manual-high.json":       21,
@@ -446,6 +459,7 @@ func TestKeeperRunMaintainsSystemPriorityRules(t *testing.T) {
 	mu.Lock()
 	expectedPatches := map[string][]int{
 		"free-quota-null.json":   {-1},
+		"k12-wrong.json":         {2},
 		"plus-wrong.json":        {4},
 		"manual-quota-high.json": {-1},
 	}

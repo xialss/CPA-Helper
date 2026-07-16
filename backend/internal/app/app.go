@@ -42,6 +42,7 @@ var defaultKeeperPriorityRules = map[string]int{
 	"pro_5x":  5,
 	"plus":    4,
 	"team":    3,
+	"k12":     2,
 	"free":    0,
 }
 

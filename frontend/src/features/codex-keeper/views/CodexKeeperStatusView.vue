@@ -73,7 +73,10 @@ type SortDirection = 'asc' | 'desc'
 type PriorityMode = 'low' | 'high' | 'default'
 type AccountAction = 'toggle' | 'priority' | 'delete' | 'refresh'
 type AccountConfirmType = 'default' | 'warning' | 'error' | 'primary'
+type QuotaWindowKey = 'primary' | 'secondary'
+type QuotaWindowKind = 'fiveHour' | 'week' | 'month' | 'unknown'
 type QuotaWindowItem = {
+  key: QuotaWindowKey
   label: string
   remainingPercent: number
   resetAt: string | null
@@ -96,6 +99,8 @@ const ACCOUNT_TABLE_VIRTUAL_THRESHOLD = 200
 const CODEX_FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60
 const CODEX_WEEK_WINDOW_SECONDS = 7 * 24 * 60 * 60
 const CODEX_MONTH_WINDOW_SECONDS = 30 * 24 * 60 * 60
+const CODEX_MIN_MONTH_WINDOW_SECONDS = 28 * 24 * 60 * 60
+const CODEX_MAX_MONTH_WINDOW_SECONDS = 31 * 24 * 60 * 60
 const disabledTableScrollX = 1302
 const normalTableScrollX = 1816
 const KEEPER_STATUS_POLL_INTERVAL_MS = 3000
@@ -192,7 +197,7 @@ const quotaSortOptions = computed(() => [
 const accountTypeOptions = computed(() =>
   [...new Set(accounts.value.map((item) => item.account_type).filter(Boolean))]
     .sort((a, b) => String(a).localeCompare(String(b)))
-    .map((value) => ({ label: String(value), value: String(value) })),
+    .map((value) => ({ label: accountTypeLabel(String(value)), value: String(value) })),
 )
 
 const filteredAccounts = computed(() =>
@@ -818,16 +823,23 @@ function defaultPriority(account: CodexKeeperAccount): number | null {
   return priorityRuleMap.value[account.account_type] ?? null
 }
 
+function accountTypeLabel(accountType: string | null): string {
+  if (accountType?.trim().toLowerCase() === 'k12') {
+    return 'K12'
+  }
+  return accountType ?? t('未知', 'Unknown')
+}
+
 function isPaidQuotaWindowAccount(accountType: string | null): boolean {
   const normalized = accountType?.trim().toLowerCase()
-  return normalized === 'plus' || normalized === 'team' || normalized?.startsWith('pro') === true
+  return normalized === 'plus' || normalized === 'team' || normalized === 'k12' || normalized?.startsWith('pro') === true
 }
 
 function isFreeQuotaWindowAccount(accountType: string | null): boolean {
   return accountType?.trim().toLowerCase() === 'free'
 }
 
-function quotaWindowSecondsFor(account: CodexKeeperAccount, window: 'primary' | 'secondary'): number | null {
+function quotaWindowSecondsFor(account: CodexKeeperAccount, window: QuotaWindowKey): number | null {
   if (window === 'primary') {
     return account.primary_window_seconds ?? account.primary_window_usage?.window_seconds ?? null
   }
@@ -850,14 +862,38 @@ function isFreeQuotaWindow(account: CodexKeeperAccount): boolean {
   )
 }
 
-function quotaWindowLabels(account: CodexKeeperAccount): { primary: string; secondary: string } {
-  if (isFreeQuotaWindow(account)) {
-    return { primary: t('月限额', 'Monthly Limit'), secondary: t('次限额', 'Secondary Limit') }
+function quotaWindowKindFor(account: CodexKeeperAccount, window: QuotaWindowKey): QuotaWindowKind {
+  const seconds = quotaWindowSecondsFor(account, window)
+  if (seconds === CODEX_FIVE_HOUR_WINDOW_SECONDS) {
+    return 'fiveHour'
+  }
+  if (seconds === CODEX_WEEK_WINDOW_SECONDS) {
+    return 'week'
+  }
+  if (seconds !== null && seconds >= CODEX_MIN_MONTH_WINDOW_SECONDS && seconds <= CODEX_MAX_MONTH_WINDOW_SECONDS) {
+    return 'month'
+  }
+  return 'unknown'
+}
+
+function quotaWindowLabel(account: CodexKeeperAccount, window: QuotaWindowKey): string {
+  const kind = quotaWindowKindFor(account, window)
+  if (kind === 'fiveHour') {
+    return t('5小时限额', '5-Hour Limit')
+  }
+  if (kind === 'week') {
+    return t('周限额', 'Weekly Limit')
+  }
+  if (kind === 'month') {
+    return t('月限额', 'Monthly Limit')
+  }
+  if (window === 'primary' && isFreeQuotaWindow(account)) {
+    return t('月限额', 'Monthly Limit')
   }
   if (isPaidQuotaWindow(account)) {
-    return { primary: t('5小时限额', '5-Hour Limit'), secondary: t('周限额', 'Weekly Limit') }
+    return window === 'primary' ? t('5小时限额', '5-Hour Limit') : t('周限额', 'Weekly Limit')
   }
-  return { primary: t('主', 'Primary'), secondary: t('次', 'Secondary') }
+  return window === 'primary' ? t('主', 'Primary') : t('次', 'Secondary')
 }
 
 function shouldShowQuotaWindow(account: CodexKeeperAccount): boolean {
@@ -865,21 +901,23 @@ function shouldShowQuotaWindow(account: CodexKeeperAccount): boolean {
 }
 
 function quotaWindowItems(account: CodexKeeperAccount): QuotaWindowItem[] {
-  if (!shouldShowQuotaWindow(account) || account.primary_used_percent === null) {
+  if (!shouldShowQuotaWindow(account)) {
     return []
   }
-  const labels = quotaWindowLabels(account)
-  const items = [
-    {
-      label: labels.primary,
+  const items: QuotaWindowItem[] = []
+  if (account.primary_used_percent !== null) {
+    items.push({
+      key: 'primary',
+      label: quotaWindowLabel(account, 'primary'),
       remainingPercent: remainingQuotaPercent(account.primary_used_percent),
       resetAt: account.primary_reset_at,
       usage: account.primary_window_usage,
-    },
-  ]
-  if (account.secondary_used_percent !== null && !isFreeQuotaWindow(account)) {
+    })
+  }
+  if (account.secondary_used_percent !== null) {
     items.push({
-      label: labels.secondary,
+      key: 'secondary',
+      label: quotaWindowLabel(account, 'secondary'),
       remainingPercent: remainingQuotaPercent(account.secondary_used_percent),
       resetAt: account.secondary_reset_at,
       usage: account.secondary_window_usage,
@@ -893,17 +931,40 @@ function quotaSortRemainingPercent(account: CodexKeeperAccount, key: AccountSort
     return null
   }
   if (key === 'quotaDay') {
-    if (isFreeQuotaWindow(account)) {
-      return null
+    const classified = quotaRemainingPercentForKinds(account, ['fiveHour'])
+    if (classified !== null) {
+      return classified
     }
-    return nullableRemainingQuotaPercent(account.primary_used_percent)
+    return isPaidQuotaWindow(account) && quotaWindowKindFor(account, 'primary') === 'unknown'
+      ? nullableRemainingQuotaPercent(account.primary_used_percent)
+      : null
   }
   if (key === 'quotaWeek') {
-    if (isFreeQuotaWindow(account)) {
-      return nullableRemainingQuotaPercent(account.primary_used_percent)
+    const classified = quotaRemainingPercentForKinds(account, ['week', 'month'])
+    if (classified !== null) {
+      return classified
     }
-    if (isPaidQuotaWindow(account)) {
-      return nullableRemainingQuotaPercent(account.secondary_used_percent)
+    if (isFreeQuotaWindow(account)) {
+      return quotaWindowKindFor(account, 'primary') === 'unknown'
+        ? nullableRemainingQuotaPercent(account.primary_used_percent)
+        : null
+    }
+    return isPaidQuotaWindow(account) && quotaWindowKindFor(account, 'secondary') === 'unknown'
+      ? nullableRemainingQuotaPercent(account.secondary_used_percent)
+      : null
+  }
+  return null
+}
+
+function quotaRemainingPercentForKinds(account: CodexKeeperAccount, kinds: QuotaWindowKind[]): number | null {
+  const windows: QuotaWindowKey[] = ['primary', 'secondary']
+  for (const window of windows) {
+    if (!kinds.includes(quotaWindowKindFor(account, window))) {
+      continue
+    }
+    const usedPercent = window === 'primary' ? account.primary_used_percent : account.secondary_used_percent
+    if (usedPercent !== null) {
+      return remainingQuotaPercent(usedPercent)
     }
   }
   return null
@@ -1146,7 +1207,7 @@ function renderAccountIdentityCell(account: CodexKeeperAccount) {
 }
 
 function renderAccountTypeCell(account: CodexKeeperAccount) {
-  const typeLabel = account.account_type ?? t('未知', 'Unknown')
+  const typeLabel = accountTypeLabel(account.account_type)
   return h(
     'span',
     { class: ['account-table-chip', 'is-type'], title: typeLabel },
@@ -2237,7 +2298,7 @@ onBeforeUnmount(() => {
               <div class="account-card-meta-grid">
                 <div class="account-card-meta-item">
                   <span>{{ t('类型', 'Type') }}</span>
-                  <strong>{{ account.account_type ?? t('未知', 'Unknown') }}</strong>
+                  <strong>{{ accountTypeLabel(account.account_type) }}</strong>
                 </div>
                 <div class="account-card-meta-item">
                   <span>{{ t('优先级', 'Priority') }}</span>
@@ -2263,7 +2324,7 @@ onBeforeUnmount(() => {
                   <template v-if="isBarCardView">
                     <div
                       v-for="item in quotaWindowItems(account)"
-                      :key="item.label"
+                      :key="item.key"
                       class="card-quota-bar"
                     >
                       <div class="card-quota-head">
@@ -2283,7 +2344,7 @@ onBeforeUnmount(() => {
                       <div class="card-quota-usage-tags" :title="quotaWindowUsageTitle(item)">
                         <span
                           v-for="tag in quotaWindowUsageTags(item)"
-                          :key="`${item.label}-${tag.label}`"
+                          :key="`${item.key}-${tag.label}`"
                           class="card-quota-usage-tag"
                           :class="tag.tone ? `is-${tag.tone}` : undefined"
                         >
@@ -2296,7 +2357,7 @@ onBeforeUnmount(() => {
                   <div v-else class="card-quota-rings">
                     <div
                       v-for="item in quotaWindowItems(account)"
-                      :key="item.label"
+                      :key="item.key"
                       class="card-quota-ring-item"
                     >
                       <div class="card-quota-ring-head">
@@ -2315,7 +2376,7 @@ onBeforeUnmount(() => {
                       <div class="card-quota-usage-tags" :title="quotaWindowUsageTitle(item)">
                         <span
                           v-for="tag in quotaWindowUsageTags(item)"
-                          :key="`${item.label}-${tag.label}`"
+                          :key="`${item.key}-${tag.label}`"
                           class="card-quota-usage-tag"
                           :class="tag.tone ? `is-${tag.tone}` : undefined"
                         >
@@ -2372,7 +2433,7 @@ onBeforeUnmount(() => {
           <NDescriptionsItem :label="t('账号', 'Account')">{{ selectedAccount.name }}</NDescriptionsItem>
           <NDescriptionsItem :label="t('邮箱', 'Email')">{{ selectedAccount.email ?? '-' }}</NDescriptionsItem>
           <NDescriptionsItem :label="t('账号类型', 'Account Type')">
-            {{ selectedAccount.account_type ?? t('未知', 'Unknown') }}
+            {{ accountTypeLabel(selectedAccount.account_type) }}
           </NDescriptionsItem>
           <NDescriptionsItem :label="t('启用状态', 'Enabled Status')">
             {{ selectedAccount.disabled ? t('已禁用', 'Disabled') : t('启用中', 'Enabled') }}
