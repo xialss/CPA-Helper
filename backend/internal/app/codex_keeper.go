@@ -31,6 +31,8 @@ const (
 	keeperFiveHourWindowSeconds    = 5 * 60 * 60
 	keeperWeekWindowSeconds        = 7 * 24 * 60 * 60
 	keeperMonthWindowSeconds       = 30 * 24 * 60 * 60
+	keeperMinMonthWindowSeconds    = 28 * 24 * 60 * 60
+	keeperMaxMonthWindowSeconds    = 31 * 24 * 60 * 60
 )
 
 type KeeperRunner struct {
@@ -113,6 +115,7 @@ type keeperPriorityUpdateRequest struct {
 type keeperAccount struct {
 	Name                   string     `json:"name"`
 	Email                  *string    `json:"email"`
+	AuthIndex              *string    `json:"auth_index"`
 	AccountType            *string    `json:"account_type"`
 	Disabled               bool       `json:"disabled"`
 	Priority               *int       `json:"priority"`
@@ -211,13 +214,27 @@ type keeperAuthState struct {
 
 type keeperUsageInfo struct {
 	PlanType               string
-	PrimaryUsedPercent     int
+	PrimaryUsedPercent     *int
 	SecondaryUsedPercent   *int
 	PrimaryResetAt         *time.Time
 	SecondaryResetAt       *time.Time
 	PrimaryWindowSeconds   *int
 	SecondaryWindowSeconds *int
 }
+
+type keeperQuotaWindowState struct {
+	UsedPercent   *int
+	ResetAt       *time.Time
+	WindowSeconds *int
+}
+
+type keeperQuotaWindowSlot int
+
+const (
+	keeperQuotaWindowSlotUnknown   keeperQuotaWindowSlot = -1
+	keeperQuotaWindowSlotPrimary   keeperQuotaWindowSlot = 0
+	keeperQuotaWindowSlotSecondary keeperQuotaWindowSlot = 1
+)
 
 type keeperHTTPResult struct {
 	StatusCode *int
@@ -230,6 +247,8 @@ type keeperAccountResult struct {
 	Name                   string
 	Result                 string
 	Email                  *string
+	AuthIndex              *string
+	PreserveAuthIndex      bool
 	AccountType            *string
 	Priority               *int
 	RestorePriority        *int
@@ -1161,6 +1180,9 @@ func (a *App) computeKeeperQuotaWindowUsages(ctx context.Context, accounts []kee
 	for _, account := range accounts {
 		addKeeperAuthAlias(aliases, account.Name, account.Name)
 		addKeeperSourceAccountAlias(sourceAccounts, account.Name, account.Name)
+		if account.AuthIndex != nil {
+			addKeeperAuthAlias(aliases, *account.AuthIndex, account.Name)
+		}
 		if account.Email != nil {
 			addKeeperAuthAlias(aliases, *account.Email, account.Name)
 			addKeeperSourceAccountAlias(sourceAccounts, *account.Email, account.Name)
@@ -1221,6 +1243,7 @@ func (a *App) computeKeeperQuotaWindowUsages(ctx context.Context, accounts []kee
 }
 
 func keeperQuotaWindowPairForAccount(account keeperAccount, now time.Time) keeperQuotaWindowUsagePair {
+	account = normalizeKeeperAccountQuotaWindows(account)
 	return keeperQuotaWindowUsagePair{
 		Primary:   keeperQuotaWindowForAccount(account, true, now),
 		Secondary: keeperQuotaWindowForAccount(account, false, now),
@@ -1228,9 +1251,6 @@ func keeperQuotaWindowPairForAccount(account keeperAccount, now time.Time) keepe
 }
 
 func keeperQuotaWindowForAccount(account keeperAccount, primary bool, now time.Time) *keeperQuotaWindowUsage {
-	if !primary && keeperFreeQuotaWindowAccount(account.AccountType) {
-		return nil
-	}
 	resetAt := account.PrimaryResetAt
 	windowSeconds := account.PrimaryWindowSeconds
 	if !primary {
@@ -1278,7 +1298,7 @@ func keeperFreeQuotaWindowAccount(accountType *string) bool {
 
 func keeperPaidQuotaWindowAccount(accountType *string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(valueOr(accountType, "")))
-	return normalized == "plus" || normalized == "team" || strings.HasPrefix(normalized, "pro")
+	return normalized == "plus" || normalized == "team" || normalized == "k12" || strings.HasPrefix(normalized, "pro")
 }
 
 func keeperQuotaWindowBounds(minStart, maxEnd time.Time, usage *keeperQuotaWindowUsage) (time.Time, time.Time) {
@@ -1328,10 +1348,13 @@ func addKeeperSourceAccountAlias(aliases map[string]string, value string, name s
 
 func keeperAccountNameForUsageRecord(record UsageRecord, sourceAccounts map[string]string, aliases map[string][]string) (string, bool) {
 	if sourceAccount := keeperUsageRecordSourceAccount(record); sourceAccount != "" {
-		if name, ok := sourceAccounts[sourceAccount]; ok && name != "" {
-			return name, true
+		if name, ok := sourceAccounts[sourceAccount]; ok {
+			if name != "" {
+				return name, true
+			}
+		} else {
+			return "", false
 		}
-		return "", false
 	}
 
 	identifiers := []string{}
@@ -2293,15 +2316,22 @@ func (a *App) ensureKeeperAuthWebsockets(
 		if err := a.setKeeperRemoteWebsockets(ctx, cfg, name); err != nil {
 			message := "启用 WebSocket 传输失败：" + err.Error()
 			disabled := keeperBool(item["disabled"])
+			authIndex := keeperRemoteAuthIndex(item)
+			accountType := accountTypeFromKeeperDetail(item, nil)
+			if accountType == nil {
+				accountType = keeperStringPtr(item["account_type"], item["accountType"])
+			}
 			result := keeperAccountResult{
-				Name:         name,
-				AccountType:  keeperStringPtr(item["account_type"], item["accountType"]),
-				Disabled:     &disabled,
-				Priority:     keeperIntPtr(item["priority"]),
-				Result:       "network_error",
-				LastError:    &message,
-				LatestAction: &message,
-				CheckedAt:    now,
+				Name:              name,
+				AuthIndex:         authIndex,
+				PreserveAuthIndex: authIndex == nil,
+				AccountType:       accountType,
+				Disabled:          &disabled,
+				Priority:          keeperIntPtr(item["priority"]),
+				Result:            "network_error",
+				LastError:         &message,
+				LatestAction:      &message,
+				CheckedAt:         now,
 			}
 			_ = a.upsertKeeperState(ctx, result)
 			logFn(name + ": " + message)
@@ -2323,7 +2353,14 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	if name == "" {
 		name = "unknown"
 	}
-	result := keeperAccountResult{Name: name, Result: "skipped", CheckedAt: now}
+	authIndex := keeperRemoteAuthIndex(authInfo)
+	result := keeperAccountResult{
+		Name:              name,
+		Result:            "skipped",
+		AuthIndex:         authIndex,
+		PreserveAuthIndex: authIndex == nil,
+		CheckedAt:         now,
+	}
 	detail, err := a.getKeeperRemoteAuthFile(ctx, cfg, name)
 	if err != nil {
 		message := "读取 auth file 详情失败：" + err.Error()
@@ -2344,6 +2381,8 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	}
 	merged := mergeKeeperObjects(authInfo, detail)
 	result.Email = keeperStringPtr(merged["email"], merged["account_email"], merged["user_email"])
+	result.AuthIndex = keeperRemoteAuthIndex(detail)
+	result.PreserveAuthIndex = false
 	result.Priority = keeperIntPtr(merged["priority"])
 	disabled := keeperBool(merged["disabled"])
 	result.Disabled = &disabled
@@ -2445,7 +2484,8 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	}
 	usage := parseKeeperUsageInfo(usageResult.JSONData)
 	result.AccountType = accountTypeFromKeeperDetail(merged, &usage)
-	result.PrimaryUsedPercent = &usage.PrimaryUsedPercent
+	usage = normalizeKeeperUsageInfoWindows(usage, result.AccountType)
+	result.PrimaryUsedPercent = usage.PrimaryUsedPercent
 	result.SecondaryUsedPercent = usage.SecondaryUsedPercent
 	result.PrimaryResetAt = usage.PrimaryResetAt
 	result.SecondaryResetAt = usage.SecondaryResetAt
@@ -2523,7 +2563,7 @@ type keeperPriorityPolicyAction struct {
 }
 
 func (a *App) applyKeeperPriorityPolicy(ctx context.Context, cfg AppConfig, name string, accountType *string, priority *int, restorePriority *int, usage keeperUsageInfo) *keeperPriorityPolicyAction {
-	quotaReached := usage.PrimaryUsedPercent >= cfg.CodexKeeper.QuotaThreshold ||
+	quotaReached := (usage.PrimaryUsedPercent != nil && *usage.PrimaryUsedPercent >= cfg.CodexKeeper.QuotaThreshold) ||
 		(usage.SecondaryUsedPercent != nil && *usage.SecondaryUsedPercent >= cfg.CodexKeeper.QuotaThreshold)
 	currentPriority := keeperEffectivePriority(priority)
 	next := keeperPriorityForType(accountType, cfg.CodexKeeperPriorityRule)
@@ -2813,7 +2853,7 @@ func (a *App) checkKeeperUsage(ctx context.Context, cfg AppConfig, detail map[st
 
 func (a *App) listKeeperAccounts(ctx context.Context) ([]keeperAccount, error) {
 	rows, err := a.db.QueryContext(ctx, `
-		SELECT auth_name, email, account_type, disabled, priority, primary_used_percent,
+		SELECT auth_name, email, auth_index, account_type, disabled, priority, primary_used_percent,
 		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
 		       last_status_code, last_error, latest_action, CAST(last_checked_at AS TEXT), CAST(last_healthy_at AS TEXT),
 		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT)
@@ -2887,7 +2927,7 @@ func (a *App) pruneKeeperMissingAuthStates(ctx context.Context, remoteNames map[
 
 func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState, error) {
 	rows, err := a.db.QueryContext(ctx, `
-		SELECT auth_name, email, account_type, disabled, priority, primary_used_percent,
+		SELECT auth_name, email, auth_index, account_type, disabled, priority, primary_used_percent,
 		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
 		       last_status_code, last_error, latest_action, CAST(last_checked_at AS TEXT), CAST(last_healthy_at AS TEXT),
 		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT)
@@ -2909,10 +2949,10 @@ func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState
 
 func scanKeeperState(scanner interface{ Scan(dest ...any) error }) (keeperAuthState, error) {
 	var state keeperAuthState
-	var email, accountType, primaryReset, secondaryReset, lastError, latestAction, lastChecked, lastHealthy, createdAt, updatedAt sql.NullString
+	var email, authIndex, accountType, primaryReset, secondaryReset, lastError, latestAction, lastChecked, lastHealthy, createdAt, updatedAt sql.NullString
 	var priority, primaryUsed, secondaryUsed, quotaThreshold, lastStatus, primaryWindowSeconds, secondaryWindowSeconds, restorePriority sql.NullInt64
 	err := scanner.Scan(
-		&state.Name, &email, &accountType, &state.Disabled, &priority, &primaryUsed,
+		&state.Name, &email, &authIndex, &accountType, &state.Disabled, &priority, &primaryUsed,
 		&secondaryUsed, &primaryReset, &secondaryReset, &quotaThreshold, &lastStatus,
 		&lastError, &latestAction, &lastChecked, &lastHealthy, &primaryWindowSeconds, &secondaryWindowSeconds, &restorePriority,
 		&createdAt, &updatedAt,
@@ -2921,6 +2961,7 @@ func scanKeeperState(scanner interface{ Scan(dest ...any) error }) (keeperAuthSt
 		return keeperAuthState{}, err
 	}
 	state.Email = nullableString(email)
+	state.AuthIndex = nullableString(authIndex)
 	state.AccountType = nullableString(accountType)
 	state.Priority = nullableInt(priority)
 	state.PrimaryUsedPercent = nullableInt(primaryUsed)
@@ -2929,6 +2970,7 @@ func scanKeeperState(scanner interface{ Scan(dest ...any) error }) (keeperAuthSt
 	state.SecondaryResetAt = timePtr(secondaryReset)
 	state.PrimaryWindowSeconds = nullableInt(primaryWindowSeconds)
 	state.SecondaryWindowSeconds = nullableInt(secondaryWindowSeconds)
+	state.keeperAccount = normalizeKeeperAccountQuotaWindows(state.keeperAccount)
 	state.QuotaThreshold = nullableInt(quotaThreshold)
 	state.LastStatusCode = nullableInt(lastStatus)
 	state.LastError = nullableString(lastError)
@@ -2954,13 +2996,17 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 	}
 	_, err := a.db.ExecContext(ctx, `
 		INSERT INTO codex_keeper_auth_states (
-			auth_name, email, account_type, disabled, priority, restore_priority, latest_action, last_error,
+			auth_name, email, auth_index, account_type, disabled, priority, restore_priority, latest_action, last_error,
 			last_status_code, primary_used_percent, secondary_used_percent, quota_threshold,
 			primary_reset_at, secondary_reset_at, primary_window_seconds, secondary_window_seconds,
 			last_checked_at, last_healthy_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(auth_name) DO UPDATE SET
 			email = excluded.email,
+			auth_index = CASE
+				WHEN ? THEN codex_keeper_auth_states.auth_index
+				ELSE excluded.auth_index
+			END,
 			account_type = excluded.account_type,
 			disabled = excluded.disabled,
 			priority = excluded.priority,
@@ -2982,7 +3028,7 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			last_checked_at = excluded.last_checked_at,
 			last_healthy_at = COALESCE(excluded.last_healthy_at, codex_keeper_auth_states.last_healthy_at),
 			updated_at = excluded.updated_at
-	`, result.Name, result.Email, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, checkedAt, lastHealthy, now, now, result.ClearRestorePriority)
+	`, result.Name, result.Email, result.AuthIndex, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, checkedAt, lastHealthy, now, now, result.PreserveAuthIndex, result.ClearRestorePriority)
 	return err
 }
 
@@ -3212,15 +3258,119 @@ func parseKeeperUsageInfo(payload map[string]any) keeperUsageInfo {
 	rateLimit, _ := payload["rate_limit"].(map[string]any)
 	primary, _ := rateLimit["primary_window"].(map[string]any)
 	secondary, _ := rateLimit["secondary_window"].(map[string]any)
-	if value := keeperIntPtr(primary["used_percent"]); value != nil {
-		usage.PrimaryUsedPercent = *value
-	}
+	usage.PrimaryUsedPercent = keeperIntPtr(primary["used_percent"])
 	usage.SecondaryUsedPercent = keeperIntPtr(secondary["used_percent"])
 	usage.PrimaryResetAt = quotaResetAt(primary, time.Now().In(appTimeLocation))
 	usage.SecondaryResetAt = quotaResetAt(secondary, time.Now().In(appTimeLocation))
 	usage.PrimaryWindowSeconds = quotaWindowSeconds(primary)
 	usage.SecondaryWindowSeconds = quotaWindowSeconds(secondary)
 	return usage
+}
+
+func normalizeKeeperUsageInfoWindows(usage keeperUsageInfo, accountType *string) keeperUsageInfo {
+	primary, secondary := normalizeKeeperQuotaWindowStates(accountType,
+		keeperQuotaWindowState{
+			UsedPercent:   usage.PrimaryUsedPercent,
+			ResetAt:       usage.PrimaryResetAt,
+			WindowSeconds: usage.PrimaryWindowSeconds,
+		},
+		keeperQuotaWindowState{
+			UsedPercent:   usage.SecondaryUsedPercent,
+			ResetAt:       usage.SecondaryResetAt,
+			WindowSeconds: usage.SecondaryWindowSeconds,
+		},
+	)
+	usage.PrimaryUsedPercent = primary.UsedPercent
+	usage.PrimaryResetAt = primary.ResetAt
+	usage.PrimaryWindowSeconds = primary.WindowSeconds
+	usage.SecondaryUsedPercent = secondary.UsedPercent
+	usage.SecondaryResetAt = secondary.ResetAt
+	usage.SecondaryWindowSeconds = secondary.WindowSeconds
+	return usage
+}
+
+func normalizeKeeperAccountQuotaWindows(account keeperAccount) keeperAccount {
+	primary, secondary := normalizeKeeperQuotaWindowStates(account.AccountType,
+		keeperQuotaWindowState{
+			UsedPercent:   account.PrimaryUsedPercent,
+			ResetAt:       account.PrimaryResetAt,
+			WindowSeconds: account.PrimaryWindowSeconds,
+		},
+		keeperQuotaWindowState{
+			UsedPercent:   account.SecondaryUsedPercent,
+			ResetAt:       account.SecondaryResetAt,
+			WindowSeconds: account.SecondaryWindowSeconds,
+		},
+	)
+	account.PrimaryUsedPercent = primary.UsedPercent
+	account.PrimaryResetAt = primary.ResetAt
+	account.PrimaryWindowSeconds = primary.WindowSeconds
+	account.SecondaryUsedPercent = secondary.UsedPercent
+	account.SecondaryResetAt = secondary.ResetAt
+	account.SecondaryWindowSeconds = secondary.WindowSeconds
+	return account
+}
+
+func normalizeKeeperQuotaWindowStates(accountType *string, primary, secondary keeperQuotaWindowState) (keeperQuotaWindowState, keeperQuotaWindowState) {
+	windows := [2]keeperQuotaWindowState{primary, secondary}
+	normalized := [2]keeperQuotaWindowState{}
+	assigned := [2]bool{}
+	consumed := [2]bool{}
+
+	for index, window := range windows {
+		if keeperQuotaWindowStateEmpty(window) {
+			consumed[index] = true
+			continue
+		}
+		target := keeperQuotaWindowPreferredSlot(accountType, window.WindowSeconds)
+		if target == keeperQuotaWindowSlotUnknown || assigned[target] {
+			continue
+		}
+		normalized[target] = window
+		assigned[target] = true
+		consumed[index] = true
+	}
+
+	for index, window := range windows {
+		if consumed[index] {
+			continue
+		}
+		target := keeperQuotaWindowSlot(index)
+		if assigned[target] {
+			target = keeperQuotaWindowSlot(1 - index)
+		}
+		if assigned[target] {
+			continue
+		}
+		normalized[target] = window
+		assigned[target] = true
+	}
+
+	return normalized[keeperQuotaWindowSlotPrimary], normalized[keeperQuotaWindowSlotSecondary]
+}
+
+func keeperQuotaWindowStateEmpty(window keeperQuotaWindowState) bool {
+	return window.UsedPercent == nil && window.ResetAt == nil && window.WindowSeconds == nil
+}
+
+func keeperQuotaWindowPreferredSlot(accountType *string, windowSeconds *int) keeperQuotaWindowSlot {
+	if windowSeconds == nil {
+		return keeperQuotaWindowSlotUnknown
+	}
+	switch {
+	case *windowSeconds == keeperFiveHourWindowSeconds && keeperPaidQuotaWindowAccount(accountType):
+		return keeperQuotaWindowSlotPrimary
+	case *windowSeconds == keeperWeekWindowSeconds:
+		return keeperQuotaWindowSlotSecondary
+	case *windowSeconds >= keeperMinMonthWindowSeconds && *windowSeconds <= keeperMaxMonthWindowSeconds:
+		if keeperFreeQuotaWindowAccount(accountType) {
+			return keeperQuotaWindowSlotPrimary
+		}
+		if keeperPaidQuotaWindowAccount(accountType) {
+			return keeperQuotaWindowSlotSecondary
+		}
+	}
+	return keeperQuotaWindowSlotUnknown
 }
 
 func quotaWindowSeconds(window map[string]any) *int {
@@ -3271,6 +3421,8 @@ func accountTypeFromKeeperDetail(detail map[string]any, usage *keeperUsageInfo) 
 	bounded := "_" + text + "_"
 	var result string
 	switch {
+	case strings.Contains(bounded, "_k12_"):
+		result = "k12"
 	case strings.Contains(text, "prolite") || strings.Contains(text, "pro_lite") || strings.Contains(text, "5x") || strings.Contains(text, "pro_5"):
 		result = "pro_5x"
 	case strings.Contains(text, "20x") || strings.Contains(text, "pro_20") || strings.Contains(bounded, "_pro_"):
@@ -3459,6 +3611,15 @@ func keeperAuthIndex(detail map[string]any) string {
 		}
 	}
 	return "unknown"
+}
+
+func keeperRemoteAuthIndex(detail map[string]any) *string {
+	for _, key := range []string{"auth_index", "authIndex", "index"} {
+		if value := keeperString(detail[key]); value != "" {
+			return &value
+		}
+	}
+	return nil
 }
 
 func keeperString(value any) string {

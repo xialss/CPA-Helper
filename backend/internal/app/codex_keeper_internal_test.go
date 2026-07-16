@@ -366,6 +366,72 @@ func TestKeeperQuotaWindowUsageAttributionPrefersSourceAccount(t *testing.T) {
 	}
 }
 
+func TestKeeperQuotaWindowUsageAttributionUsesAuthIndexWhenSourceAccountIsShared(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	now := time.Date(2026, 5, 18, 12, 30, 0, 0, appTimeLocation)
+	resetAt := now.Add(time.Hour)
+	windowSeconds := keeperFiveHourWindowSeconds
+	accounts := []keeperAccount{
+		{
+			Name:                 "shared-one.json",
+			Email:                stringPtr("shared@example.com"),
+			AuthIndex:            stringPtr("auth-one"),
+			AccountType:          stringPtr("k12"),
+			PrimaryResetAt:       timePtrValue(resetAt),
+			PrimaryWindowSeconds: intPtrValue(windowSeconds),
+		},
+		{
+			Name:                 "shared-two.json",
+			Email:                stringPtr("shared@example.com"),
+			AuthIndex:            stringPtr("auth-two"),
+			AccountType:          stringPtr("k12"),
+			PrimaryResetAt:       timePtrValue(resetAt),
+			PrimaryWindowSeconds: intPtrValue(windowSeconds),
+		},
+	}
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "shared-one",
+		Timestamp:    now.Add(-10 * time.Minute),
+		Source:       "shared@example.com",
+		AuthIndex:    "auth-one",
+		InputTokens:  11,
+		OutputTokens: 7,
+		RawJSON:      `{"source":"shared@example.com","auth_index":"auth-one"}`,
+	})
+	insertKeeperWindowUsageRecord(t, app, keeperWindowUsageSeed{
+		Dedupe:       "shared-two",
+		Timestamp:    now.Add(-5 * time.Minute),
+		Source:       "shared@example.com",
+		AuthIndex:    "auth-two",
+		InputTokens:  13,
+		OutputTokens: 9,
+		RawJSON:      `{"source":"shared@example.com","auth_index":"auth-two"}`,
+	})
+
+	usages, err := app.computeKeeperQuotaWindowUsages(context.Background(), accounts, now)
+	if err != nil {
+		t.Fatalf("compute window usages: %v", err)
+	}
+	if got := usages["shared-one.json"].Primary.Records; got != 1 {
+		t.Fatalf("shared-one records = %d, want 1", got)
+	}
+	if got := usages["shared-one.json"].Primary.TotalTokens; got != 18 {
+		t.Fatalf("shared-one tokens = %d, want 18", got)
+	}
+	if got := usages["shared-two.json"].Primary.Records; got != 1 {
+		t.Fatalf("shared-two records = %d, want 1", got)
+	}
+	if got := usages["shared-two.json"].Primary.TotalTokens; got != 22 {
+		t.Fatalf("shared-two tokens = %d, want 22", got)
+	}
+}
+
 func TestAccountTypeFromKeeperDetailNormalizesCodexProPlans(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -392,6 +458,16 @@ func TestAccountTypeFromKeeperDetailNormalizesCodexProPlans(t *testing.T) {
 			name:   "nested id token plan is used",
 			detail: map[string]any{"id_token": map[string]any{"plan_type": "pro_lite"}},
 			want:   "pro_5x",
+		},
+		{
+			name:  "usage k12 is k12",
+			usage: &keeperUsageInfo{PlanType: "k12"},
+			want:  "k12",
+		},
+		{
+			name:   "nested id token k12 is used",
+			detail: map[string]any{"id_token": map[string]any{"plan_type": "k12"}},
+			want:   "k12",
 		},
 		{
 			name:   "attributes plan is used",
@@ -449,6 +525,118 @@ func TestAccountTypeFromKeeperDetailNormalizesCodexProPlans(t *testing.T) {
 	}
 }
 
+func TestDefaultKeeperPriorityRulesIncludeK12WithoutUnknown(t *testing.T) {
+	rules := normalizePriorityRules(nil)
+	if rules["k12"] != 2 {
+		t.Fatalf("k12 priority = %d, want 2", rules["k12"])
+	}
+	if _, ok := rules["unknown"]; ok {
+		t.Fatal("unknown priority rule should not be added")
+	}
+	if got := keeperPriorityForType(nil, rules); got != nil {
+		t.Fatalf("nil account type priority = %v, want nil", got)
+	}
+}
+
+func TestKeeperRunStoresRemoteAuthIndex(t *testing.T) {
+	tests := []struct {
+		name             string
+		detailAuthFields map[string]any
+		seedAuthIndex    string
+		wantAuthIndex    *string
+	}{
+		{
+			name:             "detail alias replaces list value",
+			detailAuthFields: map[string]any{"authIndex": "detail-auth"},
+			wantAuthIndex:    stringPtr("detail-auth"),
+		},
+		{
+			name:          "detail omission clears stored value",
+			seedAuthIndex: "stored-auth",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+			cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"files": []map[string]any{{"name": "stored.json", "type": "codex", "auth_index": "list-auth"}},
+					})
+				case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+					detail := map[string]any{
+						"name":         "stored.json",
+						"type":         "codex",
+						"email":        "stored@example.com",
+						"account_type": "free",
+						"disabled":     false,
+						"priority":     0,
+						"access_token": "test-token",
+					}
+					for key, value := range tt.detailAuthFields {
+						detail[key] = value
+					}
+					_ = json.NewEncoder(w).Encode(detail)
+				case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"status_code": 200,
+						"body": map[string]any{
+							"plan_type": "free",
+							"rate_limit": map[string]any{
+								"primary_window": map[string]any{
+									"used_percent":        10,
+									"reset_after_seconds": 3600,
+								},
+							},
+						},
+					})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer cpa.Close()
+
+			app, err := New()
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+			defer app.Close()
+			configureKeeperTestCPA(t, app, cpa.URL, nil)
+			if tt.seedAuthIndex != "" {
+				insertKeeperStateForCandidate(t, app, "stored.json", nil, nil)
+				if _, err := app.db.Exec(`
+					UPDATE codex_keeper_auth_states
+					SET auth_index = ?
+					WHERE auth_name = ?
+				`, tt.seedAuthIndex, "stored.json"); err != nil {
+					t.Fatalf("seed stored auth index: %v", err)
+				}
+			}
+
+			if _, _, err := app.executeKeeperRunForAccounts(context.Background(), "manual", []string{"stored.json"}, func(string) {}); err != nil {
+				t.Fatalf("keeper run: %v", err)
+			}
+			state, err := app.getKeeperState(context.Background(), "stored.json")
+			if err != nil {
+				t.Fatalf("get keeper state: %v", err)
+			}
+			if tt.wantAuthIndex == nil {
+				if state.AuthIndex != nil {
+					t.Fatalf("auth_index = %v, want nil", state.AuthIndex)
+				}
+				return
+			}
+			if state.AuthIndex == nil || *state.AuthIndex != *tt.wantAuthIndex {
+				t.Fatalf("auth_index = %v, want %q", state.AuthIndex, *tt.wantAuthIndex)
+			}
+		})
+	}
+}
+
 func keeperTestCodexJWT(t *testing.T, planType string) string {
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{
@@ -494,6 +682,19 @@ func TestKeeperQuotaWindowUsageInfersAccountWindows(t *testing.T) {
 		t.Fatalf("plus secondary window = %#v, want inferred weekly", plusPair.Secondary)
 	}
 
+	k12Pair := keeperQuotaWindowPairForAccount(keeperAccount{
+		Name:             "k12.json",
+		AccountType:      stringPtr("k12"),
+		PrimaryResetAt:   timePtrValue(resetAt),
+		SecondaryResetAt: timePtrValue(resetAt.Add(2 * time.Hour)),
+	}, now)
+	if k12Pair.Primary == nil || k12Pair.Primary.WindowSeconds != keeperFiveHourWindowSeconds {
+		t.Fatalf("k12 primary window = %#v, want inferred 5h", k12Pair.Primary)
+	}
+	if k12Pair.Secondary == nil || k12Pair.Secondary.WindowSeconds != keeperWeekWindowSeconds {
+		t.Fatalf("k12 secondary window = %#v, want inferred weekly", k12Pair.Secondary)
+	}
+
 	usage := parseKeeperUsageInfo(map[string]any{
 		"plan_type": "plus",
 		"rate_limit": map[string]any{
@@ -513,9 +714,127 @@ func TestKeeperQuotaWindowUsageInfersAccountWindows(t *testing.T) {
 	if usage.SecondaryWindowSeconds == nil || *usage.SecondaryWindowSeconds != 5678 {
 		t.Fatalf("secondary limit_window_seconds = %v, want 5678", usage.SecondaryWindowSeconds)
 	}
+	if usage.PrimaryUsedPercent == nil || *usage.PrimaryUsedPercent != 20 {
+		t.Fatalf("primary used percent = %v, want 20", usage.PrimaryUsedPercent)
+	}
 	camelUsage := parseKeeperUsageInfo(map[string]any{"planType": "pro"})
 	if camelUsage.PlanType != "pro" {
 		t.Fatalf("camel planType = %q, want pro", camelUsage.PlanType)
+	}
+}
+
+func TestKeeperQuotaWindowNormalization(t *testing.T) {
+	primaryReset := time.Date(2026, 7, 23, 1, 0, 0, 0, appTimeLocation)
+	secondaryReset := primaryReset.Add(2 * time.Hour)
+
+	t.Run("weekly only plus moves to secondary", func(t *testing.T) {
+		usage := normalizeKeeperUsageInfoWindows(keeperUsageInfo{
+			PrimaryUsedPercent:   intPtrValue(0),
+			PrimaryResetAt:       timePtrValue(primaryReset),
+			PrimaryWindowSeconds: intPtrValue(keeperWeekWindowSeconds),
+		}, stringPtr("plus"))
+		if usage.PrimaryUsedPercent != nil || usage.PrimaryResetAt != nil || usage.PrimaryWindowSeconds != nil {
+			t.Fatalf("primary window = %#v, want empty", usage)
+		}
+		if usage.SecondaryUsedPercent == nil || *usage.SecondaryUsedPercent != 0 {
+			t.Fatalf("secondary used percent = %v, want 0", usage.SecondaryUsedPercent)
+		}
+		if usage.SecondaryResetAt == nil || !usage.SecondaryResetAt.Equal(primaryReset) {
+			t.Fatalf("secondary reset = %v, want %v", usage.SecondaryResetAt, primaryReset)
+		}
+		if usage.SecondaryWindowSeconds == nil || *usage.SecondaryWindowSeconds != keeperWeekWindowSeconds {
+			t.Fatalf("secondary seconds = %v, want weekly", usage.SecondaryWindowSeconds)
+		}
+	})
+
+	t.Run("known reversed windows are reordered", func(t *testing.T) {
+		usage := normalizeKeeperUsageInfoWindows(keeperUsageInfo{
+			PrimaryUsedPercent:     intPtrValue(40),
+			PrimaryResetAt:         timePtrValue(primaryReset),
+			PrimaryWindowSeconds:   intPtrValue(keeperWeekWindowSeconds),
+			SecondaryUsedPercent:   intPtrValue(20),
+			SecondaryResetAt:       timePtrValue(secondaryReset),
+			SecondaryWindowSeconds: intPtrValue(keeperFiveHourWindowSeconds),
+		}, stringPtr("plus"))
+		if usage.PrimaryUsedPercent == nil || *usage.PrimaryUsedPercent != 20 || usage.PrimaryResetAt == nil || !usage.PrimaryResetAt.Equal(secondaryReset) {
+			t.Fatalf("primary window = %#v, want five-hour source window", usage)
+		}
+		if usage.SecondaryUsedPercent == nil || *usage.SecondaryUsedPercent != 40 || usage.SecondaryResetAt == nil || !usage.SecondaryResetAt.Equal(primaryReset) {
+			t.Fatalf("secondary window = %#v, want weekly source window", usage)
+		}
+	})
+
+	t.Run("missing durations preserve legacy order", func(t *testing.T) {
+		usage := normalizeKeeperUsageInfoWindows(keeperUsageInfo{
+			PrimaryUsedPercent:   intPtrValue(10),
+			SecondaryUsedPercent: intPtrValue(30),
+		}, stringPtr("plus"))
+		if usage.PrimaryUsedPercent == nil || *usage.PrimaryUsedPercent != 10 || usage.SecondaryUsedPercent == nil || *usage.SecondaryUsedPercent != 30 {
+			t.Fatalf("usage = %#v, want original slot order", usage)
+		}
+	})
+
+	t.Run("free monthly window moves to primary", func(t *testing.T) {
+		usage := normalizeKeeperUsageInfoWindows(keeperUsageInfo{
+			SecondaryUsedPercent:   intPtrValue(15),
+			SecondaryResetAt:       timePtrValue(secondaryReset),
+			SecondaryWindowSeconds: intPtrValue(keeperMonthWindowSeconds),
+		}, stringPtr("free"))
+		if usage.PrimaryUsedPercent == nil || *usage.PrimaryUsedPercent != 15 || usage.PrimaryWindowSeconds == nil || *usage.PrimaryWindowSeconds != keeperMonthWindowSeconds {
+			t.Fatalf("primary window = %#v, want monthly source window", usage)
+		}
+		if usage.SecondaryUsedPercent != nil || usage.SecondaryResetAt != nil || usage.SecondaryWindowSeconds != nil {
+			t.Fatalf("secondary window = %#v, want empty", usage)
+		}
+	})
+
+	t.Run("unknown durations are retained", func(t *testing.T) {
+		usage := normalizeKeeperUsageInfoWindows(keeperUsageInfo{
+			PrimaryUsedPercent:     intPtrValue(11),
+			PrimaryWindowSeconds:   intPtrValue(1234),
+			SecondaryUsedPercent:   intPtrValue(22),
+			SecondaryWindowSeconds: intPtrValue(5678),
+		}, stringPtr("plus"))
+		if usage.PrimaryWindowSeconds == nil || *usage.PrimaryWindowSeconds != 1234 || usage.SecondaryWindowSeconds == nil || *usage.SecondaryWindowSeconds != 5678 {
+			t.Fatalf("usage = %#v, want unknown durations in original slots", usage)
+		}
+	})
+}
+
+func TestKeeperStoredQuotaWindowNormalization(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	resetAt := time.Date(2026, 7, 23, 1, 0, 0, 0, appTimeLocation)
+	insertKeeperStateForCandidate(t, app, "weekly-only.json", timePtrValue(resetAt), nil)
+	_, err = app.db.Exec(`
+		UPDATE codex_keeper_auth_states
+		SET account_type = ?, primary_used_percent = ?, primary_window_seconds = ?, updated_at = ?
+		WHERE auth_name = ?
+	`, "plus", 0, keeperWeekWindowSeconds, dbTime(time.Now().In(appTimeLocation)), "weekly-only.json")
+	if err != nil {
+		t.Fatalf("seed weekly-only keeper state: %v", err)
+	}
+
+	state, err := app.getKeeperState(context.Background(), "weekly-only.json")
+	if err != nil {
+		t.Fatalf("get keeper state: %v", err)
+	}
+	if state.PrimaryUsedPercent != nil || state.PrimaryResetAt != nil || state.PrimaryWindowSeconds != nil {
+		t.Fatalf("primary state = %#v, want empty", state.keeperAccount)
+	}
+	if state.SecondaryUsedPercent == nil || *state.SecondaryUsedPercent != 0 {
+		t.Fatalf("secondary used percent = %v, want 0", state.SecondaryUsedPercent)
+	}
+	if state.SecondaryResetAt == nil || !state.SecondaryResetAt.Equal(resetAt) {
+		t.Fatalf("secondary reset = %v, want %v", state.SecondaryResetAt, resetAt)
+	}
+	if state.SecondaryWindowSeconds == nil || *state.SecondaryWindowSeconds != keeperWeekWindowSeconds {
+		t.Fatalf("secondary seconds = %v, want weekly", state.SecondaryWindowSeconds)
 	}
 }
 
@@ -1228,6 +1547,14 @@ func TestKeeperAuthDetailRequestFailureCountsAsNetworkError(t *testing.T) {
 	}
 	defer app.Close()
 	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	insertKeeperStateForCandidate(t, app, "download-fails.json", nil, nil)
+	if _, err := app.db.Exec(`
+		UPDATE codex_keeper_auth_states
+		SET auth_index = ?
+		WHERE auth_name = ?
+	`, "stored-auth", "download-fails.json"); err != nil {
+		t.Fatalf("seed stored auth index: %v", err)
+	}
 
 	stats, _, err := app.executeKeeperRunForAccounts(context.Background(), "daemon", nil, func(string) {})
 	if err != nil {
@@ -1251,6 +1578,9 @@ func TestKeeperAuthDetailRequestFailureCountsAsNetworkError(t *testing.T) {
 	}
 	if state.LastError == nil || !strings.Contains(*state.LastError, "读取 auth file 详情失败") {
 		t.Fatalf("last_error = %v, want auth detail failure", state.LastError)
+	}
+	if state.AuthIndex == nil || *state.AuthIndex != "stored-auth" {
+		t.Fatalf("auth_index = %v, want stored-auth preserved after detail failure", state.AuthIndex)
 	}
 }
 
@@ -1337,7 +1667,7 @@ func TestConditionalKeeperRunUsesAutomaticPriorityPolicy(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"name":         "quota.json",
 				"type":         "codex",
-				"account_type": "free",
+				"account_type": "plus",
 				"disabled":     false,
 				"priority":     0,
 				"access_token": "test-token",
@@ -1346,11 +1676,12 @@ func TestConditionalKeeperRunUsesAutomaticPriorityPolicy(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"status_code": 200,
 				"body": map[string]any{
-					"plan_type": "free",
+					"plan_type": "plus",
 					"rate_limit": map[string]any{
 						"primary_window": map[string]any{
-							"used_percent":        100,
-							"reset_after_seconds": 3600,
+							"used_percent":         100,
+							"reset_after_seconds":  3600,
+							"limit_window_seconds": keeperWeekWindowSeconds,
 						},
 					},
 				},
@@ -1392,6 +1723,13 @@ func TestConditionalKeeperRunUsesAutomaticPriorityPolicy(t *testing.T) {
 	}
 	if len(priorityPatches) != 1 || priorityPatches[0] != -1 {
 		t.Fatalf("priority patches = %#v, want [-1]", priorityPatches)
+	}
+	state, err := app.getKeeperState(context.Background(), "quota.json")
+	if err != nil {
+		t.Fatalf("get normalized keeper state: %v", err)
+	}
+	if state.PrimaryUsedPercent != nil || state.SecondaryUsedPercent == nil || *state.SecondaryUsedPercent != 100 {
+		t.Fatalf("stored quota windows = %#v, want weekly usage in secondary", state.keeperAccount)
 	}
 	if got := countKeeperRows(t, app, `SELECT COUNT(*) FROM codex_keeper_runs`); got != 0 {
 		t.Fatalf("keeper run rows = %d, want 0 because conditional refresh is not persisted", got)

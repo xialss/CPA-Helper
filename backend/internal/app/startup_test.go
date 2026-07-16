@@ -138,6 +138,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceChannelColumns(t *testing.T) 
 				`CREATE TABLE app_settings (session_secret TEXT)`,
 				`CREATE TABLE users (username TEXT)`,
 				`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
+				codexKeeperAuthStateSchemaForStartupTest,
 				`CREATE TABLE model_prices (` + strings.Join(columns, ", ") + `)`,
 				modelPriceLibraryConflictSchemaForStartupTest,
 				`CREATE TABLE user_quota_charges (lifetime_deducted_usd TEXT)`,
@@ -166,6 +167,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceLibraryConflictsTable(t *test
 		`CREATE TABLE app_settings (session_secret TEXT)`,
 		`CREATE TABLE users (username TEXT)`,
 		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
+		codexKeeperAuthStateSchemaForStartupTest,
 		`CREATE TABLE model_prices (
 			request_usd TEXT, priority_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
 			long_context_threshold_tokens TEXT, long_context_input_usd_per_million TEXT,
@@ -184,6 +186,40 @@ func TestRequireSchemaShapeRejectsMissingModelPriceLibraryConflictsTable(t *test
 		t.Fatalf("requireSchemaShape error = %v, want missing model_price_library_conflicts table", err)
 	}
 }
+
+func TestRequireSchemaShapeRejectsMissingKeeperAuthIndex(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	statements := []string{
+		`CREATE TABLE app_settings (session_secret TEXT)`,
+		`CREATE TABLE users (username TEXT)`,
+		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
+		`CREATE TABLE codex_keeper_auth_states (auth_name TEXT)`,
+		`CREATE TABLE model_prices (
+			request_usd TEXT, priority_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
+			long_context_threshold_tokens TEXT, long_context_input_usd_per_million TEXT,
+			long_context_output_usd_per_million TEXT, long_context_cache_read_usd_per_million TEXT,
+			long_context_cache_creation_usd_per_million TEXT
+		)`,
+		modelPriceLibraryConflictSchemaForStartupTest,
+		`CREATE TABLE user_quota_charges (lifetime_deducted_usd TEXT)`,
+	}
+	for _, statement := range statements {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("create test schema: %v", err)
+		}
+	}
+	err = requireSchemaShape(context.Background(), db)
+	if !errors.Is(err, ErrDatabaseNeedsMigration) || !strings.Contains(err.Error(), "codex_keeper_auth_states.auth_index") {
+		t.Fatalf("requireSchemaShape error = %v, want missing codex_keeper_auth_states.auth_index", err)
+	}
+}
+
+const codexKeeperAuthStateSchemaForStartupTest = `CREATE TABLE codex_keeper_auth_states (auth_index TEXT)`
 
 const modelPriceLibraryConflictSchemaForStartupTest = `CREATE TABLE model_price_library_conflicts (
 	original_id TEXT, selected_price_id TEXT, conflict_reason TEXT, provider TEXT, model TEXT,

@@ -1,12 +1,14 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
 
 	backendMigrations "cpa-helper/backend/migrations"
+	"github.com/pressly/goose/v3"
 )
 
 func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
@@ -102,6 +104,9 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	}
 	if !testColumnExists(t, app.db, "user_quota_charges", "lifetime_deducted_usd") {
 		t.Fatal("user_quota_charges.lifetime_deducted_usd was not created")
+	}
+	if !testColumnExists(t, app.db, "codex_keeper_auth_states", "auth_index") {
+		t.Fatal("codex_keeper_auth_states.auth_index was not created")
 	}
 	if testColumnExists(t, app.db, "user_quota_charges", "total_deducted_usd") {
 		t.Fatal("old user_quota_charges.total_deducted_usd should not exist")
@@ -276,6 +281,9 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 	if testTableExists(t, app.db, "alembic_version") {
 		t.Fatal("old alembic_version table should be removed")
 	}
+	if !testColumnExists(t, app.db, "codex_keeper_auth_states", "auth_index") {
+		t.Fatal("old schema migration did not create codex_keeper_auth_states.auth_index")
+	}
 
 	var username, storedAPIKey, usageUsername string
 	if err := app.db.QueryRow(`SELECT username FROM users WHERE username = 'alice'`).Scan(&username); err != nil {
@@ -379,6 +387,87 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 	if !threshold.Valid || threshold.Int64 != 200000 || !longInput.Valid || longInput.Float64 != 2.5 || !longOutput.Valid || longOutput.Float64 != 15 {
 		t.Fatalf("migrated Gemini long-context price = %#v/%#v/%#v", threshold, longInput, longOutput)
 	}
+}
+
+func TestRunMigrationsUpgradesPreviousForkVersionWithKeeperAuthIndex(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	prepareMigrationTestDatabase(t, dataDir, 202607150001)
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	if !testColumnExists(t, app.db, "codex_keeper_auth_states", "auth_index") {
+		t.Fatal("codex_keeper_auth_states.auth_index was not created during upgrade")
+	}
+	var indexCount int
+	if err := app.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'ix_codex_keeper_auth_states_auth_index'`).Scan(&indexCount); err != nil {
+		t.Fatalf("query auth index: %v", err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("auth index count = %d, want 1", indexCount)
+	}
+}
+
+func TestRunMigrationsAcceptsPreexistingKeeperAuthIndexColumn(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	dbPath := prepareMigrationTestDatabase(t, dataDir, 202607150001)
+
+	db, err := sql.Open("sqlite", sqliteDSN(dbPath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`ALTER TABLE codex_keeper_auth_states ADD COLUMN auth_index VARCHAR(500)`); err != nil {
+		_ = db.Close()
+		t.Fatalf("add preexisting auth_index: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	var indexCount int
+	if err := app.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'ix_codex_keeper_auth_states_auth_index'`).Scan(&indexCount); err != nil {
+		t.Fatalf("query auth index: %v", err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("auth index count = %d, want 1", indexCount)
+	}
+}
+
+func prepareMigrationTestDatabase(t *testing.T, dataDir string, version int64) string {
+	t.Helper()
+	dbDir := filepath.Join(dataDir, "db")
+	if err := ensureTestDir(dbDir); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(dbDir, "cpa_helper.sqlite3")
+	db, err := sql.Open("sqlite", sqliteDSN(dbPath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	goose.SetBaseFS(backendMigrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := goose.UpToContext(context.Background(), db, ".", version); err != nil {
+		_ = db.Close()
+		t.Fatalf("migrate test database to %d: %v", version, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return dbPath
 }
 
 func testTableExists(t *testing.T, db *sql.DB, table string) bool {

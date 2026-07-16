@@ -203,6 +203,7 @@ func requireSchemaShape(ctx context.Context, db *sql.DB) error {
 		{"usage_records", "dedupe_key"},
 		{"usage_records", "ttft_ms"},
 		{"usage_records", "service_tier"},
+		{"codex_keeper_auth_states", "auth_index"},
 		{"model_prices", "request_usd"},
 		{"model_prices", "priority_multiplier"},
 		{"model_prices", "price_scope"},
