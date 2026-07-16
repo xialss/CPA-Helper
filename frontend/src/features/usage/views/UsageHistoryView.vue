@@ -1542,9 +1542,11 @@ onBeforeUnmount(() => {
               </li>
             </ol>
             <div v-if="compositionMode === 'tokens'" class="token-reasoning-summary">
-              <span class="token-reasoning-label">{{ t('推理 Token', 'Reasoning tokens') }}</span>
+              <span class="token-reasoning-copy">
+                <span class="token-reasoning-label">{{ t('推理 Token', 'Reasoning tokens') }}</span>
+                <span class="token-reasoning-meta">{{ t('不计入构成占比', 'Excluded from composition') }}</span>
+              </span>
               <strong class="token-reasoning-value">{{ reasoningTokenText }}</strong>
-              <span class="token-reasoning-meta">{{ t('不计入构成占比', 'Excluded from composition') }}</span>
             </div>
             <ol
               v-else
@@ -2737,7 +2739,7 @@ onBeforeUnmount(() => {
 
 .token-reasoning-summary {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: 10px minmax(0, 1fr) auto 36px;
   gap: 8px;
   align-items: center;
   min-width: 0;
@@ -2747,11 +2749,33 @@ onBeforeUnmount(() => {
   border-radius: 6px;
 }
 
+.token-reasoning-summary::before {
+  width: 9px;
+  height: 9px;
+  content: '';
+}
+
+.token-reasoning-copy {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+}
+
 .token-reasoning-label {
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   color: var(--cpa-text);
   font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.token-reasoning-meta {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -3015,12 +3039,5 @@ onBeforeUnmount(() => {
     overflow: visible;
   }
 
-  .token-reasoning-summary {
-    grid-template-columns: minmax(0, 1fr) auto;
-  }
-
-  .token-reasoning-meta {
-    grid-column: 1 / -1;
-  }
 }
 </style>
