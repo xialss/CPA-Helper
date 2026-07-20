@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"path/filepath"
 	"reflect"
@@ -351,6 +352,178 @@ func TestUsageOptionsRespectDateRange(t *testing.T) {
 		t.Fatalf("overview source options = %#v, want only code10001", overview.Options.Sources)
 	}
 	assertStringSlice(t, overview.Options.Endpoints, []string{"/v1/chat/completions"})
+}
+
+func TestUsageOverviewIncludeOptions(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+	seedUsageRecord(t, dataDir, "2026-05-16T16:37:00+08:00")
+
+	const overviewPath = "/api/usage/overview?scope=admin&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00"
+	defaultResponse := map[string]json.RawMessage{}
+	requestJSON(t, handler, http.MethodGet, overviewPath, nil, cookies, &defaultResponse)
+	if _, ok := defaultResponse["options"]; !ok {
+		t.Fatal("default overview response does not include options")
+	}
+
+	withoutOptions := map[string]json.RawMessage{}
+	requestJSON(t, handler, http.MethodGet, overviewPath+"&include_options=false", nil, cookies, &withoutOptions)
+	if _, ok := withoutOptions["options"]; ok {
+		t.Fatal("overview response includes options when include_options=false")
+	}
+	if _, ok := withoutOptions["summary"]; !ok {
+		t.Fatal("overview response without options does not include summary")
+	}
+
+	withOptions := map[string]json.RawMessage{}
+	requestJSON(t, handler, http.MethodGet, overviewPath+"&include_options=true", nil, cookies, &withOptions)
+	if _, ok := withOptions["options"]; !ok {
+		t.Fatal("overview response does not include options when include_options=true")
+	}
+
+	requestJSONExpectStatus(t, handler, http.MethodGet, overviewPath+"&include_options=invalid", nil, cookies, http.StatusUnprocessableEntity)
+}
+
+func TestUsageOptionsFailClosedOnConflictingAuthAndSupportLegacyRawJSONAuth(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+
+	const currentSource = "current-source"
+	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
+		Timestamp:   "2026-05-16T16:37:00+08:00",
+		Username:    "admin",
+		Source:      currentSource,
+		RequestID:   "req-current-auth",
+		Auth:        "bearer",
+		DedupeKey:   "current-auth",
+		RawJSON:     `{"auth_type":"apikey"}`,
+		TotalTokens: 1,
+	})
+	const consistentSource = "consistent-source"
+	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
+		Timestamp:   "2026-05-16T16:37:30+08:00",
+		Username:    "admin",
+		Source:      consistentSource,
+		RequestID:   "req-consistent-auth",
+		Auth:        "bearer",
+		DedupeKey:   "consistent-auth",
+		RawJSON:     `{"auth_type":"bearer"}`,
+		TotalTokens: 1,
+	})
+	const sharedSource = "shared-source"
+	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
+		Timestamp:   "2026-05-16T16:37:40+08:00",
+		Username:    "admin",
+		Source:      sharedSource,
+		RequestID:   "req-shared-bearer-auth",
+		Auth:        "bearer",
+		DedupeKey:   "shared-bearer-auth",
+		RawJSON:     `{"auth_type":"bearer"}`,
+		TotalTokens: 1,
+	})
+	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
+		Timestamp:   "2026-05-16T16:37:50+08:00",
+		Username:    "admin",
+		Source:      sharedSource,
+		RequestID:   "req-shared-api-key-auth",
+		Auth:        "apikey",
+		DedupeKey:   "shared-api-key-auth",
+		RawJSON:     `{"auth_type":"apikey"}`,
+		TotalTokens: 1,
+	})
+
+	const legacySource = "legacy-api-key-source-secret"
+	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
+		Timestamp:   "2026-05-16T16:38:00+08:00",
+		Username:    "admin",
+		Source:      legacySource,
+		RequestID:   "req-legacy-auth",
+		Auth:        "",
+		DedupeKey:   "legacy-auth",
+		RawJSON:     `{"auth_type":"apikey"}`,
+		TotalTokens: 1,
+	})
+	const malformedLegacySource = "malformed-legacy-source-secret"
+	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
+		Timestamp:   "2026-05-16T16:38:10+08:00",
+		Username:    "admin",
+		Source:      malformedLegacySource,
+		RequestID:   "req-malformed-legacy-auth",
+		Auth:        "",
+		DedupeKey:   "malformed-legacy-auth",
+		RawJSON:     `{`,
+		TotalTokens: 1,
+	})
+	const missingLegacyAuthSource = "missing-legacy-auth-source-secret"
+	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
+		Timestamp:   "2026-05-16T16:38:20+08:00",
+		Username:    "admin",
+		Source:      missingLegacyAuthSource,
+		RequestID:   "req-missing-legacy-auth",
+		Auth:        "",
+		DedupeKey:   "missing-legacy-auth",
+		RawJSON:     `{}`,
+		TotalTokens: 1,
+	})
+
+	options := usageOptionsTestResponse{}
+	requestJSON(t, handler, http.MethodGet, "/api/usage/options?scope=admin&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00", nil, cookies, &options)
+	if len(options.Sources) != 6 {
+		t.Fatalf("source options = %#v, want conflicting, consistent, shared, and three legacy sources", options.Sources)
+	}
+	labels := map[string]string{}
+	for _, option := range options.Sources {
+		labels[option.Key] = option.Label
+	}
+	currentLabel := labels[sourceKeyForTest(currentSource)]
+	if currentLabel == currentSource || !strings.Contains(currentLabel, "...") {
+		t.Fatalf("conflicting source label = %q, want fail-closed masking", currentLabel)
+	}
+	if labels[sourceKeyForTest(consistentSource)] != consistentSource {
+		t.Fatalf("consistent source label = %q, want original source", labels[sourceKeyForTest(consistentSource)])
+	}
+	sharedLabel := labels[sourceKeyForTest(sharedSource)]
+	if sharedLabel == sharedSource || !strings.Contains(sharedLabel, "...") {
+		t.Fatalf("shared source label = %q, want API-key authentication to win masking", sharedLabel)
+	}
+	legacyLabel := labels[sourceKeyForTest(legacySource)]
+	if legacyLabel == legacySource || !strings.Contains(legacyLabel, "...") {
+		t.Fatalf("legacy source label = %q, want raw_json auth compatibility masking", legacyLabel)
+	}
+	malformedLegacyLabel := labels[sourceKeyForTest(malformedLegacySource)]
+	if malformedLegacyLabel == malformedLegacySource || !strings.Contains(malformedLegacyLabel, "...") {
+		t.Fatalf("malformed legacy source label = %q, want fail-closed masking", malformedLegacyLabel)
+	}
+	missingLegacyAuthLabel := labels[sourceKeyForTest(missingLegacyAuthSource)]
+	if missingLegacyAuthLabel == missingLegacyAuthSource || !strings.Contains(missingLegacyAuthLabel, "...") {
+		t.Fatalf("missing-auth legacy source label = %q, want fail-closed masking", missingLegacyAuthLabel)
+	}
 }
 
 func TestUsageRecordsFilterBySourceForAdmin(t *testing.T) {

@@ -365,6 +365,10 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 	if !ok {
 		return validationError("model_ranking_sort 参数无效")
 	}
+	includeOptions, err := usageOverviewIncludesOptions(r)
+	if err != nil {
+		return err
+	}
 	scope := accessScope(user, filters.Scope)
 	scoped, err := a.scopedFilters(r.Context(), normalizedUsageFilters(filters), scope)
 	if err != nil {
@@ -387,11 +391,7 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 	if scope.IsAdmin {
 		userRanking = rankingFromRecordsBySort(records, pricing.Prices, "user", users, primaryRankingSort, pricing.MatchContext)
 	}
-	options, err := a.usageOptionsResponse(r.Context(), user, usageOptionFilters(filters))
-	if err != nil {
-		return err
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"summary":                     usageSummaryFromRecords(scoped, records, pricing.Prices, pricing.MatchContext),
 		"trends":                      trendPointsFromRecords(scoped, records, pricing.Prices, pricing.MatchContext),
 		"user_ranking":                userRanking,
@@ -399,9 +399,28 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 		"api_key_ranking":             apiKeyRanking,
 		"model_ranking":               rankingFromRecordsBySort(records, pricing.Prices, "model", users, modelRankingSort, pricing.MatchContext),
 		"distributions":               distributionsFromRecords(records, pricing.Prices, pricing.MatchContext),
-		"options":                     options,
-	})
+	}
+	if includeOptions {
+		options, err := a.usageOptionsResponse(r.Context(), user, usageOptionFilters(filters))
+		if err != nil {
+			return err
+		}
+		response["options"] = options
+	}
+	writeJSON(w, http.StatusOK, response)
 	return nil
+}
+
+func usageOverviewIncludesOptions(r *http.Request) (bool, error) {
+	value := strings.TrimSpace(r.URL.Query().Get("include_options"))
+	if value == "" {
+		return true, nil
+	}
+	includeOptions, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, validationError("include_options 参数无效")
+	}
+	return includeOptions, nil
 }
 
 func (a *App) usageRecords(w http.ResponseWriter, r *http.Request, filters UsageFilters, user *AuthUser) error {
@@ -516,38 +535,78 @@ func (a *App) usageOptionsResponse(ctx context.Context, user *AuthUser, filters 
 		return values, rows.Err()
 	}
 	distinctSourceOptions := func() ([]map[string]string, error) {
-		rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT source, auth, raw_json FROM usage_records `+where+` AND source IS NOT NULL`, args...)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
 		type sourceOption struct {
 			Key   string
 			Label string
 		}
 		values := map[string]sourceOption{}
-		for rows.Next() {
-			var source, auth, rawJSON sql.NullString
-			if err := rows.Scan(&source, &auth, &rawJSON); err != nil {
-				return nil, err
+		addSourceOption := func(source string, auth *string, forceMask bool) {
+			sourceValue := strings.TrimSpace(source)
+			if sourceValue == "" {
+				return
 			}
-			sourceValue := strings.TrimSpace(source.String)
-			if !source.Valid || sourceValue == "" {
-				continue
-			}
-			record := UsageRecord{Source: &sourceValue, RawJSON: rawJSON.String}
-			if auth.Valid {
-				record.Auth = &auth.String
-			}
-			displaySource := redactedUsageSource(record.Source, usageRecordAuth(record), usageRedactionOptions{})
-			sourceKey := usageSourceKey(record.Source)
+			displaySource := redactedUsageSource(&sourceValue, auth, usageRedactionOptions{MaskSource: forceMask})
+			sourceKey := usageSourceKey(&sourceValue)
 			if displaySource == nil || sourceKey == nil {
-				continue
+				return
 			}
 			existing, ok := values[*sourceKey]
 			if !ok || (existing.Label == sourceValue && *displaySource != sourceValue) {
 				values[*sourceKey] = sourceOption{Key: *sourceKey, Label: *displaySource}
 			}
+		}
+
+		rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT source, auth,
+			CASE WHEN json_valid(raw_json) THEN TRIM(CAST(json_extract(raw_json, '$.auth_type') AS TEXT)) ELSE NULL END
+			FROM usage_records `+where+` AND source IS NOT NULL AND auth IS NOT NULL AND TRIM(auth) <> ''`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var source, auth string
+			var rawAuth sql.NullString
+			if err := rows.Scan(&source, &auth, &rawAuth); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			rawAuthValue := strings.TrimSpace(rawAuth.String)
+			conflictingAuth := rawAuth.Valid && rawAuthValue != "" && usageAuthTypeKey(&auth) != usageAuthTypeKey(&rawAuthValue)
+			if rawAuth.Valid && rawAuthValue != "" {
+				addSourceOption(source, &rawAuthValue, conflictingAuth)
+			} else {
+				addSourceOption(source, &auth, false)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+
+		legacyRows, err := a.db.QueryContext(ctx, `SELECT DISTINCT source, raw_json FROM usage_records `+where+` AND source IS NOT NULL AND (auth IS NULL OR TRIM(auth) = '')`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for legacyRows.Next() {
+			var source string
+			var rawJSON sql.NullString
+			if err := legacyRows.Scan(&source, &rawJSON); err != nil {
+				_ = legacyRows.Close()
+				return nil, err
+			}
+			sourceValue := strings.TrimSpace(source)
+			record := UsageRecord{Source: &sourceValue, RawJSON: rawJSON.String}
+			auth := usageRecordAuth(record)
+			addSourceOption(sourceValue, auth, auth == nil)
+		}
+		if err := legacyRows.Err(); err != nil {
+			_ = legacyRows.Close()
+			return nil, err
+		}
+		if err := legacyRows.Close(); err != nil {
+			return nil, err
 		}
 		options := make([]sourceOption, 0, len(values))
 		for _, option := range values {
@@ -566,7 +625,7 @@ func (a *App) usageOptionsResponse(ctx context.Context, user *AuthUser, filters 
 				"label": option.Label,
 			})
 		}
-		return sources, rows.Err()
+		return sources, nil
 	}
 	if scope.IsAdmin {
 		usernames, err := distinctStrings("usage_username")
@@ -1303,23 +1362,21 @@ func redactedAuthIndex(authIndex *string, redaction usageRedactionOptions) *stri
 }
 
 func isAPIKeyAuth(authType *string) bool {
-	if authType == nil {
-		return false
-	}
-	normalized := strings.ToLower(strings.TrimSpace(*authType))
-	normalized = strings.ReplaceAll(normalized, "-", "")
-	normalized = strings.ReplaceAll(normalized, "_", "")
-	return normalized == "apikey"
+	return usageAuthTypeKey(authType) == "apikey"
 }
 
 func isOAuthAuth(authType *string) bool {
+	return usageAuthTypeKey(authType) == "oauth"
+}
+
+func usageAuthTypeKey(authType *string) string {
 	if authType == nil {
-		return false
+		return ""
 	}
 	normalized := strings.ToLower(strings.TrimSpace(*authType))
 	normalized = strings.ReplaceAll(normalized, "-", "")
 	normalized = strings.ReplaceAll(normalized, "_", "")
-	return normalized == "oauth"
+	return normalized
 }
 
 func redactedRawJSON(rawJSON string, authType *string, redaction usageRedactionOptions) any {
