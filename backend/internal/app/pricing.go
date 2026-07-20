@@ -2888,7 +2888,6 @@ func modelPriceRecordRequiresConfiguredSelectors(prices modelPriceIndex, provide
 }
 
 func findMatchingConfiguredChannelPrice(prices modelPriceIndex, selectors modelPriceChannelSelectorIndex, provider, model string, authIndexValue *string) (*ModelPrice, string) {
-	nativeBrands := matchingNativePriceBrands(provider)
 	authIndex := strings.TrimSpace(aiProviderOptionalString(authIndexValue))
 	if authIndex == "" {
 		openAICompatibleCount, nativeCount := configuredMissingAuthModelPriceCandidateCounts(selectors, provider, model)
@@ -2904,10 +2903,7 @@ func findMatchingConfiguredChannelPrice(prices modelPriceIndex, selectors modelP
 		return nil, priceMatchStatusChannelConflict
 	}
 	if matchCount == 0 {
-		if len(nativeBrands) > 0 && authIndex == "" {
-			return nil, priceMatchStatusMissingAuthIndex
-		}
-		return nil, priceMatchStatusChannelUnpriced
+		return findMatchingStoredChannelPrice(prices, provider, model, authIndexValue)
 	}
 
 	key := channelModelPriceKey(modelPriceChannelAuthTypeAPIKey, string(matchedIdentity.Brand), matchedIdentity.ChannelKey, matchedIdentity.Model)
@@ -3006,6 +3002,11 @@ func findMatchingStoredChannelPrice(prices modelPriceIndex, provider, model stri
 		for _, brand := range nativeBrands {
 			appendCandidate(nativeModelPriceKey(string(brand), authIndex, model), false)
 		}
+	} else if storedNativeModelPriceCandidateExists(prices, nativeBrands, model) {
+		if len(candidates) > 0 {
+			return nil, priceMatchStatusChannelConflict
+		}
+		return nil, priceMatchStatusMissingAuthIndex
 	}
 
 	if len(candidates) > 1 {
@@ -3022,6 +3023,25 @@ func findMatchingStoredChannelPrice(prices modelPriceIndex, provider, model stri
 		return nil, priceMatchStatusMissingAuthIndex
 	}
 	return nil, priceMatchStatusChannelUnpriced
+}
+
+func storedNativeModelPriceCandidateExists(prices modelPriceIndex, brands []aiProviderBrand, model string) bool {
+	if len(brands) == 0 {
+		return false
+	}
+	modelKey := strings.ToLower(normalizeModelPriceChannelModel(model))
+	for key, price := range prices {
+		if key[1] != modelKey || !modelPriceIsNativeChannel(price) {
+			continue
+		}
+		priceBrand := aiProviderBrand(strings.TrimSpace(*price.ChannelBrand))
+		for _, brand := range brands {
+			if priceBrand == brand {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func modelPriceIsOpenAICompatibleChannel(price ModelPrice) bool {

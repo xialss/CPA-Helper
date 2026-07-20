@@ -1494,6 +1494,176 @@ func TestRecordCostRejectsStoredChannelPricesWhenSelectorsUnavailable(t *testing
 	}
 }
 
+func TestRecordCostUsesUniqueStoredChannelPriceWhenProviderWasRemoved(t *testing.T) {
+	model := "removed-provider-model"
+	tests := []struct {
+		name       string
+		brand      aiProviderBrand
+		provider   string
+		channelKey string
+		authIndex  *string
+	}{
+		{
+			name:       "named OpenAI-compatible",
+			brand:      aiProviderBrandOpenAICompatibility,
+			provider:   "Vendor Removed",
+			channelKey: "vendor removed",
+		},
+		{
+			name:       "same-named OpenAI-compatible without stored native price",
+			brand:      aiProviderBrandOpenAICompatibility,
+			provider:   "gemini",
+			channelKey: "gemini",
+		},
+		{
+			name:       "native Codex",
+			brand:      aiProviderBrandCodex,
+			provider:   "codex",
+			channelKey: "removed-codex-auth.json",
+			authIndex:  stringPtr("removed-codex-auth.json"),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			brand := string(test.brand)
+			price := ModelPrice{
+				ID:                 1,
+				Provider:           test.provider,
+				Model:              model,
+				PriceScope:         modelPriceScopeChannel,
+				ChannelBrand:       &brand,
+				ChannelKey:         &test.channelKey,
+				InputUSDPerMillion: 2,
+			}
+			key := priceKey(test.channelKey, model)
+			if test.brand != aiProviderBrandOpenAICompatibility {
+				key = nativeModelPriceKey(brand, test.channelKey, model)
+			}
+			breakdown := calculateRecordCostBreakdown(UsageRecord{
+				Provider:    &test.provider,
+				Model:       &model,
+				AuthIndex:   test.authIndex,
+				InputTokens: 1_000_000,
+				TotalTokens: 1_000_000,
+			}, modelPriceIndex{key: price}, modelPriceMatchContext{
+				Selectors:          modelPriceChannelSelectorIndex{},
+				SelectorsRequired:  true,
+				SelectorsAvailable: true,
+			})
+			if breakdown.Unpriced || breakdown.TotalUSD != 2 {
+				t.Fatalf("removed-provider breakdown = %#v, want priced total 2", breakdown)
+			}
+		})
+	}
+}
+
+func TestRecordCostRejectsAmbiguousStoredChannelPricesWhenProvidersWereRemoved(t *testing.T) {
+	provider := "google"
+	model := "removed-google-model"
+	authIndex := "removed-google-auth"
+	geminiBrand := string(aiProviderBrandGemini)
+	vertexBrand := string(aiProviderBrandVertex)
+	prices := modelPriceIndex{
+		nativeModelPriceKey(geminiBrand, authIndex, model): {
+			ID:                 1,
+			Provider:           "gemini",
+			Model:              model,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelBrand:       &geminiBrand,
+			ChannelKey:         &authIndex,
+			InputUSDPerMillion: 2,
+		},
+		nativeModelPriceKey(vertexBrand, authIndex, model): {
+			ID:                 2,
+			Provider:           "vertex",
+			Model:              model,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelBrand:       &vertexBrand,
+			ChannelKey:         &authIndex,
+			InputUSDPerMillion: 3,
+		},
+	}
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		AuthIndex:   &authIndex,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, prices, modelPriceMatchContext{
+		Selectors:          modelPriceChannelSelectorIndex{},
+		SelectorsRequired:  true,
+		SelectorsAvailable: true,
+	})
+	if !breakdown.Unpriced || breakdown.TotalUSD != 0 || breakdown.UnpricedReason == nil ||
+		*breakdown.UnpricedReason != priceMatchStatusChannelConflict {
+		t.Fatalf("ambiguous removed-provider breakdown = %#v, want channel_conflict", breakdown)
+	}
+}
+
+func TestRecordCostRejectsStoredNativePricesWhenRemovedProviderAuthIndexIsMissing(t *testing.T) {
+	provider := "gemini"
+	model := "removed-gemini-missing-auth"
+	authIndex := "removed-gemini-auth"
+	nativeBrand := string(aiProviderBrandGemini)
+	compatibleBrand := string(aiProviderBrandOpenAICompatibility)
+	tests := []struct {
+		name              string
+		includeCompatible bool
+		wantReason        string
+	}{
+		{
+			name:              "native and same-named compatible prices conflict",
+			includeCompatible: true,
+			wantReason:        priceMatchStatusChannelConflict,
+		},
+		{
+			name:       "native price still requires auth index",
+			wantReason: priceMatchStatusMissingAuthIndex,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			prices := modelPriceIndex{
+				nativeModelPriceKey(nativeBrand, authIndex, model): {
+					ID:                 1,
+					Provider:           provider,
+					Model:              model,
+					PriceScope:         modelPriceScopeChannel,
+					ChannelBrand:       &nativeBrand,
+					ChannelKey:         &authIndex,
+					InputUSDPerMillion: 2,
+				},
+			}
+			if test.includeCompatible {
+				prices[priceKey(provider, model)] = ModelPrice{
+					ID:                 2,
+					Provider:           provider,
+					Model:              model,
+					PriceScope:         modelPriceScopeChannel,
+					ChannelBrand:       &compatibleBrand,
+					ChannelKey:         &provider,
+					InputUSDPerMillion: 9,
+				}
+			}
+
+			breakdown := calculateRecordCostBreakdown(UsageRecord{
+				Provider:    &provider,
+				Model:       &model,
+				InputTokens: 1_000_000,
+				TotalTokens: 1_000_000,
+			}, prices, modelPriceMatchContext{
+				Selectors:          modelPriceChannelSelectorIndex{},
+				SelectorsRequired:  true,
+				SelectorsAvailable: true,
+			})
+			if !breakdown.Unpriced || breakdown.TotalUSD != 0 || breakdown.UnpricedReason == nil ||
+				*breakdown.UnpricedReason != test.wantReason {
+				t.Fatalf("removed native missing-auth breakdown = %#v, want %s", breakdown, test.wantReason)
+			}
+		})
+	}
+}
+
 func TestBillingPriceIndexRejectsExactPriceWhenProviderSnapshotFails(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()
