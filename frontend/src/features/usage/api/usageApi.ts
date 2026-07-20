@@ -12,9 +12,10 @@ import type {
   UsageSummary,
 } from '@/shared/types/api'
 
-interface UsageOverviewRankingSorts {
-  primary: UsageRankingSort
-  model: UsageRankingSort
+interface UsageOverviewRequestOptions {
+  primary?: UsageRankingSort
+  model?: UsageRankingSort
+  includeOptions?: boolean
 }
 
 function filtersToParams(
@@ -63,12 +64,13 @@ export function getUsageDistributions(
 
 export function getUsageOverview(
   filters: UsageFilters,
-  rankingSorts?: UsageOverviewRankingSorts,
+  options?: UsageOverviewRequestOptions,
 ): Promise<UsageOverviewResponse> {
   return apiClient.get<UsageOverviewResponse>('/usage/overview', {
     ...filtersToParams(filters),
-    primary_ranking_sort: rankingSorts?.primary,
-    model_ranking_sort: rankingSorts?.model,
+    primary_ranking_sort: options?.primary,
+    model_ranking_sort: options?.model,
+    include_options: options?.includeOptions,
   })
 }
 

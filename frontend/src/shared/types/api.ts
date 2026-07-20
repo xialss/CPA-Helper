@@ -448,7 +448,7 @@ export interface UsageOverviewResponse {
   api_key_ranking?: UsageRankingsResponse
   model_ranking: UsageRankingsResponse
   distributions: UsageDistributionsResponse
-  options: UsageOptionsResponse
+  options?: UsageOptionsResponse
 }
 
 export interface UsageTokenCostBreakdownItem {

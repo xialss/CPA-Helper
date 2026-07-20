@@ -22,7 +22,7 @@ import {
   Timer,
 } from 'lucide-vue-next'
 
-import { getUsageOverview } from '@/features/usage/api/usageApi'
+import { getUsageOptions, getUsageOverview } from '@/features/usage/api/usageApi'
 import { getCurrentUserQuota } from '@/features/users/api/usersApi'
 import ChartPanel, { type ChartOption } from '@/features/usage/components/ChartPanel.vue'
 import type {
@@ -556,19 +556,22 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
             ...filters,
             start: formatLocalDateTimeParam(realtimeStart),
             end: formatLocalDateTimeParam(realtimeEnd),
-          })
+          }, { includeOptions: false })
         : Promise.resolve(null)
     const quotaRequest = isAccountScope.value ? getCurrentUserQuota() : Promise.resolve(null)
-    const [overviewResult, todayResult, failedResult, realtimeResult, quotaResult] =
+    const optionsRequest = silent ? Promise.resolve(null) : getUsageOptions(filters)
+    const [overviewResult, todayResult, failedResult, realtimeResult, quotaResult, optionsResult] =
       await Promise.allSettled([
         getUsageOverview(filters, {
           primary: primaryRankingSort.value,
           model: modelRankingSort.value,
+          includeOptions: false,
         }),
-        getUsageOverview(todayFilters),
-        getUsageOverview(failedFilters),
+        getUsageOverview(todayFilters, { includeOptions: false }),
+        getUsageOverview(failedFilters, { includeOptions: false }),
         realtimeRequest,
         quotaRequest,
+        optionsRequest,
       ] as const)
 
     if (overviewResult.status === 'rejected') {
@@ -589,7 +592,9 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       : (overview.user_ranking ?? emptyRanking('user')).items
     modelRanking.value = (overview.model_ranking ?? emptyRanking('model')).items
     distributions.value = normalizeUsageDistributions(overview.distributions)
-    options.value = normalizeUsageOptions(overview.options)
+    if (!silent && optionsResult.status === 'fulfilled' && optionsResult.value) {
+      options.value = normalizeUsageOptions(optionsResult.value)
+    }
 
     if (todayResult.status === 'fulfilled') {
       todayTrends.value = todayResult.value.trends
@@ -623,7 +628,8 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       todayResult.status === 'rejected' ||
       failedResult.status === 'rejected' ||
       realtimeResult.status === 'rejected' ||
-      quotaResult.status === 'rejected'
+      quotaResult.status === 'rejected' ||
+      (!silent && optionsResult.status === 'rejected')
         ? t('部分辅助指标加载失败', 'Some auxiliary metrics failed to load')
         : null
 

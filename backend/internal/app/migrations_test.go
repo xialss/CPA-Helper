@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	backendMigrations "cpa-helper/backend/migrations"
@@ -111,6 +112,14 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if testColumnExists(t, app.db, "user_quota_charges", "total_deducted_usd") {
 		t.Fatal("old user_quota_charges.total_deducted_usd should not exist")
 	}
+	for _, index := range []string{
+		"ix_usage_records_failed_timestamp",
+		"ix_usage_records_usage_username_timestamp",
+	} {
+		if !testIndexExists(t, app.db, index) {
+			t.Fatalf("%s was not created", index)
+		}
+	}
 
 	var version int64
 	if err := app.db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version`).Scan(&version); err != nil {
@@ -126,6 +135,48 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	}
 	if settingsCount != 1 {
 		t.Fatalf("app_settings singleton count = %d, want 1", settingsCount)
+	}
+}
+
+func TestUsageHistoryRangeQueriesUseCompositeIndexes(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	tests := []struct {
+		name      string
+		query     string
+		args      []any
+		wantIndex string
+	}{
+		{
+			name:      "failed range",
+			query:     `SELECT * FROM usage_records WHERE failed = ? AND timestamp >= ? AND timestamp < ? ORDER BY timestamp ASC`,
+			args:      []any{true, "2026-07-01", "2026-07-20"},
+			wantIndex: "ix_usage_records_failed_timestamp",
+		},
+		{
+			name:      "account range",
+			query:     `SELECT * FROM usage_records WHERE usage_username = ? AND timestamp >= ? AND timestamp < ? ORDER BY timestamp ASC`,
+			args:      []any{"member", "2026-07-01", "2026-07-20"},
+			wantIndex: "ix_usage_records_usage_username_timestamp",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			details := testQueryPlanDetails(t, app.db, test.query, test.args...)
+			plan := strings.Join(details, "\n")
+			if !strings.Contains(plan, test.wantIndex) {
+				t.Fatalf("query plan = %q, want index %s", plan, test.wantIndex)
+			}
+			if strings.Contains(plan, "USE TEMP B-TREE FOR ORDER BY") {
+				t.Fatalf("query plan uses a temporary sort: %q", plan)
+			}
+		})
 	}
 }
 
@@ -475,6 +526,35 @@ func testTableExists(t *testing.T, db *sql.DB, table string) bool {
 	var name string
 	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
 	return err == nil
+}
+
+func testIndexExists(t *testing.T, db *sql.DB, index string) bool {
+	t.Helper()
+	var name string
+	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`, index).Scan(&name)
+	return err == nil
+}
+
+func testQueryPlanDetails(t *testing.T, db *sql.DB, query string, args ...any) []string {
+	t.Helper()
+	rows, err := db.Query(`EXPLAIN QUERY PLAN `+query, args...)
+	if err != nil {
+		t.Fatalf("explain query plan: %v", err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return details
 }
 
 func testColumnExists(t *testing.T, db *sql.DB, table, column string) bool {
