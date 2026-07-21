@@ -7,6 +7,141 @@ import (
 	"testing"
 )
 
+func TestFilteredUsageAnalyticsRecordsUsesEffectiveAuthWithoutRawPayload(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	raw := `{"api_key":"sk-analytics-auth","provider":"codex","model":"gpt-test","source":"analytics-source","auth_type":"apikey","auth_index":"account.json","request_id":"analytics-auth","input_tokens":10,"output_tokens":2}`
+	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw), modelPriceBillingIndex{})
+	if err != nil || !created {
+		t.Fatalf("saveUsageMessage created=%v err=%v", created, err)
+	}
+	if _, err := app.db.Exec(`UPDATE usage_records SET auth = 'bearer' WHERE id = ?`, record.ID); err != nil {
+		t.Fatalf("seed conflicting stored auth: %v", err)
+	}
+
+	records, err := app.filteredUsageAnalyticsRecords(context.Background(), UsageFilters{}, "")
+	if err != nil {
+		t.Fatalf("filteredUsageAnalyticsRecords failed: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("analytics records = %d, want 1", len(records))
+	}
+	got := records[0]
+	if got.Auth == nil || *got.Auth != "apikey" {
+		t.Fatalf("analytics auth = %#v, want raw auth_type apikey", got.Auth)
+	}
+	if effective := usageRecordAuth(got); effective == nil || *effective != "apikey" {
+		t.Fatalf("effective analytics auth = %#v, want apikey", effective)
+	}
+	if !got.authResolved || got.resolvedAuth == nil || *got.resolvedAuth != "apikey" {
+		t.Fatalf("analytics auth cache = resolved %v value %#v, want cached apikey", got.authResolved, got.resolvedAuth)
+	}
+	if got.RawJSON != "" || got.RequestID != nil || got.SourceAccount != nil || got.LatencyMS != nil || got.DedupeKey != "" {
+		t.Fatalf("analytics-only omitted fields were populated: %#v", got)
+	}
+	if got.Source == nil || *got.Source != "analytics-source" || got.AuthIndex == nil || *got.AuthIndex != "account.json" {
+		t.Fatalf("analytics matching fields = source %#v auth_index %#v", got.Source, got.AuthIndex)
+	}
+}
+
+func TestFilteredUsageAnalyticsRecordsFallsBackToStoredAuth(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	tests := []struct {
+		requestID  string
+		rawJSON    string
+		storedAuth string
+		wantAuth   string
+	}{
+		{requestID: "analytics-malformed-auth", rawJSON: `{`, storedAuth: "oauth", wantAuth: "oauth"},
+		{requestID: "analytics-missing-auth", rawJSON: `{}`, storedAuth: "oauth", wantAuth: "oauth"},
+		{requestID: "analytics-ascii-whitespace-auth", rawJSON: `{"auth_type":"\t\n\r"}`, storedAuth: "oauth", wantAuth: "oauth"},
+		{requestID: "analytics-unicode-whitespace-auth", rawJSON: `{"auth_type":"\u00a0"}`, storedAuth: "apikey", wantAuth: "apikey"},
+		{requestID: "analytics-padded-auth", rawJSON: `{"auth_type":"\toauth\n"}`, storedAuth: "apikey", wantAuth: "oauth"},
+	}
+	for _, test := range tests {
+		raw := `{"api_key":"sk-analytics-fallback","provider":"codex","model":"` + test.requestID + `","request_id":"` + test.requestID + `","input_tokens":1}`
+		record, created, err := app.saveUsageMessage(context.Background(), []byte(raw), modelPriceBillingIndex{})
+		if err != nil || !created {
+			t.Fatalf("saveUsageMessage %s created=%v err=%v", test.requestID, created, err)
+		}
+		if _, err := app.db.Exec(`UPDATE usage_records SET auth = ?, raw_json = ? WHERE id = ?`, test.storedAuth, test.rawJSON, record.ID); err != nil {
+			t.Fatalf("seed %s legacy auth: %v", test.requestID, err)
+		}
+	}
+
+	records, err := app.filteredUsageAnalyticsRecords(context.Background(), UsageFilters{}, "timestamp ASC")
+	if err != nil {
+		t.Fatalf("filteredUsageAnalyticsRecords failed: %v", err)
+	}
+	if len(records) != len(tests) {
+		t.Fatalf("analytics records = %d, want %d", len(records), len(tests))
+	}
+	recordsByModel := map[string]UsageRecord{}
+	for _, record := range records {
+		if record.Model != nil {
+			recordsByModel[*record.Model] = record
+		}
+	}
+	for _, test := range tests {
+		record := recordsByModel[test.requestID]
+		if record.Auth == nil || *record.Auth != test.wantAuth {
+			t.Fatalf("analytics fallback auth for %s = %#v, want %q", test.requestID, record.Auth, test.wantAuth)
+		}
+		if record.RawJSON != "" {
+			t.Fatalf("analytics raw_json = %q, want omitted", record.RawJSON)
+		}
+	}
+}
+
+func TestFilteredUsageRecordsDoesNotResolveAuthBeforeSourceFiltering(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	raw := `{"api_key":"sk-source-filter-auth","provider":"codex","model":"gpt-test","source":"selected-source","auth_type":"apikey","request_id":"source-filter-auth","input_tokens":1}`
+	record, created, err := app.saveUsageMessage(context.Background(), []byte(raw), modelPriceBillingIndex{})
+	if err != nil || !created {
+		t.Fatalf("saveUsageMessage created=%v err=%v", created, err)
+	}
+	if _, err := app.db.Exec(`UPDATE usage_records SET auth = 'bearer' WHERE id = ?`, record.ID); err != nil {
+		t.Fatalf("seed conflicting stored auth: %v", err)
+	}
+
+	source := "selected-source"
+	sourceKey := usageSourceKey(&source)
+	records, err := app.filteredUsageRecords(context.Background(), UsageFilters{SourceKey: sourceKey}, "")
+	if err != nil {
+		t.Fatalf("filteredUsageRecords failed: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("filtered records = %d, want 1", len(records))
+	}
+	got := records[0]
+	if got.authResolved || got.resolvedAuth != nil {
+		t.Fatalf("full record auth was resolved before a consumer needed it: %#v", got.resolvedAuth)
+	}
+	if got.Auth == nil || *got.Auth != "bearer" {
+		t.Fatalf("stored auth = %#v, want bearer before lazy resolution", got.Auth)
+	}
+	if effective := usageRecordAuth(got); effective == nil || *effective != "apikey" {
+		t.Fatalf("effective auth = %#v, want raw auth_type apikey", effective)
+	}
+}
+
 func TestSaveUsageMessageStoresReasoningEffortAndTTFT(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()

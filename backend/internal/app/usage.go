@@ -66,6 +66,8 @@ type UsageRecord struct {
 	TotalTokens         int
 	DedupeKey           string
 	RawJSON             string
+	resolvedAuth        *string
+	authResolved        bool
 }
 
 type usageChannelCostItem struct {
@@ -271,7 +273,7 @@ func (a *App) usageSummary(w http.ResponseWriter, r *http.Request, filters Usage
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageRecords(r.Context(), scoped, "")
+	records, err := a.filteredUsageAnalyticsRecords(r.Context(), scoped, "")
 	if err != nil {
 		return err
 	}
@@ -289,7 +291,7 @@ func (a *App) usageTrends(w http.ResponseWriter, r *http.Request, filters UsageF
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageRecords(r.Context(), scoped, "timestamp ASC")
+	records, err := a.filteredUsageAnalyticsRecords(r.Context(), scoped, "timestamp ASC")
 	if err != nil {
 		return err
 	}
@@ -322,7 +324,7 @@ func (a *App) usageRankings(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageRecords(r.Context(), scoped, "")
+	records, err := a.filteredUsageAnalyticsRecords(r.Context(), scoped, "")
 	if err != nil {
 		return err
 	}
@@ -344,7 +346,7 @@ func (a *App) usageDistributions(w http.ResponseWriter, r *http.Request, filters
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageRecords(r.Context(), scoped, "")
+	records, err := a.filteredUsageAnalyticsRecords(r.Context(), scoped, "")
 	if err != nil {
 		return err
 	}
@@ -374,7 +376,7 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageRecords(r.Context(), scoped, "timestamp ASC")
+	records, err := a.filteredUsageAnalyticsRecords(r.Context(), scoped, "timestamp ASC")
 	if err != nil {
 		return err
 	}
@@ -483,6 +485,7 @@ func (a *App) usageRecordDetail(w http.ResponseWriter, r *http.Request, recordID
 	if err != nil {
 		return err
 	}
+	cacheUsageRecordAuth(&record)
 	redaction := usageRedactionOptions{MaskSource: !scope.IsAdmin, MaskAuthIndex: !scope.IsAdmin}
 	item := listItemFromRecord(record, users, pricing.Prices, redaction, pricing.MatchContext)
 	item["raw_json"] = redactedRawJSON(record.RawJSON, usageRecordAuth(record), redaction)
@@ -711,6 +714,51 @@ func (a *App) filteredUsageRecords(ctx context.Context, filters UsageFilters, or
 	return applyUsagePostFilters(records, filters), nil
 }
 
+func (a *App) filteredUsageAnalyticsRecords(ctx context.Context, filters UsageFilters, orderBy string) ([]UsageRecord, error) {
+	records := []UsageRecord{}
+	err := a.visitFilteredUsageAnalyticsRecords(ctx, filters, orderBy, func(record UsageRecord) {
+		records = append(records, record)
+	})
+	return records, err
+}
+
+func (a *App) visitFilteredUsageAnalyticsRecords(ctx context.Context, filters UsageFilters, orderBy string, visit func(UsageRecord)) error {
+	where, args := usageWhere(filters)
+	query := `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, service_tier, reasoning_effort, endpoint, source,
+		auth, NULL,
+		CASE WHEN json_valid(raw_json) THEN
+			CASE json_type(raw_json, '$.auth_type')
+				WHEN 'text' THEN CAST(json_extract(raw_json, '$.auth_type') AS TEXT)
+				WHEN 'integer' THEN CAST(json_extract(raw_json, '$.auth_type') AS TEXT)
+				WHEN 'real' THEN CAST(json_extract(raw_json, '$.auth_type') AS TEXT)
+				WHEN 'true' THEN 'true'
+				WHEN 'false' THEN 'false'
+			END
+		END,
+		auth_index, NULL, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
+		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, '', '' FROM usage_records ` + where
+	if strings.TrimSpace(orderBy) != "" {
+		query += " ORDER BY " + orderBy
+	} else {
+		query += " ORDER BY timestamp"
+	}
+	rows, err := a.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		record, err := scanUsageAnalyticsRecord(rows)
+		if err != nil {
+			return err
+		}
+		if usageRecordMatchesPostFilters(record, filters) {
+			visit(record)
+		}
+	}
+	return rows.Err()
+}
+
 func (a *App) countUsageRecords(ctx context.Context, filters UsageFilters) (int, error) {
 	if hasUsagePostFilters(filters) {
 		records, err := a.filteredUsageRecords(ctx, filters, "")
@@ -763,15 +811,22 @@ func applyUsagePostFilters(records []UsageRecord, filters UsageFilters) []UsageR
 	}
 	filtered := records[:0]
 	for _, record := range records {
-		if filters.SourceKey != nil {
-			key := usageSourceKey(record.Source)
-			if key == nil || *key != *filters.SourceKey {
-				continue
-			}
+		if !usageRecordMatchesPostFilters(record, filters) {
+			continue
 		}
 		filtered = append(filtered, record)
 	}
 	return filtered
+}
+
+func usageRecordMatchesPostFilters(record UsageRecord, filters UsageFilters) bool {
+	if filters.SourceKey != nil {
+		key := usageSourceKey(record.Source)
+		if key == nil || *key != *filters.SourceKey {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *App) getUsageRecord(ctx context.Context, id int) (UsageRecord, error) {
@@ -837,33 +892,68 @@ func usageWhere(filters UsageFilters) (string, []any) {
 func scanUsageRecords(rows *sql.Rows) ([]UsageRecord, error) {
 	var records []UsageRecord
 	for rows.Next() {
-		var record UsageRecord
-		var timestamp, usageUsername, description, provider, model, serviceTier, reasoningEffort, endpoint, source, sourceAccount, requestID, auth, authIndex, latency sql.NullString
-		var latencyFloat, ttftFloat sql.NullFloat64
-		if err := rows.Scan(&record.ID, &timestamp, &usageUsername, &description, &provider, &model, &serviceTier, &reasoningEffort, &endpoint, &source, &sourceAccount, &requestID, &auth, &authIndex, &latencyFloat, &ttftFloat, &record.Failed, &record.InputTokens, &record.OutputTokens, &record.CachedTokens, &record.CacheReadTokens, &record.CacheCreationTokens, &record.ReasoningTokens, &record.TotalTokens, &record.DedupeKey, &record.RawJSON); err != nil {
+		record, err := scanUsageRecord(rows)
+		if err != nil {
 			return nil, err
 		}
-		_ = latency
-		if parsed, ok := parseDBTime(timestamp.String); ok {
-			record.Timestamp = parsed
-		}
-		record.UsageUsername = nullableString(usageUsername)
-		record.APIKeyDescription = nullableString(description)
-		record.Provider = nullableString(provider)
-		record.Model = nullableString(model)
-		record.ServiceTier = nullableString(serviceTier)
-		record.ReasoningEffort = nullableString(reasoningEffort)
-		record.Endpoint = nullableString(endpoint)
-		record.Source = nullableString(source)
-		record.SourceAccount = nullableString(sourceAccount)
-		record.RequestID = nullableString(requestID)
-		record.Auth = nullableString(auth)
-		record.AuthIndex = nullableString(authIndex)
-		record.LatencyMS = nullableFloat(latencyFloat)
-		record.TTFTMS = nullableFloat(ttftFloat)
 		records = append(records, record)
 	}
 	return records, rows.Err()
+}
+
+type usageRecordScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanUsageRecord(scanner usageRecordScanner) (UsageRecord, error) {
+	var record UsageRecord
+	var timestamp, usageUsername, description, provider, model, serviceTier, reasoningEffort, endpoint, source, sourceAccount, requestID, auth, authIndex sql.NullString
+	var latencyFloat, ttftFloat sql.NullFloat64
+	if err := scanner.Scan(&record.ID, &timestamp, &usageUsername, &description, &provider, &model, &serviceTier, &reasoningEffort, &endpoint, &source, &sourceAccount, &requestID, &auth, &authIndex, &latencyFloat, &ttftFloat, &record.Failed, &record.InputTokens, &record.OutputTokens, &record.CachedTokens, &record.CacheReadTokens, &record.CacheCreationTokens, &record.ReasoningTokens, &record.TotalTokens, &record.DedupeKey, &record.RawJSON); err != nil {
+		return UsageRecord{}, err
+	}
+	if parsed, ok := parseDBTime(timestamp.String); ok {
+		record.Timestamp = parsed
+	}
+	record.UsageUsername = nullableString(usageUsername)
+	record.APIKeyDescription = nullableString(description)
+	record.Provider = nullableString(provider)
+	record.Model = nullableString(model)
+	record.ServiceTier = nullableString(serviceTier)
+	record.ReasoningEffort = nullableString(reasoningEffort)
+	record.Endpoint = nullableString(endpoint)
+	record.Source = nullableString(source)
+	record.SourceAccount = nullableString(sourceAccount)
+	record.RequestID = nullableString(requestID)
+	record.Auth = nullableString(auth)
+	record.AuthIndex = nullableString(authIndex)
+	record.LatencyMS = nullableFloat(latencyFloat)
+	record.TTFTMS = nullableFloat(ttftFloat)
+	return record, nil
+}
+
+func scanUsageAnalyticsRecord(scanner usageRecordScanner) (UsageRecord, error) {
+	record, err := scanUsageRecord(scanner)
+	if err != nil {
+		return UsageRecord{}, err
+	}
+	// The narrow projection temporarily carries stored auth in SourceAccount.
+	record.Auth = resolveProjectedUsageRecordAuth(record.Auth, record.SourceAccount)
+	record.SourceAccount = nil
+	record.resolvedAuth = record.Auth
+	record.authResolved = true
+	return record, nil
+}
+
+func resolveProjectedUsageRecordAuth(rawAuth, storedAuth *string) *string {
+	if rawAuth == nil {
+		return storedAuth
+	}
+	normalized := strings.TrimSpace(*rawAuth)
+	if normalized == "" {
+		return storedAuth
+	}
+	return &normalized
 }
 
 type userInfo struct {
@@ -894,6 +984,7 @@ func (a *App) userLookup(ctx context.Context, scope usageAccessScope) (map[strin
 }
 
 func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices map[[2]string]ModelPrice, redaction usageRedactionOptions, matchContexts ...modelPriceMatchContext) map[string]any {
+	cacheUsageRecordAuth(&record)
 	costBreakdown := calculateRecordCostBreakdown(record, prices, matchContexts...)
 	userID := (*int)(nil)
 	userLabel := "未绑定"
@@ -1322,9 +1413,27 @@ func authIndexFromUsagePayload(parsed any) *string {
 }
 
 func usageRecordAuth(record UsageRecord) *string {
-	auth := rawJSONStringField(record.RawJSON, "auth_type")
+	if record.authResolved {
+		return record.resolvedAuth
+	}
+	return resolveUsageRecordAuth(record.RawJSON, record.Auth)
+}
+
+func cacheUsageRecordAuth(record *UsageRecord) {
+	if record == nil || record.authResolved {
+		return
+	}
+	record.resolvedAuth = resolveUsageRecordAuth(record.RawJSON, record.Auth)
+	record.authResolved = true
+}
+
+func resolveUsageRecordAuth(rawJSON string, storedAuth *string) *string {
+	if strings.TrimSpace(rawJSON) == "" {
+		return storedAuth
+	}
+	auth := rawJSONStringField(rawJSON, "auth_type")
 	if auth == nil {
-		auth = record.Auth
+		auth = storedAuth
 	}
 	return auth
 }

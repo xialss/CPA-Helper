@@ -1232,10 +1232,16 @@ func (a *App) computeKeeperQuotaWindowUsages(ctx context.Context, accounts []kee
 		if !ok {
 			continue
 		}
-		if keeperRecordInQuotaWindow(record, pair.Primary) {
+		inPrimaryWindow := keeperRecordInQuotaWindow(record, pair.Primary)
+		inSecondaryWindow := keeperRecordInQuotaWindow(record, pair.Secondary)
+		if !inPrimaryWindow && !inSecondaryWindow {
+			continue
+		}
+		cacheUsageRecordAuth(&record)
+		if inPrimaryWindow {
 			addRecordToKeeperQuotaWindowUsage(pair.Primary, record, pricing.Prices, pricing.MatchContext)
 		}
-		if keeperRecordInQuotaWindow(record, pair.Secondary) {
+		if inSecondaryWindow {
 			addRecordToKeeperQuotaWindowUsage(pair.Secondary, record, pricing.Prices, pricing.MatchContext)
 		}
 	}
@@ -1417,6 +1423,7 @@ func addRecordToKeeperQuotaWindowUsage(usage *keeperQuotaWindowUsage, record Usa
 	if usage == nil {
 		return
 	}
+	cacheUsageRecordAuth(&record)
 	matchedPrice, _ := findMatchingChannelPrice(prices, record, matchContexts...)
 	matchedBrand := matchedModelPriceChannelBrand(matchedPrice, record, matchContexts...)
 	usage.Records++
