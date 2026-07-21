@@ -513,6 +513,7 @@ async function applyQuickRange(key: QuickRangeKey) {
 }
 
 let queuedRefresh: RefreshOptions | null = null
+let refreshInFlight = false
 
 function queueRefresh(options: RefreshOptions) {
   if (options.silent) {
@@ -527,10 +528,11 @@ async function refreshAfterRankingSortChange() {
 }
 
 async function refresh({ silent = false }: RefreshOptions = {}) {
-  if (isLoading.value || isAutoRefreshing.value) {
+  if (refreshInFlight) {
     queueRefresh({ silent })
     return
   }
+  refreshInFlight = true
   if (activeQuickRange.value) {
     dateRange.value = buildQuickRange(activeQuickRange.value)
   }
@@ -550,35 +552,12 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       end: formatLocalDateTimeParam(todayEnd),
     }
     const failedFilters: UsageFilters = { ...filters, failed: true }
-    const realtimeRequest =
-      activeQuickRange.value === 'today'
-        ? getUsageOverview({
-            ...filters,
-            start: formatLocalDateTimeParam(realtimeStart),
-            end: formatLocalDateTimeParam(realtimeEnd),
-          }, { includeOptions: false })
-        : Promise.resolve(null)
-    const quotaRequest = isAccountScope.value ? getCurrentUserQuota() : Promise.resolve(null)
-    const optionsRequest = silent ? Promise.resolve(null) : getUsageOptions(filters)
-    const [overviewResult, todayResult, failedResult, realtimeResult, quotaResult, optionsResult] =
-      await Promise.allSettled([
-        getUsageOverview(filters, {
-          primary: primaryRankingSort.value,
-          model: modelRankingSort.value,
-          includeOptions: false,
-        }),
-        getUsageOverview(todayFilters, { includeOptions: false }),
-        getUsageOverview(failedFilters, { includeOptions: false }),
-        realtimeRequest,
-        quotaRequest,
-        optionsRequest,
-      ] as const)
-
-    if (overviewResult.status === 'rejected') {
-      throw overviewResult.reason
-    }
-
-    const overview = overviewResult.value
+    const includeRealtime = activeQuickRange.value === 'today'
+    const overview = await getUsageOverview(filters, {
+      primary: primaryRankingSort.value,
+      model: modelRankingSort.value,
+      includeOptions: false,
+    })
     summary.value = overview.summary
     if (usedServerDefaultRange) {
       dateRange.value = [
@@ -592,46 +571,6 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       : (overview.user_ranking ?? emptyRanking('user')).items
     modelRanking.value = (overview.model_ranking ?? emptyRanking('model')).items
     distributions.value = normalizeUsageDistributions(overview.distributions)
-    if (!silent && optionsResult.status === 'fulfilled' && optionsResult.value) {
-      options.value = normalizeUsageOptions(optionsResult.value)
-    }
-
-    if (todayResult.status === 'fulfilled') {
-      todayTrends.value = todayResult.value.trends
-    } else {
-      todayTrends.value = []
-    }
-
-    if (failedResult.status === 'fulfilled') {
-      failedSummary.value = failedResult.value.summary
-      failedTrends.value = failedResult.value.trends
-      failedEndpointDistribution.value = failedResult.value.distributions.endpoints ?? []
-    } else {
-      failedSummary.value = null
-      failedTrends.value = []
-      failedEndpointDistribution.value = []
-    }
-
-    if (realtimeResult.status === 'fulfilled') {
-      realtimeSummary.value = realtimeResult.value?.summary ?? null
-    } else {
-      realtimeSummary.value = null
-    }
-
-    if (quotaResult.status === 'fulfilled') {
-      quotaStatus.value = quotaResult.value
-    } else if (isAccountScope.value) {
-      quotaStatus.value = null
-    }
-
-    auxiliaryError.value =
-      todayResult.status === 'rejected' ||
-      failedResult.status === 'rejected' ||
-      realtimeResult.status === 'rejected' ||
-      quotaResult.status === 'rejected' ||
-      (!silent && optionsResult.status === 'rejected')
-        ? t('部分辅助指标加载失败', 'Some auxiliary metrics failed to load')
-        : null
 
     void router.replace({
       query: filtersToQuery(
@@ -643,6 +582,70 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
     })
     autoRefreshError.value = null
     lastRefreshedAt.value = new Date()
+    if (!silent) {
+      isLoading.value = false
+    }
+
+    let auxiliaryFailed = false
+    try {
+      const todayOverview = await getUsageOverview(todayFilters, { includeOptions: false })
+      todayTrends.value = todayOverview.trends
+    } catch {
+      todayTrends.value = []
+      auxiliaryFailed = true
+    }
+
+    try {
+      const failedOverview = await getUsageOverview(failedFilters, { includeOptions: false })
+      failedSummary.value = failedOverview.summary
+      failedTrends.value = failedOverview.trends
+      failedEndpointDistribution.value = failedOverview.distributions.endpoints ?? []
+    } catch {
+      failedSummary.value = null
+      failedTrends.value = []
+      failedEndpointDistribution.value = []
+      auxiliaryFailed = true
+    }
+
+    if (includeRealtime) {
+      try {
+        const realtimeOverview = await getUsageOverview(
+          {
+            ...filters,
+            start: formatLocalDateTimeParam(realtimeStart),
+            end: formatLocalDateTimeParam(realtimeEnd),
+          },
+          { includeOptions: false },
+        )
+        realtimeSummary.value = realtimeOverview.summary
+      } catch {
+        realtimeSummary.value = null
+        auxiliaryFailed = true
+      }
+    } else {
+      realtimeSummary.value = null
+    }
+
+    if (isAccountScope.value) {
+      try {
+        quotaStatus.value = await getCurrentUserQuota()
+      } catch {
+        quotaStatus.value = null
+        auxiliaryFailed = true
+      }
+    }
+
+    if (!silent) {
+      try {
+        options.value = normalizeUsageOptions(await getUsageOptions(filters))
+      } catch {
+        auxiliaryFailed = true
+      }
+    }
+
+    auxiliaryError.value = auxiliaryFailed
+      ? t('部分辅助指标加载失败', 'Some auxiliary metrics failed to load')
+      : null
   } catch (error) {
     const errorMessage = errorText(error, '加载历史用量失败', 'Failed to load usage history')
     if (silent) {
@@ -651,6 +654,7 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       message.error(errorMessage)
     }
   } finally {
+    refreshInFlight = false
     if (silent) {
       isAutoRefreshing.value = false
     } else {

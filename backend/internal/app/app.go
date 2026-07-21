@@ -374,6 +374,9 @@ func (a *App) handleSPA(w http.ResponseWriter, r *http.Request) error {
 		if err != nil || served {
 			return err
 		}
+		if isSPAAssetPath(cleanSPAPath(r.URL.Path)) {
+			return notFoundError("Not Found")
+		}
 		return a.serveFrontendNotBuilt(w)
 	}
 	if a.frontendFS != nil {
@@ -386,6 +389,9 @@ func (a *App) handleSPA(w http.ResponseWriter, r *http.Request) error {
 	if err != nil || served {
 		return err
 	}
+	if isSPAAssetPath(cleanSPAPath(r.URL.Path)) {
+		return notFoundError("Not Found")
+	}
 	return a.serveFrontendNotBuilt(w)
 }
 
@@ -395,13 +401,18 @@ func (a *App) serveExternalSPA(w http.ResponseWriter, r *http.Request) (bool, er
 		staticPath := filepath.Join(a.frontendDist, filepath.FromSlash(requested))
 		if insideDir(a.frontendDist, staticPath) {
 			if info, err := os.Stat(staticPath); err == nil && !info.IsDir() {
+				setSPACacheControl(w, requested)
 				http.ServeFile(w, r, staticPath)
 				return true, nil
 			}
 		}
+		if isSPAAssetPath(requested) {
+			return false, nil
+		}
 	}
 	indexPath := filepath.Join(a.frontendDist, "index.html")
 	if _, err := os.Stat(indexPath); err == nil {
+		setSPACacheControl(w, "index.html")
 		http.ServeFile(w, r, indexPath)
 		return true, nil
 	}
@@ -412,10 +423,15 @@ func (a *App) serveEmbeddedSPA(w http.ResponseWriter, r *http.Request) (bool, er
 	requested := cleanSPAPath(r.URL.Path)
 	if requested != "" && fs.ValidPath(requested) {
 		if info, err := fs.Stat(a.frontendFS, requested); err == nil && !info.IsDir() {
+			setSPACacheControl(w, requested)
 			return true, serveFSFile(w, r, a.frontendFS, requested)
+		}
+		if isSPAAssetPath(requested) {
+			return false, nil
 		}
 	}
 	if _, err := fs.Stat(a.frontendFS, "index.html"); err == nil {
+		setSPACacheControl(w, "index.html")
 		return true, serveFSFile(w, r, a.frontendFS, "index.html")
 	}
 	return false, nil
@@ -427,6 +443,18 @@ func cleanSPAPath(requestPath string) string {
 		return ""
 	}
 	return strings.TrimPrefix(cleaned, "/")
+}
+
+func isSPAAssetPath(requested string) bool {
+	return strings.HasPrefix(requested, "assets/")
+}
+
+func setSPACacheControl(w http.ResponseWriter, requested string) {
+	if isSPAAssetPath(requested) {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-cache")
 }
 
 func serveFSFile(w http.ResponseWriter, r *http.Request, filesystem fs.FS, name string) error {

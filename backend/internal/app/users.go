@@ -931,17 +931,13 @@ func (a *App) userUsageSummaries(ctx context.Context) (map[string]userUsageSumma
 		return nil, err
 	}
 	filters := UsageFilters{}
-	records, err := a.filteredUsageRecords(ctx, filters, "")
-	if err != nil {
-		return nil, err
-	}
 	todayStart, todayEnd := defaultTodayRange()
 	result := map[string]userUsageSummary{}
 	providerSeen := map[string]map[string]bool{}
 	modelSeen := map[string]map[string]bool{}
-	for _, record := range records {
+	err = a.visitFilteredUsageAnalyticsRecords(ctx, filters, "", func(record UsageRecord) {
 		if record.UsageUsername == nil || strings.TrimSpace(*record.UsageUsername) == "" {
-			continue
+			return
 		}
 		username := *record.UsageUsername
 		matchedPrice, _ := findMatchingChannelPrice(pricing.Prices, record, pricing.MatchContext)
@@ -990,6 +986,9 @@ func (a *App) userUsageSummaries(ctx context.Context) (map[string]userUsageSumma
 			}
 		}
 		result[username] = summary
+	})
+	if err != nil {
+		return nil, err
 	}
 	return result, nil
 }

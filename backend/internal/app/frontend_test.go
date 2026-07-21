@@ -57,6 +57,9 @@ func TestHandleSPAServesEmbeddedFrontendAsset(t *testing.T) {
 	if body := recorder.Body.String(); !strings.Contains(body, "console.log('embedded')") {
 		t.Fatalf("body = %q", body)
 	}
+	if cacheControl := recorder.Header().Get("Cache-Control"); cacheControl != "public, max-age=31536000, immutable" {
+		t.Fatalf("asset Cache-Control = %q", cacheControl)
+	}
 }
 
 func TestHandleSPAFallsBackToEmbeddedIndex(t *testing.T) {
@@ -71,6 +74,26 @@ func TestHandleSPAFallsBackToEmbeddedIndex(t *testing.T) {
 	}
 	if body := recorder.Body.String(); !strings.Contains(body, "embedded index") {
 		t.Fatalf("body = %q", body)
+	}
+	if cacheControl := recorder.Header().Get("Cache-Control"); cacheControl != "no-cache" {
+		t.Fatalf("index Cache-Control = %q", cacheControl)
+	}
+}
+
+func TestHandleSPADoesNotReturnEmbeddedIndexForMissingAsset(t *testing.T) {
+	app := &App{frontendFS: fstest.MapFS{
+		"index.html": &fstest.MapFile{Data: []byte("<html>embedded index</html>")},
+	}}
+
+	req := httptest.NewRequest("GET", "http://example.com/assets/stale-chunk.js", nil)
+	recorder := httptest.NewRecorder()
+	err := app.handleSPA(recorder, req)
+	appErr, ok := err.(*AppError)
+	if !ok || appErr.Status != 404 {
+		t.Fatalf("handleSPA error = %#v, want 404 AppError", err)
+	}
+	if strings.Contains(recorder.Body.String(), "embedded index") {
+		t.Fatalf("missing asset body = %q, must not contain index", recorder.Body.String())
 	}
 }
 
@@ -94,5 +117,48 @@ func TestHandleSPAFrontendDistOverrideUsesExternalFiles(t *testing.T) {
 	}
 	if body := recorder.Body.String(); !strings.Contains(body, "external") || strings.Contains(body, "embedded") {
 		t.Fatalf("body = %q", body)
+	}
+	if cacheControl := recorder.Header().Get("Cache-Control"); cacheControl != "no-cache" {
+		t.Fatalf("external index Cache-Control = %q", cacheControl)
+	}
+}
+
+func TestHandleSPAServesExternalFrontendAssetWithImmutableCache(t *testing.T) {
+	distDir := t.TempDir()
+	assetsDir := filepath.Join(distDir, "assets")
+	if err := os.MkdirAll(assetsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(assetsDir, "app-hash.js"), []byte("console.log('external')"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{frontendDist: distDir, frontendEnv: true}
+
+	req := httptest.NewRequest("GET", "http://example.com/assets/app-hash.js", nil)
+	recorder := httptest.NewRecorder()
+	if err := app.handleSPA(recorder, req); err != nil {
+		t.Fatal(err)
+	}
+	if cacheControl := recorder.Header().Get("Cache-Control"); cacheControl != "public, max-age=31536000, immutable" {
+		t.Fatalf("external asset Cache-Control = %q", cacheControl)
+	}
+}
+
+func TestHandleSPADoesNotReturnExternalIndexForMissingAsset(t *testing.T) {
+	distDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(distDir, "index.html"), []byte("<html>external</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{frontendDist: distDir, frontendEnv: true}
+
+	req := httptest.NewRequest("GET", "http://example.com/assets/stale-chunk.js", nil)
+	recorder := httptest.NewRecorder()
+	err := app.handleSPA(recorder, req)
+	appErr, ok := err.(*AppError)
+	if !ok || appErr.Status != 404 {
+		t.Fatalf("handleSPA error = %#v, want 404 AppError", err)
+	}
+	if strings.Contains(recorder.Body.String(), "external") {
+		t.Fatalf("missing asset body = %q, must not contain index", recorder.Body.String())
 	}
 }
