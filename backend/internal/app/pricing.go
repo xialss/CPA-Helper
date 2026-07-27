@@ -3522,7 +3522,7 @@ func usageAggregateInputTokens(record UsageRecord, matchedChannelBrands ...*aiPr
 
 func usageAggregateTotalTokens(record UsageRecord, matchedChannelBrands ...*aiProviderBrand) int {
 	if usageUsesClaudeTokenSemantics(record, matchedChannelBrands...) {
-		return usageAggregateInputTokens(record, matchedChannelBrands...) + nonNegativeTokens(record.OutputTokens) + nonNegativeTokens(record.ReasoningTokens)
+		return usageAggregateInputTokens(record, matchedChannelBrands...) + nonNegativeTokens(record.OutputTokens)
 	}
 	return nonNegativeTokens(record.TotalTokens)
 }

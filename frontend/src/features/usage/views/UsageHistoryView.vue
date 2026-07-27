@@ -520,6 +520,7 @@ function queueRefresh(options: RefreshOptions) {
     return
   }
   queuedRefresh = { silent: false }
+  isLoading.value = true
 }
 
 async function refreshAfterRankingSortChange() {
@@ -558,6 +559,9 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       model: modelRankingSort.value,
       includeOptions: false,
     })
+    if (queuedRefresh) {
+      return
+    }
     summary.value = overview.summary
     if (usedServerDefaultRange) {
       dateRange.value = [
@@ -589,18 +593,30 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
     let auxiliaryFailed = false
     try {
       const todayOverview = await getUsageOverview(todayFilters, { includeOptions: false })
+      if (queuedRefresh) {
+        return
+      }
       todayTrends.value = todayOverview.trends
     } catch {
+      if (queuedRefresh) {
+        return
+      }
       todayTrends.value = []
       auxiliaryFailed = true
     }
 
     try {
       const failedOverview = await getUsageOverview(failedFilters, { includeOptions: false })
+      if (queuedRefresh) {
+        return
+      }
       failedSummary.value = failedOverview.summary
       failedTrends.value = failedOverview.trends
       failedEndpointDistribution.value = failedOverview.distributions.endpoints ?? []
     } catch {
+      if (queuedRefresh) {
+        return
+      }
       failedSummary.value = null
       failedTrends.value = []
       failedEndpointDistribution.value = []
@@ -617,8 +633,14 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
           },
           { includeOptions: false },
         )
+        if (queuedRefresh) {
+          return
+        }
         realtimeSummary.value = realtimeOverview.summary
       } catch {
+        if (queuedRefresh) {
+          return
+        }
         realtimeSummary.value = null
         auxiliaryFailed = true
       }
@@ -628,8 +650,15 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
 
     if (isAccountScope.value) {
       try {
-        quotaStatus.value = await getCurrentUserQuota()
+        const nextQuotaStatus = await getCurrentUserQuota()
+        if (queuedRefresh) {
+          return
+        }
+        quotaStatus.value = nextQuotaStatus
       } catch {
+        if (queuedRefresh) {
+          return
+        }
         quotaStatus.value = null
         auxiliaryFailed = true
       }
@@ -637,8 +666,15 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
 
     if (!silent) {
       try {
-        options.value = normalizeUsageOptions(await getUsageOptions(filters))
+        const nextOptions = await getUsageOptions(filters)
+        if (queuedRefresh) {
+          return
+        }
+        options.value = normalizeUsageOptions(nextOptions)
       } catch {
+        if (queuedRefresh) {
+          return
+        }
         auxiliaryFailed = true
       }
     }
@@ -647,6 +683,9 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       ? t('部分辅助指标加载失败', 'Some auxiliary metrics failed to load')
       : null
   } catch (error) {
+    if (queuedRefresh) {
+      return
+    }
     const errorMessage = errorText(error, '加载历史用量失败', 'Failed to load usage history')
     if (silent) {
       autoRefreshError.value = errorMessage
@@ -654,14 +693,14 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       message.error(errorMessage)
     }
   } finally {
+    const nextRefresh = queuedRefresh
+    queuedRefresh = null
     refreshInFlight = false
     if (silent) {
       isAutoRefreshing.value = false
-    } else {
+    } else if (!nextRefresh) {
       isLoading.value = false
     }
-    const nextRefresh = queuedRefresh
-    queuedRefresh = null
     if (nextRefresh) {
       void refresh(nextRefresh)
     }
