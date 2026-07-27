@@ -298,6 +298,90 @@ func TestQuotaChargesClaudeLongContextUsingCachedPromptTokens(t *testing.T) {
 	}
 }
 
+func TestQuotaChargesNativeClaudeBreakdownWithoutDoubleCountingCache(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	userID := seedQuotaTestUser(t, app, "member")
+	apiKey := "sk-quota-claude-breakdown"
+	model := "claude-quota-breakdown"
+	authIndex := "claude-breakdown.json"
+	seedQuotaTestAPIKey(t, app, userID, apiKey)
+	seedQuotaTestNativePrice(t, app, "claude", authIndex, model, 1)
+	if _, err := app.db.Exec(`
+		UPDATE model_prices
+		SET cache_read_usd_per_million = 1,
+		    cache_creation_usd_per_million = 1
+		WHERE provider = 'claude' AND model = ?
+	`, model); err != nil {
+		t.Fatalf("configure Claude cache prices: %v", err)
+	}
+	lifetime := 1.0
+	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
+		t.Fatalf("update quota: %v", err)
+	}
+	pricing := quotaTestBillingPriceIndex(t, app)
+
+	uncachedCases := []struct {
+		field     string
+		wantInput int
+	}{
+		{wantInput: 60},
+		{field: `,"uncached_tokens":"invalid"`, wantInput: 60},
+		{field: `,"uncached_tokens":0`, wantInput: 0},
+		{field: `,"uncached_tokens":-1`, wantInput: 0},
+	}
+	for index, testCase := range uncachedCases {
+		raw := `{"api_key":"` + apiKey + `","provider":"claude","model":"` + model + `","auth_index":"` + authIndex + `","request_id":"quota-claude-breakdown-` + string(rune('0'+index)) + `","token_breakdown":{"input":{"total_tokens":100,"cache_read_tokens":30,"cache_write_tokens":10` + testCase.field + `},"output":{"total_tokens":0}}}`
+		record, created, err := app.saveUsageMessage(ctx, []byte(raw), pricing)
+		if err != nil || !created {
+			t.Fatalf("Claude breakdown usage %d created=%v err=%v", index, created, err)
+		}
+		if record.InputTokens != testCase.wantInput {
+			t.Fatalf("stored uncached input %d = %d, want %d", index, record.InputTokens, testCase.wantInput)
+		}
+	}
+
+	user, err := app.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != 0.99972 {
+		t.Fatalf("quota after Claude breakdown charges lifetime=%v, want 0.99972", user.QuotaLifetimeUSD)
+	}
+	var chargeCount int
+	var chargeTotal float64
+	if err := app.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(amount_usd), 0) FROM user_quota_charges`).Scan(&chargeCount, &chargeTotal); err != nil {
+		t.Fatal(err)
+	}
+	if chargeCount != 4 || mathRound(chargeTotal, 8) != 0.00028 {
+		t.Fatalf("Claude breakdown quota ledger count/total=%d/%v, want 4/0.00028", chargeCount, chargeTotal)
+	}
+
+	rejected := `{"api_key":"` + apiKey + `","provider":"claude","model":"` + model + `","auth_index":"` + authIndex + `","request_id":"quota-claude-breakdown-rejected","token_breakdown":{"input":{"total_tokens":100,"cache_read_tokens":30},"output":{"total_tokens":0}}}`
+	if _, created, err := app.saveUsageMessage(ctx, []byte(rejected), pricing); err == nil || created {
+		t.Fatalf("unreliable Claude breakdown created=%v err=%v, want rejection", created, err)
+	}
+	var recordsAfter int
+	if err := app.db.QueryRow(`SELECT COUNT(*) FROM usage_records`).Scan(&recordsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if recordsAfter != 4 {
+		t.Fatalf("usage records after rejected breakdown=%d, want 4", recordsAfter)
+	}
+	if err := app.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(amount_usd), 0) FROM user_quota_charges`).Scan(&chargeCount, &chargeTotal); err != nil {
+		t.Fatal(err)
+	}
+	if chargeCount != 4 || mathRound(chargeTotal, 8) != 0.00028 {
+		t.Fatalf("quota ledger changed after rejection count/total=%d/%v", chargeCount, chargeTotal)
+	}
+}
+
 func TestQuotaDoesNotChargeUnroundableFastCost(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()

@@ -2497,22 +2497,25 @@ func TestUsageAggregatesClaudeCacheReadAndCreationTokens(t *testing.T) {
 	if summary["cache_creation_tokens"].(int) != 30 {
 		t.Fatalf("summary cache creation = %v, want 30", summary["cache_creation_tokens"])
 	}
-	if summary["total_tokens"].(int) != 72 {
-		t.Fatalf("summary total = %v, want 72", summary["total_tokens"])
+	if summary["reasoning_tokens"].(int) != 7 {
+		t.Fatalf("summary reasoning = %v, want informational value 7", summary["reasoning_tokens"])
+	}
+	if summary["total_tokens"].(int) != 65 {
+		t.Fatalf("summary total = %v, want 65", summary["total_tokens"])
 	}
 	trends := trendPointsFromRecords(filters, []UsageRecord{record}, prices)
-	if len(trends) != 1 || trends[0]["total_tokens"].(int) != 72 {
-		t.Fatalf("trend totals = %#v, want one item with total 72", trends)
+	if len(trends) != 1 || trends[0]["total_tokens"].(int) != 65 {
+		t.Fatalf("trend totals = %#v, want one item with total 65", trends)
 	}
 	ranking := rankingFromRecords([]UsageRecord{record}, prices, "model", nil)
 	items := ranking["items"].([]map[string]any)
-	if len(items) != 1 || items[0]["total_tokens"].(int) != 72 {
-		t.Fatalf("ranking totals = %#v, want one item with total 72", items)
+	if len(items) != 1 || items[0]["total_tokens"].(int) != 65 {
+		t.Fatalf("ranking totals = %#v, want one item with total 65", items)
 	}
 	distributions := distributionsFromRecords([]UsageRecord{record}, prices)
 	models := distributions["models"].([]map[string]any)
-	if len(models) != 1 || models[0]["total_tokens"].(int) != 72 {
-		t.Fatalf("distribution totals = %#v, want one item with total 72", models)
+	if len(models) != 1 || models[0]["total_tokens"].(int) != 65 {
+		t.Fatalf("distribution totals = %#v, want one item with total 65", models)
 	}
 }
 

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -8,6 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
+	"math/big"
 	"net/http"
 	"regexp"
 	"sort"
@@ -1389,6 +1393,13 @@ func rawJSONStringField(rawJSON, fieldName string) *string {
 	case float64:
 		text := strconv.FormatFloat(typed, 'f', -1, 64)
 		return &text
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err != nil {
+			return nil
+		}
+		text := strconv.FormatFloat(parsed, 'f', -1, 64)
+		return &text
 	case bool:
 		text := strconv.FormatBool(typed)
 		return &text
@@ -1571,6 +1582,9 @@ func (a *App) saveUsageMessage(ctx context.Context, raw []byte, pricing modelPri
 	if err != nil {
 		return UsageRecord{}, false, err
 	}
+	if err := normalized.applyBreakdownInputSemantics(pricing); err != nil {
+		return UsageRecord{}, false, err
+	}
 	usageUsername, description, err := a.usageOwnerSnapshot(ctx, normalized.APIKeyHash)
 	if err != nil {
 		return UsageRecord{}, false, err
@@ -1620,35 +1634,44 @@ func (a *App) usageRecordByDedupe(ctx context.Context, dedupeKey string) (UsageR
 }
 
 type normalizedUsage struct {
-	Timestamp           time.Time
-	APIKeyHash          string
-	Provider            *string
-	Model               *string
-	ServiceTier         *string
-	Endpoint            *string
-	Source              *string
-	SourceAccount       *string
-	RequestID           *string
-	Auth                *string
-	AuthIndex           *string
-	LatencyMS           *float64
-	ReasoningEffort     *string
-	TTFTMS              *float64
-	Failed              bool
-	InputTokens         int
-	OutputTokens        int
-	CachedTokens        int
-	CacheReadTokens     int
-	CacheCreationTokens int
-	ReasoningTokens     int
-	TotalTokens         int
-	DedupeKey           string
-	RawJSON             string
+	Timestamp             time.Time
+	APIKeyHash            string
+	Provider              *string
+	Model                 *string
+	ServiceTier           *string
+	Endpoint              *string
+	Source                *string
+	SourceAccount         *string
+	RequestID             *string
+	Auth                  *string
+	AuthIndex             *string
+	LatencyMS             *float64
+	ReasoningEffort       *string
+	TTFTMS                *float64
+	Failed                bool
+	InputTokens           int
+	OutputTokens          int
+	CachedTokens          int
+	CacheReadTokens       int
+	CacheCreationTokens   int
+	ReasoningTokens       int
+	TotalTokens           int
+	DedupeKey             string
+	RawJSON               string
+	inputFromBreakdown    bool
+	breakdownUncached     int
+	breakdownUncachedOK   bool
+	breakdownCacheRead    int
+	breakdownCacheReadOK  bool
+	breakdownCacheWrite   int
+	breakdownCacheWriteOK bool
 }
 
 func normalizeUsage(raw []byte) (normalizedUsage, error) {
 	var parsed any
-	if err := json.Unmarshal(raw, &parsed); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&parsed); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		parsed = map[string]any{"message": string(raw)}
 	}
 	canonical, err := json.Marshal(parsed)
@@ -1660,14 +1683,37 @@ func normalizeUsage(raw []byte) (normalizedUsage, error) {
 		unknown := "unknown"
 		apiKey = &unknown
 	}
-	input := toInt(findFirst(parsed, "input_tokens", "prompt_tokens", "promptTokens", "input"))
-	output := toInt(findFirst(parsed, "output_tokens", "completion_tokens", "completionTokens", "output"))
-	cached := toInt(findFirst(parsed, "cached_tokens", "cached_input_tokens", "cached"))
-	cacheRead := toInt(findFirst(parsed, "cache_read_tokens", "cache_read_input_tokens"))
-	cacheCreation := toInt(findFirst(parsed, "cache_creation_tokens", "cache_creation_input_tokens"))
-	reasoning := toInt(findFirst(parsed, "reasoning_tokens", "reasoning"))
-	total := toInt(findFirst(parsed, "total_tokens", "totalTokens", "total"))
-	if total == 0 {
+	input, inputFromBreakdown := usageInputTokenValue(parsed)
+	breakdownUncached, breakdownUncachedOK := usageTokenAtPath(parsed, "token_breakdown", "input", "uncached_tokens")
+	breakdownCacheRead, breakdownCacheReadOK := usageTokenAtPath(parsed, "token_breakdown", "input", "cache_read_tokens")
+	breakdownCacheWrite, breakdownCacheWriteOK := usageTokenAtPath(parsed, "token_breakdown", "input", "cache_write_tokens")
+	output, _ := usageTokenValue(parsed,
+		[]string{"tokens", "output_tokens"},
+		[]string{"token_breakdown", "output", "total_tokens"},
+		"output_tokens", "completion_tokens", "completionTokens", "output",
+	)
+	cached, _ := usageTokenValue(parsed,
+		[]string{"tokens", "cached_tokens"},
+		[]string{"token_breakdown", "input", "cache_read_tokens"},
+		"cached_tokens", "cached_input_tokens", "cached",
+	)
+	cacheRead, _ := usageTokenValue(parsed,
+		[]string{"tokens", "cache_read_tokens"},
+		[]string{"token_breakdown", "input", "cache_read_tokens"},
+		"cache_read_tokens", "cache_read_input_tokens",
+	)
+	cacheCreation, _ := usageTokenValue(parsed,
+		[]string{"tokens", "cache_creation_tokens"},
+		[]string{"token_breakdown", "input", "cache_write_tokens"},
+		"cache_creation_tokens", "cache_creation_input_tokens",
+	)
+	reasoning, _ := usageTokenValue(parsed,
+		[]string{"tokens", "reasoning_tokens"},
+		[]string{"token_breakdown", "output", "reasoning_tokens"},
+		"reasoning_tokens", "reasoning",
+	)
+	total, totalFound := usageTotalTokenValue(parsed)
+	if !totalFound {
 		total = input + output
 		if total == 0 {
 			total = cached + reasoning
@@ -1676,31 +1722,252 @@ func normalizeUsage(raw []byte) (normalizedUsage, error) {
 	source := toString(findFirst(parsed, "source", "origin"))
 	sum := sha256.Sum256(canonical)
 	return normalizedUsage{
-		Timestamp:           parseUsageTimestamp(findFirst(parsed, "timestamp", "time", "created_at", "createdAt", "request_time")),
-		APIKeyHash:          hashAPIKey(*apiKey),
-		Provider:            toString(findFirst(parsed, "provider", "provider_name")),
-		Model:               toString(findFirst(parsed, "model", "model_name")),
-		ServiceTier:         toString(findFirst(parsed, "service_tier", "serviceTier")),
-		Endpoint:            toString(findFirst(parsed, "endpoint", "path", "route")),
-		Source:              source,
-		SourceAccount:       sourceAccountFromUsageSource(source),
-		RequestID:           toString(findFirst(parsed, "request_id", "requestId", "id")),
-		Auth:                authLabel(parsed),
-		AuthIndex:           authIndexFromUsagePayload(parsed),
-		LatencyMS:           toFloat(findFirst(parsed, "latency_ms", "latency", "duration_ms", "duration")),
-		ReasoningEffort:     toString(findFirst(parsed, "reasoning_effort", "reasoningEffort")),
-		TTFTMS:              toPositiveFloat(findFirst(parsed, "ttft_ms", "ttftMs")),
-		Failed:              isUsageFailed(parsed),
-		InputTokens:         input,
-		OutputTokens:        output,
-		CachedTokens:        cached,
-		CacheReadTokens:     cacheRead,
-		CacheCreationTokens: cacheCreation,
-		ReasoningTokens:     reasoning,
-		TotalTokens:         total,
-		DedupeKey:           "raw:" + hex.EncodeToString(sum[:]),
-		RawJSON:             string(canonical),
+		Timestamp:             parseUsageTimestamp(findFirst(parsed, "timestamp", "time", "created_at", "createdAt", "request_time")),
+		APIKeyHash:            hashAPIKey(*apiKey),
+		Provider:              toString(findFirst(parsed, "provider", "provider_name")),
+		Model:                 toString(findFirst(parsed, "model", "model_name")),
+		ServiceTier:           toString(findFirst(parsed, "service_tier", "serviceTier")),
+		Endpoint:              toString(findFirst(parsed, "endpoint", "path", "route")),
+		Source:                source,
+		SourceAccount:         sourceAccountFromUsageSource(source),
+		RequestID:             toString(findFirst(parsed, "request_id", "requestId", "id")),
+		Auth:                  authLabel(parsed),
+		AuthIndex:             authIndexFromUsagePayload(parsed),
+		LatencyMS:             toFloat(findFirst(parsed, "latency_ms", "latency", "duration_ms", "duration")),
+		ReasoningEffort:       toString(findFirst(parsed, "reasoning_effort", "reasoningEffort")),
+		TTFTMS:                toPositiveFloat(findFirst(parsed, "ttft_ms", "ttftMs")),
+		Failed:                isUsageFailed(parsed),
+		InputTokens:           input,
+		OutputTokens:          output,
+		CachedTokens:          cached,
+		CacheReadTokens:       cacheRead,
+		CacheCreationTokens:   cacheCreation,
+		ReasoningTokens:       reasoning,
+		TotalTokens:           total,
+		DedupeKey:             "raw:" + hex.EncodeToString(sum[:]),
+		RawJSON:               string(canonical),
+		inputFromBreakdown:    inputFromBreakdown,
+		breakdownUncached:     breakdownUncached,
+		breakdownUncachedOK:   breakdownUncachedOK,
+		breakdownCacheRead:    breakdownCacheRead,
+		breakdownCacheReadOK:  breakdownCacheReadOK,
+		breakdownCacheWrite:   breakdownCacheWrite,
+		breakdownCacheWriteOK: breakdownCacheWriteOK,
 	}, nil
+}
+
+func usageInputTokenValue(value any) (int, bool) {
+	if token, ok := usageTokenAtPath(value, "tokens", "input_tokens"); ok {
+		return token, false
+	}
+	if token, ok := usageTokenAtPath(value, "token_breakdown", "input", "total_tokens"); ok {
+		return token, true
+	}
+	if token, ok := findFirstUsageToken(value, "input_tokens", "prompt_tokens", "promptTokens", "input"); ok {
+		return token, false
+	}
+	return 0, false
+}
+
+func (usage *normalizedUsage) applyBreakdownInputSemantics(pricing modelPriceBillingIndex) error {
+	if !usage.inputFromBreakdown {
+		return nil
+	}
+	record := UsageRecord{
+		Provider:  usage.Provider,
+		Model:     usage.Model,
+		Auth:      usage.Auth,
+		AuthIndex: usage.AuthIndex,
+	}
+	price, _ := findMatchingChannelPrice(pricing.Prices, record, pricing.MatchContext)
+	brand := matchedModelPriceChannelBrand(price, record, pricing.MatchContext)
+	if !usageUsesClaudeTokenSemantics(record, brand) {
+		return nil
+	}
+	if usage.breakdownUncachedOK {
+		usage.InputTokens = usage.breakdownUncached
+		return nil
+	}
+	if !usage.breakdownCacheReadOK || !usage.breakdownCacheWriteOK ||
+		usage.CacheReadTokens != usage.breakdownCacheRead ||
+		usage.CacheCreationTokens != usage.breakdownCacheWrite ||
+		usage.breakdownCacheRead > usage.InputTokens ||
+		usage.breakdownCacheWrite > usage.InputTokens-usage.breakdownCacheRead {
+		return fmt.Errorf("native Claude token breakdown is missing a reliable uncached token value")
+	}
+	usage.InputTokens -= usage.breakdownCacheRead + usage.breakdownCacheWrite
+	return nil
+}
+
+func usageTotalTokenValue(value any) (int, bool) {
+	if token, ok := usageTokenAtPath(value, "tokens", "total_tokens"); ok {
+		return token, true
+	}
+	if token, ok := usageTokenAtPath(value, "token_breakdown", "total_tokens"); ok {
+		return token, true
+	}
+	for _, key := range []string{"total_tokens", "totalTokens", "total"} {
+		if token, ok := findLegacyTotalTokenByKey(value, key); ok {
+			return token, true
+		}
+	}
+	return 0, false
+}
+
+func findLegacyTotalTokenByKey(value any, key string) (int, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if candidate, ok := typed[key]; ok {
+			if token, ok := usageTokenInt(candidate); ok {
+				return token, true
+			}
+		}
+		names := make([]string, 0, len(typed))
+		for name := range typed {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if name == key || !strings.EqualFold(name, key) {
+				continue
+			}
+			if token, ok := usageTokenInt(typed[name]); ok {
+				return token, true
+			}
+		}
+		for _, name := range names {
+			if strings.EqualFold(name, "tokens") || strings.EqualFold(name, "token_breakdown") {
+				continue
+			}
+			if token, ok := findLegacyTotalTokenByKey(typed[name], key); ok {
+				return token, true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if token, ok := findLegacyTotalTokenByKey(child, key); ok {
+				return token, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func usageTokenValue(value any, primaryPath, breakdownPath []string, legacyKeys ...string) (int, bool) {
+	if token, ok := usageTokenAtPath(value, primaryPath...); ok {
+		return token, true
+	}
+	if token, ok := usageTokenAtPath(value, breakdownPath...); ok {
+		return token, true
+	}
+	if token, ok := findFirstUsageToken(value, legacyKeys...); ok {
+		return token, true
+	}
+	return 0, false
+}
+
+func usageTokenAtPath(value any, path ...string) (int, bool) {
+	current := value
+	for _, key := range path {
+		object, ok := current.(map[string]any)
+		if !ok {
+			return 0, false
+		}
+		current, ok = object[key]
+		if !ok {
+			return 0, false
+		}
+	}
+	return usageTokenInt(current)
+}
+
+func findFirstUsageToken(value any, keys ...string) (int, bool) {
+	for _, key := range keys {
+		if token, ok := findUsageTokenByKey(value, key); ok {
+			return token, true
+		}
+	}
+	return 0, false
+}
+
+func findUsageTokenByKey(value any, key string) (int, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if candidate, ok := typed[key]; ok {
+			if token, ok := usageTokenInt(candidate); ok {
+				return token, true
+			}
+		}
+		names := make([]string, 0, len(typed))
+		for name := range typed {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if name == key || !strings.EqualFold(name, key) {
+				continue
+			}
+			if token, ok := usageTokenInt(typed[name]); ok {
+				return token, true
+			}
+		}
+		for _, name := range names {
+			if token, ok := findUsageTokenByKey(typed[name], key); ok {
+				return token, true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if token, ok := findUsageTokenByKey(child, key); ok {
+				return token, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func usageTokenInt(value any) (int, bool) {
+	switch typed := value.(type) {
+	case float64:
+		if math.IsNaN(typed) || math.IsInf(typed, 0) {
+			return 0, false
+		}
+		if typed < 0 {
+			return 0, true
+		}
+		if math.Trunc(typed) != typed || typed >= math.Ldexp(1, strconv.IntSize-1) {
+			return 0, false
+		}
+		return int(typed), true
+	case json.Number:
+		return usageTokenTextInt(typed.String())
+	case string:
+		return usageTokenTextInt(typed)
+	default:
+		return 0, false
+	}
+}
+
+func usageTokenTextInt(value string) (int, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || strings.Contains(trimmed, "/") {
+		return 0, false
+	}
+	parsed, ok := new(big.Rat).SetString(trimmed)
+	if !ok {
+		return 0, false
+	}
+	if parsed.Sign() < 0 {
+		return 0, true
+	}
+	if !parsed.IsInt() {
+		return 0, false
+	}
+	maxInt := new(big.Int).SetUint64(uint64(^uint(0) >> 1))
+	if parsed.Num().Cmp(maxInt) > 0 {
+		return 0, false
+	}
+	return int(parsed.Num().Int64()), true
 }
 
 func (a *App) usageOwnerSnapshot(ctx context.Context, apiKeyHash string) (*string, *string, error) {
@@ -1769,6 +2036,13 @@ func toString(value any) *string {
 	case float64:
 		text := strconv.FormatFloat(typed, 'f', -1, 64)
 		return &text
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err != nil {
+			return nil
+		}
+		text := strconv.FormatFloat(parsed, 'f', -1, 64)
+		return &text
 	case bool:
 		text := strconv.FormatBool(typed)
 		return &text
@@ -1781,6 +2055,11 @@ func toFloat(value any) *float64 {
 	switch typed := value.(type) {
 	case float64:
 		return &typed
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err == nil {
+			return &parsed
+		}
 	case string:
 		parsed, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
 		if err == nil {
@@ -1805,6 +2084,11 @@ func toInt(value any) int {
 			return 0
 		}
 		return int(typed)
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err == nil && parsed >= 0 {
+			return int(parsed)
+		}
 	case string:
 		parsed, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
 		if err == nil && parsed > 0 {
@@ -1826,6 +2110,11 @@ func parseUsageTimestamp(value any) time.Time {
 			seconds = typed / 1000
 		}
 		return time.Unix(int64(seconds), 0).In(appTimeLocation)
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err == nil {
+			return parseUsageTimestamp(parsed)
+		}
 	case string:
 		if parsed, ok := parseInputTime(typed); ok {
 			return parsed
