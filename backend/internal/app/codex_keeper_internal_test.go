@@ -184,6 +184,9 @@ func TestConditionalKeeperRefreshCandidatesUseUsageQuotaAndCache(t *testing.T) {
 	insertKeeperStateForCandidateWithError(t, app, "error-due.json", "network check failed", timePtrValue(now.Add(-20*time.Minute)))
 	insertKeeperStateForCandidateWithError(t, app, "error-cached.json", "network check failed", timePtrValue(now.Add(-2*time.Minute)))
 	insertKeeperStateForCandidate(t, app, "normal-local.json", nil, timePtrValue(now.Add(-20*time.Minute)))
+	for _, name := range []string{"cached-request.json", "cached-email.json", "quota-cached.json"} {
+		setKeeperStateAccountType(t, app, name, "free")
+	}
 
 	names, err := app.conditionalKeeperRefreshCandidates(ctx, cfg)
 	if err != nil {
@@ -1009,6 +1012,7 @@ func TestKeeperQuotaWindowUsageUsesFreeMonthlyWindowBoundaries(t *testing.T) {
 func TestAutomaticKeeperRunsRespectCacheButManualRefreshBypasses(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 
+	downloadCalls := 0
 	usageCalls := 0
 	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1018,6 +1022,7 @@ func TestAutomaticKeeperRunsRespectCacheButManualRefreshBypasses(t *testing.T) {
 				"files": []map[string]any{{"name": "cached.json", "type": "codex"}},
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			downloadCalls++
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"name":         "cached.json",
 				"type":         "codex",
@@ -1055,6 +1060,7 @@ func TestAutomaticKeeperRunsRespectCacheButManualRefreshBypasses(t *testing.T) {
 		cfg.CodexKeeper.AccountRefreshCacheMinutes = 10
 	})
 	insertKeeperStateForCandidate(t, app, "cached.json", nil, timePtrValue(time.Now().In(appTimeLocation).Add(-time.Minute)))
+	setKeeperStateAccountType(t, app, "cached.json", "free")
 
 	stats, _, err := app.executeKeeperRunForAccounts(context.Background(), "daemon", nil, func(string) {})
 	if err != nil {
@@ -1069,6 +1075,9 @@ func TestAutomaticKeeperRunsRespectCacheButManualRefreshBypasses(t *testing.T) {
 	if usageCalls != 0 {
 		t.Fatalf("daemon usage calls = %d, want 0", usageCalls)
 	}
+	if downloadCalls != 0 {
+		t.Fatalf("daemon download calls = %d, want 0", downloadCalls)
+	}
 
 	_, _, err = app.executeKeeperRunForAccounts(context.Background(), "accounts", []string{"cached.json"}, func(string) {})
 	if err != nil {
@@ -1077,11 +1086,112 @@ func TestAutomaticKeeperRunsRespectCacheButManualRefreshBypasses(t *testing.T) {
 	if usageCalls != 1 {
 		t.Fatalf("manual usage calls = %d, want 1", usageCalls)
 	}
+	if downloadCalls != 1 {
+		t.Fatalf("manual download calls = %d, want 1", downloadCalls)
+	}
 	if got := countKeeperRows(t, app, `SELECT COUNT(*) FROM codex_keeper_runs`); got != 1 {
 		t.Fatalf("keeper run rows = %d, want 1 because account refresh is not persisted", got)
 	}
 	if got := countKeeperRows(t, app, `SELECT COUNT(*) FROM codex_keeper_run_accounts`); got != 0 {
 		t.Fatalf("keeper run account rows = %d, want 0 because skipped daemon and manual refresh are not persisted", got)
+	}
+}
+
+func TestAutomaticKeeperRunRefreshesIncompleteAccountTypeCache(t *testing.T) {
+	tests := []struct {
+		name        string
+		accountType *string
+	}{
+		{name: "null"},
+		{name: "blank", accountType: stringPtr("   ")},
+		{name: "unknown", accountType: stringPtr("unknown")},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+			authName := "incomplete-" + tc.name + ".json"
+			downloadCalls := 0
+			usageCalls := 0
+			cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"files": []map[string]any{{"name": authName, "type": "codex"}},
+					})
+				case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+					downloadCalls++
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"name":         authName,
+						"type":         "codex",
+						"disabled":     false,
+						"priority":     0,
+						"access_token": "test-token",
+					})
+				case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+					usageCalls++
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"status_code": 200,
+						"body": map[string]any{
+							"plan_type": "k12",
+							"rate_limit": map[string]any{
+								"primary_window": map[string]any{
+									"used_percent":        10,
+									"reset_after_seconds": 3600,
+								},
+							},
+						},
+					})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer cpa.Close()
+
+			app, err := New()
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+			defer app.Close()
+			configureKeeperTestCPA(t, app, cpa.URL, func(cfg *AppConfig) {
+				cfg.CodexKeeper.AccountRefreshCacheMinutes = 10
+			})
+			insertKeeperStateForCandidate(t, app, authName, nil, timePtrValue(time.Now().In(appTimeLocation).Add(-time.Minute)))
+			if tc.accountType != nil {
+				setKeeperStateAccountType(t, app, authName, *tc.accountType)
+			}
+
+			stats, _, err := app.executeKeeperRunForAccounts(context.Background(), "daemon", nil, func(string) {})
+			if err != nil {
+				t.Fatalf("first daemon run: %v", err)
+			}
+			if stats.Skipped != 0 {
+				t.Fatalf("first daemon skipped = %d, want 0", stats.Skipped)
+			}
+			if downloadCalls != 1 || usageCalls != 1 {
+				t.Fatalf("first daemon calls = download %d usage %d, want 1/1", downloadCalls, usageCalls)
+			}
+			var accountType string
+			if err := app.db.QueryRow(`SELECT account_type FROM codex_keeper_auth_states WHERE auth_name = ?`, authName).Scan(&accountType); err != nil {
+				t.Fatalf("load refreshed account type: %v", err)
+			}
+			if accountType != "k12" {
+				t.Fatalf("refreshed account type = %q, want k12", accountType)
+			}
+
+			stats, _, err = app.executeKeeperRunForAccounts(context.Background(), "daemon", nil, func(string) {})
+			if err != nil {
+				t.Fatalf("second daemon run: %v", err)
+			}
+			if stats.Skipped != 1 {
+				t.Fatalf("second daemon skipped = %d, want 1", stats.Skipped)
+			}
+			if downloadCalls != 1 || usageCalls != 1 {
+				t.Fatalf("second daemon calls = download %d usage %d, want unchanged 1/1", downloadCalls, usageCalls)
+			}
+		})
 	}
 }
 
@@ -1290,6 +1400,61 @@ func TestAutomaticKeeperRunCountsCachedBadCredentialState(t *testing.T) {
 	}
 	if stats.StatusDisabled != 1 {
 		t.Fatalf("daemon status_disabled = %d, want cached bad credential to count", stats.StatusDisabled)
+	}
+	if stats.Healthy != 0 {
+		t.Fatalf("daemon healthy = %d, want 0", stats.Healthy)
+	}
+	if downloadCalls != 0 {
+		t.Fatalf("download calls = %d, want 0", downloadCalls)
+	}
+}
+
+func TestAutomaticKeeperRunCountsCachedPriorityStateWithoutAccountType(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	downloadCalls := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{{"name": "cached-priority.json", "type": "codex"}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			downloadCalls++
+			_ = json.NewEncoder(w).Encode(map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, func(cfg *AppConfig) {
+		cfg.CodexKeeper.AccountRefreshCacheMinutes = 10
+	})
+	insertKeeperStateForCandidate(t, app, "cached-priority.json", nil, timePtrValue(time.Now().In(appTimeLocation).Add(-time.Minute)))
+	if _, err := app.db.Exec(`
+		UPDATE codex_keeper_auth_states
+		SET priority = -1, updated_at = ?
+		WHERE auth_name = ?
+	`, dbTime(time.Now().In(appTimeLocation)), "cached-priority.json"); err != nil {
+		t.Fatalf("mark cached priority state: %v", err)
+	}
+
+	stats, _, err := app.executeKeeperRunForAccounts(context.Background(), "daemon", nil, func(string) {})
+	if err != nil {
+		t.Fatalf("daemon run: %v", err)
+	}
+	if stats.Skipped != 1 {
+		t.Fatalf("daemon skipped = %d, want 1", stats.Skipped)
+	}
+	if stats.PriorityDegraded != 1 {
+		t.Fatalf("daemon priority_degraded = %d, want cached priority state to count", stats.PriorityDegraded)
 	}
 	if stats.Healthy != 0 {
 		t.Fatalf("daemon healthy = %d, want 0", stats.Healthy)
@@ -2100,6 +2265,18 @@ func insertKeeperStateForCandidateWithEmail(t *testing.T, app *App, name string,
 	`, name, email, dbTimePtr(primaryResetAt), dbTimePtr(lastCheckedAt), now, now)
 	if err != nil {
 		t.Fatalf("insert keeper state %s: %v", name, err)
+	}
+}
+
+func setKeeperStateAccountType(t *testing.T, app *App, name string, accountType string) {
+	t.Helper()
+	_, err := app.db.Exec(`
+		UPDATE codex_keeper_auth_states
+		SET account_type = ?, updated_at = ?
+		WHERE auth_name = ?
+	`, accountType, dbTime(time.Now().In(appTimeLocation)), name)
+	if err != nil {
+		t.Fatalf("set keeper state %s account type: %v", name, err)
 	}
 }
 

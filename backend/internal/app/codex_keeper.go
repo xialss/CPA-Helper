@@ -2263,17 +2263,32 @@ func (a *App) keeperCachedAuthStats(ctx context.Context, names []string) (keeper
 }
 
 func (a *App) keeperAuthCheckedSince(ctx context.Context, name string, cutoff time.Time) (bool, error) {
-	var lastChecked sql.NullString
+	var lastChecked, accountType, lastError, latestAction sql.NullString
+	var priority, lastStatusCode sql.NullInt64
 	err := a.db.QueryRowContext(ctx, `
-		SELECT CAST(last_checked_at AS TEXT)
+		SELECT CAST(last_checked_at AS TEXT), account_type, priority, last_status_code, last_error, latest_action
 		FROM codex_keeper_auth_states
 		WHERE auth_name = ?
-	`, name).Scan(&lastChecked)
+	`, name).Scan(&lastChecked, &accountType, &priority, &lastStatusCode, &lastError, &latestAction)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
+	}
+	normalizedAccountType := strings.TrimSpace(accountType.String)
+	if !accountType.Valid || normalizedAccountType == "" || strings.EqualFold(normalizedAccountType, "unknown") {
+		state := keeperAuthState{keeperAccount: keeperAccount{
+			Priority:       nullableInt(priority),
+			LastStatusCode: nullableInt(lastStatusCode),
+			LastError:      nullableString(lastError),
+			LatestAction:   nullableString(latestAction),
+		}}
+		if !isKeeperCachedBadCredentialState(state) &&
+			(state.LastError == nil || strings.TrimSpace(*state.LastError) == "") &&
+			(state.Priority == nil || *state.Priority != -1) {
+			return false, nil
+		}
 	}
 	if !lastChecked.Valid {
 		return false, nil
