@@ -1,0 +1,1 @@
+{"all_ok":false,"generated_at":1785326215,"services":[{"model":"gpt-test","uptime_pct":98.5,"last":{"ts":1785326210,"ok":false,"latency_ms":null,"error":"HTTP 503"},"history":[{"ts":1785326210,"ok":false,"latency_ms":null,"error":"HTTP 503"},{"ts":1785326150,"ok":true,"latency_ms":1234,"error":null}]}]}

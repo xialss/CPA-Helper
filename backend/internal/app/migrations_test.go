@@ -85,6 +85,12 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if !testColumnExists(t, app.db, "app_settings", "model_request_url") {
 		t.Fatal("app_settings.model_request_url was not created")
 	}
+	if !testColumnExists(t, app.db, "app_settings", "model_monitor_proxy_enabled") {
+		t.Fatal("app_settings.model_monitor_proxy_enabled was not created")
+	}
+	if !testColumnExists(t, app.db, "app_settings", "model_monitor_proxy_url") {
+		t.Fatal("app_settings.model_monitor_proxy_url was not created")
+	}
 	if !testColumnExists(t, app.db, "users", "quota_lifetime_usd") {
 		t.Fatal("users.quota_lifetime_usd was not created")
 	}
@@ -135,6 +141,14 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	}
 	if settingsCount != 1 {
 		t.Fatalf("app_settings singleton count = %d, want 1", settingsCount)
+	}
+	var modelMonitorProxyEnabled bool
+	var modelMonitorProxyURL string
+	if err := app.db.QueryRow(`SELECT model_monitor_proxy_enabled, model_monitor_proxy_url FROM app_settings WHERE id = 1`).Scan(&modelMonitorProxyEnabled, &modelMonitorProxyURL); err != nil {
+		t.Fatalf("query model monitor proxy defaults: %v", err)
+	}
+	if modelMonitorProxyEnabled || modelMonitorProxyURL != "" {
+		t.Fatalf("model monitor proxy defaults = %t/%q, want false/empty", modelMonitorProxyEnabled, modelMonitorProxyURL)
 	}
 }
 
@@ -491,6 +505,41 @@ func TestRunMigrationsAcceptsPreexistingKeeperAuthIndexColumn(t *testing.T) {
 	}
 	if indexCount != 1 {
 		t.Fatalf("auth index count = %d, want 1", indexCount)
+	}
+}
+
+func TestRunMigrationsUpgradesModelMonitorProxySettingsIndependently(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	dbPath := prepareMigrationTestDatabase(t, dataDir, 202607200001)
+
+	db, err := sql.Open("sqlite", sqliteDSN(dbPath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`UPDATE app_settings SET litellm_proxy_enabled = 1, litellm_proxy_url = 'http://legacy-proxy.local:7890' WHERE id = 1`); err != nil {
+		_ = db.Close()
+		t.Fatalf("seed legacy LiteLLM proxy settings: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	if !testColumnExists(t, app.db, "app_settings", "model_monitor_proxy_enabled") || !testColumnExists(t, app.db, "app_settings", "model_monitor_proxy_url") {
+		t.Fatal("model monitor proxy columns were not created during upgrade")
+	}
+	cfg, err := app.loadModelMonitorProxyConfig(context.Background())
+	if err != nil {
+		t.Fatalf("loadModelMonitorProxyConfig failed: %v", err)
+	}
+	if cfg.Enabled || cfg.ProxyURL != "" {
+		t.Fatalf("model monitor proxy inherited legacy LiteLLM settings: %#v", cfg)
 	}
 }
 

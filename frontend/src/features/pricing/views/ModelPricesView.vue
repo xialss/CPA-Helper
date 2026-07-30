@@ -24,25 +24,22 @@ import {
   type DataTableColumns,
   type DataTableRowKey,
 } from 'naive-ui'
-import { Database, Layers3, RefreshCw, Search, Server, Settings2, Zap } from 'lucide-vue-next'
+import { Database, Layers3, RefreshCw, Search, Server, Zap } from 'lucide-vue-next'
 
 import {
   createModelPrice,
   deleteModelPriceLibraryConflict,
   deleteModelPrice,
-  getLiteLLMProxySettings,
   listModelPriceCatalog,
   listModelPriceLibraryConflicts,
   listModelPrices,
   promoteModelPriceLibraryConflict,
   replaceActiveModelPriceLibraryConflict,
   syncLitellmModelPrices,
-  updateLiteLLMProxySettings,
   updateModelPrice,
   updateModelPricePriorityMultiplier,
 } from '@/features/pricing/api/pricingApi'
 import type {
-  LiteLLMProxySettingsPayload,
   ModelPrice,
   ModelPriceCatalogItem,
   ModelPriceCatalogResponse,
@@ -139,9 +136,6 @@ const MODEL_PRICE_GROUPING_STORAGE_KEY = 'cpa-helper-model-price-grouping-mode'
 const priceModalStyle: CSSProperties = { width: 'min(720px, calc(100vw - 32px))' }
 const conflictModalStyle: CSSProperties = { width: 'min(520px, calc(100vw - 32px))' }
 const priorityModalStyle: CSSProperties = { width: 'min(420px, calc(100vw - 32px))' }
-const proxyModalStyle: CSSProperties = { width: 'min(460px, calc(100vw - 32px))' }
-const proxyModalContentStyle: CSSProperties = { padding: '16px 22px 4px' }
-const proxyModalFooterStyle: CSSProperties = { padding: '12px 22px 18px' }
 const desktopPriceLayoutQuery = window.matchMedia('(min-width: 861px)')
 const message = useMessage()
 const dialog = useDialog()
@@ -149,11 +143,8 @@ const { errorText, serverText, t } = useI18n()
 const isLoading = ref(false)
 const isSyncing = ref(false)
 const modalOpen = ref(false)
-const proxyModalOpen = ref(false)
 const priorityModalOpen = ref(false)
 const conflictModalOpen = ref(false)
-const isProxyLoading = ref(false)
-const isProxySaving = ref(false)
 const isPrioritySaving = ref(false)
 const isPriceSaving = ref(false)
 const isConflictSaving = ref(false)
@@ -203,11 +194,6 @@ const longContextForm = reactive<ModelPriceLongContext>({
   cache_read_usd_per_million: 0,
   cache_creation_usd_per_million: 0,
 })
-const proxyForm = reactive<LiteLLMProxySettingsPayload>({
-  enabled: false,
-  proxy_url: '',
-})
-
 const preservedLongContextSummary = computed(() => {
   const value = preservedLongContext.value
   if (!value) {
@@ -506,13 +492,6 @@ const providerOptions = computed(() => {
     .sort((left, right) => left[1].localeCompare(right[1]))
     .map(([value, label]) => ({ label, value }))
 })
-
-const liteLLMProxyHint = computed(() =>
-  t(
-    'LiteLLM 价格数据从 GitHub 下载；如果当前网络无法访问 GitHub，可以启用代理后再同步。',
-    'LiteLLM price data is downloaded from GitHub. If GitHub is not reachable from this network, enable a proxy and sync again.',
-  ),
-)
 
 const statusOptions = computed<Array<{ label: string; value: PriceStatusFilter }>>(() => [
   { label: t('渠道模型', 'Channel models'), value: 'cpa' },
@@ -1167,47 +1146,9 @@ async function syncPrices() {
     )
     await refresh()
   } catch (error) {
-    const detail = errorText(error, '同步模型价格失败', 'Failed to sync model prices')
-    message.error(t(`${detail}。${liteLLMProxyHint.value}`, `${detail}. ${liteLLMProxyHint.value}`))
+    message.error(errorText(error, '同步模型价格失败', 'Failed to sync model prices'))
   } finally {
     isSyncing.value = false
-  }
-}
-
-async function openProxySettings() {
-  proxyModalOpen.value = true
-  isProxyLoading.value = true
-  try {
-    const settings = await getLiteLLMProxySettings()
-    proxyForm.enabled = settings.enabled
-    proxyForm.proxy_url = settings.proxy_url
-  } catch (error) {
-    message.error(errorText(error, '加载代理配置失败', 'Failed to load proxy settings'))
-  } finally {
-    isProxyLoading.value = false
-  }
-}
-
-async function saveProxySettings() {
-  const payload: LiteLLMProxySettingsPayload = {
-    enabled: proxyForm.enabled,
-    proxy_url: proxyForm.proxy_url.trim(),
-  }
-  if (payload.enabled && !payload.proxy_url) {
-    message.error(t('启用代理时必须填写代理地址', 'Proxy URL is required when proxy is enabled'))
-    return
-  }
-  isProxySaving.value = true
-  try {
-    const saved = await updateLiteLLMProxySettings(payload)
-    proxyForm.enabled = saved.enabled
-    proxyForm.proxy_url = saved.proxy_url
-    proxyModalOpen.value = false
-    message.success(t('代理配置已保存', 'Proxy settings saved'))
-  } catch (error) {
-    message.error(errorText(error, '保存代理配置失败', 'Failed to save proxy settings'))
-  } finally {
-    isProxySaving.value = false
   }
 }
 
@@ -1877,12 +1818,6 @@ onBeforeUnmount(() => {
           </template>
           {{ t('同步 LiteLLM', 'Sync LiteLLM') }}
         </NButton>
-        <NButton secondary :disabled="isSyncing" @click="openProxySettings">
-          <template #icon>
-            <NIcon :component="Settings2" />
-          </template>
-          {{ t('代理配置', 'Proxy settings') }}
-        </NButton>
         <NButton type="primary" @click="() => openCreate()">{{ t('新增通用价', 'Add library price') }}</NButton>
       </NSpace>
     </div>
@@ -2110,43 +2045,6 @@ onBeforeUnmount(() => {
         </NSpace>
       </template>
     </NModal>
-
-    <NModal
-      v-model:show="proxyModalOpen"
-      preset="card"
-      :title="t('LiteLLM 代理配置', 'LiteLLM proxy settings')"
-      :style="proxyModalStyle"
-      :content-style="proxyModalContentStyle"
-      :footer-style="proxyModalFooterStyle"
-      class="proxy-modal"
-    >
-      <NForm :model="proxyForm" label-placement="top">
-        <div class="proxy-form">
-          <p class="proxy-hint">{{ liteLLMProxyHint }}</p>
-          <div class="proxy-switch-row">
-            <span class="proxy-switch-label">{{ t('使用代理', 'Use proxy') }}</span>
-            <NSwitch
-              v-model:value="proxyForm.enabled"
-              :disabled="isProxyLoading || isProxySaving"
-              :aria-label="t('使用代理', 'Use proxy')"
-            />
-          </div>
-          <NFormItem :label="t('代理地址', 'Proxy URL')">
-            <NInput
-              v-model:value="proxyForm.proxy_url"
-              :disabled="!proxyForm.enabled || isProxyLoading || isProxySaving"
-              :placeholder="t('http://127.0.0.1:7890 或 socks5://127.0.0.1:1080', 'http://127.0.0.1:7890 or socks5://127.0.0.1:1080')"
-            />
-          </NFormItem>
-        </div>
-      </NForm>
-      <template #footer>
-        <NSpace justify="end">
-          <NButton :disabled="isProxySaving" @click="proxyModalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
-          <NButton type="primary" :loading="isProxySaving" @click="saveProxySettings">{{ t('保存', 'Save') }}</NButton>
-        </NSpace>
-      </template>
-    </NModal>
   </section>
 </template>
 
@@ -2158,10 +2056,6 @@ onBeforeUnmount(() => {
 
 .price-modal :deep(.n-card__content) {
   overflow-y: auto;
-}
-
-.proxy-modal {
-  width: min(520px, calc(100vw - 24px));
 }
 
 .form-grid {
@@ -2185,43 +2079,6 @@ onBeforeUnmount(() => {
   color: var(--cpa-text);
   font-size: 14px;
   font-weight: 600;
-}
-
-.proxy-form {
-  display: grid;
-  gap: 14px;
-}
-
-.proxy-hint {
-  margin: 0;
-  padding: 10px 12px;
-  border: 1px solid rgba(8, 145, 178, 0.22);
-  border-radius: var(--cpa-radius);
-  background: rgba(8, 145, 178, 0.08);
-  color: var(--cpa-text-muted);
-  font-size: 13px;
-  line-height: 1.55;
-}
-
-.proxy-switch-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  min-height: 34px;
-  padding: 8px 10px;
-  border: 1px solid var(--cpa-border);
-  border-radius: var(--cpa-radius);
-  background: var(--cpa-surface-raised);
-}
-
-.proxy-switch-label {
-  color: var(--cpa-text);
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.proxy-form :deep(.n-form-item) {
-  margin-bottom: 0;
 }
 
 .price-metrics {

@@ -186,8 +186,60 @@ const serverTermTranslations: MessagePair[] = [
   ['。', '.'],
 ]
 
+const modelMonitorSubjectTranslations: MessagePair[] = [
+  ['可见结构引用的 component', 'component referenced by the visible structure'],
+  ['页面分组', 'page group'],
+  ['当前组件', 'current component'],
+  ['分钟样本', 'minute sample'],
+  ['历史元数据', 'history metadata'],
+  ['impact 时间范围', 'impact time range'],
+  ['uptime group 引用', 'uptime group reference'],
+  ['赋值尾部', 'assignment suffix'],
+  ['当前状态', 'current status'],
+  ['未知组件', 'unknown component'],
+  ['必要字段', 'required fields'],
+  ['非空对象', 'non-empty object'],
+  ['组件', 'component'],
+  ['页面', 'page'],
+  ['响应', 'response'],
+  ['字段', 'field'],
+  ['数组', 'array'],
+  ['历史', 'history'],
+  ['日期', 'date'],
+  ['名称', 'name'],
+  ['标题', 'title'],
+]
+
+const modelMonitorTransportMessagePatterns: ServerMessagePattern[] = [
+  [/^模型监控请求失败:\s*(.+)$/, ([, detail]) => `Model monitoring request failed: ${translateModelMonitorRequestDetail(detail ?? '')}`],
+  [/^模型监控上游返回 HTTP (\d+)$/, ([, status]) => `Model monitoring upstream returned HTTP ${status}`],
+  [/^模型监控上游返回了不支持的内容类型 (.+)$/, ([, contentType]) => `Model monitoring upstream returned unsupported content type ${contentType}`],
+  [/^读取模型监控上游响应失败:\s*(.+)$/, ([, detail]) => `Failed to read model monitoring upstream response: ${detail}`],
+  [/^模型监控上游响应超过 (.+) 限制$/, ([, limit]) => `Model monitoring upstream response exceeds the ${limit} limit`],
+]
+
 const serverMessagePatterns: ServerMessagePattern[] = [
   [/^操作失败$/, () => 'Operation failed'],
+  [/^(OpenAI|Anthropic|AI\.INPUT\.IM)(?: (.+?))? 响应不是有效 JSON(?::\s*(.+))?$/, ([, source, subject, detail]) => `${source}${subject ? ` ${translateModelMonitorSubject(subject)}` : ''} response is not valid JSON${detail ? `: ${detail}` : ''}`],
+  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+?)响应缺少\s*(.+)$/, ([, source, subject, fields]) => `${source} ${translateModelMonitorSubject(subject)} response is missing ${translateModelMonitorSubject(fields ?? '')}`],
+  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)缺少\s*必要字段$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} is missing required fields`],
+  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)结构无效$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} structure is invalid`],
+  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)字段无效$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} field is invalid`],
+  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)不是有效的非空对象$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} is not a valid non-empty object`],
+  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)为空$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} is empty`],
+  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)重复$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} is duplicated`],
+  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)无效(?::\s*(.+))?$/, ([, source, subject, detail]) => `${source} ${translateModelMonitorSubject(subject)} is invalid${detail ? `: ${translateModelMonitorDetail(detail)}` : ''}`],
+  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+?)缺少\s*(.+)$/, ([, source, subject, missing]) => `${source} ${translateModelMonitorSubject(subject)} is missing ${translateModelMonitorSubject(missing)}`],
+  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)包含未知组件 (.+)$/, ([, source, subject, component]) => `${source} ${translateModelMonitorSubject(subject)} contains unknown component ${component}`],
+  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)包含无效日期$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} contains an invalid date`],
+  [/^OpenAI summary 引用了 components 响应中不存在的组件 (.+)$/, ([, component]) => `OpenAI summary references component ${component} that is absent from the components response`],
+  [/^OpenAI (.+)引用了未知\s*(.+)$/, ([, subject, target]) => `OpenAI ${translateModelMonitorSubject(subject)} references unknown ${translateModelMonitorSubject(target)}`],
+  [/^OpenAI (.+)引用了无法映射的 incident (.+)$/, ([, subject, incident]) => `OpenAI ${translateModelMonitorSubject(subject)} references unmapped incident ${incident}`],
+  [/^OpenAI 当前 component (.+) 未出现在页面分组中$/, ([, component]) => `OpenAI current component ${component} does not appear in the page groups`],
+  [/^OpenAI 可见 group (.+) 没有可见 component$/, ([, group]) => `OpenAI visible group ${group} has no visible component`],
+  [/^OpenAI 页面当前结构数量为 (\d+)、历史结构数量为 (\d+)，均期望 (\d+)$/, ([, current, history, expected]) => `OpenAI page has ${current} current structures and ${history} history structures; expected ${expected} of each`],
+  [/^Anthropic 页面 uptimeData 赋值数量为 (\d+)，期望 (\d+)$/, ([, actual, expected]) => `Anthropic page uptimeData assignment count is ${actual}; expected ${expected}`],
+  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)不一致$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} does not match`],
   [/^加载(.+)失败$/, ([, subject]) => `Failed to load ${translateTerms(subject ?? '')}`],
   [/^保存(.+)失败$/, ([, subject]) => `Failed to save ${translateTerms(subject ?? '')}`],
   [/^删除(.+)失败$/, ([, subject]) => `Failed to delete ${translateTerms(subject ?? '')}`],
@@ -299,6 +351,57 @@ function translateTerms(value: string): string {
   )
 }
 
+function translateModelMonitorSubject(value: string | undefined): string {
+  return (value ?? '')
+    .split(/("(?:\\.|[^"\\])*")/g)
+    .map((part, index) => {
+      if (index % 2 === 1) return part
+      return modelMonitorSubjectTranslations.reduce(
+        (text, [zh, en]) => text.split(zh).join(en),
+        part,
+      )
+    })
+    .join('')
+    .replace(/\s*的\s*/g, ' ')
+    .replace(/\s*或\s*/g, ' or ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function translateModelMonitorDetail(value: string): string {
+  switch (value) {
+    case '赋值右侧不是 JSON 对象':
+      return 'assignment value is not a JSON object'
+    case 'JSON 对象未闭合':
+      return 'JSON object is not closed'
+    default:
+      return value
+  }
+}
+
+function translateModelMonitorRequestDetail(value: string): string {
+  const fixedDetails: MessagePair[] = [
+    ['状态页重定向必须使用 HTTPS', 'Status page redirects must use HTTPS'],
+    ['状态页重定向次数过多', 'Too many status page redirects'],
+  ]
+  for (const [zh, en] of fixedDetails) {
+    if (value === zh) return en
+    const wrappedSuffix = `: ${zh}`
+    if (value.endsWith(wrappedSuffix)) {
+      return `${value.slice(0, -zh.length)}${en}`
+    }
+  }
+  return value
+}
+
+function translateModelMonitorTransportMessage(message: string): string | null {
+  for (const [pattern, translate] of modelMonitorTransportMessagePatterns) {
+    const match = message.match(pattern)
+    if (match) return translate(match)
+  }
+  return null
+}
+
 function translateNested(value: string): string {
   return translateKnownServerMessage(value) ?? translateTerms(value)
 }
@@ -335,6 +438,11 @@ export function localizedServerMessage(
 
   if (!message) {
     return fallbackEn
+  }
+
+  const modelMonitorTransportMessage = translateModelMonitorTransportMessage(message)
+  if (modelMonitorTransportMessage) {
+    return modelMonitorTransportMessage
   }
 
   if (!containsHan(message)) {

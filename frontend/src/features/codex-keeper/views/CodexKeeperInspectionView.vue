@@ -510,7 +510,7 @@ onBeforeUnmount(() => {
   <section class="page inspection-page">
     <div class="page-header">
       <div>
-        <h1 class="page-title">{{ t('巡检设置', 'Inspection Settings') }}</h1>
+        <h1 class="page-title">{{ t('账号巡检设置', 'Account Inspection Settings') }}</h1>
         <p class="page-subtitle">{{ t('维护 Codex auth file 的健康状态和调度优先级', 'Maintain Codex auth file health and scheduling priorities') }}</p>
       </div>
       <NSpace>

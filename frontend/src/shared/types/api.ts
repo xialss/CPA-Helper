@@ -650,16 +650,6 @@ export interface ModelPriceCatalogResponse {
   unpriced_models: number
 }
 
-export interface LiteLLMProxySettings {
-  enabled: boolean
-  proxy_url: string
-}
-
-export interface LiteLLMProxySettingsPayload {
-  enabled: boolean
-  proxy_url: string
-}
-
 export interface UserApiKeySummary {
   api_key_hash: string
   api_key: string | null
@@ -811,4 +801,84 @@ export interface ApiKeyCreatePayload {
 
 export interface ApiKeyUpdatePayload {
   description: string
+}
+
+export type ModelMonitorSourceType = 'built_in'
+export type ModelMonitorCollectionState = 'ok' | 'error'
+export type ModelMonitorHistoryGranularity = 'day' | 'minute'
+export type ModelMonitorStatus =
+  | 'operational'
+  | 'degraded_performance'
+  | 'partial_outage'
+  | 'major_outage'
+  | 'maintenance'
+  | 'unknown'
+
+export interface ModelMonitorSample {
+  timestamp: string
+  status: ModelMonitorStatus
+  latency_ms: number | null
+  error: string | null
+  related_incidents: string[]
+}
+
+export interface ModelMonitorServiceStatus {
+  id: string
+  name: string
+  status: ModelMonitorStatus
+  uptime_percent: number | null
+  last_status: ModelMonitorStatus | null
+  last_latency_ms: number | null
+  last_error: string | null
+  samples: ModelMonitorSample[]
+}
+
+export interface ModelMonitorServiceGroup {
+  id: string
+  name: string
+  status: ModelMonitorStatus
+  uptime_percent: number | null
+  samples: ModelMonitorSample[]
+  services: ModelMonitorServiceStatus[]
+}
+
+export interface ModelMonitorIncident {
+  id: string
+  name: string
+  status: string
+  impact: string
+  url: string | null
+  updated_at: string | null
+}
+
+export interface ModelMonitorSourceStatus {
+  id: string
+  name: string
+  source_type: ModelMonitorSourceType
+  status_page_url: string
+  collection_state: ModelMonitorCollectionState
+  collection_error: string | null
+  overall_status: ModelMonitorStatus
+  source_updated_at: string | null
+  checked_at: string
+  last_success_at: string | null
+  history_granularity: ModelMonitorHistoryGranularity
+  history_window_label: string
+  groups: ModelMonitorServiceGroup[]
+  services: ModelMonitorServiceStatus[]
+  incidents: ModelMonitorIncident[]
+}
+
+export interface ModelMonitorResponse {
+  sources: ModelMonitorSourceStatus[]
+}
+
+export interface ModelMonitorProxySettings {
+  enabled: boolean
+  proxy_url: string
+}
+
+export interface ModelMonitorProxySettingsPayload {
+  enabled?: boolean
+  proxy_url?: string
 }

@@ -87,9 +87,9 @@ Configure the CLIProxyAPI / CPAMC endpoint, model request URL, management key, l
 
 ![System settings](pictures/系统设置.png)
 
-### Account Inspection
+### Channel Inspection
 
-**Inspection settings**
+**Account Inspection Settings**
 
 Configure Codex auth file inspection with Cron schedules, quota thresholds, conditional scanning, timeouts, retries, worker count and priority rules.
 
@@ -100,6 +100,10 @@ Configure Codex auth file inspection with Cron schedules, quota thresholds, cond
 Review auth file health, quota windows, account types, priorities and the latest inspection actions.
 
 ![Account status](pictures/账号状态.png)
+
+**Model Monitoring**
+
+View AI.INPUT.IM's upstream minute samples plus OpenAI and Claude Status' official daily status history from three built-in sources.
 
 ### Account Views
 
@@ -338,7 +342,7 @@ Use the System Settings page to configure:
 - The Model Pricing page shows CPA's currently available models alongside the local price catalog so missing prices are easy to find.
 - Token models store input, output, cache read and cache write prices as USD per million tokens. Models whose name contains `image` use a fixed USD price per successful request; if that per-request price is missing, the model is treated as unpriced.
 - Usage-history pages recalculate displayed costs with the current price catalog; already written balance charge records keep the amount calculated at the time and are not retroactively repriced.
-- LiteLLM sync can quickly fill the local price catalog while preserving manual prices. If GitHub is not reachable, configure the LiteLLM proxy from the Model Pricing page.
+- LiteLLM sync can quickly fill the local price catalog while preserving manual prices.
 - Each API key row includes Request Test, which shows the Base URL, endpoint URL, auth header and curl example, and can send one real test request.
 - Request testing supports Chat Completions, Responses and Claude Messages formats. The examples and test payload switch with the selected format.
 
@@ -364,9 +368,9 @@ $env:CPA_HELPER_DATA_DIR="<your-data-dir>"
 
 Then start the backend service.
 
-### Account Inspection
+### Channel Inspection
 
-The Inspection Settings page manages Codex auth files:
+The Account Inspection Settings page manages Codex auth files:
 
 - Cron expressions define the automatic inspection schedule.
 - Quota thresholds decide when account priority should be degraded or restored.
@@ -374,6 +378,7 @@ The Inspection Settings page manages Codex auth files:
 - Conditional scanning compares locally recorded accounts with the current CPA account list: accounts missing locally are queried once for quota and recorded, while accounts no longer present in CPA are removed locally.
 - Priority rules define default scheduling weights by account type.
 - The Account Status page shows health, quota, latest inspection, enabled state and manual priority.
+- The Model Monitoring page independently collects AI.INPUT.IM, OpenAI and Claude Status, preserving each source's native minute or daily history. It does not send paid model probes or claim end-to-end availability for a specific account or route. Administrators can configure an independent proxy from the Model Monitoring page when direct access is unavailable.
 
 ## Development and Checks
 
