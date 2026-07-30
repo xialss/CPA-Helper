@@ -22,6 +22,7 @@ import {
   Cpu,
   DollarSign,
   Github,
+  Gauge,
   KeyRound,
   Languages,
   List,
@@ -129,11 +130,12 @@ const adminMenuItems = computed<MenuOption[]>(() => [
 
 const accountInspectionMenuItems = computed<MenuOption[]>(() => [
   {
-    label: t('巡检设置', 'Inspection Settings'),
+    label: t('账号巡检设置', 'Account Inspection Settings'),
     key: '/admin/account-inspection',
     icon: renderIcon(Activity),
   },
   { label: t('账号状态', 'Account Status'), key: '/admin/account-status', icon: renderIcon(ListChecks) },
+  { label: t('模型监控', 'Model Monitoring'), key: '/admin/model-monitor', icon: renderIcon(Gauge) },
 ])
 
 const accountMenuItems = computed<MenuOption[]>(() => [
@@ -181,7 +183,7 @@ const menuOptions = computed<MenuOption[]>(() => {
     })
     groups.push({
       type: 'group',
-      label: t('账号巡检', 'Account Inspection'),
+      label: t('渠道巡检', 'Channel Inspection'),
       key: 'account-inspection-group',
       icon: renderIcon(Activity),
       children: accountInspectionMenuItems.value,

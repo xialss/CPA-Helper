@@ -54,6 +54,24 @@ async function loadI18nWithBrowserStubs(options) {
 }
 
 try {
+  const {
+    modelMonitorSampleTimeFormatOptions,
+    modelMonitorTimestampFormatOptions,
+  } = await server.ssrLoadModule('/src/features/model-monitor/utils/timeFormat.ts')
+  assert.deepEqual(modelMonitorSampleTimeFormatOptions('day'), {
+    month: 'short',
+    day: 'numeric',
+    timeZone: 'UTC',
+  })
+  assert.deepEqual(modelMonitorSampleTimeFormatOptions('minute'), {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+  assert.deepEqual(modelMonitorTimestampFormatOptions(), {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  })
+
   installBrowserStubs({ browserLanguages: ['en-US'] })
 
   let {
@@ -68,6 +86,65 @@ try {
   assert.equal(localizedApiErrorMessage('validation_error', null), 'Invalid request parameters')
   assert.equal(localizedApiErrorMessage(null, null), 'Request failed')
   assert.equal(localizedServerMessage('巡检完成'), 'Inspection complete')
+  const modelMonitorErrors = [
+    ['模型监控上游返回 HTTP 502', 'Model monitoring upstream returned HTTP 502'],
+    ['模型监控上游返回了不支持的内容类型 "text/html"', 'Model monitoring upstream returned unsupported content type "text/html"'],
+    ['读取模型监控上游响应失败: unexpected EOF', 'Failed to read model monitoring upstream response: unexpected EOF'],
+    ['模型监控上游响应超过 8 MiB 限制', 'Model monitoring upstream response exceeds the 8 MiB limit'],
+    ['OpenAI 页面分组结构无效', 'OpenAI page group structure is invalid'],
+    ['OpenAI summary components 字段无效', 'OpenAI summary components field is invalid'],
+    ['Anthropic 当前组件缺少必要字段', 'Anthropic current component is missing required fields'],
+    ['Anthropic 组件 "claude-api" 的历史结构无效', 'Anthropic component "claude-api" history structure is invalid'],
+    ['Anthropic 页面 uptimeData 无效: JSON 对象未闭合', 'Anthropic page uptimeData is invalid: JSON object is not closed'],
+    ['OpenAI uptime 引用了未知 group "group-api"', 'OpenAI uptime references unknown group "group-api"'],
+    ['OpenAI uptime 引用了未知组件 "api"', 'OpenAI uptime references unknown component "api"'],
+    ['OpenAI impact 引用了未知组件 "api"', 'OpenAI impact references unknown component "api"'],
+    ['OpenAI impact 引用了无法映射的 incident "incident-live"', 'OpenAI impact references unmapped incident "incident-live"'],
+    ['OpenAI 可见结构引用的 component "api" 缺少当前状态', 'OpenAI component referenced by the visible structure "api" is missing current status'],
+    ['OpenAI 页面 incident link 缺少 ID 或标题', 'OpenAI page incident link is missing ID or title'],
+    ['OpenAI 页面缺少incident links', 'OpenAI page is missing incident links'],
+    ['OpenAI 页面缺少 incident links', 'OpenAI page is missing incident links'],
+    ['OpenAI group "group-api" 缺少aggregated uptime', 'OpenAI group "group-api" is missing aggregated uptime'],
+    ['OpenAI group "group-api" 缺少 aggregated uptime', 'OpenAI group "group-api" is missing aggregated uptime'],
+    ['Anthropic 当前组件 "claude-api" 缺少历史', 'Anthropic current component "claude-api" is missing history'],
+    ['Anthropic 当前组件 "claude-api" 缺少 历史', 'Anthropic current component "claude-api" is missing history'],
+    ['Anthropic 组件 "claude-api" 的 related event 缺少名称或 code', 'Anthropic component "claude-api" related event is missing name or code'],
+    ['AI.INPUT.IM service 结构无效', 'AI.INPUT.IM service structure is invalid'],
+    ['AI.INPUT.IM 响应缺少必要字段', 'AI.INPUT.IM response is missing required fields'],
+  ]
+  for (const [input, expected] of modelMonitorErrors) {
+    const translated = localizedServerMessage(input)
+    assert.equal(translated, expected)
+    assert.doesNotMatch(translated, /\p{Script=Han}/u)
+  }
+  assert.equal(
+    localizedServerMessage('模型监控请求失败: 状态页重定向必须使用 HTTPS'),
+    'Model monitoring request failed: Status page redirects must use HTTPS',
+  )
+  assert.equal(
+    localizedServerMessage('模型监控请求失败: 状态页重定向次数过多'),
+    'Model monitoring request failed: Too many status page redirects',
+  )
+  assert.equal(
+    localizedServerMessage('模型监控请求失败: Get "https://status.example.com": 状态页重定向必须使用 HTTPS'),
+    'Model monitoring request failed: Get "https://status.example.com": Status page redirects must use HTTPS',
+  )
+  assert.equal(
+    localizedServerMessage('模型监控请求失败: Get "https://status.example.com": 状态页重定向次数过多'),
+    'Model monitoring request failed: Get "https://status.example.com": Too many status page redirects',
+  )
+  assert.equal(
+    localizedServerMessage('模型监控请求失败: dial tcp: 上游自定义详情'),
+    'Model monitoring request failed: dial tcp: 上游自定义详情',
+  )
+  assert.equal(
+    localizedServerMessage('审计页面组件无效'),
+    'Request failed: 审计页面组件 is invalid',
+  )
+  assert.equal(
+    localizedServerMessage('审计标题无效'),
+    'Request failed: 审计标题 is invalid',
+  )
   assert.equal(
     localizedServerMessage('巡检完成：健康 1，坏凭证禁用 2，恢复启用 3，优先级降级 4，网络错误 5，缓存跳过 6'),
     'Inspection complete: 1 healthy, 2 bad credentials disabled, 3 restored, 4 priorities lowered, 5 network errors, 6 skipped by cache',

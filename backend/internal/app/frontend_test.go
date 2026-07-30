@@ -162,3 +162,61 @@ func TestHandleSPADoesNotReturnExternalIndexForMissingAsset(t *testing.T) {
 		t.Fatalf("missing asset body = %q, must not contain index", recorder.Body.String())
 	}
 }
+
+func TestModelMonitorViewKeepsAggregateLoadErrorsVisible(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "frontend", "src", "features", "model-monitor", "views", "ModelMonitorView.vue")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(body)
+	for _, expected := range []string{
+		"const loading = ref(true)",
+		"if (sources.value.length === 0) {",
+		"aggregateLoadError.value = localizedError",
+		"aggregateLoadError.value = null",
+		`@click="loadMonitor(true)"`,
+		"t('重试', 'Retry')",
+	} {
+		if !strings.Contains(source, expected) {
+			t.Fatalf("ModelMonitorView.vue missing aggregate load state contract %q", expected)
+		}
+	}
+	if count := strings.Count(source, "sources.value ="); count != 1 {
+		t.Fatalf("ModelMonitorView.vue assigns sources %d times, want only the successful response assignment", count)
+	}
+	assertOrdered := func(label string, expected ...string) {
+		t.Helper()
+		offset := 0
+		for _, part := range expected {
+			index := strings.Index(source[offset:], part)
+			if index < 0 {
+				t.Fatalf("ModelMonitorView.vue missing ordered %s contract %q", label, part)
+			}
+			offset += index + len(part)
+		}
+	}
+	assertOrdered(
+		"request state",
+		"if (monitorRequestPending) {",
+		"if (manual) monitorReloadQueued = true",
+		"monitorRequestPending = true",
+		"const response = await getModelMonitor()",
+		"sources.value = response.sources",
+		"aggregateLoadError.value = null",
+		"} catch (error) {",
+		"aggregateLoadError.value = localizedError",
+		"} finally {",
+		"monitorRequestPending = false",
+		"if (monitorReloadQueued) {",
+		"void loadMonitor(true)",
+	)
+	assertOrdered(
+		"render priority",
+		`<div v-if="sources.length" class="source-grid">`,
+		`v-else-if="!loading && aggregateLoadError"`,
+		`@click="loadMonitor(true)"`,
+		"t('重试', 'Retry')",
+		`v-else-if="!loading && !aggregateLoadError"`,
+	)
+}

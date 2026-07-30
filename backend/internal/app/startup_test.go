@@ -106,6 +106,37 @@ func TestReadyEndpointReportsMigrationVersion(t *testing.T) {
 	}
 }
 
+func TestRequireSchemaShapeRejectsMissingModelMonitorProxyColumns(t *testing.T) {
+	for _, missing := range []string{"model_monitor_proxy_enabled", "model_monitor_proxy_url"} {
+		t.Run(missing, func(t *testing.T) {
+			db, err := sql.Open("sqlite", ":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			db.SetMaxOpenConns(1)
+			statements := []string{
+				appSettingsSchemaForStartupTest(missing),
+				`CREATE TABLE users (username TEXT)`,
+				`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
+				codexKeeperAuthStateSchemaForStartupTest,
+				modelPriceSchemaForStartupTest,
+				modelPriceLibraryConflictSchemaForStartupTest,
+				`CREATE TABLE user_quota_charges (lifetime_deducted_usd TEXT)`,
+			}
+			for _, statement := range statements {
+				if _, err := db.Exec(statement); err != nil {
+					t.Fatalf("create test schema: %v", err)
+				}
+			}
+			err = requireSchemaShape(context.Background(), db)
+			if !errors.Is(err, ErrDatabaseNeedsMigration) || !strings.Contains(err.Error(), "app_settings."+missing) {
+				t.Fatalf("requireSchemaShape error = %v, want missing app_settings.%s", err, missing)
+			}
+		})
+	}
+}
+
 func TestRequireSchemaShapeRejectsMissingModelPriceChannelColumns(t *testing.T) {
 	requiredModelPriceColumns := []string{
 		"request_usd",
@@ -135,7 +166,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceChannelColumns(t *testing.T) 
 				}
 			}
 			statements := []string{
-				`CREATE TABLE app_settings (session_secret TEXT)`,
+				appSettingsSchemaForStartupTest(""),
 				`CREATE TABLE users (username TEXT)`,
 				`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
 				codexKeeperAuthStateSchemaForStartupTest,
@@ -164,7 +195,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceLibraryConflictsTable(t *test
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	statements := []string{
-		`CREATE TABLE app_settings (session_secret TEXT)`,
+		appSettingsSchemaForStartupTest(""),
 		`CREATE TABLE users (username TEXT)`,
 		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
 		codexKeeperAuthStateSchemaForStartupTest,
@@ -195,7 +226,7 @@ func TestRequireSchemaShapeRejectsMissingKeeperAuthIndex(t *testing.T) {
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	statements := []string{
-		`CREATE TABLE app_settings (session_secret TEXT)`,
+		appSettingsSchemaForStartupTest(""),
 		`CREATE TABLE users (username TEXT)`,
 		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
 		`CREATE TABLE codex_keeper_auth_states (auth_name TEXT)`,
@@ -221,6 +252,13 @@ func TestRequireSchemaShapeRejectsMissingKeeperAuthIndex(t *testing.T) {
 
 const codexKeeperAuthStateSchemaForStartupTest = `CREATE TABLE codex_keeper_auth_states (auth_index TEXT)`
 
+const modelPriceSchemaForStartupTest = `CREATE TABLE model_prices (
+	request_usd TEXT, priority_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
+	long_context_threshold_tokens TEXT, long_context_input_usd_per_million TEXT,
+	long_context_output_usd_per_million TEXT, long_context_cache_read_usd_per_million TEXT,
+	long_context_cache_creation_usd_per_million TEXT
+)`
+
 const modelPriceLibraryConflictSchemaForStartupTest = `CREATE TABLE model_price_library_conflicts (
 	original_id TEXT, selected_price_id TEXT, conflict_reason TEXT, provider TEXT, model TEXT,
 	input_usd_per_million TEXT, output_usd_per_million TEXT,
@@ -230,3 +268,14 @@ const modelPriceLibraryConflictSchemaForStartupTest = `CREATE TABLE model_price_
 	long_context_cache_read_usd_per_million TEXT, long_context_cache_creation_usd_per_million TEXT,
 	source TEXT, source_model TEXT, auto_synced TEXT, last_synced_at TEXT, updated_at TEXT
 )`
+
+func appSettingsSchemaForStartupTest(missing string) string {
+	columns := []string{"session_secret TEXT", "model_monitor_proxy_enabled TEXT", "model_monitor_proxy_url TEXT"}
+	kept := make([]string, 0, len(columns))
+	for _, column := range columns {
+		if !strings.HasPrefix(column, missing+" ") {
+			kept = append(kept, column)
+		}
+	}
+	return `CREATE TABLE app_settings (` + strings.Join(kept, ", ") + `)`
+}

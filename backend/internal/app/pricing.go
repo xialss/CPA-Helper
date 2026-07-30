@@ -197,11 +197,6 @@ type modelPriceSyncRequest struct {
 	SourceURL *string `json:"source_url"`
 }
 
-type liteLLMProxySettingsPayload struct {
-	Enabled  *bool   `json:"enabled"`
-	ProxyURL *string `json:"proxy_url"`
-}
-
 type ModelPriceCatalogItem struct {
 	ID                   string                 `json:"id"`
 	Name                 string                 `json:"name"`
@@ -503,12 +498,6 @@ func (a *App) handleModelPriceByPath(w http.ResponseWriter, r *http.Request) err
 		}
 		return a.handleSyncLiteLLMPrices(w, r)
 	}
-	if path == "litellm-proxy" {
-		if _, err := a.adminUser(r.Context(), r); err != nil {
-			return err
-		}
-		return a.handleLiteLLMProxySettings(w, r)
-	}
 	if path == "catalog" {
 		if _, err := a.adminUser(r.Context(), r); err != nil {
 			return err
@@ -638,53 +627,6 @@ func (a *App) handleModelPriceByPath(w http.ResponseWriter, r *http.Request) err
 		return nil
 	default:
 		return methodNotAllowed()
-	}
-}
-
-func (a *App) handleLiteLLMProxySettings(w http.ResponseWriter, r *http.Request) error {
-	switch r.Method {
-	case http.MethodGet:
-		cfg, err := a.loadConfig(r.Context())
-		if err != nil {
-			return err
-		}
-		writeJSON(w, http.StatusOK, liteLLMProxySettingsResponse(cfg.LiteLLMProxy))
-		return nil
-	case http.MethodPut:
-		var payload liteLLMProxySettingsPayload
-		if err := decodeJSON(r, &payload); err != nil {
-			return err
-		}
-		cfg, err := a.loadConfig(r.Context())
-		if err != nil {
-			return err
-		}
-		next := cfg.LiteLLMProxy
-		if payload.Enabled != nil {
-			next.Enabled = *payload.Enabled
-		}
-		if payload.ProxyURL != nil {
-			next.ProxyURL = strings.TrimSpace(*payload.ProxyURL)
-		}
-		normalized, err := normalizeLiteLLMProxyConfig(next)
-		if err != nil {
-			return err
-		}
-		cfg.LiteLLMProxy = normalized
-		if err := a.saveConfig(r.Context(), cfg); err != nil {
-			return err
-		}
-		writeJSON(w, http.StatusOK, liteLLMProxySettingsResponse(cfg.LiteLLMProxy))
-		return nil
-	default:
-		return methodNotAllowed()
-	}
-}
-
-func liteLLMProxySettingsResponse(cfg LiteLLMProxyConfig) map[string]any {
-	return map[string]any{
-		"enabled":   cfg.Enabled,
-		"proxy_url": cfg.ProxyURL,
 	}
 }
 
@@ -2532,14 +2474,7 @@ func (a *App) handleSyncLiteLLMPrices(w http.ResponseWriter, r *http.Request) er
 	if err := ensureHTTPSURL(sourceURL); err != nil {
 		return err
 	}
-	cfg, err := a.loadConfig(r.Context())
-	if err != nil {
-		return err
-	}
-	client, err := liteLLMHTTPClient(30*time.Second, cfg.LiteLLMProxy)
-	if err != nil {
-		return err
-	}
+	client := httpClient(30 * time.Second)
 	response, rawPayload, err := doJSON(r.Context(), client, http.MethodGet, sourceURL, nil, nil)
 	if err != nil {
 		return validationError("下载 LiteLLM 价格数据失败")
@@ -3456,60 +3391,6 @@ func roundCostUSD(value float64) (float64, bool) {
 func recordCost(record UsageRecord, prices modelPriceIndex, matchContexts ...modelPriceMatchContext) (float64, bool) {
 	result := calculateRecordCost(record, prices, false, matchContexts...)
 	return result.TotalUSD, result.Unpriced
-}
-
-func liteLLMHTTPClient(timeout time.Duration, proxyCfg LiteLLMProxyConfig) (*http.Client, error) {
-	client := httpClient(timeout)
-	if !proxyCfg.Enabled {
-		return client, nil
-	}
-	normalized, err := normalizeLiteLLMProxyConfig(proxyCfg)
-	if err != nil {
-		return nil, err
-	}
-	proxyURL, err := url.Parse(normalized.ProxyURL)
-	if err != nil {
-		return nil, validationError("代理地址必须是有效的 http://、https:// 或 socks5:// 地址")
-	}
-	transport, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return nil, fmt.Errorf("default HTTP transport has unexpected type")
-	}
-	cloned := transport.Clone()
-	cloned.Proxy = http.ProxyURL(proxyURL)
-	client.Transport = cloned
-	return client, nil
-}
-
-func normalizeLiteLLMProxyConfig(input LiteLLMProxyConfig) (LiteLLMProxyConfig, error) {
-	proxyURL, err := normalizeLiteLLMProxyURL(input.ProxyURL)
-	if err != nil {
-		return LiteLLMProxyConfig{}, err
-	}
-	if input.Enabled && proxyURL == "" {
-		return LiteLLMProxyConfig{}, validationError("启用代理时必须填写代理地址")
-	}
-	return LiteLLMProxyConfig{Enabled: input.Enabled, ProxyURL: proxyURL}, nil
-}
-
-func normalizeLiteLLMProxyURL(value string) (string, error) {
-	text := strings.TrimSpace(value)
-	if text == "" {
-		return "", nil
-	}
-	parsed, err := url.Parse(text)
-	if err != nil || parsed.Host == "" || strings.TrimSpace(parsed.Hostname()) == "" {
-		return "", validationError("代理地址必须是有效的 http://、https:// 或 socks5:// 地址")
-	}
-	switch strings.ToLower(parsed.Scheme) {
-	case "http", "https", "socks5":
-		parsed.Scheme = strings.ToLower(parsed.Scheme)
-	case "sock5":
-		parsed.Scheme = "socks5"
-	default:
-		return "", validationError("代理地址必须是有效的 http://、https:// 或 socks5:// 地址")
-	}
-	return parsed.String(), nil
 }
 
 func usageAggregateInputTokens(record UsageRecord, matchedChannelBrands ...*aiProviderBrand) int {
