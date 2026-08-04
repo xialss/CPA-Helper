@@ -130,6 +130,7 @@ func (a *App) handleModelMonitor(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	defer client.CloseIdleConnections()
 
 	sources := modelMonitorBuiltInSources
 	statuses := make([]ModelMonitorSourceStatus, len(sources))

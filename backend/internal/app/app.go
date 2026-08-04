@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cpa-helper/backend/internal/app/web"
@@ -55,6 +56,8 @@ type App struct {
 	frontendEnv            bool
 	collector              *CollectorRunner
 	keeper                 *KeeperRunner
+	usageMaintenance       *usageMaintenanceRunner
+	usageHourlyMu          sync.Mutex
 	keeperUsageCache       keeperWindowUsageCache
 	priceSelectors         modelPriceSelectorSnapshotCache
 	modelMonitorHTTPClient func(ModelMonitorProxyConfig) (*http.Client, error)
@@ -96,8 +99,9 @@ func validationError(message string) *AppError {
 
 func New() (*App, error) {
 	return NewWithOptions(context.Background(), NewOptions{
-		Migrate:         true,
-		StartBackground: true,
+		Migrate:               true,
+		StartBackground:       true,
+		StartUsageMaintenance: true,
 	})
 }
 
@@ -148,6 +152,9 @@ func NewWithOptions(ctx context.Context, options NewOptions) (*App, error) {
 		return nil, err
 	}
 	app.priceSelectors.retainConfig(modelPriceSelectorConfigKey(cfg))
+	if options.StartUsageMaintenance {
+		app.startUsageMaintenance(ctx)
+	}
 	if options.StartBackground {
 		app.startBackground(ctx)
 	}
@@ -162,7 +169,18 @@ func (a *App) startBackground(ctx context.Context) {
 	a.keeper.StartAutoIfConfigured()
 }
 
+func (a *App) startUsageMaintenance(ctx context.Context) {
+	a.usageMaintenance = newUsageMaintenanceRunner(a)
+	if err := a.usageMaintenance.RunOnce(ctx); err != nil {
+		log.Printf("usage maintenance failed: %v", err)
+	}
+	a.usageMaintenance.Start()
+}
+
 func (a *App) Close() {
+	if a.usageMaintenance != nil {
+		a.usageMaintenance.Stop()
+	}
 	if a.collector != nil {
 		a.collector.Stop()
 	}

@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	usageTokenRepairAuditVersion = 2
+	usageTokenRepairAuditVersion = 3
 	usageTokenInputPath          = "$.tokens.input_tokens"
 	usageTokenOutputPath         = "$.tokens.output_tokens"
 )
@@ -49,6 +49,7 @@ type UsageTokenRepairAudit struct {
 	OutputCandidates     int64                      `json:"output_candidates"`
 	InputTokenDelta      int64                      `json:"input_token_delta"`
 	OutputTokenDelta     int64                      `json:"output_token_delta"`
+	PrunedRecords        int64                      `json:"pruned_records"`
 	EarliestTimestamp    string                     `json:"earliest_timestamp,omitempty"`
 	LatestTimestamp      string                     `json:"latest_timestamp,omitempty"`
 	QuotaChargeRows      int64                      `json:"quota_charge_rows"`
@@ -75,6 +76,7 @@ type UsageTokenRepairResult struct {
 	Updated             int64                 `json:"updated"`
 	Skipped             int64                 `json:"skipped"`
 	RemainingCandidates int64                 `json:"remaining_candidates"`
+	PrunedRecords       int64                 `json:"pruned_records"`
 }
 
 type usageTokenRepairCandidate struct {
@@ -148,6 +150,10 @@ func ApplyUsageTokenRepair(ctx context.Context, approved UsageTokenRepairAudit, 
 	if _, err := checkDatabaseReady(ctx, db, paths.DBPath); err != nil {
 		return result, err
 	}
+	analytics := &App{db: db}
+	if err := analytics.requireUsageAnalyticsFacts(ctx); err != nil {
+		return result, fmt.Errorf("usage token repair requires reconciled analytics facts: %w", err)
+	}
 	preBackup, err := auditUsageTokens(ctx, db, paths.DBPath)
 	if err != nil {
 		return result, err
@@ -216,6 +222,32 @@ func ApplyUsageTokenRepair(ctx context.Context, approved UsageTokenRepairAudit, 
 			return result, fmt.Errorf("usage token repair candidate %d changed during apply", candidate.id)
 		}
 		updated += rows
+		switch {
+		case candidate.inputMismatch && candidate.outputMismatch:
+			execResult, err = conn.ExecContext(ctx, `UPDATE usage_analytics_facts SET input_tokens = ?, output_tokens = ? WHERE usage_record_id = ?`, candidate.rawInputTokens, candidate.rawOutputTokens, candidate.id)
+		case candidate.inputMismatch:
+			execResult, err = conn.ExecContext(ctx, `UPDATE usage_analytics_facts SET input_tokens = ? WHERE usage_record_id = ?`, candidate.rawInputTokens, candidate.id)
+		default:
+			execResult, err = conn.ExecContext(ctx, `UPDATE usage_analytics_facts SET output_tokens = ? WHERE usage_record_id = ?`, candidate.rawOutputTokens, candidate.id)
+		}
+		if err != nil {
+			return result, fmt.Errorf("update usage analytics fact %d: %w", candidate.id, err)
+		}
+		factRows, err := execResult.RowsAffected()
+		if err != nil {
+			return result, err
+		}
+		if factRows != 1 {
+			return result, fmt.Errorf("usage analytics fact %d changed during repair", candidate.id)
+		}
+		if _, err := conn.ExecContext(ctx, `DELETE FROM usage_analytics_pending_facts WHERE usage_record_id = ?`, candidate.id); err != nil {
+			return result, fmt.Errorf("clear usage analytics pending fact %d: %w", candidate.id, err)
+		}
+	}
+	if updated > 0 {
+		if err := markUsageAnalyticsFactsChanged(ctx, conn); err != nil {
+			return result, err
+		}
 	}
 
 	after, _, err := auditUsageTokenCandidates(ctx, conn, paths.DBPath)
@@ -234,6 +266,7 @@ func ApplyUsageTokenRepair(ctx context.Context, approved UsageTokenRepairAudit, 
 		Updated:             updated,
 		Skipped:             current.Candidates - updated,
 		RemainingCandidates: after.Candidates,
+		PrunedRecords:       current.PrunedRecords,
 	}, nil
 }
 
@@ -243,6 +276,10 @@ func auditUsageTokens(ctx context.Context, db usageTokenRepairQuerier, dbPath st
 }
 
 func auditUsageTokenCandidates(ctx context.Context, db usageTokenRepairQuerier, dbPath string) (UsageTokenRepairAudit, []usageTokenRepairCandidate, error) {
+	return auditUsageTokenCandidatesAt(ctx, db, dbPath, time.Now().In(appTimeLocation))
+}
+
+func auditUsageTokenCandidatesAt(ctx context.Context, db usageTokenRepairQuerier, dbPath string, now time.Time) (UsageTokenRepairAudit, []usageTokenRepairCandidate, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, timestamp, input_tokens, output_tokens, cached_tokens,
 		       cache_read_tokens, cache_creation_tokens, reasoning_tokens,
@@ -257,11 +294,25 @@ func auditUsageTokenCandidates(ctx context.Context, db usageTokenRepairQuerier, 
 
 	var auditedRecords []usageTokenRepairCandidate
 	var candidates []usageTokenRepairCandidate
+	var prunedRecords int64
+	cutoff := usageRawRetentionCutoff(now)
 	for rows.Next() {
 		var candidate usageTokenRepairCandidate
 		var rawJSON string
 		if err := rows.Scan(&candidate.id, &candidate.timestamp, &candidate.inputTokens, &candidate.outputTokens, &candidate.cachedTokens, &candidate.cacheReadTokens, &candidate.cacheCreationTokens, &candidate.reasoningTokens, &candidate.totalTokens, &rawJSON); err != nil {
 			return UsageTokenRepairAudit{}, nil, err
+		}
+		if strings.TrimSpace(rawJSON) == "" {
+			prunedRecords++
+			continue
+		}
+		timestamp, ok := parseDBTime(candidate.timestamp)
+		if !ok {
+			return UsageTokenRepairAudit{}, nil, fmt.Errorf("parse usage token repair timestamp for record %d: %q", candidate.id, candidate.timestamp)
+		}
+		if timestamp.Before(cutoff) {
+			prunedRecords++
+			continue
 		}
 		var payload map[string]any
 		decoder := json.NewDecoder(strings.NewReader(rawJSON))
@@ -323,6 +374,7 @@ func auditUsageTokenCandidates(ctx context.Context, db usageTokenRepairQuerier, 
 		DatabasePath:        filepath.Clean(absoluteDBPath),
 		DatabaseFingerprint: usageTokenRepairDatabaseFingerprint(absoluteDBPath),
 		GeneratedAt:         time.Now().UTC().Format(time.RFC3339),
+		PrunedRecords:       prunedRecords,
 		Candidates:          int64(len(candidates)),
 		Evidence:            make([]UsageTokenRepairEvidence, 0, len(candidates)),
 	}
@@ -432,6 +484,7 @@ func sameUsageTokenRepairAudit(approved, current UsageTokenRepairAudit) bool {
 		approved.OutputCandidates == current.OutputCandidates &&
 		approved.InputTokenDelta == current.InputTokenDelta &&
 		approved.OutputTokenDelta == current.OutputTokenDelta &&
+		approved.PrunedRecords == current.PrunedRecords &&
 		approved.EarliestTimestamp == current.EarliestTimestamp &&
 		approved.LatestTimestamp == current.LatestTimestamp &&
 		approved.QuotaChargeRows == current.QuotaChargeRows &&

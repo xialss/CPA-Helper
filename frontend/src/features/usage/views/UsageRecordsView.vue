@@ -17,7 +17,16 @@ import {
 } from 'naive-ui'
 import { Zap } from 'lucide-vue-next'
 
-import { getUsageOptions, getUsageRecord, getUsageRecords } from '@/features/usage/api/usageApi'
+import {
+  getUsageOptions,
+  getUsageRecord,
+  getUsageRecords,
+  isUsageRecordsLegacyRangeValidationError,
+} from '@/features/usage/api/usageApi'
+import {
+  usageRecordsLatestRange as latestRecordsRange,
+  usageRecordsRetentionStart as recordsRetentionStart,
+} from '@/features/usage/recordsRetention'
 import type {
   RankingItem,
   UsageCostBreakdown,
@@ -38,7 +47,7 @@ import {
 import { useI18n } from '@/shared/i18n'
 
 type FailedFilter = 'all' | 'success' | 'failed'
-type QuickRangeKey = 'today' | 'last24h' | 'last3d' | 'last7d' | 'all'
+type QuickRangeKey = 'today' | 'last24h' | 'last3d' | 'last7d'
 type UsageScope = 'admin' | 'account'
 type RecordsTableLayoutProps =
   | { flexHeight: true }
@@ -47,6 +56,7 @@ type RecordsTableLayoutProps =
 interface RefreshOptions {
   resetPage?: boolean
   silent?: boolean
+  recoverLegacyRange?: boolean
 }
 
 interface Props {
@@ -56,8 +66,6 @@ interface Props {
 const AUTO_REFRESH_INTERVAL_MS = 5000
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
-const ALL_RECORDS_START_PARAM = '0001-01-01T00:00:00+08:00'
-const ALL_RECORDS_END_PARAM = '9999-12-31T23:59:59+08:00'
 const RECORDS_TABLE_MIN_ROW_HEIGHT = 40
 const RECORDS_TABLE_COLUMN_WIDTHS = {
   timestamp: 150,
@@ -142,12 +150,59 @@ function todayRange(): [number, number] {
   return [start.getTime(), tomorrow.getTime()]
 }
 
+function localTimeAt(
+  timestamp: number,
+  hour: number,
+  minute = 0,
+  second = 0,
+  millisecond = 0,
+): number {
+  const date = new Date(timestamp)
+  date.setHours(hour, minute, second, millisecond)
+  return date.getTime()
+}
+
+function isRecordsDateDisabled(timestamp: number): boolean {
+  return localTimeAt(timestamp, 23, 59, 59, 999) < recordsRetentionStart()
+}
+
+function isRecordsTimeDisabled(timestamp: number) {
+  const retentionStart = recordsRetentionStart()
+  return {
+    isHourDisabled(hour: number): boolean {
+      return localTimeAt(timestamp, hour, 59, 59, 999) < retentionStart
+    },
+    isMinuteDisabled(minute: number, hour: number | null): boolean {
+      return hour !== null && localTimeAt(timestamp, hour, minute, 59, 999) < retentionStart
+    },
+    isSecondDisabled(second: number, minute: number | null, hour: number | null): boolean {
+      return (
+        hour !== null &&
+        minute !== null &&
+        localTimeAt(timestamp, hour, minute, second) < retentionStart
+      )
+    },
+  }
+}
+
+function isRecordsRangeWithinRetention(range: [number, number]): boolean {
+  return range[0] >= recordsRetentionStart()
+}
+
 function isTodayRange(range: [number, number] | null): boolean {
   if (!range) {
     return false
   }
   const [todayStart, tomorrowStart] = todayRange()
   return range[0] === todayStart && range[1] === tomorrowStart
+}
+
+function isQuickRangeKey(value: unknown): value is QuickRangeKey {
+  return value === 'today' || value === 'last24h' || value === 'last3d' || value === 'last7d'
+}
+
+function quickRangeFromQuery(): QuickRangeKey | null {
+  return isQuickRangeKey(route.query.quick_range) ? route.query.quick_range : null
 }
 
 function failedFromQuery(): FailedFilter {
@@ -168,15 +223,18 @@ function numberFromQuery(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
-const initialIsAllRange = route.query.range === 'all'
-const initialDateRange = initialIsAllRange ? null : initialRange()
-const dateRange = ref<[number, number] | null>(initialDateRange)
+const legacyAllRangeRequested = ref(route.query.range === 'all')
+const legacyAllRangeTerminal = ref(false)
+const initialQuickRange = legacyAllRangeRequested.value ? null : quickRangeFromQuery()
+const initialDateRange = initialRange()
+const dateRange = ref<[number, number] | null>(
+  initialQuickRange ? buildQuickRange(initialQuickRange) : initialDateRange,
+)
 const activeQuickRange = ref<QuickRangeKey | null>(
-  initialIsAllRange
-    ? 'all'
-    : initialDateRange === null || isTodayRange(initialDateRange)
-      ? 'today'
-      : null,
+  legacyAllRangeRequested.value
+    ? null
+    : (initialQuickRange ??
+      (initialDateRange === null || isTodayRange(initialDateRange) ? 'today' : null)),
 )
 const filterForm = reactive({
   user_id: numberFromQuery(route.query.user_id),
@@ -194,7 +252,6 @@ const quickRangeOptions = computed<Array<{ key: QuickRangeKey; label: string }>>
   { key: 'last24h', label: t('近24小时', 'Last 24 hours') },
   { key: 'last3d', label: t('近3日', 'Last 3 days') },
   { key: 'last7d', label: t('近7日', 'Last 7 days') },
-  { key: 'all', label: t('全部', 'All') },
 ])
 
 const failedFilterOptions = computed(() => [
@@ -340,22 +397,10 @@ const refreshStatusText = computed(() => {
 function buildFilters(): UsageFilters {
   const failed =
     filterForm.failed === 'all' ? undefined : filterForm.failed === 'failed' ? true : false
-  const start =
-    activeQuickRange.value === 'all'
-      ? ALL_RECORDS_START_PARAM
-      : dateRange.value
-        ? formatLocalDateTimeParam(dateRange.value[0])
-        : undefined
-  const end =
-    activeQuickRange.value === 'all'
-      ? ALL_RECORDS_END_PARAM
-      : dateRange.value
-        ? formatLocalDateTimeParam(dateRange.value[1])
-        : undefined
   return {
     scope: props.scope,
-    start,
-    end,
+    start: dateRange.value ? formatLocalDateTimeParam(dateRange.value[0]) : undefined,
+    end: dateRange.value ? formatLocalDateTimeParam(dateRange.value[1]) : undefined,
     user_id: isAccountScope.value ? undefined : (filterForm.user_id ?? undefined),
     api_key_description: filterForm.api_key_description ?? undefined,
     provider: filterForm.provider ?? undefined,
@@ -368,7 +413,7 @@ function buildFilters(): UsageFilters {
 
 function filtersToQuery(
   filters: UsageFilters,
-  rangeKey: QuickRangeKey | null = null,
+  quickRangeKey: QuickRangeKey | null = null,
 ): Record<string, string> {
   const query: Record<string, string> = {}
   Object.entries(filters).forEach(([key, value]) => {
@@ -376,15 +421,13 @@ function filtersToQuery(
       query[key] = String(value)
     }
   })
-  if (rangeKey === 'all') {
-    delete query.start
-    delete query.end
-    query.range = 'all'
+  if (quickRangeKey) {
+    query.quick_range = quickRangeKey
   }
   return query
 }
 
-function buildQuickRange(key: QuickRangeKey): [number, number] | null {
+function buildQuickRange(key: QuickRangeKey): [number, number] {
   switch (key) {
     case 'today':
       return todayRange()
@@ -397,11 +440,8 @@ function buildQuickRange(key: QuickRangeKey): [number, number] | null {
       return [end - 3 * DAY_MS, end]
     }
     case 'last7d': {
-      const end = Date.now()
-      return [end - 7 * DAY_MS, end]
+      return latestRecordsRange()
     }
-    case 'all':
-      return null
   }
 }
 
@@ -424,12 +464,40 @@ function normalizeSelectValue(value: unknown): string | null {
   return String(value)
 }
 
+function clearLegacyAllRangeRequest() {
+  if (
+    legacyAllRangeRequested.value &&
+    (dateRange.value === null || !isRecordsRangeWithinRetention(dateRange.value))
+  ) {
+    activeQuickRange.value = 'last7d'
+    dateRange.value = latestRecordsRange()
+  }
+  legacyAllRangeRequested.value = false
+  // A user-selected filter/range replaces the legacy URL request immediately.
+  // Do this before its fetch settles so a transient follow-up failure keeps
+  // normal automatic polling available.
+  legacyAllRangeTerminal.value = false
+}
+
 function refreshAfterFilterChange() {
-  void refresh({ resetPage: true })
+  clearLegacyAllRangeRequest()
+  void refresh({ resetPage: true, recoverLegacyRange: true })
 }
 
 function handleCustomRangeChange(value: unknown) {
-  dateRange.value = normalizeRangeValue(value)
+  const nextRange = normalizeRangeValue(value)
+  if (!nextRange) {
+    dateRange.value = todayRange()
+    activeQuickRange.value = 'today'
+    refreshAfterFilterChange()
+    return
+  }
+  if (nextRange && !isRecordsRangeWithinRetention(nextRange)) {
+    message.error(t('请求明细仅支持近 7 日范围', 'Request records are limited to the last 7 days'))
+    return
+  }
+  clearLegacyAllRangeRequest()
+  dateRange.value = nextRange
   activeQuickRange.value = null
   refreshAfterFilterChange()
 }
@@ -470,12 +538,14 @@ function handleFailedChange(value: unknown) {
 }
 
 async function applyQuickRange(key: QuickRangeKey) {
+  clearLegacyAllRangeRequest()
   activeQuickRange.value = key
   dateRange.value = buildQuickRange(key)
-  await refresh({ resetPage: true })
+  await refresh({ resetPage: true, recoverLegacyRange: true })
 }
 
 let queuedRefresh: RefreshOptions | null = null
+let refreshGeneration = 0
 
 function queueRefresh(options: RefreshOptions) {
   if (options.silent) {
@@ -484,12 +554,21 @@ function queueRefresh(options: RefreshOptions) {
   queuedRefresh = {
     resetPage: Boolean(queuedRefresh?.resetPage || options.resetPage),
     silent: false,
+    recoverLegacyRange: Boolean(queuedRefresh?.recoverLegacyRange || options.recoverLegacyRange),
   }
 }
 
-async function refresh({ resetPage = false, silent = false }: RefreshOptions = {}) {
+async function refresh({
+  resetPage = false,
+  silent = false,
+  recoverLegacyRange = false,
+}: RefreshOptions = {}) {
+  if (legacyAllRangeTerminal.value && !recoverLegacyRange) {
+    return
+  }
+  const requestGeneration = silent ? refreshGeneration : ++refreshGeneration
   if (isLoading.value || isAutoRefreshing.value) {
-    queueRefresh({ resetPage, silent })
+    queueRefresh({ resetPage, silent, recoverLegacyRange })
     return
   }
   if (resetPage) {
@@ -503,15 +582,20 @@ async function refresh({ resetPage = false, silent = false }: RefreshOptions = {
   } else {
     isLoading.value = true
   }
+  let requestedRange: 'all' | undefined
   try {
     const filters = buildFilters()
+    requestedRange = legacyAllRangeRequested.value ? 'all' : undefined
     const usedServerDefaultRange = filters.start === undefined && filters.end === undefined
     const [recordsResult, optionsResult] = await Promise.allSettled([
-      getUsageRecords(filters, page.value, pageSize.value),
-      silent ? Promise.resolve(null) : getUsageOptions(filters),
+      getUsageRecords(filters, page.value, pageSize.value, { range: requestedRange }),
+      silent || requestedRange ? Promise.resolve(null) : getUsageOptions(filters),
     ])
     if (recordsResult.status === 'rejected') {
       throw recordsResult.reason
+    }
+    if (requestGeneration !== refreshGeneration) {
+      return
     }
     const nextRecords = recordsResult.value
     const nextOptions = optionsResult.status === 'fulfilled' ? optionsResult.value : null
@@ -534,7 +618,18 @@ async function refresh({ resetPage = false, silent = false }: RefreshOptions = {
     autoRefreshError.value = null
     lastRefreshedAt.value = new Date()
   } catch (error) {
+    if (requestGeneration !== refreshGeneration) {
+      return
+    }
     const errorMessage = errorText(error, '加载明细失败', 'Failed to load records')
+    if (
+      requestedRange === 'all' &&
+      legacyAllRangeRequested.value &&
+      isUsageRecordsLegacyRangeValidationError(error)
+    ) {
+      legacyAllRangeTerminal.value = true
+      autoRefreshError.value = errorMessage
+    }
     if (silent) {
       autoRefreshError.value = errorMessage
     } else {
@@ -1260,6 +1355,8 @@ onBeforeUnmount(() => {
             class="range-picker"
             type="datetimerange"
             clearable
+            :is-date-disabled="isRecordsDateDisabled"
+            :is-time-disabled="isRecordsTimeDisabled"
             @update:value="handleCustomRangeChange"
           />
         </div>
@@ -1321,7 +1418,7 @@ onBeforeUnmount(() => {
               :options="failedFilterOptions"
               @update:value="handleFailedChange"
             />
-            <NButton secondary :loading="isLoading" @click="refresh({ resetPage: true })">
+            <NButton secondary :loading="isLoading" @click="refreshAfterFilterChange">
               {{ t('筛选', 'Filter') }}
             </NButton>
           </div>

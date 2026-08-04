@@ -1202,6 +1202,10 @@ func TestDBBackedAPIsReturnBeijingOffsetTimeStrings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert model price times: %v", err)
 	}
+	usageWindow := newUsageTestTimeWindow()
+	usageStart, usageEnd := usageWindow.rangeValues()
+	usageCreatedAt := usageWindow.timestamp(12, 47, 53)
+	usageTimestamp := usageWindow.timestamp(12, 47, 44)
 	_, err = db.Exec(`
 		INSERT INTO usage_records (
 			created_at, timestamp, usage_username, api_key_description, provider,
@@ -1209,7 +1213,7 @@ func TestDBBackedAPIsReturnBeijingOffsetTimeStrings(t *testing.T) {
 			input_tokens, output_tokens, cached_tokens, reasoning_tokens,
 			total_tokens, dedupe_key, raw_json
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 2, 0, 0, 3, ?, '{}')
-	`, "2026-05-13T12:47:53+08:00", "2026-05-13T12:47:44+08:00", "admin", "time key", "openai", "gpt-time-test", "/v1/chat/completions", "test", "req-time", "auth", 123.0, "dedupe-time-test")
+	`, usageCreatedAt, usageTimestamp, "admin", "time key", "openai", "gpt-time-test", "/v1/chat/completions", "test", "req-time", "auth", 123.0, "dedupe-time-test")
 	if err != nil {
 		t.Fatalf("insert usage record times: %v", err)
 	}
@@ -1254,11 +1258,11 @@ func TestDBBackedAPIsReturnBeijingOffsetTimeStrings(t *testing.T) {
 	}
 
 	records := usageRecordsTimeResponse{}
-	requestJSON(t, handler, http.MethodGet, "/api/usage/records?scope=admin&page=1&page_size=1&start=2026-05-13T00:00:00&end=2026-05-14T00:00:00", nil, cookies, &records)
+	requestJSON(t, handler, http.MethodGet, "/api/usage/records?scope=admin&page=1&page_size=1&start="+usageStart+"&end="+usageEnd, nil, cookies, &records)
 	if len(records.Items) != 1 {
 		t.Fatalf("usage records length = %d, want 1", len(records.Items))
 	}
-	if got := records.Items[0].Timestamp; got != "2026-05-13T12:47:44+08:00" {
+	if got := records.Items[0].Timestamp; got != usageTimestamp {
 		t.Fatalf("usage timestamp = %q, want Beijing offset string", got)
 	}
 }

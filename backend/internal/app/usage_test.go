@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	backendApp "cpa-helper/backend/internal/app"
 )
@@ -83,6 +84,24 @@ type usageDistributionItem struct {
 	TotalTokens int    `json:"total_tokens"`
 }
 
+type usageTestTimeWindow struct {
+	start time.Time
+}
+
+func newUsageTestTimeWindow() usageTestTimeWindow {
+	location := time.FixedZone("Asia/Shanghai", 8*60*60)
+	now := time.Now().In(location)
+	return usageTestTimeWindow{start: time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)}
+}
+
+func (window usageTestTimeWindow) rangeValues() (string, string) {
+	return window.start.Format("2006-01-02T15:04:05"), window.start.AddDate(0, 0, 1).Format("2006-01-02T15:04:05")
+}
+
+func (window usageTestTimeWindow) timestamp(hour, minute, second int) string {
+	return window.start.Add(time.Duration(hour)*time.Hour + time.Duration(minute)*time.Minute + time.Duration(second)*time.Second).Format(time.RFC3339)
+}
+
 func TestUsageRecordsReturnBeijingOffsetTimes(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
@@ -99,25 +118,28 @@ func TestUsageRecordsReturnBeijingOffsetTimes(t *testing.T) {
 		"password": "test-password",
 		"nickname": "Admin",
 	}, nil, nil)
-	seedUsageRecord(t, dataDir, "2026-05-16T16:37:00+08:00")
+	window := newUsageTestTimeWindow()
+	start, end := window.rangeValues()
+	timestamp := window.timestamp(16, 37, 0)
+	seedUsageRecord(t, dataDir, timestamp)
 
-	const recordsPath = "/api/usage/records?scope=admin&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00"
+	recordsPath := "/api/usage/records?scope=admin&start=" + start + "&end=" + end
 	records := usageRecordsResponse{}
 	requestJSON(t, handler, http.MethodGet, recordsPath, nil, cookies, &records)
 	if len(records.Items) != 1 {
 		t.Fatalf("usage record count = %d, want 1", len(records.Items))
 	}
-	if records.Items[0].Timestamp != "2026-05-16T16:37:00+08:00" {
+	if records.Items[0].Timestamp != timestamp {
 		t.Fatalf("timestamp = %q, want Beijing offset value", records.Items[0].Timestamp)
 	}
-	if records.Start != "2026-05-16T00:00:00+08:00" || records.End != "2026-05-17T00:00:00+08:00" {
+	if records.Start != start+"+08:00" || records.End != end+"+08:00" {
 		t.Fatalf("range = %q - %q, want Beijing offset range", records.Start, records.End)
 	}
 
-	const summaryPath = "/api/usage/summary?scope=admin&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00"
+	summaryPath := "/api/usage/summary?scope=admin&start=" + start + "&end=" + end
 	summary := usageSummaryResponse{}
 	requestJSON(t, handler, http.MethodGet, summaryPath, nil, cookies, &summary)
-	if summary.Start != "2026-05-16T00:00:00+08:00" || summary.End != "2026-05-17T00:00:00+08:00" {
+	if summary.Start != start+"+08:00" || summary.End != end+"+08:00" {
 		t.Fatalf("summary range = %q - %q, want Beijing offset range", summary.Start, summary.End)
 	}
 }
@@ -138,12 +160,14 @@ func TestUsageRecordsExposeReasoningEffortTTFTAndSummaryAverage(t *testing.T) {
 		"password": "test-password",
 		"nickname": "Admin",
 	}, nil, nil)
+	window := newUsageTestTimeWindow()
+	start, end := window.rangeValues()
 
 	firstTTFT := 710.0
 	secondTTFT := 290.0
 	zeroTTFT := 0.0
 	firstID := seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
-		Timestamp:         "2026-05-16T16:37:00+08:00",
+		Timestamp:         window.timestamp(16, 37, 0),
 		Username:          "admin",
 		APIKeyDescription: "VSCode",
 		Provider:          "openai",
@@ -161,7 +185,7 @@ func TestUsageRecordsExposeReasoningEffortTTFTAndSummaryAverage(t *testing.T) {
 		TotalTokens:       12,
 	})
 	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
-		Timestamp:    "2026-05-16T16:38:00+08:00",
+		Timestamp:    window.timestamp(16, 38, 0),
 		Username:     "admin",
 		Source:       "code10002",
 		RequestID:    "req-ttft-2",
@@ -174,7 +198,7 @@ func TestUsageRecordsExposeReasoningEffortTTFTAndSummaryAverage(t *testing.T) {
 		TotalTokens:  12,
 	})
 	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
-		Timestamp:    "2026-05-16T16:39:00+08:00",
+		Timestamp:    window.timestamp(16, 39, 0),
 		Username:     "admin",
 		Source:       "code10003",
 		RequestID:    "req-ttft-zero",
@@ -187,7 +211,7 @@ func TestUsageRecordsExposeReasoningEffortTTFTAndSummaryAverage(t *testing.T) {
 		TotalTokens:  12,
 	})
 
-	const recordsPath = "/api/usage/records?scope=admin&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00"
+	recordsPath := "/api/usage/records?scope=admin&start=" + start + "&end=" + end
 	records := usageRecordsResponse{}
 	requestJSON(t, handler, http.MethodGet, recordsPath, nil, cookies, &records)
 	if len(records.Items) != 3 {
@@ -220,7 +244,7 @@ func TestUsageRecordsExposeReasoningEffortTTFTAndSummaryAverage(t *testing.T) {
 	}
 
 	summary := usageSummaryResponse{}
-	requestJSON(t, handler, http.MethodGet, "/api/usage/summary?scope=admin&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00", nil, cookies, &summary)
+	requestJSON(t, handler, http.MethodGet, "/api/usage/summary?scope=admin&start="+start+"&end="+end, nil, cookies, &summary)
 	if summary.AverageTTFTMS == nil || *summary.AverageTTFTMS != 500 {
 		t.Fatalf("average_ttft_ms = %#v, want 500", summary.AverageTTFTMS)
 	}
@@ -229,7 +253,7 @@ func TestUsageRecordsExposeReasoningEffortTTFTAndSummaryAverage(t *testing.T) {
 	}
 
 	overview := usageOverviewDistributionsResponse{}
-	requestJSON(t, handler, http.MethodGet, "/api/usage/overview?scope=admin&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00", nil, cookies, &overview)
+	requestJSON(t, handler, http.MethodGet, "/api/usage/overview?scope=admin&start="+start+"&end="+end, nil, cookies, &overview)
 	if overview.Summary.AverageTTFTMS == nil || *overview.Summary.AverageTTFTMS != 500 {
 		t.Fatalf("overview average_ttft_ms = %#v, want 500", overview.Summary.AverageTTFTMS)
 	}
@@ -305,7 +329,7 @@ func TestUsageOptionsRespectDateRange(t *testing.T) {
 		RequestID:         "req-time-options-inside",
 		Auth:              "bearer",
 		DedupeKey:         "time-options-inside",
-		RawJSON:           `{"request_id":"req-time-options-inside"}`,
+		RawJSON:           `{"request_id":"req-time-options-inside","auth_type":"bearer"}`,
 		InputTokens:       10,
 		OutputTokens:      2,
 		TotalTokens:       12,
@@ -321,7 +345,7 @@ func TestUsageOptionsRespectDateRange(t *testing.T) {
 		RequestID:         "req-time-options-outside",
 		Auth:              "bearer",
 		DedupeKey:         "time-options-outside",
-		RawJSON:           `{"request_id":"req-time-options-outside"}`,
+		RawJSON:           `{"request_id":"req-time-options-outside","auth_type":"bearer"}`,
 		InputTokens:       10,
 		OutputTokens:      2,
 		TotalTokens:       12,
@@ -526,6 +550,100 @@ func TestUsageOptionsFailClosedOnConflictingAuthAndSupportLegacyRawJSONAuth(t *t
 	}
 }
 
+func TestUsageOptionsPersistAuthAmbiguityAfterRawPayloadPruning(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+	window := newUsageTestTimeWindow()
+	start, end := window.rangeValues()
+
+	const mismatchSource = "stored-raw-mismatch-source-secret"
+	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
+		Timestamp:   window.timestamp(16, 37, 0),
+		Username:    "admin",
+		Source:      mismatchSource,
+		RequestID:   "stored-raw-mismatch",
+		Auth:        "oauth",
+		DedupeKey:   "stored-raw-mismatch",
+		RawJSON:     `{"auth_type":"bearer"}`,
+		TotalTokens: 1,
+	})
+	const missingSource = "missing-raw-auth-source-secret"
+	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
+		Timestamp:   window.timestamp(16, 38, 0),
+		Username:    "admin",
+		Source:      missingSource,
+		RequestID:   "missing-raw-auth",
+		Auth:        "oauth",
+		DedupeKey:   "missing-raw-auth",
+		RawJSON:     `{}`,
+		TotalTokens: 1,
+	})
+	const malformedSource = "malformed-raw-auth-source-secret"
+	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
+		Timestamp:   window.timestamp(16, 39, 0),
+		Username:    "admin",
+		Source:      malformedSource,
+		RequestID:   "malformed-raw-auth",
+		Auth:        "bearer",
+		DedupeKey:   "malformed-raw-auth",
+		RawJSON:     `{`,
+		TotalTokens: 1,
+	})
+
+	options := usageOptionsTestResponse{}
+	requestJSON(t, handler, http.MethodGet, "/api/usage/options?scope=admin&start="+start+"&end="+end, nil, cookies, &options)
+	assertMaskedUsageOptionSources(t, options, mismatchSource, missingSource, malformedSource)
+
+	db := openUsageTestDB(t, dataDir)
+	if _, err := db.Exec(`UPDATE usage_records SET raw_json = ''`); err != nil {
+		_ = db.Close()
+		t.Fatalf("prune raw payloads: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close usage database after pruning: %v", err)
+	}
+
+	options = usageOptionsTestResponse{}
+	requestJSON(t, handler, http.MethodGet, "/api/usage/options?scope=admin&start="+start+"&end="+end, nil, cookies, &options)
+	assertMaskedUsageOptionSources(t, options, mismatchSource, missingSource, malformedSource)
+
+	records := usageRecordsResponse{}
+	requestJSON(t, handler, http.MethodGet, "/api/usage/records?scope=admin&start="+start+"&end="+end, nil, cookies, &records)
+	for _, record := range records.Items {
+		if record.Source == malformedSource {
+			return
+		}
+	}
+	t.Fatalf("stored bearer record source was unexpectedly redacted in request list: %#v", records.Items)
+}
+
+func assertMaskedUsageOptionSources(t *testing.T, options usageOptionsTestResponse, sources ...string) {
+	t.Helper()
+	labels := map[string]string{}
+	for _, option := range options.Sources {
+		labels[option.Key] = option.Label
+	}
+	for _, source := range sources {
+		label := labels[sourceKeyForTest(source)]
+		if label == source || !strings.Contains(label, "...") {
+			t.Fatalf("source option %q label = %q, want fail-closed masking", source, label)
+		}
+	}
+}
+
 func TestUsageRecordsFilterBySourceForAdmin(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
@@ -542,9 +660,11 @@ func TestUsageRecordsFilterBySourceForAdmin(t *testing.T) {
 		"password": "test-password",
 		"nickname": "Admin",
 	}, nil, nil)
+	window := newUsageTestTimeWindow()
+	start, end := window.rangeValues()
 
 	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
-		Timestamp:    "2026-05-16T16:37:00+08:00",
+		Timestamp:    window.timestamp(16, 37, 0),
 		Username:     "admin",
 		Source:       "vscode-source",
 		RequestID:    "req-source-filter-a",
@@ -556,7 +676,7 @@ func TestUsageRecordsFilterBySourceForAdmin(t *testing.T) {
 		TotalTokens:  12,
 	})
 	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
-		Timestamp:    "2026-05-16T16:38:00+08:00",
+		Timestamp:    window.timestamp(16, 38, 0),
 		Username:     "admin",
 		Source:       "browser-source",
 		RequestID:    "req-source-filter-b",
@@ -569,12 +689,73 @@ func TestUsageRecordsFilterBySourceForAdmin(t *testing.T) {
 	})
 
 	records := usageRecordsResponse{}
-	requestJSON(t, handler, http.MethodGet, "/api/usage/records?scope=admin&source_key="+sourceKeyForTest("vscode-source")+"&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00&page=1&page_size=10", nil, cookies, &records)
+	requestJSON(t, handler, http.MethodGet, "/api/usage/records?scope=admin&source_key="+sourceKeyForTest("vscode-source")+"&start="+start+"&end="+end+"&page=1&page_size=10", nil, cookies, &records)
 	if len(records.Items) != 1 {
 		t.Fatalf("usage record count = %d, want 1", len(records.Items))
 	}
 	if records.Items[0].Source != "vscode-source" {
 		t.Fatalf("source-filtered record source = %q, want vscode-source", records.Items[0].Source)
+	}
+}
+
+func TestUsageRecordsCombineSourceKeyAndRequestIDForAdmin(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+	window := newUsageTestTimeWindow()
+	start, end := window.rangeValues()
+
+	const selectedSource = "combined-filter-source"
+	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
+		Timestamp:   window.timestamp(16, 37, 0),
+		Username:    "admin",
+		Source:      selectedSource,
+		RequestID:   "prefix-needle-suffix",
+		Auth:        "bearer",
+		DedupeKey:   "combined-filter-match",
+		RawJSON:     `{"request_id":"prefix-needle-suffix"}`,
+		TotalTokens: 1,
+	})
+	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
+		Timestamp:   window.timestamp(16, 38, 0),
+		Username:    "admin",
+		Source:      selectedSource,
+		RequestID:   "same-source-other-request",
+		Auth:        "bearer",
+		DedupeKey:   "combined-filter-same-source",
+		RawJSON:     `{"request_id":"same-source-other-request"}`,
+		TotalTokens: 1,
+	})
+	seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
+		Timestamp:   window.timestamp(16, 39, 0),
+		Username:    "admin",
+		Source:      "other-combined-filter-source",
+		RequestID:   "other-prefix-needle-suffix",
+		Auth:        "bearer",
+		DedupeKey:   "combined-filter-other-source",
+		RawJSON:     `{"request_id":"other-prefix-needle-suffix"}`,
+		TotalTokens: 1,
+	})
+
+	records := usageRecordsResponse{}
+	requestJSON(t, handler, http.MethodGet, "/api/usage/records?scope=admin&source_key="+sourceKeyForTest(selectedSource)+"&request_id=needle&start="+start+"&end="+end+"&page=1&page_size=10", nil, cookies, &records)
+	if len(records.Items) != 1 {
+		t.Fatalf("combined source/request filter count = %d, want 1", len(records.Items))
+	}
+	if records.Items[0].Source != selectedSource || records.Items[0].RequestID == nil || *records.Items[0].RequestID != "prefix-needle-suffix" {
+		t.Fatalf("combined source/request filter item = %#v, want selected fuzzy request match", records.Items[0])
 	}
 }
 
@@ -594,10 +775,12 @@ func TestUsageResponsesRedactAPIKeySourceWithoutChangingStoredRecord(t *testing.
 		"password": "test-password",
 		"nickname": "Admin",
 	}, nil, nil)
+	window := newUsageTestTimeWindow()
+	start, end := window.rangeValues()
 
 	const source = "test-api-key-source-redaction-secret-value"
 	id := seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
-		Timestamp:    "2026-05-16T16:37:00+08:00",
+		Timestamp:    window.timestamp(16, 37, 0),
 		Username:     "admin",
 		Source:       source,
 		RequestID:    "req-api-key-source",
@@ -610,7 +793,7 @@ func TestUsageResponsesRedactAPIKeySourceWithoutChangingStoredRecord(t *testing.
 	})
 
 	records := usageRecordsResponse{}
-	requestJSON(t, handler, http.MethodGet, "/api/usage/records?scope=admin&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00&page=1&page_size=1", nil, cookies, &records)
+	requestJSON(t, handler, http.MethodGet, "/api/usage/records?scope=admin&start="+start+"&end="+end+"&page=1&page_size=1", nil, cookies, &records)
 	if len(records.Items) != 1 {
 		t.Fatalf("usage record count = %d, want 1", len(records.Items))
 	}
@@ -630,7 +813,7 @@ func TestUsageResponsesRedactAPIKeySourceWithoutChangingStoredRecord(t *testing.
 		t.Fatalf("raw_json.api_key = %q, want masked API key", got)
 	}
 	options := usageOptionsTestResponse{}
-	requestJSON(t, handler, http.MethodGet, "/api/usage/options?scope=admin&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00", nil, cookies, &options)
+	requestJSON(t, handler, http.MethodGet, "/api/usage/options?scope=admin&start="+start+"&end="+end, nil, cookies, &options)
 	if len(options.Sources) != 1 {
 		t.Fatalf("source options = %#v, want masked API key source", options.Sources)
 	}
@@ -663,10 +846,11 @@ func TestUsageDetailRedactsSourceWhenRawJSONAuthTypeIsAPIKey(t *testing.T) {
 		"password": "test-password",
 		"nickname": "Admin",
 	}, nil, nil)
+	window := newUsageTestTimeWindow()
 
 	const source = "test-api-key-source-redaction-secret-value"
 	id := seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
-		Timestamp:    "2026-05-16T16:37:00+08:00",
+		Timestamp:    window.timestamp(16, 37, 0),
 		Username:     "admin",
 		Source:       source,
 		RequestID:    "req-raw-auth-type-api-key",
@@ -714,11 +898,13 @@ func TestUsageRecordDetailRedactsAccountSourceForNonAdminOnly(t *testing.T) {
 		"username": "member",
 		"password": "member-password",
 	}, nil, nil)
+	window := newUsageTestTimeWindow()
+	start, end := window.rangeValues()
 
 	const source = "codex-member@example.com"
 	const authIndex = "319a3ed7ef9c3080"
 	id := seedUsageRecordWithValues(t, dataDir, usageRecordSeed{
-		Timestamp:    "2026-05-16T16:37:00+08:00",
+		Timestamp:    window.timestamp(16, 37, 0),
 		Username:     "member",
 		Source:       source,
 		RequestID:    "req-account-source",
@@ -761,7 +947,7 @@ func TestUsageRecordDetailRedactsAccountSourceForNonAdminOnly(t *testing.T) {
 	}
 
 	memberRecords := usageRecordsResponse{}
-	requestJSON(t, handler, http.MethodGet, "/api/usage/records?scope=account&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00&page=1&page_size=1", nil, memberCookies, &memberRecords)
+	requestJSON(t, handler, http.MethodGet, "/api/usage/records?scope=account&start="+start+"&end="+end+"&page=1&page_size=1", nil, memberCookies, &memberRecords)
 	if len(memberRecords.Items) != 1 {
 		t.Fatalf("member usage record count = %d, want 1", len(memberRecords.Items))
 	}
@@ -769,12 +955,12 @@ func TestUsageRecordDetailRedactsAccountSourceForNonAdminOnly(t *testing.T) {
 		t.Fatalf("member list auth_index = %v, want masked auth index", memberRecords.Items[0].AuthIndex)
 	}
 	memberOptions := usageOptionsTestResponse{}
-	requestJSON(t, handler, http.MethodGet, "/api/usage/options?scope=account&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00", nil, memberCookies, &memberOptions)
+	requestJSON(t, handler, http.MethodGet, "/api/usage/options?scope=account&start="+start+"&end="+end, nil, memberCookies, &memberOptions)
 	if len(memberOptions.Sources) != 0 {
 		t.Fatalf("member source options = %#v, want hidden sources", memberOptions.Sources)
 	}
 	filteredMemberRecords := usageRecordsResponse{}
-	requestJSON(t, handler, http.MethodGet, "/api/usage/records?scope=account&source_key=not-present&start=2026-05-16T00:00:00&end=2026-05-17T00:00:00&page=1&page_size=1", nil, memberCookies, &filteredMemberRecords)
+	requestJSON(t, handler, http.MethodGet, "/api/usage/records?scope=account&source_key=not-present&start="+start+"&end="+end+"&page=1&page_size=1", nil, memberCookies, &filteredMemberRecords)
 	if len(filteredMemberRecords.Items) != 1 {
 		t.Fatalf("member source-filtered usage record count = %d, want source filter ignored", len(filteredMemberRecords.Items))
 	}

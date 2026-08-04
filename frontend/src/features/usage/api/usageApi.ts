@@ -1,4 +1,4 @@
-import { apiClient } from '@/shared/api/apiClient'
+import { apiClient, isApiRequestError } from '@/shared/api/apiClient'
 import type {
   TrendPoint,
   UsageDistributionsResponse,
@@ -16,6 +16,18 @@ interface UsageOverviewRequestOptions {
   primary?: UsageRankingSort
   model?: UsageRankingSort
   includeOptions?: boolean
+}
+
+interface UsageRecordsRequestOptions {
+  range?: 'all' | undefined
+}
+
+export function isUsageRecordsLegacyRangeValidationError(error: unknown): boolean {
+  return (
+    isApiRequestError(error) &&
+    error.status === 422 &&
+    error.code === 'validation_error'
+  )
 }
 
 function filtersToParams(
@@ -78,11 +90,13 @@ export function getUsageRecords(
   filters: UsageFilters,
   page: number,
   pageSize: number,
+  options?: UsageRecordsRequestOptions,
 ): Promise<UsageRecordsResponse> {
   return apiClient.get<UsageRecordsResponse>('/usage/records', {
     ...filtersToParams(filters),
     page,
     page_size: pageSize,
+    range: options?.range,
   })
 }
 

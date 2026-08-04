@@ -39,9 +39,9 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 			return fmt.Errorf("migrate before start: %w", err)
 		}
 		log.Printf("migration check completed: db_version=%d target_version=%d", report.CurrentVersion, report.TargetVersion)
-		return serve(ctx)
+		return serve(ctx, serviceOptions(true))
 	case "serve":
-		return serve(ctx)
+		return serve(ctx, serviceOptions(false))
 	case "migrate":
 		report, err := backendApp.Migrate(ctx)
 		if err != nil {
@@ -58,6 +58,8 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		return nil
 	case "repair-usage-tokens":
 		return runRepairUsageTokens(ctx, args[1:], stdout)
+	case "compact-usage-database":
+		return runCompactUsageDatabase(ctx, args[1:], stdout)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return nil
@@ -65,6 +67,27 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		printUsage(stdout)
 		return fmt.Errorf("unknown command %q", command)
 	}
+}
+
+func runCompactUsageDatabase(ctx context.Context, args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("compact-usage-database", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	backupPath := flags.String("backup", "", "new path where a verified SQLite backup will be created")
+	writersPaused := flags.Bool("confirm-writers-paused", false, "acknowledge that database writers are paused")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected compact-usage-database argument %q", flags.Arg(0))
+	}
+	if strings.TrimSpace(*backupPath) == "" {
+		return errors.New("compact-usage-database requires --backup")
+	}
+	report, err := backendApp.CompactUsageDatabase(ctx, *backupPath, *writersPaused)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(stdout).Encode(report)
 }
 
 func runRepairUsageTokens(ctx context.Context, args []string, stdout io.Writer) error {
@@ -223,7 +246,15 @@ func usageTokenSQLitePaths(databasePath string) []string {
 	return []string{databasePath, databasePath + "-wal", databasePath + "-shm", databasePath + "-journal"}
 }
 
-func serve(ctx context.Context) error {
+func serviceOptions(startUsageMaintenance bool) backendApp.NewOptions {
+	return backendApp.NewOptions{
+		RequireReady:          true,
+		StartBackground:       true,
+		StartUsageMaintenance: startUsageMaintenance,
+	}
+}
+
+func serve(ctx context.Context, options backendApp.NewOptions) error {
 	addr, err := backendAddr()
 	if err != nil {
 		return err
@@ -234,10 +265,7 @@ func serve(ctx context.Context) error {
 	}
 	log.Printf("startup check passed: db_version=%d target_version=%d", report.CurrentVersion, report.TargetVersion)
 
-	app, err := backendApp.NewWithOptions(ctx, backendApp.NewOptions{
-		RequireReady:    true,
-		StartBackground: true,
-	})
+	app, err := backendApp.NewWithOptions(ctx, options)
 	if err != nil {
 		return fmt.Errorf("init app: %w", err)
 	}
@@ -277,5 +305,6 @@ func printUsage(w io.Writer) {
   cpa-helper doctor     Run read-only startup checks and exit
   cpa-helper repair-usage-tokens audit [--report <path>]
   cpa-helper repair-usage-tokens apply --audit-report <path> --backup <new-path> --confirm-writers-paused
+  cpa-helper compact-usage-database --backup <new-path> --confirm-writers-paused
 `)
 }

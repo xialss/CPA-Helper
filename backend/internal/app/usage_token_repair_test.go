@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMigrateDoesNotRepairHistoricalUsageTokens(t *testing.T) {
@@ -61,18 +62,18 @@ func TestAuditUsageTokensIsReadOnlyAndRedacted(t *testing.T) {
 func TestAuditUsageTokensIncludesExactRedactedCandidateEvidence(t *testing.T) {
 	dbPath := prepareUsageTokenRepairRuntime(t)
 	const secret = "candidate-secret-must-not-appear"
-	insertUsageTokenRepairRecord(t, dbPath, 1, 0, 2, 3, 4, 5, 6, 102, `{"api_key":"`+secret+`","token_breakdown":{},"tokens":{"input_tokens":100,"output_tokens":2}}`)
-	insertUsageTokenRepairRecord(t, dbPath, 2, 1, 0, 3, 4, 5, 6, 21, `{"model":"secret-model","token_breakdown":{},"tokens":{"input_tokens":1,"output_tokens":20}}`)
-	insertUsageTokenRepairRecord(t, dbPath, 3, 0, 0, 3, 4, 5, 6, 70, `{"request":{"authorization":"secret-auth"},"token_breakdown":{},"tokens":{"input_tokens":30,"output_tokens":40}}`)
+	timestamp1 := insertUsageTokenRepairRecord(t, dbPath, 1, 0, 2, 3, 4, 5, 6, 102, `{"api_key":"`+secret+`","token_breakdown":{},"tokens":{"input_tokens":100,"output_tokens":2}}`)
+	timestamp2 := insertUsageTokenRepairRecord(t, dbPath, 2, 1, 0, 3, 4, 5, 6, 21, `{"model":"secret-model","token_breakdown":{},"tokens":{"input_tokens":1,"output_tokens":20}}`)
+	timestamp3 := insertUsageTokenRepairRecord(t, dbPath, 3, 0, 0, 3, 4, 5, 6, 70, `{"request":{"authorization":"secret-auth"},"token_breakdown":{},"tokens":{"input_tokens":30,"output_tokens":40}}`)
 
 	audit, err := AuditUsageTokens(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []UsageTokenRepairEvidence{
-		{RecordID: 1, Timestamp: "2026-07-25T12:00:00Z", Input: &UsageTokenRepairFieldEvidence{Stored: 0, Raw: 100, Path: usageTokenInputPath}},
-		{RecordID: 2, Timestamp: "2026-07-25T12:00:00Z", Output: &UsageTokenRepairFieldEvidence{Stored: 0, Raw: 20, Path: usageTokenOutputPath}},
-		{RecordID: 3, Timestamp: "2026-07-25T12:00:00Z", Input: &UsageTokenRepairFieldEvidence{Stored: 0, Raw: 30, Path: usageTokenInputPath}, Output: &UsageTokenRepairFieldEvidence{Stored: 0, Raw: 40, Path: usageTokenOutputPath}},
+		{RecordID: 1, Timestamp: timestamp1, Input: &UsageTokenRepairFieldEvidence{Stored: 0, Raw: 100, Path: usageTokenInputPath}},
+		{RecordID: 2, Timestamp: timestamp2, Output: &UsageTokenRepairFieldEvidence{Stored: 0, Raw: 20, Path: usageTokenOutputPath}},
+		{RecordID: 3, Timestamp: timestamp3, Input: &UsageTokenRepairFieldEvidence{Stored: 0, Raw: 30, Path: usageTokenInputPath}, Output: &UsageTokenRepairFieldEvidence{Stored: 0, Raw: 40, Path: usageTokenOutputPath}},
 	}
 	if !reflect.DeepEqual(audit.Evidence, want) {
 		t.Fatalf("evidence = %#v, want %#v", audit.Evidence, want)
@@ -94,6 +95,113 @@ func TestAuditUsageTokensIncludesExactRedactedCandidateEvidence(t *testing.T) {
 	}
 	if !reflect.DeepEqual(decoded.Evidence, want) {
 		t.Fatalf("round-tripped evidence = %#v, want %#v", decoded.Evidence, want)
+	}
+}
+
+func TestAuditUsageTokenCandidatesUseRawRetentionCutoffBeforeParsing(t *testing.T) {
+	dbPath := prepareUsageTokenRepairRuntime(t)
+	now := time.Date(2026, time.August, 3, 12, 34, 56, 987_654_321, appTimeLocation)
+	cutoff := usageRawRetentionCutoff(now)
+	insertUsageTokenRepairRecordAt(t, dbPath, 1, 0, 2, 3, 4, 5, 6, 102, cutoff.Add(-time.Second), `{"token_breakdown":{},"tokens":{"input_tokens":100,"output_tokens":2,"cached_tokens":99}}`)
+	exactTimestamp := insertUsageTokenRepairRecordAt(t, dbPath, 2, 0, 2, 3, 4, 5, 6, 102, cutoff, `{"token_breakdown":{},"tokens":{"input_tokens":100,"output_tokens":2,"cached_tokens":3}}`)
+
+	db := openUsageTokenRepairRuntimeDB(t, dbPath)
+	defer db.Close()
+	audit, candidates, err := auditUsageTokenCandidatesAt(context.Background(), db, dbPath, now)
+	if err != nil {
+		t.Fatalf("audit usage token candidates: %v", err)
+	}
+	if audit.PrunedRecords != 1 || audit.Candidates != 1 || audit.InputCandidates != 1 {
+		t.Fatalf("audit = %#v, want one pruned and one exact-cutoff candidate", audit)
+	}
+	if audit.UnexpectedMismatches.CachedTokens != 0 {
+		t.Fatalf("expired payload contributed a non-target mismatch: %#v", audit.UnexpectedMismatches)
+	}
+	if len(candidates) != 1 || candidates[0].id != 2 {
+		t.Fatalf("candidates = %#v, want only exact-cutoff record 2", candidates)
+	}
+	if len(audit.Evidence) != 1 || audit.Evidence[0].RecordID != 2 || audit.Evidence[0].Timestamp != exactTimestamp {
+		t.Fatalf("audit evidence = %#v, want only exact-cutoff record", audit.Evidence)
+	}
+
+	laterAudit, laterCandidates, err := auditUsageTokenCandidatesAt(context.Background(), db, dbPath, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("audit usage token candidates after cutoff: %v", err)
+	}
+	if laterAudit.PrunedRecords != 2 || laterAudit.Candidates != 0 || len(laterCandidates) != 0 {
+		t.Fatalf("later audit = %#v, want both records pruned", laterAudit)
+	}
+	if sameUsageTokenRepairAudit(audit, laterAudit) {
+		t.Fatal("retention-boundary change did not invalidate the audit")
+	}
+}
+
+func TestAuditUsageTokenCandidatesRejectsMalformedStoredTimestamp(t *testing.T) {
+	dbPath := prepareUsageTokenRepairRuntime(t)
+	insertUsageTokenRepairRecord(t, dbPath, 1, 0, 2, 3, 4, 5, 6, 102, `{"token_breakdown":{},"tokens":{"input_tokens":100,"output_tokens":2}}`)
+
+	db := openUsageTokenRepairRuntimeDB(t, dbPath)
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE usage_records SET timestamp = 'not-a-timestamp' WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := auditUsageTokenCandidatesAt(context.Background(), db, dbPath, time.Now().In(appTimeLocation)); err == nil || !strings.Contains(err.Error(), "parse usage token repair timestamp") {
+		t.Fatalf("malformed timestamp error = %v", err)
+	}
+}
+
+func TestAuditUsageTokenCandidatesCountsBlankPayloadBeforeTimestampParsing(t *testing.T) {
+	dbPath := prepareUsageTokenRepairRuntime(t)
+	insertUsageTokenRepairRecord(t, dbPath, 1, 0, 2, 3, 4, 5, 6, 102, "")
+
+	db := openUsageTokenRepairRuntimeDB(t, dbPath)
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE usage_records SET timestamp = 'not-a-timestamp' WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	audit, candidates, err := auditUsageTokenCandidatesAt(context.Background(), db, dbPath, time.Now().In(appTimeLocation))
+	if err != nil {
+		t.Fatalf("audit blank payload: %v", err)
+	}
+	if audit.PrunedRecords != 1 || audit.Candidates != 0 || len(candidates) != 0 {
+		t.Fatalf("audit = %#v, candidates = %#v; want one pruned record", audit, candidates)
+	}
+}
+
+func TestApplyUsageTokenRepairSkipsExpiredRawPayloadWithoutUpdatingFacts(t *testing.T) {
+	dbPath := prepareUsageTokenRepairRuntime(t)
+	now := time.Now().In(appTimeLocation)
+	raw := `{"token_breakdown":{},"tokens":{"input_tokens":100,"output_tokens":2}}`
+	insertUsageTokenRepairRecordAt(t, dbPath, 1, 0, 2, 3, 4, 5, 6, 102, usageRawRetentionCutoff(now).Add(-time.Second), raw)
+
+	audit, err := AuditUsageTokens(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if audit.PrunedRecords != 1 || audit.Candidates != 0 || len(audit.Evidence) != 0 {
+		t.Fatalf("audit = %#v, want expired payload reported only as pruned", audit)
+	}
+	before := usageTokenRepairAnalyticsSnapshot(t, dbPath, 1)
+	backupPath := newUsageTokenRepairBackupPath(t)
+	result, err := ApplyUsageTokenRepair(context.Background(), audit, backupPath, true)
+	if err != nil {
+		t.Fatalf("apply usage token repair: %v", err)
+	}
+	if result.Updated != 0 || result.PrunedRecords != 1 || result.RemainingCandidates != 0 {
+		t.Fatalf("apply result = %#v", result)
+	}
+	after := usageTokenRepairAnalyticsSnapshot(t, dbPath, 1)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("expired repair changed usage record or fact: before=%#v after=%#v", before, after)
+	}
+	var storedRaw string
+	db := openUsageTokenRepairRuntimeDB(t, dbPath)
+	defer db.Close()
+	if err := db.QueryRow(`SELECT raw_json FROM usage_records WHERE id = 1`).Scan(&storedRaw); err != nil {
+		t.Fatal(err)
+	}
+	if storedRaw != raw {
+		t.Fatalf("expired raw payload changed during repair: %q", storedRaw)
 	}
 }
 
@@ -167,10 +275,45 @@ func TestApplyUsageTokenRepairRequiresGuardsAndRejectsStaleAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = db.Close()
+	materializeUsageTokenRepairFacts(t, dbPath)
 	if _, err := ApplyUsageTokenRepair(context.Background(), audit, backupPath, true); err == nil || !strings.Contains(err.Error(), "stale") {
 		t.Fatalf("stale audit error = %v", err)
 	}
 	assertUsageTokenRepairValues(t, dbPath, 1, 1, 2, 3, 4, 5, 6, 102)
+}
+
+func TestApplyUsageTokenRepairRejectsPendingAnalyticsFactsWithoutMutation(t *testing.T) {
+	dbPath := prepareUsageTokenRepairRuntime(t)
+	insertUsageTokenRepairRecord(t, dbPath, 1, 0, 2, 3, 4, 5, 6, 102, `{"token_breakdown":{"input":{"total_tokens":0}},"tokens":{"input_tokens":100,"output_tokens":2,"cached_tokens":3,"cache_read_tokens":4,"cache_creation_tokens":5,"reasoning_tokens":6,"total_tokens":102}}`)
+	audit, err := AuditUsageTokens(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db := openUsageTokenRepairRuntimeDB(t, dbPath)
+	if _, err := db.Exec(`UPDATE usage_records SET input_tokens = 1 WHERE id = 1`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := usageTokenRepairAnalyticsSnapshot(t, dbPath, 1)
+	if before.recordInput != 1 || before.factInput != 0 || before.pending != 1 {
+		t.Fatalf("unexpected pending analytics snapshot: %#v", before)
+	}
+
+	backupPath := newUsageTokenRepairBackupPath(t)
+	if _, err := ApplyUsageTokenRepair(context.Background(), audit, backupPath, true); err == nil || !strings.Contains(err.Error(), "pending repair") {
+		t.Fatalf("pending analytics facts error = %v", err)
+	}
+	if _, err := os.Lstat(backupPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pending analytics facts unexpectedly created backup: %v", err)
+	}
+	after := usageTokenRepairAnalyticsSnapshot(t, dbPath, 1)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("analytics state changed before repair safeguards: before=%#v after=%#v", before, after)
+	}
 }
 
 func TestApplyUsageTokenRepairRejectsTamperedEvidence(t *testing.T) {
@@ -249,6 +392,7 @@ func TestApplyUsageTokenRepairRejectsQuotaChargesAndUnexpectedTotalMismatch(t *t
 			dbPath := prepareUsageTokenRepairRuntime(t)
 			insertUsageTokenRepairRecord(t, dbPath, 1, 0, 2, 3, 4, 5, 6, 102, `{"token_breakdown":{"input":{"total_tokens":0}},"tokens":{"input_tokens":100,"output_tokens":2,"cached_tokens":3,"cache_read_tokens":4,"cache_creation_tokens":5,"reasoning_tokens":6,"total_tokens":102}}`)
 			testCase.prepare(t, dbPath)
+			materializeUsageTokenRepairFacts(t, dbPath)
 			audit, err := AuditUsageTokens(context.Background())
 			if err != nil {
 				t.Fatal(err)
@@ -298,6 +442,7 @@ func TestApplyUsageTokenRepairCreatesConsistentBackupIncludingWALState(t *testin
 	if _, err := os.Stat(dbPath + "-wal"); err != nil {
 		t.Fatalf("expected live WAL before backup: %v", err)
 	}
+	materializeUsageTokenRepairFacts(t, dbPath)
 	audit, err := AuditUsageTokens(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -477,19 +622,71 @@ func prepareUsageTokenRepairRuntime(t *testing.T) string {
 	return filepath.Join(dataDir, "db", "cpa_helper.sqlite3")
 }
 
-func insertUsageTokenRepairRecord(t *testing.T, dbPath string, id, input, output, cached, cacheRead, cacheCreation, reasoning, total int, raw string) {
+func insertUsageTokenRepairRecord(t *testing.T, dbPath string, id, input, output, cached, cacheRead, cacheCreation, reasoning, total int, raw string) string {
+	return insertUsageTokenRepairRecordAt(t, dbPath, id, input, output, cached, cacheRead, cacheCreation, reasoning, total, time.Now().In(appTimeLocation).Add(-time.Hour), raw)
+}
+
+func insertUsageTokenRepairRecordAt(t *testing.T, dbPath string, id, input, output, cached, cacheRead, cacheCreation, reasoning, total int, timestamp time.Time, raw string) string {
 	t.Helper()
 	db := openUsageTokenRepairRuntimeDB(t, dbPath)
-	defer db.Close()
-	if _, err := db.Exec(`
+	timestampText := dbTime(timestamp)
+	_, err := db.Exec(`
 		INSERT INTO usage_records (
 			id, created_at, timestamp, input_tokens, output_tokens, cached_tokens,
 			cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens,
 			dedupe_key, raw_json
-		) VALUES (?, '2026-07-25 12:00:00', '2026-07-25 12:00:00', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, id, input, output, cached, cacheRead, cacheCreation, reasoning, total, "repair-test-"+string(rune('0'+id)), raw); err != nil {
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, id, timestampText, timestampText, input, output, cached, cacheRead, cacheCreation, reasoning, total, "repair-test-"+string(rune('0'+id)), raw)
+	if err != nil {
+		_ = db.Close()
 		t.Fatal(err)
 	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	materializeUsageTokenRepairFacts(t, dbPath)
+	return timestampText
+}
+
+func materializeUsageTokenRepairFacts(t *testing.T, dbPath string) {
+	t.Helper()
+	db := openUsageTokenRepairRuntimeDB(t, dbPath)
+	defer db.Close()
+	analytics := &App{db: db}
+	if err := analytics.ensureUsageAnalyticsFacts(context.Background()); err != nil {
+		t.Fatalf("materialize usage analytics facts: %v", err)
+	}
+	if err := analytics.requireUsageAnalyticsFacts(context.Background()); err != nil {
+		t.Fatalf("verify usage analytics facts: %v", err)
+	}
+}
+
+type usageTokenRepairAnalyticsState struct {
+	recordInput        int
+	factInput          int
+	pending            int
+	factsVersion       int
+	hourlyNeedsRebuild int
+}
+
+func usageTokenRepairAnalyticsSnapshot(t *testing.T, dbPath string, recordID int) usageTokenRepairAnalyticsState {
+	t.Helper()
+	db := openUsageTokenRepairRuntimeDB(t, dbPath)
+	defer db.Close()
+	var state usageTokenRepairAnalyticsState
+	if err := db.QueryRow(`SELECT input_tokens FROM usage_records WHERE id = ?`, recordID).Scan(&state.recordInput); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT input_tokens FROM usage_analytics_facts WHERE usage_record_id = ?`, recordID).Scan(&state.factInput); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM usage_analytics_pending_facts`).Scan(&state.pending); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT facts_version, hourly_needs_rebuild FROM usage_analytics_state WHERE id = 1`).Scan(&state.factsVersion, &state.hourlyNeedsRebuild); err != nil {
+		t.Fatal(err)
+	}
+	return state
 }
 
 func openUsageTokenRepairRuntimeDB(t *testing.T, dbPath string) *sql.DB {

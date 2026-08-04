@@ -72,6 +72,7 @@ type UsageRecord struct {
 	RawJSON             string
 	resolvedAuth        *string
 	authResolved        bool
+	analyticsSourceKey  *string
 }
 
 type usageChannelCostItem struct {
@@ -277,15 +278,15 @@ func (a *App) usageSummary(w http.ResponseWriter, r *http.Request, filters Usage
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageAnalyticsRecords(r.Context(), scoped, "")
-	if err != nil {
-		return err
-	}
 	pricing, err := a.billingPriceIndex(r.Context())
 	if err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, usageSummaryFromRecords(scoped, records, pricing.Prices, pricing.MatchContext))
+	collector := newUsageAnalyticsCollector(scoped, pricing.Prices, pricing.MatchContext, nil, usageAnalyticsCollectorOptions{Summary: true})
+	if err := a.collectUsageAnalytics(r.Context(), scoped, pricing, collector, ""); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, collector.summaryResponse())
 	return nil
 }
 
@@ -295,15 +296,15 @@ func (a *App) usageTrends(w http.ResponseWriter, r *http.Request, filters UsageF
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageAnalyticsRecords(r.Context(), scoped, "timestamp ASC")
-	if err != nil {
-		return err
-	}
 	pricing, err := a.billingPriceIndex(r.Context())
 	if err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, trendPointsFromRecords(scoped, records, pricing.Prices, pricing.MatchContext))
+	collector := newUsageAnalyticsCollector(scoped, pricing.Prices, pricing.MatchContext, nil, usageAnalyticsCollectorOptions{Trends: true})
+	if err := a.collectUsageAnalytics(r.Context(), scoped, pricing, collector, "timestamp ASC"); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, collector.trendResponse())
 	return nil
 }
 
@@ -328,10 +329,6 @@ func (a *App) usageRankings(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageAnalyticsRecords(r.Context(), scoped, "")
-	if err != nil {
-		return err
-	}
 	pricing, err := a.billingPriceIndex(r.Context())
 	if err != nil {
 		return err
@@ -340,7 +337,11 @@ func (a *App) usageRankings(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, rankingFromRecordsBySort(records, pricing.Prices, groupBy, users, sortBy, pricing.MatchContext))
+	collector := newUsageAnalyticsCollector(scoped, pricing.Prices, pricing.MatchContext, users, usageAnalyticsCollectorOptions{Rankings: map[string]string{groupBy: sortBy}})
+	if err := a.collectUsageAnalytics(r.Context(), scoped, pricing, collector, ""); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, collector.rankingResponse(groupBy))
 	return nil
 }
 
@@ -350,15 +351,15 @@ func (a *App) usageDistributions(w http.ResponseWriter, r *http.Request, filters
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageAnalyticsRecords(r.Context(), scoped, "")
-	if err != nil {
-		return err
-	}
 	pricing, err := a.billingPriceIndex(r.Context())
 	if err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, distributionsFromRecords(records, pricing.Prices, pricing.MatchContext))
+	collector := newUsageAnalyticsCollector(scoped, pricing.Prices, pricing.MatchContext, nil, usageAnalyticsCollectorOptions{Distributions: true})
+	if err := a.collectUsageAnalytics(r.Context(), scoped, pricing, collector, ""); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, collector.distributionResponse())
 	return nil
 }
 
@@ -380,10 +381,6 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	records, err := a.filteredUsageAnalyticsRecords(r.Context(), scoped, "timestamp ASC")
-	if err != nil {
-		return err
-	}
 	pricing, err := a.billingPriceIndex(r.Context())
 	if err != nil {
 		return err
@@ -392,19 +389,35 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	apiKeyRanking := rankingFromRecordsBySort(records, pricing.Prices, "api_key_description", users, primaryRankingSort, pricing.MatchContext)
+	rankingSorts := map[string]string{
+		"api_key_description": primaryRankingSort,
+		"model":               modelRankingSort,
+	}
+	if scope.IsAdmin {
+		rankingSorts["user"] = primaryRankingSort
+	}
+	collector := newUsageAnalyticsCollector(scoped, pricing.Prices, pricing.MatchContext, users, usageAnalyticsCollectorOptions{
+		Summary:       true,
+		Trends:        true,
+		Distributions: true,
+		Rankings:      rankingSorts,
+	})
+	if err := a.collectUsageAnalytics(r.Context(), scoped, pricing, collector, "timestamp ASC"); err != nil {
+		return err
+	}
+	apiKeyRanking := collector.rankingResponse("api_key_description")
 	userRanking := map[string]any{"group_by": "user", "items": []any{}}
 	if scope.IsAdmin {
-		userRanking = rankingFromRecordsBySort(records, pricing.Prices, "user", users, primaryRankingSort, pricing.MatchContext)
+		userRanking = collector.rankingResponse("user")
 	}
 	response := map[string]any{
-		"summary":                     usageSummaryFromRecords(scoped, records, pricing.Prices, pricing.MatchContext),
-		"trends":                      trendPointsFromRecords(scoped, records, pricing.Prices, pricing.MatchContext),
+		"summary":                     collector.summaryResponse(),
+		"trends":                      collector.trendResponse(),
 		"user_ranking":                userRanking,
 		"api_key_description_ranking": apiKeyRanking,
 		"api_key_ranking":             apiKeyRanking,
-		"model_ranking":               rankingFromRecordsBySort(records, pricing.Prices, "model", users, modelRankingSort, pricing.MatchContext),
-		"distributions":               distributionsFromRecords(records, pricing.Prices, pricing.MatchContext),
+		"model_ranking":               collector.rankingResponse("model"),
+		"distributions":               collector.distributionResponse(),
 	}
 	if includeOptions {
 		options, err := a.usageOptionsResponse(r.Context(), user, usageOptionFilters(filters))
@@ -430,8 +443,11 @@ func usageOverviewIncludesOptions(r *http.Request) (bool, error) {
 }
 
 func (a *App) usageRecords(w http.ResponseWriter, r *http.Request, filters UsageFilters, user *AuthUser) error {
+	if err := validateUsageRecordRetention(r, filters, time.Now().In(appTimeLocation)); err != nil {
+		return err
+	}
 	scope := accessScope(user, filters.Scope)
-	scoped, err := a.scopedFilters(r.Context(), normalizedUsageFilters(filters), scope)
+	scoped, err := a.scopedFilters(r.Context(), filters, scope)
 	if err != nil {
 		return err
 	}
@@ -440,11 +456,16 @@ func (a *App) usageRecords(w http.ResponseWriter, r *http.Request, filters Usage
 	if pageSize > 200 {
 		pageSize = 200
 	}
-	total, err := a.countUsageRecords(r.Context(), scoped)
-	if err != nil {
-		return err
+	var total int
+	var records []UsageRecord
+	if hasUsagePostFilters(scoped) {
+		total, records, err = a.filteredUsageRecordsPage(r.Context(), scoped, page, pageSize)
+	} else {
+		total, err = a.countUsageRecords(r.Context(), scoped)
+		if err == nil {
+			records, err = a.pagedUsageRecords(r.Context(), scoped, page, pageSize)
+		}
 	}
-	records, err := a.pagedUsageRecords(r.Context(), scoped, page, pageSize)
 	if err != nil {
 		return err
 	}
@@ -481,6 +502,9 @@ func (a *App) usageRecordDetail(w http.ResponseWriter, r *http.Request, recordID
 	if !scope.IsAdmin && (record.UsageUsername == nil || *record.UsageUsername != scope.Username) {
 		return notFoundError("usage 记录不存在")
 	}
+	if usageRecordIsExpired(record, time.Now().In(appTimeLocation)) {
+		return appError("usage_record_expired", http.StatusGone, "使用明细已超过 7 天保留期")
+	}
 	users, err := a.userLookup(r.Context(), scope)
 	if err != nil {
 		return err
@@ -515,15 +539,21 @@ func usageOptionFilters(filters UsageFilters) UsageFilters {
 }
 
 func (a *App) usageOptionsResponse(ctx context.Context, user *AuthUser, filters UsageFilters) (map[string]any, error) {
+	if err := a.ensureUsageAnalyticsFacts(ctx); err != nil {
+		return nil, err
+	}
 	scope := accessScope(user, filters.Scope)
 	scoped, err := a.scopedFilters(ctx, filters, scope)
 	if err != nil {
 		return nil, err
 	}
-	where, args := usageWhere(scoped)
+	where, args, err := usageFactsWhere(scoped, "facts")
+	if err != nil {
+		return nil, err
+	}
 	users := []map[string]any{}
 	distinctStrings := func(column string) ([]string, error) {
-		rows, err := a.db.QueryContext(ctx, fmt.Sprintf(`SELECT DISTINCT %s FROM usage_records %s AND %s IS NOT NULL`, column, where, column), args...)
+		rows, err := a.db.QueryContext(ctx, fmt.Sprintf(`SELECT DISTINCT facts.%s FROM usage_analytics_facts AS facts %s AND facts.%s IS NOT NULL`, column, where, column), args...)
 		if err != nil {
 			return nil, err
 		}
@@ -546,78 +576,40 @@ func (a *App) usageOptionsResponse(ctx context.Context, user *AuthUser, filters 
 			Key   string
 			Label string
 		}
-		values := map[string]sourceOption{}
-		addSourceOption := func(source string, auth *string, forceMask bool) {
-			sourceValue := strings.TrimSpace(source)
-			if sourceValue == "" {
-				return
-			}
-			displaySource := redactedUsageSource(&sourceValue, auth, usageRedactionOptions{MaskSource: forceMask})
-			sourceKey := usageSourceKey(&sourceValue)
-			if displaySource == nil || sourceKey == nil {
-				return
-			}
-			existing, ok := values[*sourceKey]
-			if !ok || (existing.Label == sourceValue && *displaySource != sourceValue) {
-				values[*sourceKey] = sourceOption{Key: *sourceKey, Label: *displaySource}
-			}
-		}
-
-		rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT source, auth,
-			CASE WHEN json_valid(raw_json) THEN TRIM(CAST(json_extract(raw_json, '$.auth_type') AS TEXT)) ELSE NULL END
-			FROM usage_records `+where+` AND source IS NOT NULL AND auth IS NOT NULL AND TRIM(auth) <> ''`, args...)
+		rows, err := a.db.QueryContext(ctx, `
+			SELECT DISTINCT catalog.source_key, catalog.source, catalog.auth, catalog.auth_conflict
+			FROM usage_analytics_facts AS facts
+			JOIN usage_source_catalog AS catalog ON catalog.source_key = facts.source_key
+			`+where+` AND catalog.source IS NOT NULL AND trim(catalog.source) <> ''
+		`, args...)
 		if err != nil {
 			return nil, err
 		}
+		defer rows.Close()
+		options := []sourceOption{}
 		for rows.Next() {
-			var source, auth string
-			var rawAuth sql.NullString
-			if err := rows.Scan(&source, &auth, &rawAuth); err != nil {
-				_ = rows.Close()
+			var key, source string
+			var auth sql.NullString
+			var conflict bool
+			if err := rows.Scan(&key, &source, &auth, &conflict); err != nil {
 				return nil, err
 			}
-			rawAuthValue := strings.TrimSpace(rawAuth.String)
-			conflictingAuth := rawAuth.Valid && rawAuthValue != "" && usageAuthTypeKey(&auth) != usageAuthTypeKey(&rawAuthValue)
-			if rawAuth.Valid && rawAuthValue != "" {
-				addSourceOption(source, &rawAuthValue, conflictingAuth)
-			} else {
-				addSourceOption(source, &auth, false)
+			sourceValue := strings.TrimSpace(source)
+			if sourceValue == "" || strings.TrimSpace(key) == "" {
+				continue
 			}
+			authValue := nullableString(auth)
+			if authValue != nil && strings.TrimSpace(*authValue) == "" {
+				authValue = nil
+			}
+			displaySource := redactedUsageSource(&sourceValue, authValue, usageRedactionOptions{MaskSource: conflict || authValue == nil})
+			if displaySource == nil {
+				continue
+			}
+			options = append(options, sourceOption{Key: key, Label: *displaySource})
 		}
 		if err := rows.Err(); err != nil {
-			_ = rows.Close()
 			return nil, err
-		}
-		if err := rows.Close(); err != nil {
-			return nil, err
-		}
-
-		legacyRows, err := a.db.QueryContext(ctx, `SELECT DISTINCT source, raw_json FROM usage_records `+where+` AND source IS NOT NULL AND (auth IS NULL OR TRIM(auth) = '')`, args...)
-		if err != nil {
-			return nil, err
-		}
-		for legacyRows.Next() {
-			var source string
-			var rawJSON sql.NullString
-			if err := legacyRows.Scan(&source, &rawJSON); err != nil {
-				_ = legacyRows.Close()
-				return nil, err
-			}
-			sourceValue := strings.TrimSpace(source)
-			record := UsageRecord{Source: &sourceValue, RawJSON: rawJSON.String}
-			auth := usageRecordAuth(record)
-			addSourceOption(sourceValue, auth, auth == nil)
-		}
-		if err := legacyRows.Err(); err != nil {
-			_ = legacyRows.Close()
-			return nil, err
-		}
-		if err := legacyRows.Close(); err != nil {
-			return nil, err
-		}
-		options := make([]sourceOption, 0, len(values))
-		for _, option := range values {
-			options = append(options, option)
 		}
 		sort.Slice(options, func(i, j int) bool {
 			if options[i].Label == options[j].Label {
@@ -727,24 +719,35 @@ func (a *App) filteredUsageAnalyticsRecords(ctx context.Context, filters UsageFi
 }
 
 func (a *App) visitFilteredUsageAnalyticsRecords(ctx context.Context, filters UsageFilters, orderBy string, visit func(UsageRecord)) error {
-	where, args := usageWhere(filters)
-	query := `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, service_tier, reasoning_effort, endpoint, source,
-		auth, NULL,
-		CASE WHEN json_valid(raw_json) THEN
-			CASE json_type(raw_json, '$.auth_type')
-				WHEN 'text' THEN CAST(json_extract(raw_json, '$.auth_type') AS TEXT)
-				WHEN 'integer' THEN CAST(json_extract(raw_json, '$.auth_type') AS TEXT)
-				WHEN 'real' THEN CAST(json_extract(raw_json, '$.auth_type') AS TEXT)
-				WHEN 'true' THEN 'true'
-				WHEN 'false' THEN 'false'
-			END
-		END,
-		auth_index, NULL, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
-		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, '', '' FROM usage_records ` + where
-	if strings.TrimSpace(orderBy) != "" {
-		query += " ORDER BY " + orderBy
-	} else {
-		query += " ORDER BY timestamp"
+	return a.visitFilteredUsageAnalyticsRecordsAfterID(ctx, filters, 0, orderBy, visit)
+}
+
+func (a *App) visitFilteredUsageAnalyticsRecordsAfterID(ctx context.Context, filters UsageFilters, minimumRecordID int64, orderBy string, visit func(UsageRecord)) error {
+	if err := a.ensureUsageAnalyticsFacts(ctx); err != nil {
+		return err
+	}
+	where, args, err := usageFactsWhere(filters, "facts")
+	if err != nil {
+		return err
+	}
+	query := `SELECT facts.usage_record_id, CAST(facts.timestamp AS TEXT), facts.usage_username,
+		facts.api_key_description, facts.provider, facts.model, facts.service_tier, facts.endpoint,
+		facts.source_key, facts.auth, facts.auth_index, facts.source_account, facts.ttft_ms, facts.failed,
+		facts.input_tokens, facts.output_tokens, facts.cached_tokens, facts.cache_read_tokens,
+		facts.cache_creation_tokens, facts.reasoning_tokens, facts.total_tokens, catalog.source
+		FROM usage_analytics_facts AS facts
+		LEFT JOIN usage_source_catalog AS catalog ON catalog.source_key = facts.source_key ` + where
+	if minimumRecordID > 0 {
+		query += " AND facts.usage_record_id > ?"
+		args = append(args, minimumRecordID)
+	}
+	switch strings.TrimSpace(orderBy) {
+	case "timestamp ASC":
+		query += " ORDER BY facts.timestamp ASC, facts.usage_record_id ASC"
+	case "timestamp DESC":
+		query += " ORDER BY facts.timestamp DESC, facts.usage_record_id DESC"
+	default:
+		query += " ORDER BY facts.timestamp, facts.usage_record_id"
 	}
 	rows, err := a.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -752,13 +755,11 @@ func (a *App) visitFilteredUsageAnalyticsRecords(ctx context.Context, filters Us
 	}
 	defer rows.Close()
 	for rows.Next() {
-		record, err := scanUsageAnalyticsRecord(rows)
+		record, err := scanUsageAnalyticsFactRecordWithSource(rows)
 		if err != nil {
 			return err
 		}
-		if usageRecordMatchesPostFilters(record, filters) {
-			visit(record)
-		}
+		visit(record)
 	}
 	return rows.Err()
 }
@@ -803,6 +804,94 @@ func (a *App) pagedUsageRecords(ctx context.Context, filters UsageFilters, page,
 	}
 	defer rows.Close()
 	return scanUsageRecords(rows)
+}
+
+func (a *App) filteredUsageRecordsPage(ctx context.Context, filters UsageFilters, page, pageSize int) (int, []UsageRecord, error) {
+	if err := a.ensureUsageAnalyticsFacts(ctx); err != nil {
+		return 0, nil, err
+	}
+	factFilters := filters
+	factFilters.RequestID = nil
+	where, args, err := usageFactsWhere(factFilters, "facts")
+	if err != nil {
+		return 0, nil, err
+	}
+	join := ""
+	requestIDWhere := ""
+	if filters.RequestID != nil {
+		join = " JOIN usage_records AS records ON records.id = facts.usage_record_id"
+		requestIDWhere = " AND records.request_id LIKE ?"
+		args = append(args, "%"+*filters.RequestID+"%")
+	}
+	pageStart := (page - 1) * pageSize
+	// Traverse the fact index once: retain only IDs for the requested page.
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT facts.usage_record_id
+		FROM usage_analytics_facts AS facts `+join+` `+where+requestIDWhere+`
+		ORDER BY facts.timestamp DESC
+	`, args...)
+	if err != nil {
+		return 0, nil, err
+	}
+	var total int
+	ids := make([]int, 0, pageSize)
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, nil, err
+		}
+		if total >= pageStart && len(ids) < pageSize {
+			ids = append(ids, id)
+		}
+		total++
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, nil, err
+	}
+	records, err := a.usageRecordsByID(ctx, ids)
+	if err != nil {
+		return 0, nil, err
+	}
+	return total, records, nil
+}
+
+func (a *App) usageRecordsByID(ctx context.Context, ids []int) ([]UsageRecord, error) {
+	if len(ids) == 0 {
+		return []UsageRecord{}, nil
+	}
+	placeholders := make([]string, 0, len(ids))
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		placeholders = append(placeholders, "?")
+		args = append(args, id)
+	}
+	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, service_tier, reasoning_effort, endpoint, source,
+		source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
+		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json FROM usage_records WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	records, err := scanUsageRecords(rows)
+	if err != nil {
+		return nil, err
+	}
+	recordsByID := make(map[int]UsageRecord, len(records))
+	for _, record := range records {
+		recordsByID[record.ID] = record
+	}
+	ordered := make([]UsageRecord, 0, len(records))
+	for _, id := range ids {
+		if record, ok := recordsByID[id]; ok {
+			ordered = append(ordered, record)
+		}
+	}
+	return ordered, nil
 }
 
 func hasUsagePostFilters(filters UsageFilters) bool {
@@ -937,13 +1026,25 @@ func scanUsageRecord(scanner usageRecordScanner) (UsageRecord, error) {
 }
 
 func scanUsageAnalyticsRecord(scanner usageRecordScanner) (UsageRecord, error) {
-	record, err := scanUsageRecord(scanner)
-	if err != nil {
+	var record UsageRecord
+	var timestamp, usageUsername, description, provider, model, serviceTier, endpoint, source, storedAuth, rawAuth, authIndex sql.NullString
+	var ttftFloat sql.NullFloat64
+	if err := scanner.Scan(&record.ID, &timestamp, &usageUsername, &description, &provider, &model, &serviceTier, &endpoint, &source, &storedAuth, &rawAuth, &authIndex, &ttftFloat, &record.Failed, &record.InputTokens, &record.OutputTokens, &record.CachedTokens, &record.CacheReadTokens, &record.CacheCreationTokens, &record.ReasoningTokens, &record.TotalTokens); err != nil {
 		return UsageRecord{}, err
 	}
-	// The narrow projection temporarily carries stored auth in SourceAccount.
-	record.Auth = resolveProjectedUsageRecordAuth(record.Auth, record.SourceAccount)
-	record.SourceAccount = nil
+	if parsed, ok := parseDBTime(timestamp.String); ok {
+		record.Timestamp = parsed
+	}
+	record.UsageUsername = nullableString(usageUsername)
+	record.APIKeyDescription = nullableString(description)
+	record.Provider = nullableString(provider)
+	record.Model = nullableString(model)
+	record.ServiceTier = nullableString(serviceTier)
+	record.Endpoint = nullableString(endpoint)
+	record.Source = nullableString(source)
+	record.Auth = resolveProjectedUsageRecordAuth(nullableString(rawAuth), nullableString(storedAuth))
+	record.AuthIndex = nullableString(authIndex)
+	record.TTFTMS = nullableFloat(ttftFloat)
 	record.resolvedAuth = record.Auth
 	record.authResolved = true
 	return record, nil
@@ -1001,12 +1102,10 @@ func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices ma
 			userLabel = *record.UsageUsername
 		}
 	}
-	authIndex := record.AuthIndex
-	if authIndex == nil {
-		authIndex = rawJSONStringField(record.RawJSON, "auth_index")
-	}
+	authIndex := usageAnalyticsRecordAuthIndex(record)
 	authIndex = redactedAuthIndex(authIndex, redaction)
 	auth := usageRecordAuth(record)
+	source := usageAnalyticsRecordSource(record)
 	return map[string]any{
 		"id":                    record.ID,
 		"timestamp":             usageAPITime(record.Timestamp),
@@ -1018,7 +1117,7 @@ func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices ma
 		"service_tier":          record.ServiceTier,
 		"reasoning_effort":      record.ReasoningEffort,
 		"endpoint":              record.Endpoint,
-		"source":                redactedUsageSource(record.Source, auth, redaction),
+		"source":                redactedUsageSource(source, auth, redaction),
 		"request_id":            record.RequestID,
 		"auth_index":            authIndex,
 		"auth":                  auth,
@@ -1408,19 +1507,92 @@ func rawJSONStringField(rawJSON, fieldName string) *string {
 	}
 }
 
+var usageSourcePayloadFields = []string{"source", "origin"}
+
+// usagePayloadStringFromRawJSON intentionally uses the same aliases and
+// recursive lookup as normalizeUsage. Direct imports can bypass
+// normalizeUsage, but their retained raw payload must still produce the same
+// scalar and compact metadata projections.
+func usagePayloadStringFromRawJSON(rawJSON string, fields ...string) *string {
+	if strings.TrimSpace(rawJSON) == "" {
+		return nil
+	}
+	var payload any
+	if json.Unmarshal([]byte(rawJSON), &payload) != nil {
+		return nil
+	}
+	return toString(findFirst(payload, fields...))
+}
+
+func sourceFromUsageRawJSON(rawJSON string) *string {
+	return usagePayloadStringFromRawJSON(rawJSON, usageSourcePayloadFields...)
+}
+
 func sourceAccountFromUsageSource(source *string) *string {
 	if source == nil {
 		return nil
 	}
 	if match := usageEmailPattern.FindString(*source); match != "" {
-		normalized := strings.ToLower(strings.TrimSpace(match))
-		return &normalized
+		return normalizeUsageSourceAccount(match)
 	}
 	return nil
 }
 
+var usageSourceAccountPayloadFields = []string{
+	"email",
+	"account_email",
+	"accountEmail",
+	"user_email",
+	"userEmail",
+}
+
+func sourceAccountFromUsagePayload(value any, source *string) *string {
+	if account := sourceAccountFromUsagePayloadValue(value); account != nil {
+		return account
+	}
+	return sourceAccountFromUsageSource(source)
+}
+
+func sourceAccountFromUsageRawJSON(rawJSON string) *string {
+	if strings.TrimSpace(rawJSON) == "" {
+		return nil
+	}
+	var payload any
+	if json.Unmarshal([]byte(rawJSON), &payload) != nil {
+		return nil
+	}
+	return sourceAccountFromUsagePayloadValue(payload)
+}
+
+func sourceAccountFromUsagePayloadValue(value any) *string {
+	for _, field := range usageSourceAccountPayloadFields {
+		if account := toString(findFirst(value, field)); account != nil {
+			return normalizeUsageSourceAccount(*account)
+		}
+	}
+	return nil
+}
+
+func normalizeUsageSourceAccount(value string) *string {
+	normalized := strings.TrimSpace(value)
+	if normalized == "" {
+		return nil
+	}
+	if match := usageEmailPattern.FindString(normalized); match != "" {
+		normalized = strings.ToLower(strings.TrimSpace(match))
+	}
+	return &normalized
+}
+
 func authIndexFromUsagePayload(parsed any) *string {
 	return toString(findFirst(parsed, "auth_index", "authIndex", "index", "auth_name", "authName", "account_id", "accountId"))
+}
+
+func authFromUsageRawJSON(rawJSON string) *string {
+	if authType := usagePayloadStringFromRawJSON(rawJSON, "auth_type"); authType != nil {
+		return authType
+	}
+	return usagePayloadStringFromRawJSON(rawJSON, "auth", "authentication")
 }
 
 func usageRecordAuth(record UsageRecord) *string {
@@ -1442,7 +1614,7 @@ func resolveUsageRecordAuth(rawJSON string, storedAuth *string) *string {
 	if strings.TrimSpace(rawJSON) == "" {
 		return storedAuth
 	}
-	auth := rawJSONStringField(rawJSON, "auth_type")
+	auth := authFromUsageRawJSON(rawJSON)
 	if auth == nil {
 		auth = storedAuth
 	}
@@ -1560,7 +1732,7 @@ func jsonStringField(payload map[string]any, fieldName string) *string {
 
 func shouldRedactJSONField(key string, authType *string, redaction usageRedactionOptions) bool {
 	lower := strings.ToLower(key)
-	if (redaction.MaskSource || isAPIKeyAuth(authType)) && lower == "source" {
+	if (redaction.MaskSource || isAPIKeyAuth(authType)) && (lower == "source" || lower == "origin") {
 		return true
 	}
 	if redaction.MaskAuthIndex && (lower == "auth_index" || lower == "authindex") {
@@ -1590,7 +1762,12 @@ func (a *App) saveUsageMessage(ctx context.Context, raw []byte, pricing modelPri
 		return UsageRecord{}, false, err
 	}
 	now := dbTime(time.Now())
-	result, err := a.db.ExecContext(ctx, `
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return UsageRecord{}, false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		INSERT INTO usage_records (
 			created_at, timestamp, usage_username, api_key_description, provider, model, service_tier, endpoint,
 			reasoning_effort, source, source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens,
@@ -1599,14 +1776,48 @@ func (a *App) saveUsageMessage(ctx context.Context, raw []byte, pricing modelPri
 	`, now, dbTime(normalized.Timestamp), usageUsername, description, normalized.Provider, normalized.Model, normalized.ServiceTier, normalized.Endpoint, normalized.ReasoningEffort, normalized.Source, normalized.SourceAccount, normalized.RequestID, normalized.Auth, normalized.AuthIndex, normalized.LatencyMS, normalized.TTFTMS, normalized.Failed, normalized.InputTokens, normalized.OutputTokens, normalized.CachedTokens, normalized.CacheReadTokens, normalized.CacheCreationTokens, normalized.ReasoningTokens, normalized.TotalTokens, normalized.DedupeKey, normalized.RawJSON)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			_ = tx.Rollback()
 			record, getErr := a.usageRecordByDedupe(ctx, normalized.DedupeKey)
 			return record, false, getErr
 		}
 		return UsageRecord{}, false, err
 	}
-	id, _ := result.LastInsertId()
-	record, err := a.getUsageRecord(ctx, int(id))
+	id, err := result.LastInsertId()
 	if err != nil {
+		return UsageRecord{}, false, err
+	}
+	record := UsageRecord{
+		ID:                  int(id),
+		Timestamp:           normalized.Timestamp,
+		UsageUsername:       usageUsername,
+		APIKeyDescription:   description,
+		Provider:            normalized.Provider,
+		Model:               normalized.Model,
+		ServiceTier:         normalized.ServiceTier,
+		ReasoningEffort:     normalized.ReasoningEffort,
+		Endpoint:            normalized.Endpoint,
+		Source:              normalized.Source,
+		SourceAccount:       normalized.SourceAccount,
+		RequestID:           normalized.RequestID,
+		Auth:                normalized.Auth,
+		AuthIndex:           normalized.AuthIndex,
+		LatencyMS:           normalized.LatencyMS,
+		TTFTMS:              normalized.TTFTMS,
+		Failed:              normalized.Failed,
+		InputTokens:         normalized.InputTokens,
+		OutputTokens:        normalized.OutputTokens,
+		CachedTokens:        normalized.CachedTokens,
+		CacheReadTokens:     normalized.CacheReadTokens,
+		CacheCreationTokens: normalized.CacheCreationTokens,
+		ReasoningTokens:     normalized.ReasoningTokens,
+		TotalTokens:         normalized.TotalTokens,
+		DedupeKey:           normalized.DedupeKey,
+		RawJSON:             normalized.RawJSON,
+	}
+	if err := a.upsertUsageAnalyticsFact(ctx, tx, record); err != nil {
+		return UsageRecord{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
 		return UsageRecord{}, false, err
 	}
 	if err := a.applyQuotaCharge(ctx, record, pricing); err != nil {
@@ -1719,7 +1930,7 @@ func normalizeUsage(raw []byte) (normalizedUsage, error) {
 			total = cached + reasoning
 		}
 	}
-	source := toString(findFirst(parsed, "source", "origin"))
+	source := toString(findFirst(parsed, usageSourcePayloadFields...))
 	sum := sha256.Sum256(canonical)
 	return normalizedUsage{
 		Timestamp:             parseUsageTimestamp(findFirst(parsed, "timestamp", "time", "created_at", "createdAt", "request_time")),
@@ -1729,7 +1940,7 @@ func normalizeUsage(raw []byte) (normalizedUsage, error) {
 		ServiceTier:           toString(findFirst(parsed, "service_tier", "serviceTier")),
 		Endpoint:              toString(findFirst(parsed, "endpoint", "path", "route")),
 		Source:                source,
-		SourceAccount:         sourceAccountFromUsageSource(source),
+		SourceAccount:         sourceAccountFromUsagePayload(parsed, source),
 		RequestID:             toString(findFirst(parsed, "request_id", "requestId", "id")),
 		Auth:                  authLabel(parsed),
 		AuthIndex:             authIndexFromUsagePayload(parsed),

@@ -414,7 +414,7 @@ watch(proxyModalOpen, (open) => {
                   </div>
                   <NAlert v-if="service.last_error" type="error" :show-icon="false" class="last-error">{{ service.last_error }}</NAlert>
                   <div v-if="service.samples.length" class="sample-strip" :class="`is-${source.history_granularity}`">
-                    <NTooltip v-for="sample in service.samples" :key="sample.timestamp" trigger="hover" :theme-overrides="modelMonitorTooltipThemeOverrides">
+                    <NTooltip v-for="(sample, sampleIndex) in service.samples" :key="`${sample.timestamp}-${sampleIndex}`" trigger="hover" :theme-overrides="modelMonitorTooltipThemeOverrides">
                       <template #trigger><span class="sample-bar" :class="`is-${sample.status}`" role="img" :aria-label="sampleTooltip(sample, source)" /></template>
                       <div class="sample-tooltip-content">
                         <span v-for="(line, lineIndex) in sampleTooltipLines(sample, source)" :key="lineIndex">{{ line }}</span>

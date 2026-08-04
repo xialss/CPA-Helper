@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 
 import { createServer } from 'vite'
@@ -72,6 +73,18 @@ try {
     timeStyle: 'short',
   })
 
+  const { usageRecordsLatestRange, usageRecordsRetentionStart } = await server.ssrLoadModule(
+    '/src/features/usage/recordsRetention.ts',
+  )
+  const retentionNow = Date.UTC(2026, 7, 4, 12, 0, 0, 999)
+  const retentionStart = usageRecordsRetentionStart(retentionNow)
+  const retentionWindowMs = 7 * 24 * 60 * 60 * 1000
+  assert.equal(retentionStart % 1000, 0)
+  assert.deepEqual(usageRecordsLatestRange(retentionNow), [retentionStart, retentionNow])
+  const cutoffAfterThreeSeconds =
+    Math.floor((retentionNow + 3 * 1000) / 1000) * 1000 - retentionWindowMs
+  assert.ok(retentionStart >= cutoffAfterThreeSeconds)
+
   installBrowserStubs({ browserLanguages: ['en-US'] })
 
   let {
@@ -84,6 +97,14 @@ try {
 
   setLanguage('en')
   assert.equal(localizedApiErrorMessage('validation_error', null), 'Invalid request parameters')
+  assert.equal(
+    localizedApiErrorMessage('usage_record_expired', '使用明细已超过 7 天保留期'),
+    'Usage record is outside the 7-day retention period',
+  )
+  assert.equal(
+    localizedApiErrorMessage('validation_error', '请求明细仅保留最近 7 天，不能使用 range=all'),
+    'Request records are retained for only the last 7 days; range=all is unavailable',
+  )
   assert.equal(localizedApiErrorMessage(null, null), 'Request failed')
   assert.equal(localizedServerMessage('巡检完成'), 'Inspection complete')
   const modelMonitorErrors = [
@@ -185,6 +206,10 @@ try {
 
   setLanguage('zh')
   assert.equal(localizedApiErrorMessage('validation_error', null), '请求参数无效')
+  assert.equal(
+    localizedApiErrorMessage('usage_record_expired', null),
+    '使用明细已超过 7 天保留期',
+  )
   assert.equal(localizedApiErrorMessage(null, null), '请求失败')
   assert.equal(localizedKeeperStatusDetail('守护运行中'), '自动巡检运行中')
   assert.equal(localizedUsageChannelFallbackLabel('codex', 'apikey'), 'Codex API Key（标签不可用）')
@@ -238,7 +263,102 @@ try {
   )
   assert.equal(localizedKeeperStatusDetail(null), 'Not running')
 
-  const { apiClient } = await server.ssrLoadModule(`/src/shared/api/apiClient.ts?case=${moduleCase++}`)
+  const { apiClient, isApiRequestError } = await server.ssrLoadModule(
+    `/src/shared/api/apiClient.ts?case=${moduleCase++}`,
+  )
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 410,
+    statusText: 'Gone',
+    json: async () => ({
+      detail: {
+        code: 'usage_record_expired',
+        message: '使用明细已超过 7 天保留期',
+      },
+    }),
+  })
+  await assert.rejects(
+    () => apiClient.get('/usage/records/42'),
+    (error) =>
+      isApiRequestError(error) &&
+      error.status === 410 &&
+      error.code === 'usage_record_expired' &&
+      error.message === 'Usage record is outside the 7-day retention period',
+  )
+
+  const { getUsageRecords, isUsageRecordsLegacyRangeValidationError } =
+    await server.ssrLoadModule(`/src/features/usage/api/usageApi.ts?case=${moduleCase++}`)
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 422,
+    statusText: 'Unprocessable Entity',
+    json: async () => ({
+      detail: {
+        code: 'validation_error',
+        message: '请求明细仅保留最近 7 天，不能使用 range=all',
+      },
+    }),
+  })
+  await assert.rejects(
+    () => getUsageRecords({}, 1, 50, { range: 'all' }),
+    (error) => isUsageRecordsLegacyRangeValidationError(error),
+  )
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 500,
+    statusText: 'Internal Server Error',
+    json: async () => ({
+      detail: {
+        code: 'validation_error',
+        message: '请求参数无效',
+      },
+    }),
+  })
+  await assert.rejects(
+    () => getUsageRecords({}, 1, 50, { range: 'all' }),
+    (error) => !isUsageRecordsLegacyRangeValidationError(error),
+  )
+
+  const usageRecordsView = await readFile(
+    new URL('../src/features/usage/views/UsageRecordsView.vue', import.meta.url),
+    'utf8',
+  )
+  const usageHistoryView = await readFile(
+    new URL('../src/features/usage/views/UsageHistoryView.vue', import.meta.url),
+    'utf8',
+  )
+  assert.match(
+    usageHistoryView,
+    /function quickRangeFromQuery\(\): QuickRangeKey \| null \{\s*const value = route\.query\.quick_range\s*if \(isQuickRangeKey\(value\)\) \{\s*return value\s*\}\s*return route\.query\.range === 'all' \? 'all' : null/,
+  )
+  assert.match(
+    usageHistoryView,
+    /const \[retentionStart, end\] = usageRecordsLatestRange\(\)/,
+  )
+  assert.match(
+    usageRecordsView,
+    /function clearLegacyAllRangeRequest\(\) \{\s*if \(\s*legacyAllRangeRequested\.value &&\s*\(dateRange\.value === null \|\| !isRecordsRangeWithinRetention\(dateRange\.value\)\)\s*\) \{\s*activeQuickRange\.value = 'last7d'\s*dateRange\.value = latestRecordsRange\(\)\s*\}\s*legacyAllRangeRequested\.value = false\s*[\s\S]*legacyAllRangeTerminal\.value = false/,
+  )
+  assert.match(
+    usageRecordsView,
+    /function refreshAfterFilterChange\(\) \{\s*clearLegacyAllRangeRequest\(\)\s*void refresh\(\{ resetPage: true, recoverLegacyRange: true \}\)/,
+  )
+  assert.match(
+    usageRecordsView,
+    /requestedRange === 'all' &&\s*legacyAllRangeRequested\.value &&\s*isUsageRecordsLegacyRangeValidationError\(error\)/,
+  )
+  assert.match(
+    usageRecordsView,
+    /recoverLegacyRange: Boolean\(queuedRefresh\?\.recoverLegacyRange \|\| options\.recoverLegacyRange\)/,
+  )
+  assert.match(
+    usageRecordsView,
+    /const requestGeneration = silent \? refreshGeneration : \+\+refreshGeneration/,
+  )
+  assert.match(
+    usageRecordsView,
+    /if \(requestGeneration !== refreshGeneration\) \{\s*return\s*\}/,
+  )
   globalThis.fetch = async () => ({
     ok: false,
     status: 418,

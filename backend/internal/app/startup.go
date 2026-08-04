@@ -20,9 +20,10 @@ var (
 )
 
 type NewOptions struct {
-	Migrate         bool
-	RequireReady    bool
-	StartBackground bool
+	Migrate               bool
+	RequireReady          bool
+	StartBackground       bool
+	StartUsageMaintenance bool
 }
 
 type RuntimePaths struct {
@@ -71,12 +72,26 @@ func Migrate(ctx context.Context) (MigrationReport, error) {
 	if err != nil {
 		return MigrationReport{DBPath: paths.DBPath, PreviousVersion: before, TargetVersion: backendMigrations.LatestVersion}, err
 	}
-	return MigrationReport{
+	report := MigrationReport{
 		DBPath:          paths.DBPath,
 		PreviousVersion: before,
 		CurrentVersion:  after,
 		TargetVersion:   backendMigrations.LatestVersion,
-	}, nil
+	}
+	pending, err := app.usageAnalyticsFactsPending(ctx)
+	if err != nil {
+		return report, fmt.Errorf("check migrated usage analytics facts: %w", err)
+	}
+	if !pending {
+		return report, nil
+	}
+	if err := app.ensureUsageAnalyticsFacts(ctx); err != nil {
+		return report, fmt.Errorf("reconcile migrated usage analytics facts: %w", err)
+	}
+	if err := app.requireUsageAnalyticsFacts(ctx); err != nil {
+		return report, fmt.Errorf("validate migrated usage analytics facts: %w", err)
+	}
+	return report, nil
 }
 
 func CheckStartup(ctx context.Context) (StartupCheck, error) {
@@ -205,6 +220,28 @@ func requireSchemaShape(ctx context.Context, db *sql.DB) error {
 		{"usage_records", "dedupe_key"},
 		{"usage_records", "ttft_ms"},
 		{"usage_records", "service_tier"},
+		{"usage_analytics_facts", "usage_record_id"},
+		{"usage_analytics_facts", "timestamp"},
+		{"usage_analytics_facts", "source_key"},
+		{"usage_analytics_facts", "auth"},
+		{"usage_analytics_facts", "auth_index"},
+		{"usage_analytics_facts", "source_account"},
+		{"usage_source_catalog", "source_key"},
+		{"usage_source_catalog", "source"},
+		{"usage_source_catalog", "auth_conflict"},
+		{"usage_analytics_pending_facts", "usage_record_id"},
+		{"usage_analytics_hourly", "hour_start"},
+		{"usage_analytics_hourly", "facts_version"},
+		{"usage_analytics_hourly", "source_key"},
+		{"usage_analytics_hourly", "aggregate_total_tokens"},
+		{"usage_analytics_hourly", "estimated_cost_usd"},
+		{"usage_analytics_state", "facts_version"},
+		{"usage_analytics_state", "hourly_facts_version"},
+		{"usage_analytics_state", "hourly_max_record_id"},
+		{"usage_analytics_state", "hourly_needs_rebuild"},
+		{"usage_analytics_state", "selector_fingerprint"},
+		{"usage_analytics_state", "last_pruned_records"},
+		{"usage_analytics_state", "last_maintenance_error"},
 		{"codex_keeper_auth_states", "auth_index"},
 		{"model_prices", "request_usd"},
 		{"model_prices", "priority_multiplier"},

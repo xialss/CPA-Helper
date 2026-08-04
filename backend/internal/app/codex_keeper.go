@@ -1104,6 +1104,9 @@ func (a *App) keeperQuotaWindowUsages(ctx context.Context, accounts []keeperAcco
 	if len(accounts) == 0 {
 		return map[string]keeperQuotaWindowUsagePair{}, nil
 	}
+	if err := a.ensureUsageAnalyticsFacts(ctx); err != nil {
+		return nil, err
+	}
 	key, err := a.keeperQuotaWindowUsageCacheKey(ctx)
 	if err != nil {
 		return nil, err
@@ -1121,14 +1124,14 @@ func (a *App) keeperQuotaWindowUsages(ctx context.Context, accounts []keeperAcco
 }
 
 func (a *App) keeperQuotaWindowUsageCacheKey(ctx context.Context) (string, error) {
-	var stateUpdated, usageID sql.NullString
+	var stateUpdated, factsVersion sql.NullString
 	if err := a.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(CAST(updated_at AS TEXT)), '') FROM codex_keeper_auth_states`).Scan(&stateUpdated); err != nil {
 		return "", err
 	}
-	if err := a.db.QueryRowContext(ctx, `SELECT COALESCE(CAST(MAX(id) AS TEXT), '') FROM usage_records`).Scan(&usageID); err != nil {
+	if err := a.db.QueryRowContext(ctx, `SELECT COALESCE(CAST(facts_version AS TEXT), '') FROM usage_analytics_state WHERE id = 1`).Scan(&factsVersion); err != nil {
 		return "", err
 	}
-	return stateUpdated.String + "|" + usageID.String, nil
+	return stateUpdated.String + "|" + factsVersion.String, nil
 }
 
 func (a *App) cachedKeeperQuotaWindowUsages(key string, now time.Time) (map[string]keeperQuotaWindowUsagePair, bool) {
@@ -1321,17 +1324,33 @@ func keeperQuotaWindowBounds(minStart, maxEnd time.Time, usage *keeperQuotaWindo
 }
 
 func (a *App) keeperUsageRecordsInRange(ctx context.Context, start, end time.Time) ([]UsageRecord, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT id, CAST(timestamp AS TEXT), usage_username, api_key_description, provider, model, service_tier, reasoning_effort, endpoint, source,
-		source_account, request_id, auth, auth_index, latency_ms, ttft_ms, failed, input_tokens, output_tokens, cached_tokens,
-		cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json
-		FROM usage_records
-		WHERE timestamp >= ? AND timestamp < ?
-		ORDER BY timestamp`, dbTime(start), dbTime(end))
+	if err := a.ensureUsageAnalyticsFacts(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := a.db.QueryContext(ctx, `
+	SELECT facts.usage_record_id, CAST(facts.timestamp AS TEXT), facts.usage_username,
+	       facts.api_key_description, facts.provider, facts.model, facts.service_tier, facts.endpoint,
+	       facts.source_key, facts.auth, facts.auth_index, facts.source_account, facts.ttft_ms, facts.failed,
+		       facts.input_tokens, facts.output_tokens, facts.cached_tokens, facts.cache_read_tokens,
+		       facts.cache_creation_tokens, facts.reasoning_tokens, facts.total_tokens, catalog.source
+		FROM usage_analytics_facts AS facts
+		LEFT JOIN usage_source_catalog AS catalog ON catalog.source_key = facts.source_key
+		WHERE facts.timestamp >= ? AND facts.timestamp < ?
+		ORDER BY facts.timestamp, facts.usage_record_id
+	`, dbTime(start), dbTime(end))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanUsageRecords(rows)
+	records := []UsageRecord{}
+	for rows.Next() {
+		record, err := scanUsageAnalyticsFactRecordWithSource(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
 }
 
 func addKeeperSourceAccountAlias(aliases map[string]string, value string, name string) {
@@ -1749,6 +1768,9 @@ func keeperRefreshCacheDuration(cfg AppConfig) time.Duration {
 }
 
 func (a *App) conditionalKeeperRefreshCandidates(ctx context.Context, cfg AppConfig) ([]string, error) {
+	if err := a.ensureUsageAnalyticsFacts(ctx); err != nil {
+		return nil, err
+	}
 	cacheWindow := keeperRefreshCacheDuration(cfg)
 	since := time.Now().In(appTimeLocation).Add(-cacheWindow)
 	aliases, err := a.keeperAuthNameAliases(ctx)
@@ -1787,18 +1809,18 @@ func (a *App) conditionalKeeperRefreshCandidates(ctx context.Context, cfg AppCon
 	}
 
 	rows, err := a.db.QueryContext(ctx, `
-		SELECT source, raw_json
-		FROM usage_records
-		WHERE timestamp >= ?
-		ORDER BY timestamp DESC
+		SELECT catalog.source, facts.auth_index, facts.source_account
+		FROM usage_analytics_facts AS facts
+		LEFT JOIN usage_source_catalog AS catalog ON catalog.source_key = facts.source_key
+		WHERE facts.timestamp >= ?
+		ORDER BY facts.timestamp DESC, facts.usage_record_id DESC
 	`, dbTime(since))
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
-		var source sql.NullString
-		var rawJSON string
-		if err := rows.Scan(&source, &rawJSON); err != nil {
+		var source, authIndex, sourceAccount sql.NullString
+		if err := rows.Scan(&source, &authIndex, &sourceAccount); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
@@ -1806,21 +1828,14 @@ func (a *App) conditionalKeeperRefreshCandidates(ctx context.Context, cfg AppCon
 		if source.Valid {
 			sourceResolved = addUsageIdentifier(source.String, false)
 		}
-		if identifier := rawJSONStringField(rawJSON, "source"); identifier != nil {
-			sourceResolved = addUsageIdentifier(*identifier, false) || sourceResolved
-		}
 		if sourceResolved {
 			continue
 		}
-		for _, field := range []string{"auth_index", "authIndex", "index", "auth_name", "authName", "account_id", "accountId"} {
-			if identifier := rawJSONStringField(rawJSON, field); identifier != nil {
-				addUsageIdentifier(*identifier, true)
-			}
+		if authIndex.Valid {
+			addUsageIdentifier(authIndex.String, true)
 		}
-		for _, field := range []string{"email", "account_email", "accountEmail", "user_email", "userEmail"} {
-			if identifier := rawJSONStringField(rawJSON, field); identifier != nil {
-				addUsageIdentifier(*identifier, false)
-			}
+		if sourceAccount.Valid {
+			addUsageIdentifier(sourceAccount.String, false)
 		}
 	}
 	if err := rows.Close(); err != nil {
