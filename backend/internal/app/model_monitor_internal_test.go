@@ -91,6 +91,84 @@ func TestParseOpenAIPageHistoryBuildsOfficialGroupsWithIncidentTitles(t *testing
 	}
 }
 
+func TestApplyOpenAIHistoryHandlesUndefinedImpactEndAt(t *testing.T) {
+	t.Run("undefined uses page now", func(t *testing.T) {
+		summary, _, services := loadOpenAIHistoryTestData(t)
+		const conversationsID = "01JMXBNJXGV1T5GT2M9XA83XNG"
+		for groupIndex := range summary.Structure.Items {
+			for componentIndex := range summary.Structure.Items[groupIndex].Group.Components {
+				component := &summary.Structure.Items[groupIndex].Group.Components[componentIndex]
+				if component.ComponentID == "chat" {
+					component.ComponentID = conversationsID
+				}
+			}
+		}
+		for uptimeIndex := range summary.ComponentUptimes {
+			if summary.ComponentUptimes[uptimeIndex].ComponentID == "chat" {
+				summary.ComponentUptimes[uptimeIndex].ComponentID = conversationsID
+			}
+		}
+		for serviceIndex := range services {
+			if services[serviceIndex].ID == "chat" {
+				services[serviceIndex].ID = conversationsID
+			}
+		}
+		undefined := "$undefined"
+		summary.ComponentImpacts = append(summary.ComponentImpacts, openAIPageImpact{
+			ComponentID: conversationsID,
+			StartAt:     "2026-08-04T12:43:44.616Z",
+			EndAt:       &undefined,
+			Status:      "degraded_performance",
+			IncidentID:  "01KZ6CT9K9Q52S3707W75MNBGB",
+		})
+		summary.IncidentLinks = append(summary.IncidentLinks, openAIIncidentLink{
+			ID:   "01KZ6CT9K9Q52S3707W75MNBGB",
+			Name: "Conversations degraded performance",
+		})
+		now := time.Date(2026, 8, 4, 13, 0, 0, 0, time.UTC)
+		current := ModelMonitorSourceStatus{Services: services}
+		if err := applyOpenAIHistory(&current, summary, now); err != nil {
+			t.Fatal(err)
+		}
+
+		nowDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+		groupSample := findModelMonitorSample(t, current.Groups[1].Samples, nowDay)
+		if groupSample.Status != "degraded_performance" {
+			t.Fatalf("ongoing impact group sample status = %q, want degraded_performance", groupSample.Status)
+		}
+		if !equalStrings(groupSample.RelatedIncidents, []string{"Conversations degraded performance"}) {
+			t.Fatalf("ongoing impact group related incidents = %#v", groupSample.RelatedIncidents)
+		}
+		conversationsSample := findModelMonitorSample(t, current.Groups[1].Services[0].Samples, nowDay)
+		if conversationsSample.Status != "degraded_performance" {
+			t.Fatalf("ongoing impact sample status = %q, want degraded_performance", conversationsSample.Status)
+		}
+		if !equalStrings(conversationsSample.RelatedIncidents, []string{"Conversations degraded performance"}) {
+			t.Fatalf("ongoing impact related incidents = %#v", conversationsSample.RelatedIncidents)
+		}
+	})
+
+	for _, test := range []struct {
+		name  string
+		endAt string
+	}{
+		{name: "invalid end time", endAt: "not-a-time"},
+		{name: "end before start", endAt: "2026-07-27T11:00:00Z"},
+		{name: "non-exact undefined marker", endAt: " $undefined "},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			summary, now, services := loadOpenAIHistoryTestData(t)
+			endAt := test.endAt
+			summary.ComponentImpacts[0].EndAt = &endAt
+			current := ModelMonitorSourceStatus{Services: services}
+			err := applyOpenAIHistory(&current, summary, now)
+			if err == nil || !strings.Contains(err.Error(), "impact 时间范围无效") {
+				t.Fatalf("impact end_at %q error = %v, want impact time-range error", test.endAt, err)
+			}
+		})
+	}
+}
+
 func TestOpenAIIncidentLinkValidation(t *testing.T) {
 	historyBody := string(readModelMonitorFixture(t, "openai_history.html"))
 	incidentLinks := `,\"incident_links\":[{\"id\":\"incident-1\",\"name\":\"Elevated API error rates\"},{\"id\":\"incident-2\",\"name\":\"Search requests unavailable\"}]`

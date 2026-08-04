@@ -522,7 +522,7 @@ func applyOpenAIHistory(current *ModelMonitorSourceStatus, summary openAIPageSum
 			return fmt.Errorf("OpenAI 组件 %q 的 impact 结构无效", impact.ComponentID)
 		}
 		end := now
-		if impact.EndAt != nil {
+		if impact.EndAt != nil && *impact.EndAt != "$undefined" {
 			end, err = time.Parse(time.RFC3339Nano, *impact.EndAt)
 			if err != nil || end.Before(start) {
 				return fmt.Errorf("OpenAI 组件 %q 的 impact 时间范围无效", impact.ComponentID)
