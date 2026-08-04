@@ -22,7 +22,8 @@ import {
   Timer,
 } from 'lucide-vue-next'
 
-import { getUsageOptions, getUsageOverview } from '@/features/usage/api/usageApi'
+import { getUsageOptions, getUsageOverview, getUsageSummary } from '@/features/usage/api/usageApi'
+import { usageRecordsLatestRange } from '@/features/usage/recordsRetention'
 import { getCurrentUserQuota } from '@/features/users/api/usersApi'
 import ChartPanel, { type ChartOption } from '@/features/usage/components/ChartPanel.vue'
 import type {
@@ -49,7 +50,7 @@ import {
 import { localizedUsageChannelFallbackLabel, useI18n } from '@/shared/i18n'
 
 type FailedFilter = 'all' | 'success' | 'failed'
-type QuickRangeKey = 'today' | 'last24h' | 'last3d' | 'last7d' | 'last30d'
+type QuickRangeKey = 'today' | 'last24h' | 'last3d' | 'last7d' | 'last30d' | 'all'
 type UsageScope = 'admin' | 'account'
 type CompositionMode = 'tokens' | 'cost'
 
@@ -109,9 +110,12 @@ interface HourActivityItem {
 }
 
 const AUTO_REFRESH_INTERVAL_MS = 5000
+const AUXILIARY_REFRESH_INTERVAL_MS = 60 * 1000
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
 const THIRTY_MINUTES_MS = 30 * 60 * 1000
+const ALL_USAGE_START_PARAM = '0001-01-01T00:00:00+08:00'
+const ALL_USAGE_END_PARAM = '9999-12-31T23:59:59+08:00'
 const DISTRIBUTION_CHART_COLORS = [
   { token: '--cpa-chart-1', fallback: '#009aa8' },
   { token: '--cpa-chart-2', fallback: '#1d8dff' },
@@ -128,6 +132,7 @@ const { currentLanguage, errorText, t } = useI18n()
 const isLoading = ref(false)
 const isAutoRefreshing = ref(false)
 const autoRefreshError = ref<string | null>(null)
+const fullRefreshError = ref<string | null>(null)
 const auxiliaryError = ref<string | null>(null)
 const lastRefreshedAt = ref<Date | null>(null)
 const filtersExpanded = ref(false)
@@ -223,7 +228,7 @@ function isTodayRange(range: [number, number] | null): boolean {
   return range[0] === todayStart && range[1] === tomorrowStart
 }
 
-function buildQuickRange(key: QuickRangeKey): [number, number] {
+function buildQuickRange(key: QuickRangeKey): [number, number] | null {
   switch (key) {
     case 'today':
       return todayRange()
@@ -235,6 +240,8 @@ function buildQuickRange(key: QuickRangeKey): [number, number] {
       return rollingRange(7 * DAY_MS)
     case 'last30d':
       return rollingRange(30 * DAY_MS)
+    case 'all':
+      return null
   }
 }
 
@@ -244,7 +251,10 @@ function isQuickRangeKey(value: unknown): value is QuickRangeKey {
 
 function quickRangeFromQuery(): QuickRangeKey | null {
   const value = route.query.quick_range
-  return isQuickRangeKey(value) ? value : null
+  if (isQuickRangeKey(value)) {
+    return value
+  }
+  return route.query.range === 'all' ? 'all' : null
 }
 
 function inferQuickRangeFromRange(range: [number, number] | null): QuickRangeKey | null {
@@ -300,6 +310,7 @@ const quickRangeOptions = computed<Array<{ key: QuickRangeKey; label: string }>>
   { key: 'last3d', label: t('近 3 日', 'Last 3 days') },
   { key: 'last7d', label: t('近 7 日', 'Last 7 days') },
   { key: 'last30d', label: t('近 30 日', 'Last 30 days') },
+  { key: 'all', label: t('全部', 'All') },
 ])
 
 const initialQuickRange = quickRangeFromQuery()
@@ -361,9 +372,10 @@ const rankingTitle = computed(() =>
 )
 
 const refreshStatusText = computed(() => {
+  const refreshError = autoRefreshError.value ?? fullRefreshError.value
   const lastRefreshTime = lastRefreshedAt.value
   if (!lastRefreshTime) {
-    return autoRefreshError.value
+    return refreshError
       ? t('自动刷新异常 · 尚无成功同步', 'Auto refresh error · no successful sync yet')
       : t('每 5 秒自动刷新 · 等待首次同步', 'Auto refresh every 5 seconds · waiting for first sync')
   }
@@ -372,7 +384,7 @@ const refreshStatusText = computed(() => {
     minute: '2-digit',
     second: '2-digit',
   }).format(lastRefreshTime)
-  if (autoRefreshError.value) {
+  if (refreshError) {
     return t(`自动刷新异常 · 最近成功 ${lastRefreshText}`, `Auto refresh error · last success ${lastRefreshText}`)
   }
   if (auxiliaryError.value) {
@@ -380,6 +392,8 @@ const refreshStatusText = computed(() => {
   }
   return t(`每 5 秒自动刷新 · 最近 ${lastRefreshText}`, `Auto refresh every 5 seconds · latest ${lastRefreshText}`)
 })
+
+const hasRefreshError = computed(() => Boolean(autoRefreshError.value || fullRefreshError.value))
 
 const dashboardRangeLabel = computed(() => {
   const activeRange = quickRangeOptions.value.find((option) => option.key === activeQuickRange.value)
@@ -418,10 +432,19 @@ function formatMetricRangeTime(value: number): string {
 function buildFilters(): UsageFilters {
   const failed =
     filterForm.failed === 'all' ? undefined : filterForm.failed === 'failed' ? true : false
+  const isAllTimeRange = activeQuickRange.value === 'all'
   return {
     scope: props.scope,
-    start: dateRange.value ? formatLocalDateTimeParam(dateRange.value[0]) : undefined,
-    end: dateRange.value ? formatLocalDateTimeParam(dateRange.value[1]) : undefined,
+    start: isAllTimeRange
+      ? ALL_USAGE_START_PARAM
+      : dateRange.value
+        ? formatLocalDateTimeParam(dateRange.value[0])
+        : undefined,
+    end: isAllTimeRange
+      ? ALL_USAGE_END_PARAM
+      : dateRange.value
+        ? formatLocalDateTimeParam(dateRange.value[1])
+        : undefined,
     user_id: isAccountScope.value ? undefined : (filterForm.user_id ?? undefined),
     api_key_description: filterForm.api_key_description ?? undefined,
     provider: filterForm.provider ?? undefined,
@@ -512,15 +535,31 @@ async function applyQuickRange(key: QuickRangeKey) {
   await refresh()
 }
 
-let queuedRefresh: RefreshOptions | null = null
-let refreshInFlight = false
+let queuedFullRefresh: RefreshOptions | null = null
+let fullRefreshInFlight = false
+let summaryRefreshInFlight = false
+let refreshVersion = 0
+let automaticRefreshesInFlight = 0
 
-function queueRefresh(options: RefreshOptions) {
-  if (options.silent) {
+function beginAutomaticRefresh() {
+  automaticRefreshesInFlight += 1
+  isAutoRefreshing.value = true
+}
+
+function finishAutomaticRefresh() {
+  automaticRefreshesInFlight = Math.max(automaticRefreshesInFlight - 1, 0)
+  isAutoRefreshing.value = automaticRefreshesInFlight > 0
+}
+
+function queueFullRefresh(options: RefreshOptions) {
+  if (!options.silent) {
+    queuedFullRefresh = { silent: false }
+    isLoading.value = true
     return
   }
-  queuedRefresh = { silent: false }
-  isLoading.value = true
+  if (!queuedFullRefresh) {
+    queuedFullRefresh = { silent: true }
+  }
 }
 
 async function refreshAfterRankingSortChange() {
@@ -529,16 +568,20 @@ async function refreshAfterRankingSortChange() {
 }
 
 async function refresh({ silent = false }: RefreshOptions = {}) {
-  if (refreshInFlight) {
-    queueRefresh({ silent })
+  if (fullRefreshInFlight) {
+    if (!silent) {
+      refreshVersion += 1
+    }
+    queueFullRefresh({ silent })
     return
   }
-  refreshInFlight = true
+  const refreshId = ++refreshVersion
+  fullRefreshInFlight = true
   if (activeQuickRange.value) {
     dateRange.value = buildQuickRange(activeQuickRange.value)
   }
   if (silent) {
-    isAutoRefreshing.value = true
+    beginAutomaticRefresh()
   } else {
     isLoading.value = true
   }
@@ -559,7 +602,7 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       model: modelRankingSort.value,
       includeOptions: false,
     })
-    if (queuedRefresh) {
+    if (refreshId !== refreshVersion) {
       return
     }
     summary.value = overview.summary
@@ -585,6 +628,7 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       ),
     })
     autoRefreshError.value = null
+    fullRefreshError.value = null
     lastRefreshedAt.value = new Date()
     if (!silent) {
       isLoading.value = false
@@ -593,12 +637,12 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
     let auxiliaryFailed = false
     try {
       const todayOverview = await getUsageOverview(todayFilters, { includeOptions: false })
-      if (queuedRefresh) {
+      if (refreshId !== refreshVersion) {
         return
       }
       todayTrends.value = todayOverview.trends
     } catch {
-      if (queuedRefresh) {
+      if (refreshId !== refreshVersion) {
         return
       }
       todayTrends.value = []
@@ -607,14 +651,14 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
 
     try {
       const failedOverview = await getUsageOverview(failedFilters, { includeOptions: false })
-      if (queuedRefresh) {
+      if (refreshId !== refreshVersion) {
         return
       }
       failedSummary.value = failedOverview.summary
       failedTrends.value = failedOverview.trends
       failedEndpointDistribution.value = failedOverview.distributions.endpoints ?? []
     } catch {
-      if (queuedRefresh) {
+      if (refreshId !== refreshVersion) {
         return
       }
       failedSummary.value = null
@@ -625,20 +669,19 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
 
     if (includeRealtime) {
       try {
-        const realtimeOverview = await getUsageOverview(
+        const nextRealtimeSummary = await getUsageSummary(
           {
             ...filters,
             start: formatLocalDateTimeParam(realtimeStart),
             end: formatLocalDateTimeParam(realtimeEnd),
           },
-          { includeOptions: false },
         )
-        if (queuedRefresh) {
+        if (refreshId !== refreshVersion) {
           return
         }
-        realtimeSummary.value = realtimeOverview.summary
+        realtimeSummary.value = nextRealtimeSummary
       } catch {
-        if (queuedRefresh) {
+        if (refreshId !== refreshVersion) {
           return
         }
         realtimeSummary.value = null
@@ -651,12 +694,12 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
     if (isAccountScope.value) {
       try {
         const nextQuotaStatus = await getCurrentUserQuota()
-        if (queuedRefresh) {
+        if (refreshId !== refreshVersion) {
           return
         }
         quotaStatus.value = nextQuotaStatus
       } catch {
-        if (queuedRefresh) {
+        if (refreshId !== refreshVersion) {
           return
         }
         quotaStatus.value = null
@@ -667,12 +710,12 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
     if (!silent) {
       try {
         const nextOptions = await getUsageOptions(filters)
-        if (queuedRefresh) {
+        if (refreshId !== refreshVersion) {
           return
         }
         options.value = normalizeUsageOptions(nextOptions)
       } catch {
-        if (queuedRefresh) {
+        if (refreshId !== refreshVersion) {
           return
         }
         auxiliaryFailed = true
@@ -683,21 +726,23 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       ? t('部分辅助指标加载失败', 'Some auxiliary metrics failed to load')
       : null
   } catch (error) {
-    if (queuedRefresh) {
+    if (refreshId !== refreshVersion) {
       return
     }
     const errorMessage = errorText(error, '加载历史用量失败', 'Failed to load usage history')
-    if (silent) {
-      autoRefreshError.value = errorMessage
-    } else {
+    fullRefreshError.value = errorMessage
+    if (!silent) {
       message.error(errorMessage)
     }
   } finally {
-    const nextRefresh = queuedRefresh
-    queuedRefresh = null
-    refreshInFlight = false
+    const nextRefresh = queuedFullRefresh
+    queuedFullRefresh = null
+    fullRefreshInFlight = false
     if (silent) {
-      isAutoRefreshing.value = false
+      finishAutomaticRefresh()
+      if (!nextRefresh) {
+        isLoading.value = false
+      }
     } else if (!nextRefresh) {
       isLoading.value = false
     }
@@ -707,12 +752,102 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
   }
 }
 
+async function refreshSummary() {
+  if (fullRefreshInFlight || summaryRefreshInFlight) {
+    return
+  }
+  summaryRefreshInFlight = true
+  const refreshId = refreshVersion
+  if (activeQuickRange.value) {
+    dateRange.value = buildQuickRange(activeQuickRange.value)
+  }
+  beginAutomaticRefresh()
+  try {
+    const filters = buildFilters()
+    const usedServerDefaultRange = filters.start === undefined && filters.end === undefined
+    const includeRealtime = activeQuickRange.value === 'today'
+    const nextSummary = await getUsageSummary(filters)
+    if (refreshId !== refreshVersion) {
+      return
+    }
+    summary.value = nextSummary
+    if (usedServerDefaultRange) {
+      dateRange.value = [
+        new Date(nextSummary.start).getTime(),
+        new Date(nextSummary.end).getTime(),
+      ]
+    }
+
+    let realtimeError: string | null = null
+    if (includeRealtime) {
+      const [realtimeStart, realtimeEnd] = rollingRange(THIRTY_MINUTES_MS)
+      try {
+        const nextRealtimeSummary = await getUsageSummary({
+          ...filters,
+          start: formatLocalDateTimeParam(realtimeStart),
+          end: formatLocalDateTimeParam(realtimeEnd),
+        })
+        if (refreshId !== refreshVersion) {
+          return
+        }
+        realtimeSummary.value = nextRealtimeSummary
+      } catch (error) {
+        if (refreshId !== refreshVersion) {
+          return
+        }
+        realtimeSummary.value = null
+        realtimeError = errorText(
+          error,
+          '刷新近实时用量失败',
+          'Failed to refresh near-real-time usage',
+        )
+      }
+    } else {
+      realtimeSummary.value = null
+    }
+
+    autoRefreshError.value = realtimeError
+    lastRefreshedAt.value = new Date()
+  } catch (error) {
+    if (refreshId !== refreshVersion) {
+      return
+    }
+    autoRefreshError.value = errorText(
+      error,
+      '刷新历史用量失败',
+      'Failed to refresh usage history',
+    )
+  } finally {
+    summaryRefreshInFlight = false
+    finishAutomaticRefresh()
+  }
+}
+
 function goRecords(extra: UsageFilters = {}) {
-  const filters = { ...buildFilters(), ...extra }
+  const navigation = usageRecordFiltersForNavigation({ ...buildFilters(), ...extra })
   void router.push({
     name: isAccountScope.value ? 'account-records' : 'admin-records',
-    query: filtersToQuery(filters),
+    query: filtersToQuery(navigation.filters, navigation.quickRange),
   })
+}
+
+function usageRecordFiltersForNavigation(filters: UsageFilters): {
+  filters: UsageFilters
+  quickRange: 'last7d' | null
+} {
+  const start = filters.start ? new Date(filters.start).getTime() : Number.NaN
+  const [retentionStart, end] = usageRecordsLatestRange()
+  if (Number.isFinite(start) && start >= retentionStart) {
+    return { filters, quickRange: null }
+  }
+  return {
+    filters: {
+      ...filters,
+      start: formatLocalDateTimeParam(retentionStart),
+      end: formatLocalDateTimeParam(end),
+    },
+    quickRange: 'last7d',
+  }
 }
 
 function rankingFilters(row: RankingItem): UsageFilters {
@@ -1362,17 +1497,24 @@ const endpointDistributionOption = computed<ChartOption>(() =>
 )
 
 let autoRefreshTimer: number | undefined
+let auxiliaryRefreshTimer: number | undefined
 
 onMounted(() => {
   void refresh()
   autoRefreshTimer = window.setInterval(() => {
-    void refresh({ silent: true })
+    void refreshSummary()
   }, AUTO_REFRESH_INTERVAL_MS)
+  auxiliaryRefreshTimer = window.setInterval(() => {
+    void refresh({ silent: true })
+  }, AUXILIARY_REFRESH_INTERVAL_MS)
 })
 
 onBeforeUnmount(() => {
   if (autoRefreshTimer !== undefined) {
     window.clearInterval(autoRefreshTimer)
+  }
+  if (auxiliaryRefreshTimer !== undefined) {
+    window.clearInterval(auxiliaryRefreshTimer)
   }
 })
 </script>
@@ -1398,7 +1540,7 @@ onBeforeUnmount(() => {
           <strong>{{ quotaValueText(quotaStatus) }}</strong>
           <small>{{ quotaFootnote(quotaStatus) }}</small>
         </span>
-        <span class="refresh-status" :class="{ 'is-error': autoRefreshError }">
+        <span class="refresh-status" :class="{ 'is-error': hasRefreshError }">
           {{ refreshStatusText }}
         </span>
         <NButton secondary @click="goRecords()">{{ t('明细', 'Records') }}</NButton>

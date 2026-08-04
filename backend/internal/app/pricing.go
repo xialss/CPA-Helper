@@ -1015,8 +1015,16 @@ func validatePriorityMultiplierForPrice(price ModelPrice) error {
 	return nil
 }
 
+type modelPriceQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
 func (a *App) listPrices(ctx context.Context) ([]ModelPrice, error) {
-	rows, err := a.db.QueryContext(ctx, `
+	return listPricesWithQueryer(ctx, a.db)
+}
+
+func listPricesWithQueryer(ctx context.Context, queryer modelPriceQueryer) ([]ModelPrice, error) {
+	rows, err := queryer.QueryContext(ctx, `
 		SELECT id, provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 		       input_usd_per_million, output_usd_per_million,
 		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
@@ -1048,6 +1056,22 @@ func (a *App) billingPriceIndexWithoutSelectors(ctx context.Context) (modelPrice
 		return modelPriceBillingIndex{}, err
 	}
 	result := modelPriceBillingIndex{Prices: channelPricesByKey(prices)}
+	result.MatchContext.SelectorsRequired = modelPriceIndexNeedsConfiguredSelectors(result.Prices)
+	return result, nil
+}
+
+// usageAnalyticsBillingPriceIndex reads model prices through the same SQLite
+// transaction as usage_analytics_state. The state pricing version therefore
+// certifies exactly the price snapshot used to build hourly rows.
+func usageAnalyticsBillingPriceIndex(ctx context.Context, queryer modelPriceQueryer, matchContext modelPriceMatchContext) (modelPriceBillingIndex, error) {
+	prices, err := listPricesWithQueryer(ctx, queryer)
+	if err != nil {
+		return modelPriceBillingIndex{}, err
+	}
+	result := modelPriceBillingIndex{
+		Prices:       channelPricesByKey(prices),
+		MatchContext: matchContext,
+	}
 	result.MatchContext.SelectorsRequired = modelPriceIndexNeedsConfiguredSelectors(result.Prices)
 	return result, nil
 }
@@ -3165,6 +3189,10 @@ func calculateRecordCostBreakdown(record UsageRecord, prices modelPriceIndex, ma
 func calculateRecordCost(record UsageRecord, prices modelPriceIndex, collectItems bool, matchContexts ...modelPriceMatchContext) usageCostBreakdown {
 	price, matchStatus := findMatchingChannelPrice(prices, record, matchContexts...)
 	channelBrand := matchedModelPriceChannelBrand(price, record, matchContexts...)
+	return calculateRecordCostForMatch(record, price, matchStatus, channelBrand, collectItems)
+}
+
+func calculateRecordCostForMatch(record UsageRecord, price *ModelPrice, matchStatus string, channelBrand *aiProviderBrand, collectItems bool) usageCostBreakdown {
 	tokens := normalizedUsageTokenBreakdown(record, channelBrand)
 	contextInputTokens := usageAggregateInputTokens(record, channelBrand)
 	breakdown := usageCostBreakdown{

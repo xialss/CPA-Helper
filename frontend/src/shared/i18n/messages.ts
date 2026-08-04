@@ -17,6 +17,11 @@ const exactServerMessages: MessagePair[] = [
   ['首次登录后必须先修改账号密码', 'Change the account password after first sign-in'],
   ['需要管理员权限', 'Admin access is required'],
   ['资源不存在', 'Resource does not exist'],
+  ['使用明细已超过 7 天保留期', 'Usage record is outside the 7-day retention period'],
+  ['请求明细仅保留最近 7 天，不能使用 range=all', 'Request records are retained for only the last 7 days; range=all is unavailable'],
+  ['请求明细必须提供有效的时间范围', 'Request records require a valid time range'],
+  ['请求明细时间范围无效', 'Request record time range is invalid'],
+  ['请求明细仅保留最近 7 天', 'Request records are retained for only the last 7 days'],
   ['用户名或密码不正确', 'Username or password is incorrect'],
   ['系统尚未初始化，请先创建第一个管理员账号', 'The system is not initialized. Create the first admin account first.'],
   ['第一个管理员账号已存在', 'The first admin account already exists'],
@@ -47,6 +52,7 @@ const serverCodeFallbackMessages = new Map<string, MessagePair>([
   ['method_not_allowed', ['请求方法不支持', 'Request method is not allowed']],
   ['not_found', ['资源不存在', 'Resource does not exist']],
   ['startup_check_failed', ['启动检查失败', 'Startup check failed']],
+  ['usage_record_expired', ['使用明细已超过 7 天保留期', 'Usage record is outside the 7-day retention period']],
   ['validation_error', ['请求参数无效', 'Invalid request parameters']],
 ])
 

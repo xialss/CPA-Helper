@@ -369,6 +369,121 @@ func TestKeeperQuotaWindowUsageAttributionPrefersSourceAccount(t *testing.T) {
 	}
 }
 
+func TestConditionalKeeperRefreshCandidatesUsePersistedRawSourceAccountAlias(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = ""
+	cfg.CodexKeeper.AccountRefreshCacheMinutes = 10
+
+	insertKeeperUsageRecord(t, app, "persisted-raw-email", time.Now().In(appTimeLocation).Add(-time.Minute), `{"email":"Keeper-Alias@Example.com"}`)
+	if err := app.ensureUsageAnalyticsFacts(ctx); err != nil {
+		t.Fatalf("materialize usage analytics facts: %v", err)
+	}
+	if _, err := app.db.Exec(`UPDATE usage_records SET raw_json = '' WHERE dedupe_key = 'conditional-persisted-raw-email'`); err != nil {
+		t.Fatalf("prune retained raw payload: %v", err)
+	}
+	insertKeeperStateForCandidateWithEmail(t, app, "alias-account.json", stringPtr("keeper-alias@example.com"), nil, nil)
+
+	var sourceAccount string
+	if err := app.db.QueryRow(`SELECT source_account FROM usage_analytics_facts`).Scan(&sourceAccount); err != nil {
+		t.Fatalf("query persisted fact source account: %v", err)
+	}
+	if sourceAccount != "keeper-alias@example.com" {
+		t.Fatalf("persisted fact source account = %q, want normalized raw alias", sourceAccount)
+	}
+
+	names, err := app.conditionalKeeperRefreshCandidates(ctx, cfg)
+	if err != nil {
+		t.Fatalf("conditionalKeeperRefreshCandidates: %v", err)
+	}
+	assertStringSet(t, names, []string{"alias-account.json"})
+}
+
+func TestKeeperQuotaWindowUsageCacheReconcilesPendingFactsBeforeRead(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	now := time.Now().In(appTimeLocation)
+	accounts := []keeperAccount{{
+		Name:                 "cached-alias.json",
+		Email:                stringPtr("cache-alias@example.com"),
+		AccountType:          stringPtr("plus"),
+		PrimaryResetAt:       timePtrValue(now.Add(30 * time.Minute)),
+		PrimaryWindowSeconds: intPtrValue(3600),
+	}}
+	seed := keeperWindowUsageSeed{
+		Source:       "opaque-cache-source",
+		InputTokens:  1,
+		OutputTokens: 1,
+		RawJSON:      `{"email":"cache-alias@example.com"}`,
+	}
+	seed.Dedupe = "cache-first"
+	seed.Timestamp = now.Add(-10 * time.Minute)
+	insertKeeperWindowUsageRecord(t, app, seed)
+
+	usages, err := app.keeperQuotaWindowUsages(context.Background(), accounts)
+	if err != nil {
+		t.Fatalf("first keeperQuotaWindowUsages: %v", err)
+	}
+	if got := usages["cached-alias.json"].Primary.Records; got != 1 {
+		t.Fatalf("first cached usage records = %d, want 1", got)
+	}
+
+	seed.Dedupe = "cache-second"
+	seed.Timestamp = now.Add(-5 * time.Minute)
+	insertKeeperWindowUsageRecord(t, app, seed)
+	usages, err = app.keeperQuotaWindowUsages(context.Background(), accounts)
+	if err != nil {
+		t.Fatalf("second keeperQuotaWindowUsages: %v", err)
+	}
+	if got := usages["cached-alias.json"].Primary.Records; got != 2 {
+		t.Fatalf("cache-reconciled usage records = %d, want 2", got)
+	}
+	if got := usages["cached-alias.json"].Primary.TotalTokens; got != 4 {
+		t.Fatalf("cache-reconciled usage tokens = %d, want 4", got)
+	}
+
+	if _, err := app.db.Exec(`
+		UPDATE usage_records
+		SET input_tokens = input_tokens + 2, total_tokens = total_tokens + 2
+		WHERE dedupe_key = 'quota-cache-second'
+	`); err != nil {
+		t.Fatalf("directly update cached usage record: %v", err)
+	}
+	usages, err = app.keeperQuotaWindowUsages(context.Background(), accounts)
+	if err != nil {
+		t.Fatalf("updated keeperQuotaWindowUsages: %v", err)
+	}
+	if got := usages["cached-alias.json"].Primary.Records; got != 2 {
+		t.Fatalf("updated cache-reconciled usage records = %d, want 2", got)
+	}
+	if got := usages["cached-alias.json"].Primary.TotalTokens; got != 6 {
+		t.Fatalf("updated cache-reconciled usage tokens = %d, want 6", got)
+	}
+
+	var pending int
+	if err := app.db.QueryRow(`SELECT COUNT(*) FROM usage_analytics_pending_facts`).Scan(&pending); err != nil {
+		t.Fatalf("count pending usage analytics facts: %v", err)
+	}
+	if pending != 0 {
+		t.Fatalf("pending usage analytics facts = %d, want 0", pending)
+	}
+}
+
 func TestKeeperQuotaWindowUsageAttributionUsesAuthIndexWhenSourceAccountIsShared(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()

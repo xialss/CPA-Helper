@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	backendMigrations "cpa-helper/backend/migrations"
 )
@@ -48,6 +49,77 @@ func TestMigrateMakesStartupCheckReady(t *testing.T) {
 	if check.CurrentVersion != backendMigrations.LatestVersion {
 		t.Fatalf("startup version = %d, want %d", check.CurrentVersion, backendMigrations.LatestVersion)
 	}
+}
+
+func TestUsageMaintenanceStartupProfiles(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	ctx := context.Background()
+	setup, err := NewWithOptions(ctx, NewOptions{Migrate: true})
+	if err != nil {
+		t.Fatalf("initialize database: %v", err)
+	}
+
+	now := time.Now().In(appTimeLocation)
+	expiredAt := usageRawRetentionCutoff(now).Add(-time.Second)
+	const rawJSON = `{"source":"startup-profile@example.com"}`
+	result, err := setup.db.ExecContext(ctx, `
+		INSERT INTO usage_records (
+			created_at, timestamp, provider, model, endpoint, failed,
+			input_tokens, output_tokens, cached_tokens, cache_read_tokens,
+			cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json
+		) VALUES (?, ?, 'codex', 'gpt-startup-profile', '/v1/responses', 0,
+			1, 0, 0, 0, 0, 0, 1, 'startup-profile-expired-record', ?)
+	`, dbTime(now), dbTime(expiredAt), rawJSON)
+	if err != nil {
+		setup.Close()
+		t.Fatalf("insert expired raw usage record: %v", err)
+	}
+	recordID, err := result.LastInsertId()
+	if err != nil {
+		setup.Close()
+		t.Fatalf("read expired raw usage record id: %v", err)
+	}
+	setup.Close()
+
+	assertRawJSON := func(stage string, app *App, want string) {
+		t.Helper()
+		var got string
+		if err := app.db.QueryRowContext(ctx, `SELECT raw_json FROM usage_records WHERE id = ?`, recordID).Scan(&got); err != nil {
+			t.Fatalf("%s: query raw usage record: %v", stage, err)
+		}
+		if got != want {
+			t.Fatalf("%s: raw_json = %q, want %q", stage, got, want)
+		}
+	}
+
+	serveApp, err := NewWithOptions(ctx, NewOptions{
+		RequireReady:          true,
+		StartBackground:       true,
+		StartUsageMaintenance: false,
+	})
+	if err != nil {
+		t.Fatalf("initialize serve profile: %v", err)
+	}
+	if serveApp.usageMaintenance != nil {
+		serveApp.Close()
+		t.Fatal("serve profile created a usage maintenance runner")
+	}
+	if serveApp.collector == nil || serveApp.keeper == nil {
+		serveApp.Close()
+		t.Fatal("serve profile did not start the collector and Keeper background runners")
+	}
+	assertRawJSON("serve profile", serveApp, rawJSON)
+	serveApp.Close()
+
+	defaultApp, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer defaultApp.Close()
+	if defaultApp.usageMaintenance == nil || defaultApp.usageMaintenance.done == nil {
+		t.Fatal("New() did not start immediate and periodic usage maintenance")
+	}
+	assertRawJSON("default app", defaultApp, "")
 }
 
 func TestCheckStartupDoesNotCreateVersionTableForUnmigratedDatabase(t *testing.T) {
@@ -174,6 +246,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceChannelColumns(t *testing.T) 
 				modelPriceLibraryConflictSchemaForStartupTest,
 				`CREATE TABLE user_quota_charges (lifetime_deducted_usd TEXT)`,
 			}
+			statements = append(statements, usageAnalyticsSchemasForStartupTest...)
 			for _, statement := range statements {
 				if _, err := db.Exec(statement); err != nil {
 					t.Fatalf("create test schema: %v", err)
@@ -207,6 +280,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceLibraryConflictsTable(t *test
 		)`,
 		`CREATE TABLE user_quota_charges (lifetime_deducted_usd TEXT)`,
 	}
+	statements = append(statements, usageAnalyticsSchemasForStartupTest...)
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatalf("create test schema: %v", err)
@@ -239,6 +313,7 @@ func TestRequireSchemaShapeRejectsMissingKeeperAuthIndex(t *testing.T) {
 		modelPriceLibraryConflictSchemaForStartupTest,
 		`CREATE TABLE user_quota_charges (lifetime_deducted_usd TEXT)`,
 	}
+	statements = append(statements, usageAnalyticsSchemasForStartupTest...)
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatalf("create test schema: %v", err)
@@ -268,6 +343,21 @@ const modelPriceLibraryConflictSchemaForStartupTest = `CREATE TABLE model_price_
 	long_context_cache_read_usd_per_million TEXT, long_context_cache_creation_usd_per_million TEXT,
 	source TEXT, source_model TEXT, auto_synced TEXT, last_synced_at TEXT, updated_at TEXT
 )`
+
+var usageAnalyticsSchemasForStartupTest = []string{
+	`CREATE TABLE usage_analytics_facts (
+		usage_record_id TEXT, timestamp TEXT, source_key TEXT, auth TEXT, auth_index TEXT, source_account TEXT
+	)`,
+	`CREATE TABLE usage_source_catalog (source_key TEXT, source TEXT, auth_conflict TEXT)`,
+	`CREATE TABLE usage_analytics_pending_facts (usage_record_id TEXT)`,
+	`CREATE TABLE usage_analytics_hourly (
+		hour_start TEXT, facts_version TEXT, source_key TEXT, aggregate_total_tokens TEXT, estimated_cost_usd TEXT
+	)`,
+	`CREATE TABLE usage_analytics_state (
+		facts_version TEXT, hourly_facts_version TEXT, hourly_max_record_id TEXT, hourly_needs_rebuild TEXT,
+		selector_fingerprint TEXT, last_pruned_records TEXT, last_maintenance_error TEXT
+	)`,
+}
 
 func appSettingsSchemaForStartupTest(missing string) string {
 	columns := []string{"session_secret TEXT", "model_monitor_proxy_enabled TEXT", "model_monitor_proxy_url TEXT"}

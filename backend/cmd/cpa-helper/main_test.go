@@ -27,6 +27,26 @@ func TestRunHelpListsOperationalSubcommands(t *testing.T) {
 	}
 }
 
+func TestServiceOptionsSeparateUsageMaintenance(t *testing.T) {
+	for _, testCase := range []struct {
+		name                  string
+		startUsageMaintenance bool
+	}{
+		{name: "serve", startUsageMaintenance: false},
+		{name: "start", startUsageMaintenance: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			options := serviceOptions(testCase.startUsageMaintenance)
+			if !options.RequireReady || !options.StartBackground {
+				t.Fatalf("service options = %#v, want readiness and generic background runners", options)
+			}
+			if options.StartUsageMaintenance != testCase.startUsageMaintenance {
+				t.Fatalf("service usage maintenance = %t, want %t", options.StartUsageMaintenance, testCase.startUsageMaintenance)
+			}
+		})
+	}
+}
+
 func TestRunRepairUsageTokensRequiresModeAndAuditReport(t *testing.T) {
 	var output bytes.Buffer
 	if err := run(context.Background(), []string{"repair-usage-tokens"}, &output); err == nil || !strings.Contains(err.Error(), "requires audit or apply") {
