@@ -308,6 +308,48 @@ func TestParseInputIMStatusSortsMinuteSamplesAndKeepsUptime(t *testing.T) {
 	}
 }
 
+func TestParseInputIMStatusRetainsSameSecondSamplesInStableInputOrder(t *testing.T) {
+	ok := true
+	failed := false
+	uptime := 99.5
+	firstLatency := 240.0
+	firstError := "first failure"
+	secondLatency := 80.0
+	secondError := "second detail"
+	laterLatency := 15.0
+	body, err := json.Marshal(inputIMPayload{
+		AllOK:       &ok,
+		GeneratedAt: 300,
+		Services: []inputIMService{{
+			Model: "gpt-same-second", UptimePct: &uptime,
+			Last: &inputIMSample{Timestamp: 300, OK: &ok, LatencyMS: &laterLatency},
+			History: []inputIMSample{
+				{Timestamp: 300, OK: &ok, LatencyMS: &laterLatency},
+				{Timestamp: 200, OK: &failed, LatencyMS: &firstLatency, Error: &firstError},
+				{Timestamp: 200, OK: &ok, LatencyMS: &secondLatency, Error: &secondError},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := parseInputIMStatus(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	samples := status.Services[0].Samples
+	if len(samples) != 3 || samples[0].Timestamp.Unix() != 200 || samples[1].Timestamp.Unix() != 200 || samples[2].Timestamp.Unix() != 300 {
+		t.Fatalf("same-second samples = %#v, want stable ascending order", samples)
+	}
+	if samples[0].Status != "major_outage" || samples[0].LatencyMS == nil || *samples[0].LatencyMS != firstLatency || samples[0].Error == nil || *samples[0].Error != firstError {
+		t.Fatalf("first same-second sample = %#v, want first input sample", samples[0])
+	}
+	if samples[1].Status != "operational" || samples[1].LatencyMS == nil || *samples[1].LatencyMS != secondLatency || samples[1].Error == nil || *samples[1].Error != secondError {
+		t.Fatalf("second same-second sample = %#v, want second input sample", samples[1])
+	}
+}
+
 func TestParseInputIMStatusRejectsUnsafeTimestamps(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -703,6 +745,19 @@ func (fn modelMonitorRoundTripper) RoundTrip(request *http.Request) (*http.Respo
 	return fn(request)
 }
 
+type modelMonitorCloseTrackingTransport struct {
+	roundTripper http.RoundTripper
+	closeCalls   int
+}
+
+func (transport *modelMonitorCloseTrackingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport.roundTripper.RoundTrip(request)
+}
+
+func (transport *modelMonitorCloseTrackingTransport) CloseIdleConnections() {
+	transport.closeCalls++
+}
+
 func TestModelMonitorProxyNormalizationAndTransport(t *testing.T) {
 	normalized, err := normalizeModelMonitorProxyURL(" sock5://127.0.0.1:1080 ")
 	if err != nil {
@@ -821,7 +876,7 @@ func TestModelMonitorAggregationKeepsBuiltInOrderAndPartialFailures(t *testing.T
 	defer app.Close()
 	openAIClient := openAITestClient(t, openAITestSummary())
 	var seenHosts sync.Map
-	fakeClient := &http.Client{Transport: modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+	transport := &modelMonitorCloseTrackingTransport{roundTripper: modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
 		seenHosts.Store(request.URL.Host, true)
 		if request.URL.Host == "status.input.im" {
 			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(readModelMonitorFixture(t, "input_im_status.json")))), Request: request}, nil
@@ -831,6 +886,7 @@ func TestModelMonitorAggregationKeepsBuiltInOrderAndPartialFailures(t *testing.T
 		}
 		return openAIClient.Transport.RoundTrip(request)
 	})}
+	fakeClient := &http.Client{Transport: transport}
 	factoryCalls := 0
 	app.modelMonitorHTTPClient = func(proxyCfg ModelMonitorProxyConfig) (*http.Client, error) {
 		factoryCalls++
@@ -846,6 +902,9 @@ func TestModelMonitorAggregationKeepsBuiltInOrderAndPartialFailures(t *testing.T
 	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor", nil, cookies, http.StatusOK, &response)
 	if factoryCalls != 1 {
 		t.Fatalf("model monitor HTTP client factory calls = %d, want 1", factoryCalls)
+	}
+	if transport.closeCalls != 1 {
+		t.Fatalf("model monitor CloseIdleConnections calls = %d, want 1", transport.closeCalls)
 	}
 	for _, host := range []string{"status.input.im", "status.openai.com", "status.claude.com"} {
 		if _, ok := seenHosts.Load(host); !ok {
