@@ -296,6 +296,8 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("/api/ai-providers/", a.wrap(a.handleAIProviderByPath))
 	mux.HandleFunc("/api/codex-keeper/", a.wrap(a.handleCodexKeeper))
 	mux.HandleFunc("/api/model-monitor", a.wrap(a.handleModelMonitor))
+	mux.HandleFunc("/api/model-monitor/settings", a.wrap(a.handleModelMonitorSettings))
+	mux.HandleFunc("/api/model-monitor/sources/{id}", a.wrap(a.handleModelMonitorSource))
 	mux.HandleFunc("/api/model-monitor/proxy", a.wrap(a.handleModelMonitorProxy))
 	mux.HandleFunc("/", a.wrap(a.handleSPA))
 	return withCORS(mux)

@@ -873,6 +873,25 @@ export interface ModelMonitorResponse {
   sources: ModelMonitorSourceStatus[]
 }
 
+export interface ModelMonitorBuiltInSource {
+  id: string
+  name: string
+  source_type: ModelMonitorSourceType
+  status_page_url: string
+  history_granularity: ModelMonitorHistoryGranularity
+  history_window_label: string
+  enabled: boolean
+}
+
+export interface ModelMonitorSettings {
+  enabled_source_ids: string[]
+  sources: ModelMonitorBuiltInSource[]
+}
+
+export interface ModelMonitorSettingsPayload {
+  enabled_source_ids: string[]
+}
+
 export interface ModelMonitorProxySettings {
   enabled: boolean
   proxy_url: string

@@ -92,6 +92,9 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if !testColumnExists(t, app.db, "app_settings", "model_monitor_proxy_url") {
 		t.Fatal("app_settings.model_monitor_proxy_url was not created")
 	}
+	if !testColumnExists(t, app.db, "app_settings", "model_monitor_enabled_source_ids") {
+		t.Fatal("app_settings.model_monitor_enabled_source_ids was not created")
+	}
 	if !testColumnExists(t, app.db, "users", "quota_lifetime_usd") {
 		t.Fatal("users.quota_lifetime_usd was not created")
 	}
@@ -167,12 +170,15 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 		t.Fatalf("app_settings singleton count = %d, want 1", settingsCount)
 	}
 	var modelMonitorProxyEnabled bool
-	var modelMonitorProxyURL string
-	if err := app.db.QueryRow(`SELECT model_monitor_proxy_enabled, model_monitor_proxy_url FROM app_settings WHERE id = 1`).Scan(&modelMonitorProxyEnabled, &modelMonitorProxyURL); err != nil {
+	var modelMonitorProxyURL, modelMonitorEnabledSourceIDs string
+	if err := app.db.QueryRow(`SELECT model_monitor_proxy_enabled, model_monitor_proxy_url, model_monitor_enabled_source_ids FROM app_settings WHERE id = 1`).Scan(&modelMonitorProxyEnabled, &modelMonitorProxyURL, &modelMonitorEnabledSourceIDs); err != nil {
 		t.Fatalf("query model monitor proxy defaults: %v", err)
 	}
 	if modelMonitorProxyEnabled || modelMonitorProxyURL != "" {
 		t.Fatalf("model monitor proxy defaults = %t/%q, want false/empty", modelMonitorProxyEnabled, modelMonitorProxyURL)
+	}
+	if modelMonitorEnabledSourceIDs != `["ai-input-im","openai","anthropic","deepseek"]` {
+		t.Fatalf("model monitor enabled source IDs default = %q", modelMonitorEnabledSourceIDs)
 	}
 }
 
@@ -570,6 +576,29 @@ func TestRunMigrationsUpgradesModelMonitorProxySettingsIndependently(t *testing.
 	}
 	if cfg.Enabled || cfg.ProxyURL != "" {
 		t.Fatalf("model monitor proxy inherited legacy LiteLLM settings: %#v", cfg)
+	}
+}
+
+func TestRunMigrationsUpgradesModelMonitorSourceSettings(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	prepareMigrationTestDatabase(t, dataDir, 202607310010)
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	if !testColumnExists(t, app.db, "app_settings", "model_monitor_enabled_source_ids") {
+		t.Fatal("model monitor source settings column was not created during upgrade")
+	}
+	settings, err := app.loadModelMonitorSourceSettings(context.Background())
+	if err != nil {
+		t.Fatalf("loadModelMonitorSourceSettings failed: %v", err)
+	}
+	want := []string{"ai-input-im", "openai", "anthropic", "deepseek"}
+	if !equalStrings(settings.EnabledSourceIDs, want) {
+		t.Fatalf("migrated enabled source IDs = %#v, want %#v", settings.EnabledSourceIDs, want)
 	}
 }
 

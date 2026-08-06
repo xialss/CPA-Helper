@@ -154,6 +154,9 @@ const serverTermTranslations: MessagePair[] = [
   ['设置', 'settings'],
   ['账户', 'account'],
   ['可用模型', 'available models'],
+  ['模型监控来源设置', 'model monitoring source settings'],
+  ['模型监控来源配置', 'model monitoring source settings'],
+  ['模型监控来源', 'model monitoring source'],
   ['代理配置', 'proxy settings'],
   ['API 密钥', 'API keys'],
   ['历史用量', 'usage history'],
@@ -226,26 +229,33 @@ const modelMonitorTransportMessagePatterns: ServerMessagePattern[] = [
 
 const serverMessagePatterns: ServerMessagePattern[] = [
   [/^操作失败$/, () => 'Operation failed'],
-  [/^(OpenAI|Anthropic|AI\.INPUT\.IM)(?: (.+?))? 响应不是有效 JSON(?::\s*(.+))?$/, ([, source, subject, detail]) => `${source}${subject ? ` ${translateModelMonitorSubject(subject)}` : ''} response is not valid JSON${detail ? `: ${detail}` : ''}`],
-  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+?)响应缺少\s*(.+)$/, ([, source, subject, fields]) => `${source} ${translateModelMonitorSubject(subject)} response is missing ${translateModelMonitorSubject(fields ?? '')}`],
-  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)缺少\s*必要字段$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} is missing required fields`],
-  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)结构无效$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} structure is invalid`],
-  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)字段无效$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} field is invalid`],
-  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)不是有效的非空对象$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} is not a valid non-empty object`],
-  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)为空$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} is empty`],
-  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)重复$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} is duplicated`],
-  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)无效(?::\s*(.+))?$/, ([, source, subject, detail]) => `${source} ${translateModelMonitorSubject(subject)} is invalid${detail ? `: ${translateModelMonitorDetail(detail)}` : ''}`],
-  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+?)缺少\s*(.+)$/, ([, source, subject, missing]) => `${source} ${translateModelMonitorSubject(subject)} is missing ${translateModelMonitorSubject(missing)}`],
-  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)包含未知组件 (.+)$/, ([, source, subject, component]) => `${source} ${translateModelMonitorSubject(subject)} contains unknown component ${component}`],
-  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)包含无效日期$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} contains an invalid date`],
+  [/^模型监控来源配置无效:\s*(.+)$/, ([, detail]) => `Model monitoring source settings are invalid: ${translateModelMonitorSourceSettingsDetail(detail ?? '')}`],
+  [/^模型监控来源设置缺少 enabled_source_ids 字段$/, () => 'Model monitoring source settings are missing enabled_source_ids'],
+  [/^enabled_source_ids 必须是 JSON 字符串数组$/, () => 'enabled_source_ids must be a JSON string array'],
+  [/^模型监控来源 ID 不能为空$/, () => 'Model monitoring source ID is required'],
+  [/^模型监控来源 ID "(.+)" 不受支持$/, ([, id]) => `Model monitoring source ID "${id}" is not supported`],
+  [/^模型监控来源 ID "(.+)" 重复$/, ([, id]) => `Model monitoring source ID "${id}" is duplicated`],
+  [/^模型监控来源不存在$/, () => 'Model monitoring source does not exist'],
+  [/^(OpenAI|Anthropic|DeepSeek|AI\.INPUT\.IM)(?: (.+?))? 响应不是有效 JSON(?::\s*(.+))?$/, ([, source, subject, detail]) => `${source}${subject ? ` ${translateModelMonitorSubject(subject)}` : ''} response is not valid JSON${detail ? `: ${detail}` : ''}`],
+  [/^(OpenAI|Anthropic|DeepSeek|AI\.INPUT\.IM) (.+?)响应缺少\s*(.+)$/, ([, source, subject, fields]) => `${source} ${translateModelMonitorSubject(subject)} response is missing ${translateModelMonitorSubject(fields ?? '')}`],
+  [/^(OpenAI|Anthropic|DeepSeek|AI\.INPUT\.IM) (.+)缺少\s*必要字段$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} is missing required fields`],
+  [/^(OpenAI|Anthropic|DeepSeek|AI\.INPUT\.IM) (.+)结构无效$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} structure is invalid`],
+  [/^(OpenAI|Anthropic|DeepSeek|AI\.INPUT\.IM) (.+)字段无效$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} field is invalid`],
+  [/^(OpenAI|Anthropic|DeepSeek|AI\.INPUT\.IM) (.+)不是有效的非空对象$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} is not a valid non-empty object`],
+  [/^(OpenAI|Anthropic|DeepSeek|AI\.INPUT\.IM) (.+)为空$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} is empty`],
+  [/^(OpenAI|Anthropic|DeepSeek|AI\.INPUT\.IM) (.+)重复$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} is duplicated`],
+  [/^(OpenAI|Anthropic|DeepSeek|AI\.INPUT\.IM) (.+)无效(?::\s*(.+))?$/, ([, source, subject, detail]) => `${source} ${translateModelMonitorSubject(subject)} is invalid${detail ? `: ${translateModelMonitorDetail(detail)}` : ''}`],
+  [/^(OpenAI|Anthropic|DeepSeek|AI\.INPUT\.IM) (.+?)缺少\s*(.+)$/, ([, source, subject, missing]) => `${source} ${translateModelMonitorSubject(subject)} is missing ${translateModelMonitorSubject(missing)}`],
+  [/^(OpenAI|Anthropic|DeepSeek|AI\.INPUT\.IM) (.+)包含未知组件 (.+)$/, ([, source, subject, component]) => `${source} ${translateModelMonitorSubject(subject)} contains unknown component ${component}`],
+  [/^(OpenAI|Anthropic|DeepSeek|AI\.INPUT\.IM) (.+)包含无效日期$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} contains an invalid date`],
   [/^OpenAI summary 引用了 components 响应中不存在的组件 (.+)$/, ([, component]) => `OpenAI summary references component ${component} that is absent from the components response`],
   [/^OpenAI (.+)引用了未知\s*(.+)$/, ([, subject, target]) => `OpenAI ${translateModelMonitorSubject(subject)} references unknown ${translateModelMonitorSubject(target)}`],
   [/^OpenAI (.+)引用了无法映射的 incident (.+)$/, ([, subject, incident]) => `OpenAI ${translateModelMonitorSubject(subject)} references unmapped incident ${incident}`],
   [/^OpenAI 当前 component (.+) 未出现在页面分组中$/, ([, component]) => `OpenAI current component ${component} does not appear in the page groups`],
   [/^OpenAI 可见 group (.+) 没有可见 component$/, ([, group]) => `OpenAI visible group ${group} has no visible component`],
   [/^OpenAI 页面当前结构数量为 (\d+)、历史结构数量为 (\d+)，均期望 (\d+)$/, ([, current, history, expected]) => `OpenAI page has ${current} current structures and ${history} history structures; expected ${expected} of each`],
-  [/^Anthropic 页面 uptimeData 赋值数量为 (\d+)，期望 (\d+)$/, ([, actual, expected]) => `Anthropic page uptimeData assignment count is ${actual}; expected ${expected}`],
-  [/^(OpenAI|Anthropic|AI\.INPUT\.IM) (.+)不一致$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} does not match`],
+  [/^(Anthropic|DeepSeek) 页面 uptimeData 赋值数量为 (\d+)，期望 (\d+)$/, ([, source, actual, expected]) => `${source} page uptimeData assignment count is ${actual}; expected ${expected}`],
+  [/^(OpenAI|Anthropic|DeepSeek|AI\.INPUT\.IM) (.+)不一致$/, ([, source, subject]) => `${source} ${translateModelMonitorSubject(subject)} does not match`],
   [/^加载(.+)失败$/, ([, subject]) => `Failed to load ${translateTerms(subject ?? '')}`],
   [/^保存(.+)失败$/, ([, subject]) => `Failed to save ${translateTerms(subject ?? '')}`],
   [/^删除(.+)失败$/, ([, subject]) => `Failed to delete ${translateTerms(subject ?? '')}`],
@@ -383,6 +393,23 @@ function translateModelMonitorDetail(value: string): string {
     default:
       return value
   }
+}
+
+function translateModelMonitorSourceSettingsDetail(value: string): string {
+  switch (value) {
+    case 'enabled_source_ids 必须是 JSON 字符串数组':
+      return 'enabled_source_ids must be a JSON string array'
+    case '模型监控来源 ID 不能为空':
+      return 'model monitoring source ID is required'
+  }
+
+  const unsupported = value.match(/^模型监控来源 ID "(.+)" 不受支持$/)
+  if (unsupported) return `model monitoring source ID "${unsupported[1]}" is not supported`
+
+  const duplicate = value.match(/^模型监控来源 ID "(.+)" 重复$/)
+  if (duplicate) return `model monitoring source ID "${duplicate[1]}" is duplicated`
+
+  return value
 }
 
 function translateModelMonitorRequestDetail(value: string): string {
