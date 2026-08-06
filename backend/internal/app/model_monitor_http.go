@@ -83,11 +83,18 @@ func normalizeModelMonitorProxyURL(value string) (string, error) {
 }
 
 func modelMonitorGet(ctx context.Context, client *http.Client, targetURL, expectedContentType string) ([]byte, error) {
+	return modelMonitorGetWithHost(ctx, client, targetURL, expectedContentType, "")
+}
+
+func modelMonitorGetWithHost(ctx context.Context, client *http.Client, targetURL, expectedContentType, requestHost string) ([]byte, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	request.Header.Set("Accept", expectedContentType)
+	if requestHost != "" {
+		request.Host = requestHost
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("模型监控请求失败: %w", err)

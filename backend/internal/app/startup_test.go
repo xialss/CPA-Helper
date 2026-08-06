@@ -178,8 +178,8 @@ func TestReadyEndpointReportsMigrationVersion(t *testing.T) {
 	}
 }
 
-func TestRequireSchemaShapeRejectsMissingModelMonitorProxyColumns(t *testing.T) {
-	for _, missing := range []string{"model_monitor_proxy_enabled", "model_monitor_proxy_url"} {
+func TestRequireSchemaShapeRejectsMissingModelMonitorColumns(t *testing.T) {
+	for _, missing := range []string{"model_monitor_proxy_enabled", "model_monitor_proxy_url", "model_monitor_enabled_source_ids"} {
 		t.Run(missing, func(t *testing.T) {
 			db, err := sql.Open("sqlite", ":memory:")
 			if err != nil {
@@ -360,7 +360,7 @@ var usageAnalyticsSchemasForStartupTest = []string{
 }
 
 func appSettingsSchemaForStartupTest(missing string) string {
-	columns := []string{"session_secret TEXT", "model_monitor_proxy_enabled TEXT", "model_monitor_proxy_url TEXT"}
+	columns := []string{"session_secret TEXT", "model_monitor_proxy_enabled TEXT", "model_monitor_proxy_url TEXT", "model_monitor_enabled_source_ids TEXT"}
 	kept := make([]string, 0, len(columns))
 	for _, column := range columns {
 		if !strings.HasPrefix(column, missing+" ") {

@@ -103,7 +103,7 @@ Review auth file health, quota windows, account types, priorities and the latest
 
 **Model Monitoring**
 
-View AI.INPUT.IM's upstream minute samples plus OpenAI and Claude Status' official daily status history from three built-in sources.
+View AI.INPUT.IM's upstream minute samples plus OpenAI, Claude Status, and DeepSeek official daily status history. Administrators can enable or disable these four built-in sources and set the display order; custom third-party status pages are not supported.
 
 ### Account Views
 
@@ -378,7 +378,7 @@ The Account Inspection Settings page manages Codex auth files:
 - Conditional scanning compares locally recorded accounts with the current CPA account list: accounts missing locally are queried once for quota and recorded, while accounts no longer present in CPA are removed locally.
 - Priority rules define default scheduling weights by account type.
 - The Account Status page shows health, quota, latest inspection, enabled state and manual priority.
-- The Model Monitoring page independently collects AI.INPUT.IM, OpenAI and Claude Status, preserving each source's native minute or daily history. It does not send paid model probes or claim end-to-end availability for a specific account or route. Administrators can configure an independent proxy from the Model Monitoring page when direct access is unavailable.
+- The Model Monitoring page independently collects AI.INPUT.IM, OpenAI, Claude Status, and DeepSeek, preserving each source's native minute or daily history. It does not send paid model probes or claim end-to-end availability for a specific account or route. Administrators can enable, disable, and reorder the four built-in sources, refresh one source or all enabled sources, and configure an independent proxy when direct access is unavailable. It does not accept custom third-party status pages.
 
 ## Development and Checks
 

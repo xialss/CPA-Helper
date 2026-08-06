@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -524,9 +525,12 @@ func applyOpenAIHistory(current *ModelMonitorSourceStatus, summary openAIPageSum
 		end := now
 		if impact.EndAt != nil && *impact.EndAt != "$undefined" {
 			end, err = time.Parse(time.RFC3339Nano, *impact.EndAt)
-			if err != nil || end.Before(start) {
+			if err != nil {
 				return fmt.Errorf("OpenAI 组件 %q 的 impact 时间范围无效", impact.ComponentID)
 			}
+		}
+		if end.Before(start) {
+			return fmt.Errorf("OpenAI 组件 %q 的 impact 时间范围无效", impact.ComponentID)
 		}
 		incidentTitle := ""
 		if impact.IncidentID != "" {
@@ -565,7 +569,7 @@ func applyOpenAIHistory(current *ModelMonitorSourceStatus, summary openAIPageSum
 				service.UptimePercent = nil
 			}
 			availableSince, _ := time.Parse(time.RFC3339Nano, metadata.DataAvailableSince)
-			service.Samples = projectOpenAIComponentSamples(now, availableSince.UTC(), impactsByComponent[metadata.ComponentID])
+			service.Samples = projectModelMonitorComponentSamples(now, availableSince.UTC(), impactsByComponent[metadata.ComponentID])
 			services = append(services, service)
 			groupStatus = worseModelMonitorStatus(groupStatus, service.Status)
 		}
@@ -579,7 +583,7 @@ func applyOpenAIHistory(current *ModelMonitorSourceStatus, summary openAIPageSum
 		if *group.DisplayAggregatedUptime {
 			uptime := uptimeByGroup[group.ID]
 			result.UptimePercent = uptime.percent
-			result.Samples = aggregateOpenAIGroupSamples(services, uptime.availableSince)
+			result.Samples = aggregateModelMonitorGroupSamples(services, uptime.availableSince)
 		}
 		groups = append(groups, result)
 	}
@@ -601,7 +605,7 @@ func parseOpenAIUptime(item openAIPageUptime, label string) (parsedOpenAIPageUpt
 	return parsedOpenAIPageUptime{percent: &copy, availableSince: availableSince.UTC()}, nil
 }
 
-func projectOpenAIComponentSamples(now, availableSince time.Time, impacts []parsedOpenAIPageImpact) []ModelMonitorSample {
+func projectModelMonitorComponentSamples(now, availableSince time.Time, impacts []parsedOpenAIPageImpact) []ModelMonitorSample {
 	windowEnd := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	windowStart := windowEnd.AddDate(0, 0, -89)
 	componentWindowStart := time.Date(availableSince.Year(), availableSince.Month(), availableSince.Day(), 0, 0, 0, 0, time.UTC)
@@ -625,7 +629,7 @@ func projectOpenAIComponentSamples(now, availableSince time.Time, impacts []pars
 	return samples
 }
 
-func aggregateOpenAIGroupSamples(services []ModelMonitorServiceStatus, availableSince time.Time) []ModelMonitorSample {
+func aggregateModelMonitorGroupSamples(services []ModelMonitorServiceStatus, availableSince time.Time) []ModelMonitorSample {
 	windowStart := time.Date(availableSince.Year(), availableSince.Month(), availableSince.Day(), 0, 0, 0, 0, time.UTC)
 	byDay := make(map[time.Time]ModelMonitorSample)
 	for _, service := range services {
@@ -705,11 +709,870 @@ type anthropicRelatedEvent struct {
 var anthropicUptimeAssignmentPattern = regexp.MustCompile(`\bwindow\s*\.\s*uptimeData\s*=`)
 
 func collectAnthropicStatus(ctx context.Context, client *http.Client, baseURL string) (ModelMonitorSourceStatus, error) {
+	return collectStatuspageStatus(ctx, client, baseURL, "Anthropic")
+}
+
+func collectDeepSeekStatus(ctx context.Context, client *http.Client, baseURL string) (ModelMonitorSourceStatus, error) {
+	pageBody, err := modelMonitorGetWithHost(
+		ctx,
+		client,
+		strings.TrimRight(baseURL, "/")+"/",
+		"text/html",
+		modelMonitorDeepSeekCollectionHost,
+	)
+	if err != nil {
+		return ModelMonitorSourceStatus{}, err
+	}
+	return parseDeepSeekFlashcatPage(pageBody)
+}
+
+type deepSeekFlashcatPageConfig struct {
+	Components []deepSeekFlashcatComponent `json:"components"`
+	Sections   []deepSeekFlashcatSection   `json:"sections"`
+}
+
+type deepSeekFlashcatComponent struct {
+	ComponentID           string `json:"component_id"`
+	SectionID             string `json:"section_id"`
+	Name                  string `json:"name"`
+	AvailableSinceSeconds int64  `json:"available_since_seconds"`
+	OrderID               int    `json:"order_id"`
+	HideAll               *bool  `json:"hide_all"`
+}
+
+type deepSeekFlashcatSection struct {
+	SectionID string `json:"section_id"`
+	Name      string `json:"name"`
+	OrderID   int    `json:"order_id"`
+	HideAll   *bool  `json:"hide_all"`
+}
+
+type deepSeekFlashcatCurrentPage struct {
+	Components []deepSeekFlashcatComponent `json:"components"`
+	// Some older Flight payloads nested active_changes in page.
+	ActiveChanges json.RawMessage `json:"active_changes"`
+}
+
+type deepSeekFlashcatCurrentData struct {
+	Page          *deepSeekFlashcatCurrentPage `json:"page"`
+	ActiveChanges json.RawMessage              `json:"active_changes"`
+}
+
+type deepSeekFlashcatHistoryData struct {
+	SectionImpacts   []deepSeekFlashcatSectionImpact   `json:"section_impacts"`
+	SectionUptimes   []deepSeekFlashcatSectionUptime   `json:"section_uptimes"`
+	ComponentImpacts []deepSeekFlashcatComponentImpact `json:"component_impacts"`
+	ComponentUptimes []deepSeekFlashcatComponentUptime `json:"component_uptimes"`
+	LinkedChanges    []deepSeekFlashcatLinkedChange    `json:"linked_changes"`
+}
+
+type deepSeekFlashcatComponentUptime struct {
+	ComponentID           string   `json:"component_id"`
+	SectionID             string   `json:"section_id"`
+	Uptime                *float64 `json:"uptime"`
+	AvailableSinceSeconds int64    `json:"available_since_seconds"`
+}
+
+type deepSeekFlashcatSectionUptime struct {
+	SectionID             string   `json:"section_id"`
+	Uptime                *float64 `json:"uptime"`
+	AvailableSinceSeconds int64    `json:"available_since_seconds"`
+}
+
+type deepSeekFlashcatComponentImpact struct {
+	ComponentID    string `json:"component_id"`
+	SectionID      string `json:"section_id"`
+	ChangeID       int64  `json:"change_id"`
+	StartAtSeconds int64  `json:"start_at_seconds"`
+	EndAtSeconds   int64  `json:"end_at_seconds"`
+	Status         string `json:"status"`
+}
+
+type deepSeekFlashcatSectionImpact struct {
+	SectionID      string `json:"section_id"`
+	ChangeID       int64  `json:"change_id"`
+	StartAtSeconds int64  `json:"start_at_seconds"`
+	EndAtSeconds   int64  `json:"end_at_seconds"`
+	Status         string `json:"status"`
+}
+
+type deepSeekFlashcatLinkedChange struct {
+	ID    int64  `json:"id"`
+	Type  string `json:"type"`
+	Title string `json:"title"`
+}
+
+type deepSeekFlashcatActiveChange struct {
+	ChangeID int64                                `json:"change_id"`
+	Title    string                               `json:"title"`
+	Status   string                               `json:"status"`
+	Updates  []deepSeekFlashcatActiveChangeUpdate `json:"updates"`
+}
+
+type deepSeekFlashcatActiveChangeUpdate struct {
+	AtSeconds        int64                             `json:"at_seconds"`
+	ComponentChanges []deepSeekFlashcatComponentChange `json:"component_changes"`
+}
+
+type deepSeekFlashcatComponentChange struct {
+	ComponentID string `json:"component_id"`
+	Status      string `json:"status"`
+}
+
+type deepSeekFlashcatPayload struct {
+	PageConfig deepSeekFlashcatPageConfig
+	Current    deepSeekFlashcatCurrentData
+	History    deepSeekFlashcatHistoryData
+	UpdatedAt  time.Time
+}
+
+type deepSeekFlashcatCatalog struct {
+	ComponentsByID     map[string]deepSeekFlashcatComponent
+	SectionsByID       map[string]deepSeekFlashcatSection
+	HiddenComponentIDs map[string]struct{}
+	HiddenSectionIDs   map[string]struct{}
+	Components         []deepSeekFlashcatComponent
+	Sections           []deepSeekFlashcatSection
+}
+
+type deepSeekFlashcatUptime struct {
+	percent        *float64
+	availableSince time.Time
+}
+
+type deepSeekFlashcatActiveStatusEvent struct {
+	at          time.Time
+	componentID string
+	status      string
+}
+
+func parseDeepSeekFlashcatPage(body []byte) (ModelMonitorSourceStatus, error) {
+	payload, err := parseDeepSeekFlashcatPayload(body)
+	if err != nil {
+		return ModelMonitorSourceStatus{}, err
+	}
+	catalog, err := deepSeekFlashcatCatalogFromConfig(payload.PageConfig)
+	if err != nil {
+		return ModelMonitorSourceStatus{}, err
+	}
+	if _, err := deepSeekFlashcatCurrentComponents(payload.Current.Page, catalog); err != nil {
+		return ModelMonitorSourceStatus{}, err
+	}
+	statuses, incidents, err := deepSeekFlashcatActiveStatuses(deepSeekFlashcatCurrentActiveChanges(payload.Current), catalog)
+	if err != nil {
+		return ModelMonitorSourceStatus{}, err
+	}
+	componentUptimes, sectionUptimes, err := deepSeekFlashcatUptimes(payload.History, catalog)
+	if err != nil {
+		return ModelMonitorSourceStatus{}, err
+	}
+	componentImpacts, sectionImpacts, err := deepSeekFlashcatImpacts(payload.History, catalog)
+	if err != nil {
+		return ModelMonitorSourceStatus{}, err
+	}
+
+	standaloneServices := make([]ModelMonitorServiceStatus, 0, len(catalog.Components))
+	servicesBySection := make(map[string][]ModelMonitorServiceStatus, len(catalog.Sections))
+	overallStatus := "operational"
+	for _, component := range catalog.Components {
+		uptime := componentUptimes[component.ComponentID]
+		service := ModelMonitorServiceStatus{
+			ID:            component.ComponentID,
+			Name:          component.Name,
+			Status:        statuses[component.ComponentID],
+			UptimePercent: uptime.percent,
+			Samples:       projectModelMonitorComponentSamples(payload.UpdatedAt, uptime.availableSince, componentImpacts[component.ComponentID]),
+		}
+		overallStatus = worseModelMonitorStatus(overallStatus, service.Status)
+		if component.SectionID == "" {
+			standaloneServices = append(standaloneServices, service)
+			continue
+		}
+		servicesBySection[component.SectionID] = append(servicesBySection[component.SectionID], service)
+	}
+
+	groups := make([]ModelMonitorServiceGroup, 0, len(catalog.Sections))
+	for _, section := range catalog.Sections {
+		services := servicesBySection[section.SectionID]
+		if len(services) == 0 {
+			return ModelMonitorSourceStatus{}, fmt.Errorf("DeepSeek 页面分组 %q 缺少必要字段", section.SectionID)
+		}
+		groupStatus := "operational"
+		for _, service := range services {
+			groupStatus = worseModelMonitorStatus(groupStatus, service.Status)
+		}
+		uptime := sectionUptimes[section.SectionID]
+		groups = append(groups, ModelMonitorServiceGroup{
+			ID:            section.SectionID,
+			Name:          section.Name,
+			Status:        groupStatus,
+			UptimePercent: uptime.percent,
+			Samples:       applyDeepSeekFlashcatSectionImpacts(aggregateModelMonitorGroupSamples(services, uptime.availableSince), sectionImpacts[section.SectionID]),
+			Services:      services,
+		})
+	}
+	return ModelMonitorSourceStatus{
+		OverallStatus:   overallStatus,
+		SourceUpdatedAt: &payload.UpdatedAt,
+		Groups:          groups,
+		Services:        standaloneServices,
+		Incidents:       incidents,
+	}, nil
+}
+
+func parseDeepSeekFlashcatPayload(body []byte) (deepSeekFlashcatPayload, error) {
+	frames, err := deepSeekFlashcatNextFlightFrames(body)
+	if err != nil {
+		return deepSeekFlashcatPayload{}, err
+	}
+	var (
+		payload                         deepSeekFlashcatPayload
+		pageConfigFrames, currentFrames int
+		historyFrames                   int
+	)
+	for _, frame := range frames {
+		if strings.Contains(frame, `"initialPageConfig"`) {
+			properties, err := decodeDeepSeekFlashcatFrameProperties(frame)
+			pageConfigJSON, found := properties["initialPageConfig"]
+			if err != nil || !found || json.Unmarshal(pageConfigJSON, &payload.PageConfig) != nil {
+				return deepSeekFlashcatPayload{}, errors.New("DeepSeek 页面结构无效")
+			}
+			pageConfigFrames++
+		}
+		if strings.Contains(frame, `"initialDataUpdatedAt"`) {
+			properties, err := decodeDeepSeekFlashcatFrameProperties(frame)
+			initialDataJSON, hasInitialData := properties["initialData"]
+			updatedAtJSON, hasUpdatedAt := properties["initialDataUpdatedAt"]
+			if err != nil || !hasInitialData || !hasUpdatedAt || json.Unmarshal(initialDataJSON, &payload.Current) != nil {
+				return deepSeekFlashcatPayload{}, errors.New("DeepSeek 页面结构无效")
+			}
+			updatedAtNumber, err := decodeDeepSeekFlashcatNumber(updatedAtJSON)
+			if err != nil {
+				return deepSeekFlashcatPayload{}, errors.New("DeepSeek 页面结构无效")
+			}
+			updatedAt, err := parseDeepSeekFlashcatMilliseconds(updatedAtNumber)
+			if err != nil {
+				return deepSeekFlashcatPayload{}, err
+			}
+			payload.UpdatedAt = updatedAt
+			currentFrames++
+		}
+		if strings.Contains(frame, `"component_uptimes"`) {
+			properties, err := decodeDeepSeekFlashcatFrameProperties(frame)
+			initialDataJSON, found := properties["initialData"]
+			if err != nil || !found {
+				return deepSeekFlashcatPayload{}, errors.New("DeepSeek 页面结构无效")
+			}
+			history, err := decodeDeepSeekFlashcatHistoryData(initialDataJSON)
+			if err != nil {
+				return deepSeekFlashcatPayload{}, errors.New("DeepSeek 页面结构无效")
+			}
+			payload.History = history
+			historyFrames++
+		}
+	}
+	if pageConfigFrames != 1 || currentFrames != 1 || historyFrames != 1 || payload.Current.Page == nil || payload.UpdatedAt.IsZero() {
+		return deepSeekFlashcatPayload{}, errors.New("DeepSeek 页面结构无效")
+	}
+	if payload.History.ComponentUptimes == nil || payload.History.ComponentImpacts == nil || payload.History.SectionUptimes == nil || payload.History.SectionImpacts == nil || payload.History.LinkedChanges == nil {
+		return deepSeekFlashcatPayload{}, errors.New("DeepSeek 页面结构无效")
+	}
+	return payload, nil
+}
+
+func deepSeekFlashcatNextFlightFrames(body []byte) ([]string, error) {
+	const prefix = "self.__next_f.push("
+	text := string(body)
+	frames := make([]string, 0)
+	for offset := 0; ; {
+		start := strings.Index(text[offset:], prefix)
+		if start < 0 {
+			break
+		}
+		start += offset + len(prefix)
+		end := strings.Index(text[start:], ")</script>")
+		if end < 0 {
+			return nil, errors.New("DeepSeek 页面结构无效")
+		}
+		end += start
+		var frame []json.RawMessage
+		if err := json.Unmarshal([]byte(text[start:end]), &frame); err != nil {
+			return nil, errors.New("DeepSeek 页面结构无效")
+		}
+		if len(frame) >= 2 {
+			var decoded string
+			if err := json.Unmarshal(frame[1], &decoded); err != nil {
+				return nil, errors.New("DeepSeek 页面结构无效")
+			}
+			frames = append(frames, decoded)
+		}
+		offset = end + len(")</script>")
+	}
+	if len(frames) == 0 {
+		return nil, errors.New("DeepSeek 页面结构无效")
+	}
+	return frames, nil
+}
+
+func decodeDeepSeekFlashcatFrameProperties(frame string) (map[string]json.RawMessage, error) {
+	object, err := deepSeekFlashcatFramePropsObject(frame)
+	if err != nil {
+		return nil, err
+	}
+	return decodeDeepSeekFlashcatJSONObjectProperties(object)
+}
+
+func deepSeekFlashcatFramePropsObject(frame string) ([]byte, error) {
+	separator := strings.IndexByte(frame, ':')
+	if separator <= 0 {
+		return nil, errors.New("DeepSeek 页面结构无效")
+	}
+	payload := bytes.TrimSpace([]byte(frame[separator+1:]))
+	if len(payload) == 0 {
+		return nil, errors.New("DeepSeek 页面结构无效")
+	}
+	if payload[0] == '{' {
+		return payload, nil
+	}
+	if payload[0] != '[' {
+		return nil, errors.New("DeepSeek 页面结构无效")
+	}
+
+	var row []json.RawMessage
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	if err := decoder.Decode(&row); err != nil {
+		return nil, errors.New("DeepSeek 页面结构无效")
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("DeepSeek 页面结构无效")
+	}
+	if len(row) < 4 {
+		return nil, errors.New("DeepSeek 页面结构无效")
+	}
+	return row[3], nil
+}
+
+func decodeDeepSeekFlashcatJSONObjectProperties(object []byte) (map[string]json.RawMessage, error) {
+	decoder := json.NewDecoder(bytes.NewReader(object))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return nil, errors.New("DeepSeek 页面结构无效")
+	}
+
+	properties := make(map[string]json.RawMessage)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, errors.New("DeepSeek 页面结构无效")
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, errors.New("DeepSeek 页面结构无效")
+		}
+		if _, exists := properties[key]; exists {
+			return nil, errors.New("DeepSeek 页面结构无效")
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, errors.New("DeepSeek 页面结构无效")
+		}
+		if err := validateDeepSeekFlashcatJSONValue(value); err != nil {
+			return nil, errors.New("DeepSeek 页面结构无效")
+		}
+		properties[key] = value
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return nil, errors.New("DeepSeek 页面结构无效")
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("DeepSeek 页面结构无效")
+	}
+	return properties, nil
+}
+
+func validateDeepSeekFlashcatJSONValue(value json.RawMessage) error {
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	decoder.UseNumber()
+	if err := validateDeepSeekFlashcatJSONToken(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("DeepSeek 页面结构无效")
+	}
+	return nil
+}
+
+func validateDeepSeekFlashcatJSONToken(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return errors.New("DeepSeek 页面结构无效")
+	}
+	delimiter, isDelimiter := token.(json.Delim)
+	if !isDelimiter {
+		return nil
+	}
+
+	switch delimiter {
+	case '{':
+		keys := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return errors.New("DeepSeek 页面结构无效")
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("DeepSeek 页面结构无效")
+			}
+			if _, exists := keys[key]; exists {
+				return errors.New("DeepSeek 页面结构无效")
+			}
+			keys[key] = struct{}{}
+			if err := validateDeepSeekFlashcatJSONToken(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim('}') {
+			return errors.New("DeepSeek 页面结构无效")
+		}
+	case '[':
+		for decoder.More() {
+			if err := validateDeepSeekFlashcatJSONToken(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim(']') {
+			return errors.New("DeepSeek 页面结构无效")
+		}
+	default:
+		return errors.New("DeepSeek 页面结构无效")
+	}
+	return nil
+}
+
+func decodeDeepSeekFlashcatHistoryData(object json.RawMessage) (deepSeekFlashcatHistoryData, error) {
+	properties, err := decodeDeepSeekFlashcatJSONObjectProperties(object)
+	if err != nil {
+		return deepSeekFlashcatHistoryData{}, err
+	}
+	for _, key := range []string{"component_uptimes", "section_uptimes", "component_impacts", "section_impacts", "linked_changes"} {
+		if _, found := properties[key]; !found {
+			return deepSeekFlashcatHistoryData{}, errors.New("DeepSeek 页面结构无效")
+		}
+	}
+	var history deepSeekFlashcatHistoryData
+	if err := json.Unmarshal(object, &history); err != nil {
+		return deepSeekFlashcatHistoryData{}, errors.New("DeepSeek 页面结构无效")
+	}
+	return history, nil
+}
+
+func decodeDeepSeekFlashcatNumber(raw json.RawMessage) (json.Number, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return "", err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return "", errors.New("invalid number")
+	}
+	number, ok := value.(json.Number)
+	if !ok {
+		return "", errors.New("invalid number")
+	}
+	return number, nil
+}
+
+func parseDeepSeekFlashcatMilliseconds(value json.Number) (time.Time, error) {
+	milliseconds, ok := new(big.Rat).SetString(value.String())
+	if !ok || !milliseconds.IsInt() || milliseconds.Sign() <= 0 || !milliseconds.Num().IsInt64() {
+		return time.Time{}, errors.New("DeepSeek 页面字段无效")
+	}
+	timestamp := time.UnixMilli(milliseconds.Num().Int64()).UTC()
+	if timestamp.Year() < 1 || timestamp.Year() > 9999 {
+		return time.Time{}, errors.New("DeepSeek 页面字段无效")
+	}
+	return timestamp, nil
+}
+
+func parseDeepSeekFlashcatSeconds(value int64) (time.Time, error) {
+	if value <= 0 {
+		return time.Time{}, errors.New("DeepSeek 页面字段无效")
+	}
+	timestamp := time.Unix(value, 0).UTC()
+	if timestamp.Year() < 1 || timestamp.Year() > 9999 {
+		return time.Time{}, errors.New("DeepSeek 页面字段无效")
+	}
+	return timestamp, nil
+}
+
+func deepSeekFlashcatCatalogFromConfig(config deepSeekFlashcatPageConfig) (deepSeekFlashcatCatalog, error) {
+	if config.Components == nil || len(config.Components) == 0 || config.Sections == nil {
+		return deepSeekFlashcatCatalog{}, errors.New("DeepSeek 页面结构无效")
+	}
+	catalog := deepSeekFlashcatCatalog{
+		ComponentsByID:     make(map[string]deepSeekFlashcatComponent, len(config.Components)),
+		SectionsByID:       make(map[string]deepSeekFlashcatSection, len(config.Sections)),
+		HiddenComponentIDs: make(map[string]struct{}),
+		HiddenSectionIDs:   make(map[string]struct{}),
+	}
+	allSectionIDs := make(map[string]struct{}, len(config.Sections))
+	sectionOrders := make(map[int]struct{}, len(config.Sections))
+	for _, section := range config.Sections {
+		sectionID := strings.TrimSpace(section.SectionID)
+		if sectionID == "" {
+			return deepSeekFlashcatCatalog{}, errors.New("DeepSeek 页面结构无效")
+		}
+		if _, exists := allSectionIDs[sectionID]; exists {
+			return deepSeekFlashcatCatalog{}, errors.New("DeepSeek 页面结构无效")
+		}
+		allSectionIDs[sectionID] = struct{}{}
+		if section.HideAll != nil && *section.HideAll {
+			catalog.HiddenSectionIDs[sectionID] = struct{}{}
+			continue
+		}
+		if strings.TrimSpace(section.Name) == "" || section.OrderID <= 0 {
+			return deepSeekFlashcatCatalog{}, errors.New("DeepSeek 页面结构无效")
+		}
+		if _, exists := sectionOrders[section.OrderID]; exists {
+			return deepSeekFlashcatCatalog{}, errors.New("DeepSeek 页面结构无效")
+		}
+		sectionOrders[section.OrderID] = struct{}{}
+		catalog.SectionsByID[sectionID] = section
+		catalog.Sections = append(catalog.Sections, section)
+	}
+	allComponentIDs := make(map[string]struct{}, len(config.Components))
+	topLevelOrders := make(map[int]struct{}, len(config.Components))
+	sectionComponentOrders := make(map[string]map[int]struct{}, len(catalog.Sections))
+	for _, component := range config.Components {
+		componentID := strings.TrimSpace(component.ComponentID)
+		if componentID == "" {
+			return deepSeekFlashcatCatalog{}, errors.New("DeepSeek 页面结构无效")
+		}
+		if _, exists := allComponentIDs[componentID]; exists {
+			return deepSeekFlashcatCatalog{}, errors.New("DeepSeek 页面结构无效")
+		}
+		allComponentIDs[componentID] = struct{}{}
+		if component.HideAll != nil && *component.HideAll {
+			catalog.HiddenComponentIDs[componentID] = struct{}{}
+			continue
+		}
+		if _, hiddenSection := catalog.HiddenSectionIDs[component.SectionID]; hiddenSection {
+			catalog.HiddenComponentIDs[componentID] = struct{}{}
+			continue
+		}
+		if strings.TrimSpace(component.Name) == "" || component.OrderID <= 0 {
+			return deepSeekFlashcatCatalog{}, errors.New("DeepSeek 页面结构无效")
+		}
+		if _, err := parseDeepSeekFlashcatSeconds(component.AvailableSinceSeconds); err != nil {
+			return deepSeekFlashcatCatalog{}, err
+		}
+		if component.SectionID == "" {
+			if _, exists := topLevelOrders[component.OrderID]; exists {
+				return deepSeekFlashcatCatalog{}, errors.New("DeepSeek 页面结构无效")
+			}
+			topLevelOrders[component.OrderID] = struct{}{}
+		} else {
+			if _, exists := catalog.SectionsByID[component.SectionID]; !exists {
+				return deepSeekFlashcatCatalog{}, errors.New("DeepSeek 页面结构无效")
+			}
+			orders := sectionComponentOrders[component.SectionID]
+			if orders == nil {
+				orders = make(map[int]struct{})
+				sectionComponentOrders[component.SectionID] = orders
+			}
+			if _, exists := orders[component.OrderID]; exists {
+				return deepSeekFlashcatCatalog{}, errors.New("DeepSeek 页面结构无效")
+			}
+			orders[component.OrderID] = struct{}{}
+		}
+		catalog.ComponentsByID[componentID] = component
+		catalog.Components = append(catalog.Components, component)
+	}
+	if len(catalog.Components) == 0 {
+		return deepSeekFlashcatCatalog{}, errors.New("DeepSeek 页面结构无效")
+	}
+	sort.Slice(catalog.Components, func(left, right int) bool {
+		if catalog.Components[left].SectionID != catalog.Components[right].SectionID {
+			return catalog.Components[left].SectionID < catalog.Components[right].SectionID
+		}
+		return catalog.Components[left].OrderID < catalog.Components[right].OrderID
+	})
+	sort.Slice(catalog.Sections, func(left, right int) bool { return catalog.Sections[left].OrderID < catalog.Sections[right].OrderID })
+	return catalog, nil
+}
+
+func deepSeekFlashcatCurrentComponents(page *deepSeekFlashcatCurrentPage, catalog deepSeekFlashcatCatalog) (map[string]deepSeekFlashcatComponent, error) {
+	if page == nil || page.Components == nil || len(page.Components) == 0 {
+		return nil, errors.New("DeepSeek 页面结构无效")
+	}
+	currentByID := make(map[string]deepSeekFlashcatComponent, len(page.Components))
+	for _, component := range page.Components {
+		componentID := strings.TrimSpace(component.ComponentID)
+		if componentID == "" {
+			return nil, errors.New("DeepSeek 当前组件缺少必要字段")
+		}
+		if _, hidden := catalog.HiddenComponentIDs[componentID]; hidden {
+			continue
+		}
+		if strings.TrimSpace(component.Name) == "" {
+			return nil, errors.New("DeepSeek 当前组件缺少必要字段")
+		}
+		configured, exists := catalog.ComponentsByID[componentID]
+		if !exists || configured.Name != component.Name {
+			return nil, fmt.Errorf("DeepSeek 当前组件 %q 结构无效", componentID)
+		}
+		if _, exists := currentByID[componentID]; exists {
+			return nil, fmt.Errorf("DeepSeek 当前组件 %q 重复", componentID)
+		}
+		currentByID[componentID] = component
+	}
+	if len(currentByID) != len(catalog.ComponentsByID) {
+		return nil, errors.New("DeepSeek 当前组件结构无效")
+	}
+	return currentByID, nil
+}
+
+func deepSeekFlashcatCurrentActiveChanges(current deepSeekFlashcatCurrentData) json.RawMessage {
+	if len(current.ActiveChanges) != 0 {
+		return current.ActiveChanges
+	}
+	if current.Page == nil {
+		return nil
+	}
+	return current.Page.ActiveChanges
+}
+
+func deepSeekFlashcatActiveStatuses(rawChanges json.RawMessage, catalog deepSeekFlashcatCatalog) (map[string]string, []ModelMonitorIncident, error) {
+	var changes []deepSeekFlashcatActiveChange
+	if len(rawChanges) == 0 || bytes.Equal(bytes.TrimSpace(rawChanges), []byte("null")) {
+		changes = []deepSeekFlashcatActiveChange{}
+	} else if json.Unmarshal(rawChanges, &changes) != nil || changes == nil {
+		return nil, nil, errors.New("DeepSeek 页面结构无效")
+	}
+	componentsByID := catalog.ComponentsByID
+	statuses := make(map[string]string, len(componentsByID))
+	for componentID := range componentsByID {
+		statuses[componentID] = "operational"
+	}
+	events := make([]deepSeekFlashcatActiveStatusEvent, 0)
+	incidents := make([]ModelMonitorIncident, 0, len(changes))
+	seenChangeIDs := make(map[int64]struct{}, len(changes))
+	for _, change := range changes {
+		if change.ChangeID <= 0 || strings.TrimSpace(change.Title) == "" || strings.TrimSpace(change.Status) == "" || change.Updates == nil || len(change.Updates) == 0 {
+			return nil, nil, errors.New("DeepSeek 页面结构无效")
+		}
+		if _, exists := seenChangeIDs[change.ChangeID]; exists {
+			return nil, nil, errors.New("DeepSeek 页面结构无效")
+		}
+		seenChangeIDs[change.ChangeID] = struct{}{}
+		latest := time.Time{}
+		impact := "operational"
+		for _, update := range change.Updates {
+			updatedAt, err := parseDeepSeekFlashcatSeconds(update.AtSeconds)
+			if err != nil || update.ComponentChanges == nil {
+				return nil, nil, errors.New("DeepSeek 页面结构无效")
+			}
+			updateHasVisibleComponent := false
+			for _, componentChange := range update.ComponentChanges {
+				componentID := strings.TrimSpace(componentChange.ComponentID)
+				if _, hidden := catalog.HiddenComponentIDs[componentID]; hidden {
+					continue
+				}
+				if _, exists := componentsByID[componentID]; !exists {
+					return nil, nil, fmt.Errorf("DeepSeek 页面包含未知组件 %q", componentID)
+				}
+				status, err := normalizeDeepSeekFlashcatStatus(componentChange.Status)
+				if err != nil {
+					return nil, nil, err
+				}
+				updateHasVisibleComponent = true
+				impact = worseModelMonitorStatus(impact, status)
+				events = append(events, deepSeekFlashcatActiveStatusEvent{at: updatedAt, componentID: componentID, status: status})
+			}
+			if updateHasVisibleComponent && updatedAt.After(latest) {
+				latest = updatedAt
+			}
+		}
+		if latest.IsZero() {
+			continue
+		}
+		updatedAt := latest
+		incidents = append(incidents, ModelMonitorIncident{
+			ID:        strconv.FormatInt(change.ChangeID, 10),
+			Name:      change.Title,
+			Status:    change.Status,
+			Impact:    impact,
+			UpdatedAt: &updatedAt,
+		})
+	}
+	sort.SliceStable(events, func(left, right int) bool { return events[left].at.Before(events[right].at) })
+	for _, event := range events {
+		statuses[event.componentID] = event.status
+	}
+	sort.SliceStable(incidents, func(left, right int) bool { return incidents[left].UpdatedAt.After(*incidents[right].UpdatedAt) })
+	return statuses, incidents, nil
+}
+
+func normalizeDeepSeekFlashcatStatus(value string) (string, error) {
+	status := normalizeModelMonitorStatus(value)
+	if status == "unknown" {
+		return "", errors.New("DeepSeek 页面字段无效")
+	}
+	return status, nil
+}
+
+func deepSeekFlashcatUptimes(history deepSeekFlashcatHistoryData, catalog deepSeekFlashcatCatalog) (map[string]deepSeekFlashcatUptime, map[string]deepSeekFlashcatUptime, error) {
+	componentUptimes := make(map[string]deepSeekFlashcatUptime, len(history.ComponentUptimes))
+	for _, item := range history.ComponentUptimes {
+		if _, hidden := catalog.HiddenComponentIDs[item.ComponentID]; hidden {
+			continue
+		}
+		component, exists := catalog.ComponentsByID[item.ComponentID]
+		if !exists || component.SectionID != item.SectionID {
+			return nil, nil, errors.New("DeepSeek 页面结构无效")
+		}
+		if _, exists := componentUptimes[item.ComponentID]; exists {
+			return nil, nil, errors.New("DeepSeek 页面结构无效")
+		}
+		uptime, err := parseDeepSeekFlashcatUptime(item.Uptime, item.AvailableSinceSeconds)
+		if err != nil || uptime.availableSince.Unix() != component.AvailableSinceSeconds {
+			return nil, nil, errors.New("DeepSeek 页面结构无效")
+		}
+		componentUptimes[item.ComponentID] = uptime
+	}
+	for componentID := range catalog.ComponentsByID {
+		if _, exists := componentUptimes[componentID]; !exists {
+			return nil, nil, errors.New("DeepSeek 页面结构无效")
+		}
+	}
+	sectionUptimes := make(map[string]deepSeekFlashcatUptime, len(history.SectionUptimes))
+	for _, item := range history.SectionUptimes {
+		if _, hidden := catalog.HiddenSectionIDs[item.SectionID]; hidden {
+			continue
+		}
+		if _, exists := catalog.SectionsByID[item.SectionID]; !exists {
+			return nil, nil, errors.New("DeepSeek 页面结构无效")
+		}
+		if _, exists := sectionUptimes[item.SectionID]; exists {
+			return nil, nil, errors.New("DeepSeek 页面结构无效")
+		}
+		uptime, err := parseDeepSeekFlashcatUptime(item.Uptime, item.AvailableSinceSeconds)
+		if err != nil {
+			return nil, nil, err
+		}
+		sectionUptimes[item.SectionID] = uptime
+	}
+	for sectionID := range catalog.SectionsByID {
+		if _, exists := sectionUptimes[sectionID]; !exists {
+			return nil, nil, errors.New("DeepSeek 页面结构无效")
+		}
+	}
+	return componentUptimes, sectionUptimes, nil
+}
+
+func parseDeepSeekFlashcatUptime(value *float64, availableSinceSeconds int64) (deepSeekFlashcatUptime, error) {
+	if value == nil || math.IsNaN(*value) || math.IsInf(*value, 0) || *value < 0 || *value > 100 {
+		return deepSeekFlashcatUptime{}, errors.New("DeepSeek 页面字段无效")
+	}
+	availableSince, err := parseDeepSeekFlashcatSeconds(availableSinceSeconds)
+	if err != nil {
+		return deepSeekFlashcatUptime{}, err
+	}
+	copy := *value
+	return deepSeekFlashcatUptime{percent: &copy, availableSince: availableSince}, nil
+}
+
+func deepSeekFlashcatImpacts(history deepSeekFlashcatHistoryData, catalog deepSeekFlashcatCatalog) (map[string][]parsedOpenAIPageImpact, map[string][]parsedOpenAIPageImpact, error) {
+	linkedChanges := make(map[int64]string, len(history.LinkedChanges))
+	for _, change := range history.LinkedChanges {
+		if change.ID <= 0 || strings.TrimSpace(change.Type) == "" || strings.TrimSpace(change.Title) == "" {
+			return nil, nil, errors.New("DeepSeek 页面结构无效")
+		}
+		if _, exists := linkedChanges[change.ID]; exists {
+			return nil, nil, errors.New("DeepSeek 页面结构无效")
+		}
+		linkedChanges[change.ID] = change.Title
+	}
+	componentImpacts := make(map[string][]parsedOpenAIPageImpact, len(catalog.ComponentsByID))
+	for _, impact := range history.ComponentImpacts {
+		if _, hidden := catalog.HiddenComponentIDs[impact.ComponentID]; hidden {
+			continue
+		}
+		component, exists := catalog.ComponentsByID[impact.ComponentID]
+		if !exists || component.SectionID != impact.SectionID {
+			return nil, nil, errors.New("DeepSeek 页面结构无效")
+		}
+		parsedImpact, err := parseDeepSeekFlashcatImpact(impact.ChangeID, impact.StartAtSeconds, impact.EndAtSeconds, impact.Status, linkedChanges)
+		if err != nil {
+			return nil, nil, err
+		}
+		componentImpacts[impact.ComponentID] = append(componentImpacts[impact.ComponentID], parsedImpact)
+	}
+	sectionImpacts := make(map[string][]parsedOpenAIPageImpact, len(catalog.SectionsByID))
+	for _, impact := range history.SectionImpacts {
+		if _, hidden := catalog.HiddenSectionIDs[impact.SectionID]; hidden {
+			continue
+		}
+		if _, exists := catalog.SectionsByID[impact.SectionID]; !exists {
+			return nil, nil, errors.New("DeepSeek 页面结构无效")
+		}
+		parsedImpact, err := parseDeepSeekFlashcatImpact(impact.ChangeID, impact.StartAtSeconds, impact.EndAtSeconds, impact.Status, linkedChanges)
+		if err != nil {
+			return nil, nil, err
+		}
+		sectionImpacts[impact.SectionID] = append(sectionImpacts[impact.SectionID], parsedImpact)
+	}
+	return componentImpacts, sectionImpacts, nil
+}
+
+func parseDeepSeekFlashcatImpact(changeID, startAtSeconds, endAtSeconds int64, rawStatus string, linkedChanges map[int64]string) (parsedOpenAIPageImpact, error) {
+	incidentTitle, exists := linkedChanges[changeID]
+	if changeID <= 0 || !exists {
+		return parsedOpenAIPageImpact{}, errors.New("DeepSeek 页面结构无效")
+	}
+	start, err := parseDeepSeekFlashcatSeconds(startAtSeconds)
+	if err != nil {
+		return parsedOpenAIPageImpact{}, err
+	}
+	end, err := parseDeepSeekFlashcatSeconds(endAtSeconds)
+	if err != nil || !end.After(start) {
+		return parsedOpenAIPageImpact{}, errors.New("DeepSeek 页面结构无效")
+	}
+	status, err := normalizeDeepSeekFlashcatStatus(rawStatus)
+	if err != nil {
+		return parsedOpenAIPageImpact{}, err
+	}
+	return parsedOpenAIPageImpact{start: start, end: end, status: status, incidentTitle: incidentTitle}, nil
+}
+
+func applyDeepSeekFlashcatSectionImpacts(samples []ModelMonitorSample, impacts []parsedOpenAIPageImpact) []ModelMonitorSample {
+	for index := range samples {
+		day := samples[index].Timestamp
+		for _, impact := range impacts {
+			if !impact.start.Before(day.AddDate(0, 0, 1)) || !impact.end.After(day) {
+				continue
+			}
+			samples[index].Status = worseModelMonitorStatus(samples[index].Status, impact.status)
+			if !containsString(samples[index].RelatedIncidents, impact.incidentTitle) {
+				samples[index].RelatedIncidents = append(samples[index].RelatedIncidents, impact.incidentTitle)
+			}
+		}
+	}
+	return samples
+}
+
+// sourceName keeps malformed upstream data attributable to its actual source.
+func collectStatuspageStatus(ctx context.Context, client *http.Client, baseURL, sourceName string) (ModelMonitorSourceStatus, error) {
 	summaryBody, err := modelMonitorGet(ctx, client, strings.TrimRight(baseURL, "/")+"/api/v2/summary.json", "application/json")
 	if err != nil {
 		return ModelMonitorSourceStatus{}, err
 	}
-	current, err := parseAnthropicSummary(summaryBody)
+	current, err := parseStatuspageSummary(summaryBody, sourceName)
 	if err != nil {
 		return ModelMonitorSourceStatus{}, err
 	}
@@ -717,12 +1580,35 @@ func collectAnthropicStatus(ctx context.Context, client *http.Client, baseURL st
 	if err != nil {
 		return ModelMonitorSourceStatus{}, err
 	}
-	services, err := parseAnthropicPageHistory(historyBody, current.Services)
+	services, err := parseStatuspagePageHistory(historyBody, current.Services, sourceName)
 	if err != nil {
 		return ModelMonitorSourceStatus{}, err
 	}
 	current.Services = services
 	return current, nil
+}
+
+func parseStatuspageSummary(body []byte, sourceName string) (ModelMonitorSourceStatus, error) {
+	status, err := parseAnthropicSummary(body)
+	if err != nil {
+		return ModelMonitorSourceStatus{}, modelMonitorStatuspageSourceError(sourceName, err)
+	}
+	return status, nil
+}
+
+func parseStatuspagePageHistory(body []byte, currentServices []ModelMonitorServiceStatus, sourceName string) ([]ModelMonitorServiceStatus, error) {
+	services, err := parseAnthropicPageHistory(body, currentServices)
+	if err != nil {
+		return nil, modelMonitorStatuspageSourceError(sourceName, err)
+	}
+	return services, nil
+}
+
+func modelMonitorStatuspageSourceError(sourceName string, err error) error {
+	if err == nil || sourceName == "Anthropic" {
+		return err
+	}
+	return errors.New(strings.Replace(err.Error(), "Anthropic", sourceName, 1))
 }
 
 func parseAnthropicSummary(body []byte) (ModelMonitorSourceStatus, error) {

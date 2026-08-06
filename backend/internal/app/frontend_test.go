@@ -163,7 +163,7 @@ func TestHandleSPADoesNotReturnExternalIndexForMissingAsset(t *testing.T) {
 	}
 }
 
-func TestModelMonitorViewKeepsAggregateLoadErrorsVisible(t *testing.T) {
+func TestModelMonitorViewUsesIndependentSourceRefresh(t *testing.T) {
 	path := filepath.Join("..", "..", "..", "frontend", "src", "features", "model-monitor", "views", "ModelMonitorView.vue")
 	body, err := os.ReadFile(path)
 	if err != nil {
@@ -171,19 +171,53 @@ func TestModelMonitorViewKeepsAggregateLoadErrorsVisible(t *testing.T) {
 	}
 	source := string(body)
 	for _, expected := range []string{
-		"const loading = ref(true)",
-		"if (sources.value.length === 0) {",
-		"aggregateLoadError.value = localizedError",
-		"aggregateLoadError.value = null",
-		`@click="loadMonitor(true)"`,
+		"getModelMonitorSettings",
+		"getModelMonitorSource",
+		"updateModelMonitorSettings",
+		"const sourceStates = reactive<Record<string, ModelMonitorSourceViewState>>({})",
+		"async function refreshSource(id: string)",
+		"function refreshAllSources(): void",
+		"async function loadModelMonitorSettings(): Promise<void>",
+		"const settings = await getModelMonitorSettings()",
+		"const source = await getModelMonitorSource(id)",
+		`@click="refreshAllSources"`,
+		`@click="refreshSource(slot.definition.id)"`,
+		"模型监控来源配置",
+		"enabled_source_ids:",
+		"const saved = await updateModelMonitorSettings(payload)",
 		"t('重试', 'Retry')",
 	} {
 		if !strings.Contains(source, expected) {
-			t.Fatalf("ModelMonitorView.vue missing aggregate load state contract %q", expected)
+			t.Fatalf("ModelMonitorView.vue missing independent source-refresh contract %q", expected)
 		}
 	}
-	if count := strings.Count(source, "sources.value ="); count != 1 {
-		t.Fatalf("ModelMonitorView.vue assigns sources %d times, want only the successful response assignment", count)
+	if count := strings.Count(source, "!slot.state.error &&"); count != 2 {
+		t.Fatalf("ModelMonitorView.vue checks source errors in %d health totals, want 2", count)
+	}
+	for _, forbidden := range []string{
+		"monitorRequestPending",
+		"monitorReloadQueued",
+		"getModelMonitor()",
+		"loadMonitor(true)",
+		"t('内置', 'Built-in')",
+		`<div v-else-if="source.services.length" class="service-list">`,
+		`<NCollapse v-else-if="source.groups.length" class="group-list">`,
+	} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("ModelMonitorView.vue still contains removed aggregate-refresh behavior %q", forbidden)
+		}
+	}
+	for _, expected := range []string{
+		"<NButton secondary @click=\"openSourceSettings\">",
+		"<NButton secondary @click=\"openProxySettings\">",
+		"<NButton secondary :loading=\"refreshing\"",
+		"arrow-placement=\"right\"",
+		".service-list + .group-list { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--cpa-border); }",
+		".group-services { display: grid; gap: 8px; padding: 2px 0 8px 30px; }",
+	} {
+		if !strings.Contains(source, expected) {
+			t.Fatalf("ModelMonitorView.vue missing unified header action style %q", expected)
+		}
 	}
 	assertOrdered := func(label string, expected ...string) {
 		t.Helper()
@@ -197,26 +231,53 @@ func TestModelMonitorViewKeepsAggregateLoadErrorsVisible(t *testing.T) {
 		}
 	}
 	assertOrdered(
-		"request state",
-		"if (monitorRequestPending) {",
-		"if (manual) monitorReloadQueued = true",
-		"monitorRequestPending = true",
-		"const response = await getModelMonitor()",
-		"sources.value = response.sources",
-		"aggregateLoadError.value = null",
-		"} catch (error) {",
-		"aggregateLoadError.value = localizedError",
-		"} finally {",
-		"monitorRequestPending = false",
-		"if (monitorReloadQueued) {",
-		"void loadMonitor(true)",
+		"per-source queue",
+		"if (state.pending) {",
+		"state.queued = true",
+		"state.pending = true",
+		"const source = await getModelMonitorSource(id)",
+		"state.pending = false",
+		"if (state.queued && isSourceEnabled(id))",
+		"void refreshSource(id)",
 	)
 	assertOrdered(
-		"render priority",
-		`<div v-if="sources.length" class="source-grid">`,
-		`v-else-if="!loading && aggregateLoadError"`,
-		`@click="loadMonitor(true)"`,
+		"source collection-error retention",
+		"if (source.collection_state === 'error' && state.source?.collection_state === 'ok') {",
+		"state.error = serverText(source.collection_error ?? '', '本次采集失败', 'This collection failed')",
+		"} else {",
+		"state.source = source",
+	)
+	assertOrdered(
+		"source health error priority",
+		"function sourceSlotHealthIcon(slot: ModelMonitorSourceSlot)",
+		"if (slot.state.error) return WifiOff",
+		"if (!slot.state.source) return RefreshCw",
+	)
+	assertOrdered(
+		"settings then fan-out",
+		"const settings = await getModelMonitorSettings()",
+		"applyModelMonitorSettings(settings)",
+		"refreshAllSources()",
+	)
+	assertOrdered(
+		"source-settings close bootstrap recovery",
+		"watch(sourceSettingsModalOpen, (open) => {",
+		"if (open) return",
+		"const bootstrapPending = settingsLoading.value && !modelMonitorSettings.value",
+		"sourceSettingsModalGeneration++",
+		"if (bootstrapPending) void loadModelMonitorSettings()",
+	)
+	assertOrdered(
+		"settings error render priority",
+		`<div v-if="enabledSourceSlots.length" class="source-grid">`,
+		`v-else-if="!settingsLoading && settingsLoadError"`,
+		`@click="loadModelMonitorSettings"`,
 		"t('重试', 'Retry')",
-		`v-else-if="!loading && !aggregateLoadError"`,
+		`v-else-if="!settingsLoading"`,
+	)
+	assertOrdered(
+		"top-level services before groups",
+		`<div v-if="source.services.length" class="service-list">`,
+		`<NCollapse v-if="source.groups.length" class="group-list" arrow-placement="right">`,
 	)
 }

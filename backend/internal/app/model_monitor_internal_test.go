@@ -148,6 +148,18 @@ func TestApplyOpenAIHistoryHandlesUndefinedImpactEndAt(t *testing.T) {
 		}
 	})
 
+	t.Run("undefined end before start", func(t *testing.T) {
+		summary, now, services := loadOpenAIHistoryTestData(t)
+		undefined := "$undefined"
+		summary.ComponentImpacts[0].StartAt = now.Add(time.Second).Format(time.RFC3339Nano)
+		summary.ComponentImpacts[0].EndAt = &undefined
+		current := ModelMonitorSourceStatus{Services: services}
+		err := applyOpenAIHistory(&current, summary, now)
+		if err == nil || !strings.Contains(err.Error(), "impact 时间范围无效") {
+			t.Fatalf("impact end_at %q with future start_at error = %v, want impact time-range error", undefined, err)
+		}
+	})
+
 	for _, test := range []struct {
 		name  string
 		endAt string
@@ -302,7 +314,8 @@ func TestModelMonitorAggregationIsolatesOpenAINonFiniteUptime(t *testing.T) {
 	}
 	openAIClient := openAITestClientWithHistory(t, openAITestSummary(), []byte(badOpenAIHistory))
 	anthropicClient := anthropicTestClient(t, readModelMonitorFixture(t, "anthropic_summary.json"), readModelMonitorFixture(t, "anthropic_history.html"))
-	fakeClient := &http.Client{Transport: modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+	deepseekClient := deepseekFlashcatTestClient(t, readModelMonitorFixture(t, "deepseek_flashcat.html"))
+	transport := &modelMonitorCloseTrackingTransport{roundTripper: modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
 		switch request.URL.Host {
 		case "status.input.im":
 			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(readModelMonitorFixture(t, "input_im_status.json")))), Request: request}, nil
@@ -310,10 +323,13 @@ func TestModelMonitorAggregationIsolatesOpenAINonFiniteUptime(t *testing.T) {
 			return openAIClient.Transport.RoundTrip(request)
 		case "status.claude.com":
 			return anthropicClient.Transport.RoundTrip(request)
+		case "statuspage.flashcat.cloud":
+			return deepseekClient.Transport.RoundTrip(request)
 		default:
 			return nil, fmt.Errorf("unexpected model monitor host %q", request.URL.Host)
 		}
 	})}
+	fakeClient := &http.Client{Transport: transport}
 	app.modelMonitorHTTPClient = func(ModelMonitorProxyConfig) (*http.Client, error) { return fakeClient, nil }
 
 	handler := app.Routes()
@@ -331,7 +347,7 @@ func TestModelMonitorAggregationIsolatesOpenAINonFiniteUptime(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Sources) != 3 || response.Sources[0].CollectionState != modelMonitorCollectionOK || response.Sources[1].CollectionState != modelMonitorCollectionError || response.Sources[2].CollectionState != modelMonitorCollectionOK {
+	if len(response.Sources) != 4 || response.Sources[0].CollectionState != modelMonitorCollectionOK || response.Sources[1].CollectionState != modelMonitorCollectionError || response.Sources[2].CollectionState != modelMonitorCollectionOK || response.Sources[3].ID != "deepseek" || response.Sources[3].CollectionState != modelMonitorCollectionOK {
 		t.Fatalf("non-finite OpenAI uptime was not isolated: %#v", response.Sources)
 	}
 }
@@ -506,6 +522,7 @@ func TestModelMonitorAggregationIsolatesInputIMUnsafeTimestamp(t *testing.T) {
 	}
 	openAIClient := openAITestClient(t, openAITestSummary())
 	anthropicClient := anthropicTestClient(t, readModelMonitorFixture(t, "anthropic_summary.json"), readModelMonitorFixture(t, "anthropic_history.html"))
+	deepseekClient := deepseekFlashcatTestClient(t, readModelMonitorFixture(t, "deepseek_flashcat.html"))
 	fakeClient := &http.Client{Transport: modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
 		switch request.URL.Host {
 		case "status.input.im":
@@ -514,6 +531,8 @@ func TestModelMonitorAggregationIsolatesInputIMUnsafeTimestamp(t *testing.T) {
 			return openAIClient.Transport.RoundTrip(request)
 		case "status.claude.com":
 			return anthropicClient.Transport.RoundTrip(request)
+		case "statuspage.flashcat.cloud":
+			return deepseekClient.Transport.RoundTrip(request)
 		default:
 			return nil, fmt.Errorf("unexpected model monitor host %q", request.URL.Host)
 		}
@@ -535,7 +554,7 @@ func TestModelMonitorAggregationIsolatesInputIMUnsafeTimestamp(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Sources) != 3 || response.Sources[0].ID != "ai-input-im" || response.Sources[0].CollectionState != modelMonitorCollectionError || response.Sources[1].ID != "openai" || response.Sources[1].CollectionState != modelMonitorCollectionOK || response.Sources[2].ID != "anthropic" || response.Sources[2].CollectionState != modelMonitorCollectionOK {
+	if len(response.Sources) != 4 || response.Sources[0].ID != "ai-input-im" || response.Sources[0].CollectionState != modelMonitorCollectionError || response.Sources[1].ID != "openai" || response.Sources[1].CollectionState != modelMonitorCollectionOK || response.Sources[2].ID != "anthropic" || response.Sources[2].CollectionState != modelMonitorCollectionOK || response.Sources[3].ID != "deepseek" || response.Sources[3].CollectionState != modelMonitorCollectionOK {
 		t.Fatalf("unsafe AI.INPUT.IM timestamp was not isolated: %#v", response.Sources)
 	}
 	if response.Sources[0].CollectionError == nil || response.Sources[1].CollectionError != nil || response.Sources[2].CollectionError != nil {
@@ -817,6 +836,469 @@ func TestCollectAnthropicStatusUsesSummaryAndRootPage(t *testing.T) {
 	}
 }
 
+func TestCollectDeepSeekStatusUsesHostRoutedFlashcatPage(t *testing.T) {
+	client := deepseekFlashcatTestClient(t, readModelMonitorFixture(t, "deepseek_flashcat.html"))
+	status, err := collectDeepSeekStatus(context.Background(), client, modelMonitorDeepSeekCollectionBaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.OverallStatus != "partial_outage" || len(status.Services) != 2 || len(status.Groups) != 1 || len(status.Incidents) != 1 {
+		t.Fatalf("unexpected DeepSeek collection: %#v", status)
+	}
+	if status.SourceUpdatedAt == nil || !status.SourceUpdatedAt.Equal(time.UnixMilli(1785868658945).UTC()) {
+		t.Fatalf("DeepSeek source timestamp = %#v", status.SourceUpdatedAt)
+	}
+	if status.Services[0].ID != "01KY4MVS8BM3F9JSYWACGQVG7A" || status.Services[0].Status != "operational" || status.Services[1].ID != "01KY4MVS8BSBSVW6053QJ37RJE" || status.Services[1].Status != "degraded_performance" || status.Services[1].UptimePercent == nil || *status.Services[1].UptimePercent != 99.77 {
+		t.Fatalf("DeepSeek standalone services = %#v", status.Services)
+	}
+	if status.Services[0].Name == "API 服务 (API Service)" || status.Services[1].Name == "网页对话服务 (Web Chat Service)" {
+		t.Fatalf("hidden legacy DeepSeek components leaked into services: %#v", status.Services)
+	}
+	group := status.Groups[0]
+	if group.ID != "01KY4ND2MQAQKEAGJKTNGREKBR" || group.Name != "对话服务(Chat Service)" || group.Status != "partial_outage" || group.UptimePercent == nil || *group.UptimePercent != 99.76 || len(group.Services) != 5 {
+		t.Fatalf("DeepSeek chat group = %#v", group)
+	}
+	wantChildIDs := []string{
+		"01KY4ND2PNYT9FY5W4ZH80VGJ4",
+		"01KY4ND2PN1CCNW2MFT5VW713H",
+		"01KY4ND2PNJ6MFA4VJ0DSN6M2J",
+		"01KY4ND2PNNFFY6QKV67WFJW8N",
+		"01KY4ND2PN6EFSJ4RDYDJYPMNK",
+	}
+	for index, service := range group.Services {
+		if service.ID != wantChildIDs[index] {
+			t.Fatalf("DeepSeek group component order = %#v, want %#v", group.Services, wantChildIDs)
+		}
+	}
+	if group.Services[1].Status != "partial_outage" || group.Services[1].UptimePercent == nil || *group.Services[1].UptimePercent != 99.72 {
+		t.Fatalf("DeepSeek expert mode = %#v", group.Services[1])
+	}
+	impactDay := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	flashSample := findModelMonitorSample(t, status.Services[1].Samples, impactDay)
+	if flashSample.Status != "degraded_performance" || !equalStrings(flashSample.RelatedIncidents, []string{"Flash API degraded"}) {
+		t.Fatalf("DeepSeek Flash history = %#v", flashSample)
+	}
+	groupSample := findModelMonitorSample(t, group.Samples, impactDay)
+	if groupSample.Status != "major_outage" || !equalStrings(groupSample.RelatedIncidents, []string{"Expert mode partial outage", "Chat service outage"}) {
+		t.Fatalf("DeepSeek group history = %#v", groupSample)
+	}
+	if status.Incidents[0].ID != "9001" || status.Incidents[0].Impact != "partial_outage" || status.Incidents[0].UpdatedAt == nil {
+		t.Fatalf("DeepSeek current incident = %#v", status.Incidents)
+	}
+}
+
+func TestParseDeepSeekFlashcatPageAcceptsReactFlightPropArrayFrames(t *testing.T) {
+	body := deepSeekFlashcatReactFlightPropArrayFrames(t, readModelMonitorFixture(t, "deepseek_flashcat.html"))
+	status, err := parseDeepSeekFlashcatPage(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Services) != 2 || len(status.Groups) != 1 || len(status.Groups[0].Services) != 5 || len(status.Incidents) != 1 {
+		t.Fatalf("unexpected DeepSeek React Flight props result: %#v", status)
+	}
+	if status.SourceUpdatedAt == nil || !status.SourceUpdatedAt.Equal(time.UnixMilli(1785868658945).UTC()) {
+		t.Fatalf("DeepSeek React Flight props timestamp = %#v", status.SourceUpdatedAt)
+	}
+}
+
+func TestParseDeepSeekFlashcatPageRejectsDuplicateNestedObjectFields(t *testing.T) {
+	fixture := deepSeekFlashcatReactFlightPropArrayFrames(t, readModelMonitorFixture(t, "deepseek_flashcat.html"))
+	for _, test := range []struct {
+		name        string
+		frameMarker string
+		from        string
+		to          string
+	}{
+		{
+			name:        "page config components",
+			frameMarker: `"initialPageConfig"`,
+			from:        `"initialPageConfig":{"components":[`,
+			to:          `"initialPageConfig":{"components":[],"components":[`,
+		},
+		{
+			name:        "current active changes",
+			frameMarker: `"initialDataUpdatedAt"`,
+			from:        `"active_changes":[`,
+			to:          `"active_changes":[],"active_changes":[`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := mutateDeepSeekFlashcatRawFrame(t, fixture, test.frameMarker, func(frame string) string {
+				result := strings.Replace(frame, test.from, test.to, 1)
+				if result == frame {
+					t.Fatalf("DeepSeek fixture did not contain %q", test.from)
+				}
+				return result
+			})
+			if _, err := parseDeepSeekFlashcatPage(body); err == nil {
+				t.Fatalf("duplicate DeepSeek nested field %s should fail", test.name)
+			}
+		})
+	}
+}
+
+func TestParseDeepSeekFlashcatPageRejectsMalformedHistory(t *testing.T) {
+	body := strings.Replace(
+		string(readModelMonitorFixture(t, "deepseek_flashcat.html")),
+		`\"component_uptimes\":[`,
+		`\"component_uptimes\":null,\"ignored\":[`,
+		1,
+	)
+	if _, err := parseDeepSeekFlashcatPage([]byte(body)); err == nil || !strings.Contains(err.Error(), "DeepSeek") {
+		t.Fatalf("malformed DeepSeek Flashcat history error = %v", err)
+	}
+}
+
+func TestParseDeepSeekFlashcatPageRejectsDuplicateRequiredHistoryFields(t *testing.T) {
+	fixture := deepSeekFlashcatReactFlightPropArrayFrames(t, readModelMonitorFixture(t, "deepseek_flashcat.html"))
+	for _, key := range []string{
+		"component_uptimes",
+		"section_uptimes",
+		"component_impacts",
+		"section_impacts",
+		"linked_changes",
+	} {
+		t.Run(key, func(t *testing.T) {
+			marker := `"` + key + `":[`
+			body := mutateDeepSeekFlashcatRawFrame(t, fixture, marker, func(frame string) string {
+				return strings.Replace(frame, marker, `"`+key+`":[],"`+key+`":[`, 1)
+			})
+			if _, err := parseDeepSeekFlashcatPage(body); err == nil {
+				t.Fatalf("duplicate DeepSeek history field %q should fail", key)
+			}
+		})
+	}
+}
+
+func TestParseDeepSeekFlashcatPageValidatesFullUpdatedAtNumber(t *testing.T) {
+	fixture := deepSeekFlashcatReactFlightPropArrayFrames(t, readModelMonitorFixture(t, "deepseek_flashcat.html"))
+	body := mutateDeepSeekFlashcatUpdatedAtNumber(t, fixture, "1.785868658945e12")
+	status, err := parseDeepSeekFlashcatPage(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.SourceUpdatedAt == nil || !status.SourceUpdatedAt.Equal(time.UnixMilli(1785868658945).UTC()) {
+		t.Fatalf("DeepSeek scientific-notation timestamp = %#v", status.SourceUpdatedAt)
+	}
+
+	for _, value := range []string{"1785868658945.5", "1e-3", "1785868658945invalid"} {
+		t.Run(value, func(t *testing.T) {
+			body := mutateDeepSeekFlashcatUpdatedAtNumber(t, fixture, value)
+			if _, err := parseDeepSeekFlashcatPage(body); err == nil {
+				t.Fatalf("DeepSeek updated-at value %q should fail", value)
+			}
+		})
+	}
+}
+
+func TestParseDeepSeekFlashcatPageOmitsHiddenSectionChildren(t *testing.T) {
+	const hiddenSectionID = "hidden-chat-section"
+	const hiddenComponentID = "hidden-chat-component"
+	body := readModelMonitorFixture(t, "deepseek_flashcat.html")
+	body = mutateDeepSeekFlashcatFrame(t, body, `"initialPageConfig"`, func(payload map[string]any) {
+		config := payload["initialPageConfig"].(map[string]any)
+		config["sections"] = append(config["sections"].([]any), map[string]any{
+			"section_id": hiddenSectionID,
+			"name":       "Hidden Chat",
+			"order_id":   1,
+			"hide_all":   true,
+		})
+		config["components"] = append(config["components"].([]any), map[string]any{
+			"component_id":            hiddenComponentID,
+			"section_id":              hiddenSectionID,
+			"name":                    "Hidden Chat Service",
+			"available_since_seconds": 1706745600,
+			"order_id":                1,
+		})
+	})
+	body = mutateDeepSeekFlashcatFrame(t, body, `"initialDataUpdatedAt"`, func(payload map[string]any) {
+		page := payload["initialData"].(map[string]any)["page"].(map[string]any)
+		page["components"] = append(page["components"].([]any), map[string]any{
+			"component_id": hiddenComponentID,
+			"name":         "Hidden Chat Service",
+		})
+		page["active_changes"] = append(page["active_changes"].([]any), map[string]any{
+			"change_id": 9002,
+			"title":     "Hidden Chat Incident",
+			"status":    "investigating",
+			"updates": []any{map[string]any{
+				"at_seconds": 1785868200,
+				"component_changes": []any{map[string]any{
+					"component_id": hiddenComponentID,
+					"status":       "partial_outage",
+				}},
+			}},
+		})
+	})
+	body = mutateDeepSeekFlashcatFrame(t, body, `"component_uptimes"`, func(payload map[string]any) {
+		history := payload["initialData"].(map[string]any)
+		history["section_impacts"] = append(history["section_impacts"].([]any), map[string]any{
+			"section_id":       hiddenSectionID,
+			"change_id":        104,
+			"start_at_seconds": 1785800000,
+			"end_at_seconds":   1785803600,
+			"status":           "full_outage",
+		})
+		history["section_uptimes"] = append(history["section_uptimes"].([]any), map[string]any{
+			"section_id":              hiddenSectionID,
+			"uptime":                  0,
+			"available_since_seconds": 1706745600,
+		})
+		history["component_impacts"] = append(history["component_impacts"].([]any), map[string]any{
+			"component_id":     hiddenComponentID,
+			"section_id":       hiddenSectionID,
+			"change_id":        104,
+			"start_at_seconds": 1785800000,
+			"end_at_seconds":   1785803600,
+			"status":           "full_outage",
+		})
+		history["component_uptimes"] = append(history["component_uptimes"].([]any), map[string]any{
+			"component_id":            hiddenComponentID,
+			"section_id":              hiddenSectionID,
+			"uptime":                  0,
+			"available_since_seconds": 1706745600,
+		})
+		history["linked_changes"] = append(history["linked_changes"].([]any), map[string]any{
+			"id":    104,
+			"type":  "incident",
+			"title": "Hidden Chat Incident",
+		})
+	})
+
+	status, err := parseDeepSeekFlashcatPage(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Services) != 2 || len(status.Groups) != 1 || len(status.Groups[0].Services) != 5 {
+		t.Fatalf("hidden section changed visible DeepSeek hierarchy: %#v", status)
+	}
+	if len(status.Incidents) != 1 || status.Incidents[0].ID != "9001" {
+		t.Fatalf("hidden section incident leaked into current incidents: %#v", status.Incidents)
+	}
+	for _, service := range append(append([]ModelMonitorServiceStatus{}, status.Services...), status.Groups[0].Services...) {
+		if service.ID == hiddenComponentID {
+			t.Fatalf("hidden section component leaked into DeepSeek response: %#v", status)
+		}
+	}
+	if status.Groups[0].ID == hiddenSectionID {
+		t.Fatalf("hidden section leaked into DeepSeek response: %#v", status.Groups)
+	}
+}
+
+func TestParseDeepSeekFlashcatPageAcceptsNoActiveChanges(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "empty array", mutate: func(current map[string]any) { current["active_changes"] = []any{} }},
+		{name: "null", mutate: func(current map[string]any) { current["active_changes"] = nil }},
+		{name: "omitted", mutate: func(current map[string]any) {}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := mutateDeepSeekFlashcatFrame(t, readModelMonitorFixture(t, "deepseek_flashcat.html"), `"initialDataUpdatedAt"`, func(payload map[string]any) {
+				current := payload["initialData"].(map[string]any)
+				delete(current["page"].(map[string]any), "active_changes")
+				test.mutate(current)
+			})
+			status, err := parseDeepSeekFlashcatPage(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status.OverallStatus != "operational" || len(status.Incidents) != 0 || status.Groups[0].Status != "operational" {
+				t.Fatalf("DeepSeek active changes %s = %#v", test.name, status)
+			}
+			for _, service := range append(append([]ModelMonitorServiceStatus{}, status.Services...), status.Groups[0].Services...) {
+				if service.Status != "operational" {
+					t.Fatalf("DeepSeek active changes %s left service affected: %#v", test.name, service)
+				}
+			}
+		})
+	}
+}
+
+func TestParseDeepSeekFlashcatPageReadsTopLevelActiveChanges(t *testing.T) {
+	body := mutateDeepSeekFlashcatFrame(t, readModelMonitorFixture(t, "deepseek_flashcat.html"), `"initialDataUpdatedAt"`, func(payload map[string]any) {
+		current := payload["initialData"].(map[string]any)
+		page := current["page"].(map[string]any)
+		current["active_changes"] = page["active_changes"]
+		delete(page, "active_changes")
+	})
+	status, err := parseDeepSeekFlashcatPage(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Incidents) != 1 || status.Incidents[0].ID != "9001" || status.Services[1].Status != "degraded_performance" || status.Groups[0].Services[1].Status != "partial_outage" {
+		t.Fatalf("DeepSeek top-level active changes = %#v", status)
+	}
+}
+
+func TestParseDeepSeekFlashcatPageRejectsInvalidActiveChanges(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "object", mutate: func(current map[string]any) { current["active_changes"] = map[string]any{} }},
+		{name: "string", mutate: func(current map[string]any) { current["active_changes"] = "not an array" }},
+		{name: "boolean", mutate: func(current map[string]any) { current["active_changes"] = false }},
+		{name: "number", mutate: func(current map[string]any) { current["active_changes"] = 1 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := mutateDeepSeekFlashcatFrame(t, readModelMonitorFixture(t, "deepseek_flashcat.html"), `"initialDataUpdatedAt"`, func(payload map[string]any) {
+				current := payload["initialData"].(map[string]any)
+				delete(current["page"].(map[string]any), "active_changes")
+				test.mutate(current)
+			})
+			if _, err := parseDeepSeekFlashcatPage(body); err == nil {
+				t.Fatalf("DeepSeek active changes %s should fail", test.name)
+			}
+		})
+	}
+}
+
+func TestParseDeepSeekFlashcatPageRejectsMissingOrDuplicateRequiredFrames(t *testing.T) {
+	frames, err := deepSeekFlashcatNextFlightFrames(readModelMonitorFixture(t, "deepseek_flashcat.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{`"initialPageConfig"`, `"initialDataUpdatedAt"`, `"component_uptimes"`} {
+		t.Run("missing "+marker, func(t *testing.T) {
+			missing := append([]string{}, frames...)
+			for index, frame := range missing {
+				if strings.Contains(frame, marker) {
+					missing[index] = strings.Replace(frame, marker, `"missing"`, 1)
+					if _, err := parseDeepSeekFlashcatPage(deepSeekFlashcatHTMLFromFrames(t, missing)); err == nil {
+						t.Fatalf("missing required frame %s should fail", marker)
+					}
+					return
+				}
+			}
+			t.Fatalf("fixture is missing required marker %s", marker)
+		})
+		t.Run("duplicate "+marker, func(t *testing.T) {
+			for _, frame := range frames {
+				if strings.Contains(frame, marker) {
+					duplicated := append(append([]string{}, frames...), frame)
+					if _, err := parseDeepSeekFlashcatPage(deepSeekFlashcatHTMLFromFrames(t, duplicated)); err == nil {
+						t.Fatalf("duplicate required frame %s should fail", marker)
+					}
+					return
+				}
+			}
+			t.Fatalf("fixture is missing required marker %s", marker)
+		})
+	}
+}
+
+func mutateDeepSeekFlashcatFrame(t *testing.T, body []byte, marker string, mutate func(map[string]any)) []byte {
+	t.Helper()
+	frames, err := deepSeekFlashcatNextFlightFrames(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matched := 0
+	for index, frame := range frames {
+		if !strings.Contains(frame, marker) {
+			continue
+		}
+		separator := strings.IndexByte(frame, ':')
+		if separator <= 0 {
+			t.Fatalf("DeepSeek fixture frame %q has no payload separator", marker)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(frame[separator+1:]), &payload); err != nil {
+			t.Fatal(err)
+		}
+		mutate(payload)
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frames[index] = frame[:separator+1] + string(encoded)
+		matched++
+	}
+	if matched != 1 {
+		t.Fatalf("DeepSeek fixture frame %q matches = %d, want 1", marker, matched)
+	}
+	return deepSeekFlashcatHTMLFromFrames(t, frames)
+}
+
+func deepSeekFlashcatReactFlightPropArrayFrames(t *testing.T, body []byte) []byte {
+	t.Helper()
+	frames, err := deepSeekFlashcatNextFlightFrames(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, frame := range frames {
+		separator := strings.IndexByte(frame, ':')
+		if separator <= 0 {
+			t.Fatalf("DeepSeek fixture frame %q has no payload separator", frame)
+		}
+		props := strings.TrimSpace(frame[separator+1:])
+		if !strings.HasPrefix(props, "{") {
+			t.Fatalf("DeepSeek fixture frame %q does not contain object props", frame)
+		}
+		frames[index] = `c:["$","$L1b",null,` + props + `]`
+	}
+	return deepSeekFlashcatHTMLFromFrames(t, frames)
+}
+
+func mutateDeepSeekFlashcatRawFrame(t *testing.T, body []byte, marker string, mutate func(string) string) []byte {
+	t.Helper()
+	frames, err := deepSeekFlashcatNextFlightFrames(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matched := 0
+	for index, frame := range frames {
+		if !strings.Contains(frame, marker) {
+			continue
+		}
+		frames[index] = mutate(frame)
+		matched++
+	}
+	if matched != 1 {
+		t.Fatalf("DeepSeek fixture raw frame %q matches = %d, want 1", marker, matched)
+	}
+	return deepSeekFlashcatHTMLFromFrames(t, frames)
+}
+
+func mutateDeepSeekFlashcatUpdatedAtNumber(t *testing.T, body []byte, replacement string) []byte {
+	t.Helper()
+	const marker = `"initialDataUpdatedAt":`
+	return mutateDeepSeekFlashcatRawFrame(t, body, marker, func(frame string) string {
+		start := strings.Index(frame, marker) + len(marker)
+		for start < len(frame) && (frame[start] == ' ' || frame[start] == '\n' || frame[start] == '\r' || frame[start] == '\t') {
+			start++
+		}
+		end := start
+		for end < len(frame) && (frame[end] == '-' || frame[end] == '+' || frame[end] == '.' || frame[end] == 'e' || frame[end] == 'E' || (frame[end] >= '0' && frame[end] <= '9')) {
+			end++
+		}
+		if start == end {
+			t.Fatalf("DeepSeek fixture updated-at value is missing")
+		}
+		return frame[:start] + replacement + frame[end:]
+	})
+}
+
+func deepSeekFlashcatHTMLFromFrames(t *testing.T, frames []string) []byte {
+	t.Helper()
+	var body strings.Builder
+	body.WriteString("<!doctype html><html><body>")
+	for _, frame := range frames {
+		encoded, err := json.Marshal([]any{1, frame})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body.WriteString("<script>self.__next_f.push(")
+		body.Write(encoded)
+		body.WriteString(")</script>")
+	}
+	body.WriteString("</body></html>")
+	return []byte(body.String())
+}
+
 type modelMonitorRoundTripper func(*http.Request) (*http.Response, error)
 
 func (fn modelMonitorRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -953,6 +1435,7 @@ func TestModelMonitorAggregationKeepsBuiltInOrderAndPartialFailures(t *testing.T
 	}
 	defer app.Close()
 	openAIClient := openAITestClient(t, openAITestSummary())
+	deepseekClient := deepseekFlashcatTestClient(t, readModelMonitorFixture(t, "deepseek_flashcat.html"))
 	var seenHosts sync.Map
 	transport := &modelMonitorCloseTrackingTransport{roundTripper: modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
 		seenHosts.Store(request.URL.Host, true)
@@ -961,6 +1444,9 @@ func TestModelMonitorAggregationKeepsBuiltInOrderAndPartialFailures(t *testing.T
 		}
 		if request.URL.Host == "status.claude.com" {
 			return &http.Response{StatusCode: http.StatusBadGateway, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":"upstream down"}`)), Request: request}, nil
+		}
+		if request.URL.Host == "statuspage.flashcat.cloud" {
+			return deepseekClient.Transport.RoundTrip(request)
 		}
 		return openAIClient.Transport.RoundTrip(request)
 	})}
@@ -984,18 +1470,18 @@ func TestModelMonitorAggregationKeepsBuiltInOrderAndPartialFailures(t *testing.T
 	if transport.closeCalls != 1 {
 		t.Fatalf("model monitor CloseIdleConnections calls = %d, want 1", transport.closeCalls)
 	}
-	for _, host := range []string{"status.input.im", "status.openai.com", "status.claude.com"} {
+	for _, host := range []string{"status.input.im", "status.openai.com", "status.claude.com", "statuspage.flashcat.cloud"} {
 		if _, ok := seenHosts.Load(host); !ok {
 			t.Fatalf("model monitor source %q did not use the configured client", host)
 		}
 	}
-	if len(response.Sources) != 3 || response.Sources[0].ID != "ai-input-im" || response.Sources[1].ID != "openai" || response.Sources[2].ID != "anthropic" {
+	if len(response.Sources) != 4 || response.Sources[0].ID != "ai-input-im" || response.Sources[1].ID != "openai" || response.Sources[2].ID != "anthropic" || response.Sources[3].ID != "deepseek" {
 		t.Fatalf("unexpected source order: %#v", response.Sources)
 	}
 	if response.Sources[2].Name != "Claude Status" || response.Sources[2].StatusPageURL != "https://status.claude.com" {
 		t.Fatalf("unexpected Claude Status identity: %#v", response.Sources[2])
 	}
-	if response.Sources[0].CollectionState != modelMonitorCollectionOK || response.Sources[1].CollectionState != modelMonitorCollectionOK || response.Sources[2].CollectionState != modelMonitorCollectionError {
+	if response.Sources[0].CollectionState != modelMonitorCollectionOK || response.Sources[1].CollectionState != modelMonitorCollectionOK || response.Sources[2].CollectionState != modelMonitorCollectionError || response.Sources[3].CollectionState != modelMonitorCollectionOK {
 		t.Fatalf("unexpected collection states: %#v", response.Sources)
 	}
 	for _, source := range response.Sources {
@@ -1004,6 +1490,256 @@ func TestModelMonitorAggregationKeepsBuiltInOrderAndPartialFailures(t *testing.T
 		}
 	}
 	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor/sources", nil, cookies, http.StatusNotFound, nil)
+}
+
+func TestModelMonitorSourceSettingsAndSingleSourceRoutes(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := NewWithOptions(context.Background(), NewOptions{Migrate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	openAIClient := openAITestClient(t, openAITestSummary())
+	deepseekClient := deepseekFlashcatTestClient(t, readModelMonitorFixture(t, "deepseek_flashcat.html"))
+	transport := &modelMonitorCloseTrackingTransport{roundTripper: modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Host {
+		case "status.openai.com":
+			return openAIClient.Transport.RoundTrip(request)
+		case "statuspage.flashcat.cloud":
+			return deepseekClient.Transport.RoundTrip(request)
+		default:
+			return nil, fmt.Errorf("unexpected model monitor host %q", request.URL.Host)
+		}
+	})}
+	fakeClient := &http.Client{Transport: transport}
+	factoryCalls := 0
+	app.modelMonitorHTTPClient = func(ModelMonitorProxyConfig) (*http.Client, error) {
+		factoryCalls++
+		return fakeClient, nil
+	}
+
+	handler := app.Routes()
+	cookies := modelMonitorRequest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{"username": "admin", "password": "test-password", "nickname": "Admin"}, nil, http.StatusOK, nil)
+	var settings ModelMonitorSettings
+	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor/settings", nil, cookies, http.StatusOK, &settings)
+	wantDefaultIDs := []string{"ai-input-im", "openai", "anthropic", "deepseek"}
+	if !equalStrings(settings.EnabledSourceIDs, wantDefaultIDs) || len(settings.Sources) != 4 {
+		t.Fatalf("default model monitor settings = %#v", settings)
+	}
+	for _, source := range settings.Sources {
+		if !source.Enabled {
+			t.Fatalf("default source %q is disabled", source.ID)
+		}
+	}
+	if settings.Sources[3].ID != "deepseek" || settings.Sources[3].StatusPageURL != "https://status.deepseek.com" || settings.Sources[3].HistoryGranularity != modelMonitorHistoryDay || settings.Sources[3].HistoryWindowLabel != "90 days" {
+		t.Fatalf("DeepSeek settings metadata = %#v", settings.Sources[3])
+	}
+
+	modelMonitorRequest(t, handler, http.MethodPost, "/api/model-monitor/settings", nil, cookies, http.StatusMethodNotAllowed, nil)
+	for _, payload := range []map[string]any{
+		{},
+		{"enabled_source_ids": nil},
+		{"enabled_source_ids": []string{"deepseek", "deepseek"}},
+		{"enabled_source_ids": []string{"unknown"}},
+		{"enabled_source_ids": []string{" "}},
+	} {
+		modelMonitorRequest(t, handler, http.MethodPut, "/api/model-monitor/settings", payload, cookies, http.StatusUnprocessableEntity, nil)
+	}
+	settings = ModelMonitorSettings{}
+	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor/settings", nil, cookies, http.StatusOK, &settings)
+	if !equalStrings(settings.EnabledSourceIDs, wantDefaultIDs) {
+		t.Fatalf("invalid settings update changed persisted order: %#v", settings.EnabledSourceIDs)
+	}
+
+	modelMonitorRequest(t, handler, http.MethodPut, "/api/model-monitor/settings", map[string]any{"enabled_source_ids": []string{"deepseek", "openai"}}, cookies, http.StatusOK, &settings)
+	if !equalStrings(settings.EnabledSourceIDs, []string{"deepseek", "openai"}) {
+		t.Fatalf("saved settings order = %#v", settings.EnabledSourceIDs)
+	}
+	if len(settings.Sources) != 4 || settings.Sources[0].ID != "deepseek" || !settings.Sources[0].Enabled || settings.Sources[1].ID != "openai" || !settings.Sources[1].Enabled || settings.Sources[2].ID != "ai-input-im" || settings.Sources[2].Enabled || settings.Sources[3].ID != "anthropic" || settings.Sources[3].Enabled {
+		t.Fatalf("saved settings projection = %#v", settings.Sources)
+	}
+	appCfg, err := app.loadConfig(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	appCfg.Collector.QueueName = "source-settings-isolation"
+	if err := app.saveConfig(context.Background(), appCfg); err != nil {
+		t.Fatal(err)
+	}
+	persistedSettings, err := app.loadModelMonitorSourceSettings(context.Background())
+	if err != nil || !equalStrings(persistedSettings.EnabledSourceIDs, []string{"deepseek", "openai"}) {
+		t.Fatalf("generic config save overwrote source settings: %#v / %v", persistedSettings, err)
+	}
+
+	var source ModelMonitorSourceStatus
+	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor/sources/deepseek", nil, cookies, http.StatusOK, &source)
+	if source.ID != "deepseek" || source.CollectionState != modelMonitorCollectionOK || factoryCalls != 1 || transport.closeCalls != 1 {
+		t.Fatalf("single DeepSeek source = %#v; factory/close calls = %d/%d", source, factoryCalls, transport.closeCalls)
+	}
+	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor/sources/anthropic", nil, cookies, http.StatusNotFound, nil)
+	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor/sources/unknown", nil, cookies, http.StatusNotFound, nil)
+	modelMonitorRequest(t, handler, http.MethodPut, "/api/model-monitor/sources/deepseek", nil, cookies, http.StatusMethodNotAllowed, nil)
+	if factoryCalls != 1 {
+		t.Fatalf("disabled or unknown source route collected a source; factory calls = %d", factoryCalls)
+	}
+
+	var aggregate ModelMonitorResponse
+	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor", nil, cookies, http.StatusOK, &aggregate)
+	if factoryCalls != 2 || transport.closeCalls != 2 || len(aggregate.Sources) != 2 || aggregate.Sources[0].ID != "deepseek" || aggregate.Sources[1].ID != "openai" {
+		t.Fatalf("ordered aggregate = %#v; factory/close calls = %d/%d", aggregate.Sources, factoryCalls, transport.closeCalls)
+	}
+
+	modelMonitorRequest(t, handler, http.MethodPut, "/api/model-monitor/settings", map[string]any{"enabled_source_ids": []string{}}, cookies, http.StatusOK, &settings)
+	if settings.EnabledSourceIDs == nil || len(settings.EnabledSourceIDs) != 0 {
+		t.Fatalf("empty enabled source IDs = %#v", settings.EnabledSourceIDs)
+	}
+	aggregate = ModelMonitorResponse{}
+	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor", nil, cookies, http.StatusOK, &aggregate)
+	if aggregate.Sources == nil || len(aggregate.Sources) != 0 || factoryCalls != 2 {
+		t.Fatalf("empty aggregate = %#v; factory calls = %d", aggregate.Sources, factoryCalls)
+	}
+	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor/sources/deepseek", nil, cookies, http.StatusNotFound, nil)
+}
+
+func TestModelMonitorSourceSettingsRejectCorruptPersistedValuesAndSurviveRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	app, err := NewWithOptions(context.Background(), NewOptions{Migrate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ids := []string{"deepseek", "openai"}
+	if _, err := app.updateModelMonitorSourceSettings(context.Background(), modelMonitorSourceSettingsPayload{EnabledSourceIDs: &ids}); err != nil {
+		app.Close()
+		t.Fatalf("save source settings: %v", err)
+	}
+	app.Close()
+
+	app, err = NewWithOptions(context.Background(), NewOptions{Migrate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	settings, err := app.loadModelMonitorSourceSettings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalStrings(settings.EnabledSourceIDs, ids) {
+		t.Fatalf("source settings after restart = %#v, want %#v", settings.EnabledSourceIDs, ids)
+	}
+	for _, value := range []string{`not JSON`, `null`, `["openai","openai"]`, `["unknown"]`, `[""]`} {
+		if _, err := app.db.Exec(`UPDATE app_settings SET model_monitor_enabled_source_ids = ? WHERE id = 1`, value); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := app.loadModelMonitorSourceSettings(context.Background()); err == nil {
+			t.Fatalf("corrupt persisted value %q should fail", value)
+		}
+	}
+}
+
+func TestModelMonitorRoutesReturnValidationErrorForCorruptSourceSettings(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := NewWithOptions(context.Background(), NewOptions{Migrate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	factoryCalls := 0
+	app.modelMonitorHTTPClient = func(ModelMonitorProxyConfig) (*http.Client, error) {
+		factoryCalls++
+		return nil, fmt.Errorf("collector client must not be created for corrupt source settings")
+	}
+	handler := app.Routes()
+	cookies := modelMonitorRequest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{"username": "admin", "password": "test-password", "nickname": "Admin"}, nil, http.StatusOK, nil)
+	routes := []struct {
+		name   string
+		target string
+	}{
+		{name: "settings", target: "/api/model-monitor/settings"},
+		{name: "aggregate", target: "/api/model-monitor"},
+		{name: "source", target: "/api/model-monitor/sources/openai"},
+	}
+	tests := []struct {
+		name            string
+		persistedValue  string
+		expectedMessage string
+	}{
+		{
+			name:            "malformed JSON",
+			persistedValue:  `not JSON`,
+			expectedMessage: "模型监控来源配置无效: enabled_source_ids 必须是 JSON 字符串数组",
+		},
+		{
+			name:            "duplicate ID",
+			persistedValue:  "[\"openai\",\"openai\"]",
+			expectedMessage: "模型监控来源配置无效: 模型监控来源 ID \"openai\" 重复",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := app.db.Exec(`UPDATE app_settings SET model_monitor_enabled_source_ids = ? WHERE id = 1`, test.persistedValue); err != nil {
+				t.Fatal(err)
+			}
+			for _, route := range routes {
+				t.Run(route.name, func(t *testing.T) {
+					var response struct {
+						Detail struct {
+							Code    string `json:"code"`
+							Message string `json:"message"`
+						} `json:"detail"`
+					}
+					modelMonitorRequest(t, handler, http.MethodGet, route.target, nil, cookies, http.StatusUnprocessableEntity, &response)
+					if response.Detail.Code != "validation_error" || response.Detail.Message != test.expectedMessage {
+						t.Fatalf("%s error = %#v, want validation_error / %q", route.target, response.Detail, test.expectedMessage)
+					}
+				})
+			}
+		})
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("collector client factory calls = %d, want 0", factoryCalls)
+	}
+}
+
+func TestModelMonitorAggregationIsolatesDeepSeekHistoryFailure(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := NewWithOptions(context.Background(), NewOptions{Migrate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	openAIClient := openAITestClient(t, openAITestSummary())
+	anthropicClient := anthropicTestClient(t, readModelMonitorFixture(t, "anthropic_summary.json"), readModelMonitorFixture(t, "anthropic_history.html"))
+	deepseekClient := deepseekFlashcatTestClient(t, []byte(`<html></html>`))
+	app.modelMonitorHTTPClient = func(ModelMonitorProxyConfig) (*http.Client, error) {
+		return &http.Client{Transport: modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+			switch request.URL.Host {
+			case "status.input.im":
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(readModelMonitorFixture(t, "input_im_status.json")))), Request: request}, nil
+			case "status.openai.com":
+				return openAIClient.Transport.RoundTrip(request)
+			case "status.claude.com":
+				return anthropicClient.Transport.RoundTrip(request)
+			case "statuspage.flashcat.cloud":
+				return deepseekClient.Transport.RoundTrip(request)
+			default:
+				return nil, fmt.Errorf("unexpected model monitor host %q", request.URL.Host)
+			}
+		})}, nil
+	}
+
+	handler := app.Routes()
+	cookies := modelMonitorRequest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{"username": "admin", "password": "test-password", "nickname": "Admin"}, nil, http.StatusOK, nil)
+	var response ModelMonitorResponse
+	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor", nil, cookies, http.StatusOK, &response)
+	if len(response.Sources) != 4 || response.Sources[0].CollectionState != modelMonitorCollectionOK || response.Sources[1].CollectionState != modelMonitorCollectionOK || response.Sources[2].CollectionState != modelMonitorCollectionOK || response.Sources[3].ID != "deepseek" || response.Sources[3].CollectionState != modelMonitorCollectionError || response.Sources[3].CollectionError == nil || !strings.Contains(*response.Sources[3].CollectionError, "DeepSeek") {
+		t.Fatalf("DeepSeek history failure was not isolated: %#v", response.Sources)
+	}
 }
 
 func TestModelMonitorRouteRequiresAdmin(t *testing.T) {
@@ -1052,9 +1788,17 @@ func TestModelMonitorRouteRequiresAdmin(t *testing.T) {
 	if !proxySettings.Enabled || proxySettings.ProxyURL != "socks5://127.0.0.1:1080" {
 		t.Fatalf("general config save overwrote model monitor proxy settings: %#v", proxySettings)
 	}
+	var sourceSettings ModelMonitorSettings
+	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor/settings", nil, adminCookies, http.StatusOK, &sourceSettings)
+	if !equalStrings(sourceSettings.EnabledSourceIDs, []string{"ai-input-im", "openai", "anthropic", "deepseek"}) {
+		t.Fatalf("default source settings = %#v", sourceSettings.EnabledSourceIDs)
+	}
 	modelMonitorRequest(t, handler, http.MethodPost, "/api/users", map[string]any{"username": "member", "password": "member-password", "nickname": "Member", "is_admin": false}, adminCookies, http.StatusOK, nil)
 	memberCookies := modelMonitorRequest(t, handler, http.MethodPost, "/api/auth/login", map[string]any{"username": "member", "password": "member-password"}, nil, http.StatusOK, nil)
 	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor", nil, memberCookies, http.StatusForbidden, nil)
+	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor/settings", nil, memberCookies, http.StatusForbidden, nil)
+	modelMonitorRequest(t, handler, http.MethodPut, "/api/model-monitor/settings", map[string]any{"enabled_source_ids": []string{}}, memberCookies, http.StatusForbidden, nil)
+	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor/sources/deepseek", nil, memberCookies, http.StatusForbidden, nil)
 	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor/proxy", nil, memberCookies, http.StatusForbidden, nil)
 	modelMonitorRequest(t, handler, http.MethodPut, "/api/model-monitor/proxy", map[string]any{"enabled": false}, memberCookies, http.StatusForbidden, nil)
 }
@@ -1086,6 +1830,28 @@ func openAITestClientWithHistory(t *testing.T, summaryBody, historyBody []byte) 
 }
 
 func anthropicTestClient(t *testing.T, summaryBody, historyBody []byte) *http.Client {
+	return statuspageTestClient(t, "Anthropic", summaryBody, historyBody)
+}
+
+func deepseekFlashcatTestClient(t *testing.T, pageBody []byte) *http.Client {
+	t.Helper()
+	return &http.Client{Transport: modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Scheme != "https" || request.URL.Host != "statuspage.flashcat.cloud" || request.Host != modelMonitorDeepSeekCollectionHost || request.URL.Path != "/" {
+			t.Fatalf("unexpected DeepSeek Flashcat request: url=%s host=%q", request.URL, request.Host)
+		}
+		if request.Header.Get("Accept") != "text/html" {
+			t.Fatalf("DeepSeek Flashcat Accept = %q, want text/html", request.Header.Get("Accept"))
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+			Body:       io.NopCloser(strings.NewReader(string(pageBody))),
+			Request:    request,
+		}, nil
+	})}
+}
+
+func statuspageTestClient(t *testing.T, sourceName string, summaryBody, historyBody []byte) *http.Client {
 	t.Helper()
 	return &http.Client{Transport: modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
 		var body []byte
@@ -1098,7 +1864,7 @@ func anthropicTestClient(t *testing.T, summaryBody, historyBody []byte) *http.Cl
 			body = historyBody
 			contentType = "text/html"
 		default:
-			t.Fatalf("unexpected Anthropic request path: %s", request.URL.Path)
+			t.Fatalf("unexpected %s request path: %s", sourceName, request.URL.Path)
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{contentType}}, Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
 	})}

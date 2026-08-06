@@ -130,6 +130,8 @@ try {
     ['Anthropic 当前组件 "claude-api" 缺少历史', 'Anthropic current component "claude-api" is missing history'],
     ['Anthropic 当前组件 "claude-api" 缺少 历史', 'Anthropic current component "claude-api" is missing history'],
     ['Anthropic 组件 "claude-api" 的 related event 缺少名称或 code', 'Anthropic component "claude-api" related event is missing name or code'],
+    ['DeepSeek 当前组件 "api" 缺少必要字段', 'DeepSeek current component "api" is missing required fields'],
+    ['DeepSeek 页面 uptimeData 无效: JSON 对象未闭合', 'DeepSeek page uptimeData is invalid: JSON object is not closed'],
     ['AI.INPUT.IM service 结构无效', 'AI.INPUT.IM service structure is invalid'],
     ['AI.INPUT.IM 响应缺少必要字段', 'AI.INPUT.IM response is missing required fields'],
   ]
@@ -157,6 +159,26 @@ try {
   assert.equal(
     localizedServerMessage('模型监控请求失败: dial tcp: 上游自定义详情'),
     'Model monitoring request failed: dial tcp: 上游自定义详情',
+  )
+  assert.equal(
+    localizedServerMessage('模型监控来源设置缺少 enabled_source_ids 字段'),
+    'Model monitoring source settings are missing enabled_source_ids',
+  )
+  assert.equal(
+    localizedServerMessage('enabled_source_ids 必须是 JSON 字符串数组'),
+    'enabled_source_ids must be a JSON string array',
+  )
+  assert.equal(
+    localizedServerMessage('模型监控来源 ID "deepseek" 不受支持'),
+    'Model monitoring source ID "deepseek" is not supported',
+  )
+  assert.equal(
+    localizedServerMessage('模型监控来源配置无效: 模型监控来源 ID "unknown" 重复'),
+    'Model monitoring source settings are invalid: model monitoring source ID "unknown" is duplicated',
+  )
+  assert.equal(
+    localizedServerMessage('模型监控来源不存在'),
+    'Model monitoring source does not exist',
   )
   assert.equal(
     localizedServerMessage('审计页面组件无效'),
