@@ -16,7 +16,12 @@ import { Cpu, KeyRound, RefreshCw, ShieldCheck } from 'lucide-vue-next'
 
 import { listAvailableModels } from '@/features/models/api/availableModelsApi'
 import { useI18n } from '@/shared/i18n'
-import type { AvailableModel, AvailableModelPrice, AvailableModelsResponse } from '@/shared/types/api'
+import type {
+  AvailableModel,
+  AvailableModelPrice,
+  AvailableModelsResponse,
+  ModelPriceBillingUnit,
+} from '@/shared/types/api'
 
 type PriceField = keyof Pick<
   AvailableModelPrice,
@@ -25,8 +30,6 @@ type PriceField = keyof Pick<
   | 'cache_read_usd_per_million'
   | 'cache_creation_usd_per_million'
 >
-type BillingUnit = 'token' | 'request'
-
 const router = useRouter()
 const { currentLanguage, errorText, serverText, t } = useI18n()
 const isLoading = ref(false)
@@ -63,11 +66,11 @@ function formatUsdPerMtok(value: number): string {
   })
 }
 
-function billingUnitForModel(model: string): BillingUnit {
+function billingUnitForModel(model: string): ModelPriceBillingUnit {
   return model.trim().toLowerCase().includes('image') ? 'request' : 'token'
 }
 
-function modelBillingUnit(row: AvailableModel): BillingUnit {
+function modelBillingUnit(row: AvailableModel): ModelPriceBillingUnit {
   if (row.price?.billing_unit === 'request') {
     return 'request'
   }

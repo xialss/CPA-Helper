@@ -451,6 +451,8 @@ export interface UsageOverviewResponse {
   options?: UsageOptionsResponse
 }
 
+export type ModelPriceBillingUnit = 'token' | 'request'
+
 export interface UsageTokenCostBreakdownItem {
   kind: 'input' | 'cache_read' | 'cache_creation' | 'output'
   tokens: number
@@ -470,7 +472,7 @@ export type UsageCostBreakdownItem =
   | UsageRequestCostBreakdownItem
 
 export interface UsageCostBreakdown {
-  billing_unit: 'token' | 'request'
+  billing_unit: ModelPriceBillingUnit
   normal_input_tokens: number
   cache_read_tokens: number
   cache_creation_tokens: number
@@ -552,7 +554,7 @@ export interface ModelPrice {
   priority_multiplier: number | null
   long_context: ModelPriceLongContext | null
   preserved_long_context: ModelPriceLibraryConflictLongContext | null
-  billing_unit: 'token' | 'request' | string
+  billing_unit: ModelPriceBillingUnit
   source: 'manual' | 'litellm' | string
   source_model: string | null
   auto_synced: boolean
@@ -568,6 +570,7 @@ export interface ModelPricePayload {
   channel_brand: string | null
   channel_key: string | null
   channel_identity_hash: string | null
+  billing_unit: ModelPriceBillingUnit
   input_usd_per_million: number
   output_usd_per_million: number
   cache_read_usd_per_million: number
@@ -714,7 +717,7 @@ export interface AvailableModelPrice {
   cache_creation_usd_per_million: number
   request_usd: number | null
   long_context: ModelPriceLongContext | null
-  billing_unit: 'token' | 'request' | string
+  billing_unit: ModelPriceBillingUnit
 }
 
 export interface AvailableModel {

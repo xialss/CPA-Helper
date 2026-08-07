@@ -45,6 +45,7 @@ import type {
   ModelPriceCatalogResponse,
   ModelPriceLibraryConflict,
   ModelPriceLibraryConflictLongContext,
+  ModelPriceBillingUnit,
   ModelPriceLongContext,
   ModelPricePayload,
 } from '@/shared/types/api'
@@ -57,7 +58,6 @@ type PriceTableLayoutProps =
 
 type PriceRowStatus = 'missing' | 'litellm' | 'manual'
 type PriceStatusFilter = 'cpa' | 'missing' | 'litellm' | 'manual' | 'library' | 'migration_conflict'
-type BillingUnit = 'token' | 'request'
 type PriceGroupingMode = 'model' | 'provider'
 type PriceScope = 'library' | 'channel'
 type ChannelAuthType = 'apikey' | 'oauth'
@@ -105,7 +105,7 @@ interface PriceDisplayRow {
   comparisonModelKey: string
   catalogModels: CatalogModelReference[]
   templatePrice: ModelPrice | null
-  billing_unit: BillingUnit
+  billing_unit: ModelPriceBillingUnit
   status: PriceRowStatus
   migrationConflict: ModelPriceLibraryConflict | null
 }
@@ -121,7 +121,7 @@ interface PriceGroupRow {
   modelCount: number
   pricedCount: number
   unpricedCount: number
-  billingUnits: BillingUnit[]
+  billingUnits: ModelPriceBillingUnit[]
   longContextConfiguredCount: number
   longContextEligibleCount: number
   priorityConfiguredCount: number
@@ -180,6 +180,7 @@ const form = reactive<ModelPricePayload>({
   channel_brand: null,
   channel_key: null,
   channel_identity_hash: null,
+  billing_unit: 'token',
   input_usd_per_million: 0,
   output_usd_per_million: 0,
   cache_read_usd_per_million: 0,
@@ -507,6 +508,11 @@ const groupingOptions = computed<Array<{ label: string; value: PriceGroupingMode
   { label: t('按渠道', 'By channel'), value: 'provider' },
 ])
 
+const billingUnitOptions = computed<Array<{ label: string; value: ModelPriceBillingUnit }>>(() => [
+  { label: t('按量（Token）', 'Per token'), value: 'token' },
+  { label: t('按次（请求）', 'Per request'), value: 'request' },
+])
+
 const filteredPrices = computed(() => {
   return priceRows.value.filter((row) => {
     if (selectedProvider.value && row.channelFilterKey !== selectedProvider.value) {
@@ -545,6 +551,18 @@ watch(preserveInvalidLongContext, (preserve) => {
     longContextEnabled.value = false
   }
 })
+
+watch(
+  () => form.billing_unit,
+  (billingUnit) => {
+    if (billingUnit === 'token') {
+      form.request_usd = null
+      return
+    }
+    longContextEnabled.value = false
+    preserveInvalidLongContext.value = false
+  },
+)
 
 function renderSearchIcon() {
   return h(NIcon, { component: Search })
@@ -693,11 +711,11 @@ function pruneExpandedRowKeys() {
   expandedRowKeys.value = expandedRowKeys.value.filter((key) => validKeys.has(String(key)))
 }
 
-function billingUnitForModel(model: string): BillingUnit {
+function billingUnitForModel(model: string): ModelPriceBillingUnit {
   return model.trim().toLowerCase().includes('image') ? 'request' : 'token'
 }
 
-function billingUnitForPrice(price: ModelPrice | null, fallbackModel: string): BillingUnit {
+function billingUnitForPrice(price: ModelPrice | null, fallbackModel: string): ModelPriceBillingUnit {
   if (price?.billing_unit === 'request') {
     return 'request'
   }
@@ -791,14 +809,14 @@ const priceTableLayoutProps = computed<PriceTableLayoutProps>(() =>
     ? { flexHeight: true }
     : { flexHeight: false, maxHeight: PRICE_TABLE_FALLBACK_MAX_HEIGHT },
 )
-const isRequestPriceForm = computed(() => billingUnitForModel(form.model) === 'request')
+const isRequestPriceForm = computed(() => form.billing_unit === 'request')
 const isChannelPriceForm = computed(() => form.price_scope === 'channel')
 const priceSaveHint = computed(() => {
   if (isChannelPriceForm.value) {
     return isRequestPriceForm.value
       ? t(
-          '此价格只用于当前渠道的该模型；image 模型按每次成功调用固定金额计费。',
-          'This price applies only to this channel and model. Image models are charged per successful call.',
+          '此价格只用于当前渠道的该模型；按次计费会按每次成功调用固定金额计算。',
+          'This price applies only to this channel and model. Per-request billing charges a fixed amount for each successful call.',
         )
       : t(
           '此价格只用于当前渠道的该模型，通用价格仅作为本次表单的预填参考。',
@@ -807,8 +825,8 @@ const priceSaveHint = computed(() => {
   }
   return isRequestPriceForm.value
     ? t(
-        'image 模型按每次成功调用固定金额计费，保存后会作为手动价格优先保留。',
-        'Image models are charged a fixed amount per successful call. Saved values are kept as manual prices with priority.',
+        '按次计费会按每次成功调用固定金额计算，保存后会作为手动价格优先保留。',
+        'Per-request billing charges a fixed amount for each successful call. Saved values are kept as manual prices with priority.',
       )
     : t(
         '保存后会作为手动价格，后续 LiteLLM 同步会优先保留。',
@@ -900,6 +918,7 @@ function resetForm() {
   form.channel_brand = null
   form.channel_key = null
   form.channel_identity_hash = null
+  form.billing_unit = 'token'
   form.input_usd_per_million = 0
   form.output_usd_per_million = 0
   form.cache_read_usd_per_million = 0
@@ -945,6 +964,7 @@ function openCreate(prefill: Partial<ModelPricePayload> = {}, channelLabel = '')
   form.channel_brand = prefill.channel_brand ?? null
   form.channel_key = prefill.channel_key ?? null
   form.channel_identity_hash = prefill.channel_identity_hash ?? null
+  form.billing_unit = prefill.billing_unit ?? billingUnitForModel(form.model)
   form.input_usd_per_million = prefill.input_usd_per_million ?? 0
   form.output_usd_per_million = prefill.output_usd_per_million ?? 0
   form.cache_read_usd_per_million = prefill.cache_read_usd_per_million ?? 0
@@ -966,6 +986,7 @@ function openCreateForRow(row: PriceDisplayRow) {
     channel_brand: row.channelBrand,
     channel_key: row.channelKey,
     channel_identity_hash: row.channelIdentityHash,
+    billing_unit: billingUnitForPrice(template, row.model),
     input_usd_per_million: template?.input_usd_per_million ?? 0,
     output_usd_per_million: template?.output_usd_per_million ?? 0,
     cache_read_usd_per_million: template?.cache_read_usd_per_million ?? 0,
@@ -990,6 +1011,7 @@ function openEdit(row: PriceDisplayRow) {
   form.channel_brand = price.channel_brand
   form.channel_key = price.channel_key
   form.channel_identity_hash = row.channelIdentityHash
+  form.billing_unit = billingUnitForPrice(price, price.model)
   form.input_usd_per_million = price.input_usd_per_million
   form.output_usd_per_million = price.output_usd_per_million
   form.cache_read_usd_per_million = price.cache_read_usd_per_million
@@ -1037,9 +1059,17 @@ function validLongContextForm(): boolean {
 }
 
 async function savePrice() {
-  const requestPriceMode = isRequestPriceForm.value
-  const requestUSD = requestPriceMode && typeof form.request_usd === 'number' ? form.request_usd : null
-  const preservePartialLongContext = preservedLongContext.value !== null && preserveInvalidLongContext.value
+  const billingUnit = form.billing_unit
+  const requestPriceMode = billingUnit === 'request'
+  const requestUSD = requestPriceMode &&
+    typeof form.request_usd === 'number' &&
+    Number.isFinite(form.request_usd) &&
+    form.request_usd >= 0
+    ? form.request_usd
+    : null
+  const preservePartialLongContext = !requestPriceMode &&
+    preservedLongContext.value !== null &&
+    preserveInvalidLongContext.value
   const longContext = !requestPriceMode && !preservePartialLongContext && longContextEnabled.value
     ? { ...longContextForm }
     : null
@@ -1051,6 +1081,7 @@ async function savePrice() {
     channel_brand: form.channel_brand,
     channel_key: form.channel_key,
     channel_identity_hash: form.channel_identity_hash,
+    billing_unit: billingUnit,
     input_usd_per_million: form.input_usd_per_million,
     output_usd_per_million: form.output_usd_per_million,
     cache_read_usd_per_million: form.cache_read_usd_per_million,
@@ -1058,7 +1089,7 @@ async function savePrice() {
     request_usd: requestUSD,
     long_context: longContext,
   }
-  if (preservedLongContext.value !== null) {
+  if (!requestPriceMode && preservedLongContext.value !== null) {
     payload.preserve_invalid_long_context = preservePartialLongContext
   }
   if (!payload.provider || !payload.model) {
@@ -1073,7 +1104,7 @@ async function savePrice() {
     return
   }
   if (requestPriceMode && requestUSD === null) {
-    message.error(t('image 模型需要填写每次调用价格', 'Image models require a per-call price'))
+    message.error(t('按次计费需要填写有效的每次调用价格', 'Per-request billing requires a valid per-call price'))
     return
   }
   if (longContext !== null && !validLongContextForm()) {
@@ -1269,7 +1300,7 @@ function summarizePriceValues(values: number[]): string {
     : `${formatPriceValue(minimum)} - ${formatPriceValue(maximum)}`
 }
 
-function renderBillingUnitBadge(unit: BillingUnit | 'mixed') {
+function renderBillingUnitBadge(unit: ModelPriceBillingUnit | 'mixed') {
   const isRequest = unit === 'request'
   const isMixed = unit === 'mixed'
   return h(
@@ -1948,6 +1979,17 @@ onBeforeUnmount(() => {
           <NFormItem :label="t('模型', 'Model')">
             <NInput v-model:value="form.model" :disabled="isChannelPriceForm" />
           </NFormItem>
+          <NFormItem :label="t('计费方式', 'Billing mode')" class="wide-form-item">
+            <NRadioGroup v-model:value="form.billing_unit" class="billing-unit-options" :disabled="isPriceSaving">
+              <NRadioButton
+                v-for="option in billingUnitOptions"
+                :key="option.value"
+                :value="option.value"
+              >
+                {{ option.label }}
+              </NRadioButton>
+            </NRadioGroup>
+          </NFormItem>
           <NAlert
             v-if="preservedLongContext"
             class="wide-form-item"
@@ -2066,6 +2108,12 @@ onBeforeUnmount(() => {
 
 .wide-form-item {
   grid-column: 1 / -1;
+}
+
+.billing-unit-options {
+  display: flex;
+  flex-wrap: wrap;
+  max-width: 100%;
 }
 
 .long-context-switch-row {

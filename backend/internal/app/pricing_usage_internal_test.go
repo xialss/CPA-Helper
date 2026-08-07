@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -15,6 +16,14 @@ import (
 	"testing"
 	"time"
 )
+
+func requireInvalidStoredBillingUnitError(t *testing.T, err error) {
+	t.Helper()
+	var appErr *AppError
+	if !errors.As(err, &appErr) || appErr.Code != "invalid_stored_billing_unit" || appErr.Status != http.StatusInternalServerError {
+		t.Fatalf("error = %#v, want invalid_stored_billing_unit internal server error", err)
+	}
+}
 
 func TestRecordCostUsesClaudeCacheReadAndCreationTokens(t *testing.T) {
 	provider := "claude"
@@ -1190,6 +1199,60 @@ func TestRecordCostTreatsImageWithoutRequestPriceAsUnpriced(t *testing.T) {
 	}
 }
 
+func TestRecordCostUsesPersistedBillingUnitOverride(t *testing.T) {
+	provider := "openai"
+	chatModel := "gpt-billed-per-request"
+	imageModel := "image-billed-per-token"
+	requestUSD := 0.75
+	prices := modelPriceIndex{
+		priceKey(provider, chatModel): {
+			Provider:    provider,
+			Model:       chatModel,
+			BillingUnit: modelBillingUnitRequest,
+			RequestUSD:  &requestUSD,
+		},
+		priceKey(provider, imageModel): {
+			Provider:           provider,
+			Model:              imageModel,
+			BillingUnit:        modelBillingUnitToken,
+			InputUSDPerMillion: 2,
+		},
+	}
+
+	requestRecord := UsageRecord{Provider: &provider, Model: &chatModel, InputTokens: 1_000_000, TotalTokens: 1_000_000}
+	requestBreakdown := calculateRecordCostBreakdown(requestRecord, prices)
+	if requestBreakdown.BillingUnit != modelBillingUnitRequest || requestBreakdown.TotalUSD != requestUSD || len(requestBreakdown.Items) != 1 {
+		t.Fatalf("chat override breakdown = %#v, want request billing at %v", requestBreakdown, requestUSD)
+	}
+
+	tokenRecord := UsageRecord{Provider: &provider, Model: &imageModel, InputTokens: 1_000_000, TotalTokens: 1_000_000}
+	tokenBreakdown := calculateRecordCostBreakdown(tokenRecord, prices)
+	if tokenBreakdown.BillingUnit != modelBillingUnitToken || tokenBreakdown.TotalUSD != 2 || len(tokenBreakdown.Items) == 0 {
+		t.Fatalf("image override breakdown = %#v, want token billing at 2", tokenBreakdown)
+	}
+}
+
+func TestRecordCostFailsClosedForInvalidBillingUnit(t *testing.T) {
+	provider := "openai"
+	model := "gpt-invalid-billing-unit"
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &provider,
+		Model:       &model,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, modelPriceIndex{
+		priceKey(provider, model): {
+			Provider:           provider,
+			Model:              model,
+			BillingUnit:        "message",
+			InputUSDPerMillion: 2,
+		},
+	})
+	if breakdown.BillingUnit != "" || !breakdown.Unpriced || breakdown.UnpricedReason == nil || *breakdown.UnpricedReason != priceMatchStatusInvalidPrice || breakdown.TotalUSD != 0 || len(breakdown.Items) != 0 {
+		t.Fatalf("invalid billing unit breakdown = %#v, want an unpriced invalid price", breakdown)
+	}
+}
+
 func TestRecordCostBreakdownTreatsMissingTokenPriceAsUnpriced(t *testing.T) {
 	provider := "openai"
 	model := "missing-model"
@@ -1931,6 +1994,66 @@ func TestModelPriceAPIUpdatesImageRequestPrice(t *testing.T) {
 	}
 }
 
+func TestModelPriceAPIAllowsBillingUnitOverrides(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+
+	var requestPrice ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       "openai",
+		"model":                          "gpt-configurable-request",
+		"billing_unit":                   modelBillingUnitRequest,
+		"input_usd_per_million":          0,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+		"request_usd":                    0.5,
+	}, cookies, &requestPrice)
+	if requestPrice.BillingUnit != modelBillingUnitRequest || requestPrice.RequestUSD == nil || *requestPrice.RequestUSD != 0.5 {
+		t.Fatalf("chat request price = %#v", requestPrice)
+	}
+	var updatedRequestPrice ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPut, fmt.Sprintf("/api/model-prices/%d", requestPrice.ID), map[string]any{
+		"provider":                       "openai",
+		"model":                          "gpt-configurable-request",
+		"billing_unit":                   modelBillingUnitToken,
+		"input_usd_per_million":          3,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+		"request_usd":                    nil,
+	}, cookies, &updatedRequestPrice)
+	if updatedRequestPrice.BillingUnit != modelBillingUnitToken || updatedRequestPrice.RequestUSD != nil || updatedRequestPrice.InputUSDPerMillion != 3 {
+		t.Fatalf("updated chat token price = %#v", updatedRequestPrice)
+	}
+
+	var tokenPrice ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       "openai",
+		"model":                          "custom-image-token",
+		"billing_unit":                   modelBillingUnitToken,
+		"input_usd_per_million":          2,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+		"request_usd":                    nil,
+	}, cookies, &tokenPrice)
+	if tokenPrice.BillingUnit != modelBillingUnitToken || tokenPrice.RequestUSD != nil || tokenPrice.InputUSDPerMillion != 2 {
+		t.Fatalf("image token price = %#v", tokenPrice)
+	}
+}
+
 func TestModelPriceAPIRoundTripsAndClearsLongContextPrice(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()
@@ -2017,7 +2140,8 @@ func TestModelPriceAPIRejectsPartialAndRequestLongContextPrice(t *testing.T) {
 	}, cookies, http.StatusUnprocessableEntity)
 	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
 		"provider":                       "openai",
-		"model":                          "gpt-image-long-test",
+		"model":                          "gpt-request-long-test",
+		"billing_unit":                   modelBillingUnitRequest,
 		"input_usd_per_million":          0,
 		"output_usd_per_million":         0,
 		"cache_read_usd_per_million":     0,
@@ -2031,6 +2155,115 @@ func TestModelPriceAPIRejectsPartialAndRequestLongContextPrice(t *testing.T) {
 			"cache_creation_usd_per_million": 0,
 		},
 	}, cookies, http.StatusUnprocessableEntity)
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       "openai",
+		"model":                          "gpt-request-missing-price-test",
+		"billing_unit":                   modelBillingUnitRequest,
+		"input_usd_per_million":          0,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+	}, cookies, http.StatusUnprocessableEntity)
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices", map[string]any{
+		"provider":                       "openai",
+		"model":                          "gpt-invalid-billing-unit-test",
+		"billing_unit":                   "message",
+		"input_usd_per_million":          1,
+		"output_usd_per_million":         0,
+		"cache_read_usd_per_million":     0,
+		"cache_creation_usd_per_million": 0,
+	}, cookies, http.StatusUnprocessableEntity)
+}
+
+func TestStoredBillingUnitRejectsInvalidActivePrice(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	price, err := app.createPrice(ctx, modelPricePayload{
+		Provider:                   "openai",
+		Model:                      "gpt-invalid-stored-unit",
+		PriceScope:                 modelPriceScopeLibrary,
+		BillingUnit:                modelBillingUnitToken,
+		InputUSDPerMillion:         1,
+		OutputUSDPerMillion:        0,
+		CacheReadUSDPerMillion:     0,
+		CacheCreationUSDPerMillion: 0,
+	})
+	if err != nil {
+		t.Fatalf("createPrice failed: %v", err)
+	}
+	if _, err := app.db.ExecContext(ctx, `UPDATE model_prices SET billing_unit = ? WHERE id = ?`, "message", price.ID); err != nil {
+		t.Fatalf("corrupt active billing unit: %v", err)
+	}
+	_, err = app.listPrices(ctx)
+	requireInvalidStoredBillingUnitError(t, err)
+	_, err = app.billingPriceIndexWithoutSelectors(ctx)
+	requireInvalidStoredBillingUnitError(t, err)
+}
+
+func TestStoredBillingUnitUsesLegacyFallbackForNullAndBlankActivePrices(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	requestUSD := 0.25
+	imagePrice, err := app.createPrice(ctx, modelPricePayload{
+		Provider:                   "openai",
+		Model:                      "legacy-image-null",
+		PriceScope:                 modelPriceScopeLibrary,
+		BillingUnit:                modelBillingUnitRequest,
+		InputUSDPerMillion:         0,
+		OutputUSDPerMillion:        0,
+		CacheReadUSDPerMillion:     0,
+		CacheCreationUSDPerMillion: 0,
+		RequestUSD:                 &requestUSD,
+	})
+	if err != nil {
+		t.Fatalf("create image price: %v", err)
+	}
+	chatPrice, err := app.createPrice(ctx, modelPricePayload{
+		Provider:                   "openai",
+		Model:                      "legacy-chat-blank",
+		PriceScope:                 modelPriceScopeLibrary,
+		BillingUnit:                modelBillingUnitToken,
+		InputUSDPerMillion:         1,
+		OutputUSDPerMillion:        0,
+		CacheReadUSDPerMillion:     0,
+		CacheCreationUSDPerMillion: 0,
+	})
+	if err != nil {
+		t.Fatalf("create chat price: %v", err)
+	}
+	if _, err := app.db.ExecContext(ctx, `UPDATE model_prices SET billing_unit = NULL WHERE id = ?`, imagePrice.ID); err != nil {
+		t.Fatalf("clear image billing unit: %v", err)
+	}
+	if _, err := app.db.ExecContext(ctx, `UPDATE model_prices SET billing_unit = ? WHERE id = ?`, " \t ", chatPrice.ID); err != nil {
+		t.Fatalf("blank chat billing unit: %v", err)
+	}
+
+	prices, err := app.listPrices(ctx)
+	if err != nil {
+		t.Fatalf("listPrices failed: %v", err)
+	}
+	pricesByID := make(map[int]ModelPrice, len(prices))
+	for _, price := range prices {
+		pricesByID[price.ID] = price
+	}
+	if price := pricesByID[imagePrice.ID]; price.BillingUnit != modelBillingUnitRequest {
+		t.Fatalf("NULL image billing unit = %#v, want request fallback", price)
+	}
+	if price := pricesByID[chatPrice.ID]; price.BillingUnit != modelBillingUnitToken {
+		t.Fatalf("blank chat billing unit = %#v, want token fallback", price)
+	}
 }
 
 func TestModelPriceAPIUpdatesPriorityMultiplierWithoutChangingSyncSource(t *testing.T) {
@@ -3165,6 +3398,90 @@ func TestModelPriceLibraryConflictsAreVisibleAndResolvable(t *testing.T) {
 	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/library-conflicts", nil, cookies, &conflicts)
 	if len(conflicts) != 0 {
 		t.Fatalf("library conflicts after delete = %#v, want empty", conflicts)
+	}
+}
+
+func TestStoredBillingUnitRejectsInvalidLibraryConflictAndPreservesLegacyFallback(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	active, err := app.createPrice(ctx, modelPricePayload{
+		Provider:                   "openai",
+		Model:                      "legacy-image-conflict",
+		PriceScope:                 modelPriceScopeLibrary,
+		BillingUnit:                modelBillingUnitToken,
+		InputUSDPerMillion:         1,
+		OutputUSDPerMillion:        0,
+		CacheReadUSDPerMillion:     0,
+		CacheCreationUSDPerMillion: 0,
+	})
+	if err != nil {
+		t.Fatalf("create active price: %v", err)
+	}
+	const conflictID = 970001
+	if _, err := app.db.ExecContext(ctx, `
+		INSERT INTO model_price_library_conflicts (
+			original_id, selected_price_id, conflict_reason, provider, model,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			billing_unit, source, auto_synced, updated_at
+		) VALUES (?, ?, 'case_insensitive_library_identity', 'openai', 'legacy-image-conflict',
+			2, 0, 0, 0, 'message', 'manual', 0, '2026-08-07T00:00:00Z')
+	`, conflictID, active.ID); err != nil {
+		t.Fatalf("seed invalid library conflict: %v", err)
+	}
+	_, err = app.listModelPriceLibraryConflicts(ctx)
+	requireInvalidStoredBillingUnitError(t, err)
+	_, err = app.promoteModelPriceLibraryConflict(ctx, conflictID, modelPriceLibraryConflictPromotePayload{
+		Provider: "openai-legacy",
+		Model:    "legacy-image-promoted",
+	})
+	requireInvalidStoredBillingUnitError(t, err)
+	_, err = app.replaceActiveModelPriceLibraryConflict(ctx, conflictID)
+	requireInvalidStoredBillingUnitError(t, err)
+
+	var promotedCount, conflictCount int
+	if err := app.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_prices WHERE provider = ? AND model = ?`, "openai-legacy", "legacy-image-promoted").Scan(&promotedCount); err != nil {
+		t.Fatalf("count promoted price: %v", err)
+	}
+	if err := app.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_price_library_conflicts WHERE original_id = ?`, conflictID).Scan(&conflictCount); err != nil {
+		t.Fatalf("count library conflict: %v", err)
+	}
+	if promotedCount != 0 || conflictCount != 1 {
+		t.Fatalf("resolution writes = promoted %d, conflicts %d; want 0/1", promotedCount, conflictCount)
+	}
+	var activeInputUSD float64
+	if err := app.db.QueryRowContext(ctx, `SELECT input_usd_per_million FROM model_prices WHERE id = ?`, active.ID).Scan(&activeInputUSD); err != nil {
+		t.Fatalf("read active price after rejected replacement: %v", err)
+	}
+	if activeInputUSD != 1 {
+		t.Fatalf("active price input = %v, want unchanged 1", activeInputUSD)
+	}
+
+	if _, err := app.db.ExecContext(ctx, `UPDATE model_price_library_conflicts SET billing_unit = NULL WHERE original_id = ?`, conflictID); err != nil {
+		t.Fatalf("clear conflict billing unit: %v", err)
+	}
+	conflicts, err := app.listModelPriceLibraryConflicts(ctx)
+	if err != nil {
+		t.Fatalf("list NULL billing unit conflict: %v", err)
+	}
+	if len(conflicts) != 1 || conflicts[0].Price.BillingUnit != modelBillingUnitRequest {
+		t.Fatalf("NULL conflict billing unit = %#v, want request fallback", conflicts)
+	}
+	if _, err := app.db.ExecContext(ctx, `UPDATE model_price_library_conflicts SET billing_unit = ? WHERE original_id = ?`, " \t ", conflictID); err != nil {
+		t.Fatalf("blank conflict billing unit: %v", err)
+	}
+	conflicts, err = app.listModelPriceLibraryConflicts(ctx)
+	if err != nil {
+		t.Fatalf("list blank billing unit conflict: %v", err)
+	}
+	if len(conflicts) != 1 || conflicts[0].Price.BillingUnit != modelBillingUnitRequest {
+		t.Fatalf("blank conflict billing unit = %#v, want request fallback", conflicts)
 	}
 }
 
