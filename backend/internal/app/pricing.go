@@ -88,6 +88,7 @@ type ModelPriceLibraryConflict struct {
 	Price                    ModelPrice                            `json:"price"`
 	ArchivedLongContext      *ModelPriceLibraryConflictLongContext `json:"archived_long_context"`
 	requestUSD               sql.NullFloat64
+	billingUnit              sql.NullString
 	priorityMultiplier       sql.NullFloat64
 	longContextThreshold     sql.NullInt64
 	longContextInput         sql.NullFloat64
@@ -167,6 +168,7 @@ type modelPricePayload struct {
 	ChannelBrand               *string                       `json:"channel_brand"`
 	ChannelKey                 *string                       `json:"channel_key"`
 	ChannelIdentityHash        *string                       `json:"channel_identity_hash"`
+	BillingUnit                string                        `json:"billing_unit"`
 	InputUSDPerMillion         float64                       `json:"input_usd_per_million"`
 	OutputUSDPerMillion        float64                       `json:"output_usd_per_million"`
 	CacheReadUSDPerMillion     float64                       `json:"cache_read_usd_per_million"`
@@ -634,6 +636,11 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 	payload.Provider = strings.TrimSpace(payload.Provider)
 	payload.Model = strings.TrimSpace(payload.Model)
 	payload.PriceScope = strings.ToLower(strings.TrimSpace(payload.PriceScope))
+	requestedBillingUnit := strings.TrimSpace(payload.BillingUnit)
+	payload.BillingUnit = normalizeModelPriceBillingUnit(requestedBillingUnit)
+	if requestedBillingUnit != "" && payload.BillingUnit == "" {
+		return payload, validationError("计费方式无效")
+	}
 	if payload.ChannelAuthType != nil {
 		rawValue := strings.TrimSpace(*payload.ChannelAuthType)
 		if rawValue == "" {
@@ -699,6 +706,11 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 	if payload.Provider == "" || payload.Model == "" {
 		return payload, validationError("provider/model 不能为空")
 	}
+	if payload.BillingUnit == "" {
+		// Older clients did not send a billing unit. Preserve their existing
+		// model-name convention while all new writes persist an explicit unit.
+		payload.BillingUnit = billingUnitForModel(payload.Model)
+	}
 	if !finiteNonNegative(payload.InputUSDPerMillion) ||
 		!finiteNonNegative(payload.OutputUSDPerMillion) ||
 		!finiteNonNegative(payload.CacheReadUSDPerMillion) ||
@@ -707,7 +719,7 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 		return payload, validationError("价格不能为负数")
 	}
 	if payload.LongContext != nil {
-		if billingUnitForModel(payload.Model) != modelBillingUnitToken {
+		if payload.BillingUnit != modelBillingUnitToken {
 			return payload, validationError("按次计费模型不支持长上下文阶梯价格")
 		}
 		if _, err := longContextFromPayload(payload.LongContext); err != nil {
@@ -726,6 +738,7 @@ func modelPriceFromPayload(payload modelPricePayload, priorityMultiplier *float6
 		ChannelAuthType:            payload.ChannelAuthType,
 		ChannelBrand:               payload.ChannelBrand,
 		ChannelKey:                 payload.ChannelKey,
+		BillingUnit:                payload.BillingUnit,
 		InputUSDPerMillion:         payload.InputUSDPerMillion,
 		OutputUSDPerMillion:        payload.OutputUSDPerMillion,
 		CacheReadUSDPerMillion:     payload.CacheReadUSDPerMillion,
@@ -734,6 +747,13 @@ func modelPriceFromPayload(payload modelPricePayload, priorityMultiplier *float6
 		PriorityMultiplier:         priorityMultiplier,
 		LongContext:                longContext,
 	}
+}
+
+func validateManualPriceBillingUnit(payload modelPricePayload) error {
+	if payload.BillingUnit == modelBillingUnitRequest && payload.RequestUSD == nil {
+		return validationError("按次计费模型需要填写每次调用价格")
+	}
+	return nil
 }
 
 func normalizeModelPriceChannelAuthType(value string) string {
@@ -1027,7 +1047,7 @@ func listPricesWithQueryer(ctx context.Context, queryer modelPriceQueryer) ([]Mo
 	rows, err := queryer.QueryContext(ctx, `
 		SELECT id, provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 		       input_usd_per_million, output_usd_per_million,
-		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
 		       priority_multiplier, long_context_threshold_tokens,
 		       long_context_input_usd_per_million, long_context_output_usd_per_million,
 		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
@@ -1035,11 +1055,35 @@ func listPricesWithQueryer(ctx context.Context, queryer modelPriceQueryer) ([]Mo
 		FROM model_prices
 		ORDER BY price_scope DESC, auto_synced ASC, lower(provider), lower(model)
 	`)
+	if isMissingBillingUnitColumnError(err) {
+		// A read-only migration test (and older maintenance commands) can open
+		// a pre-migration database before the new column is added. Keep that
+		// read path available; the migration backfills the persisted value.
+		rows, err = queryer.QueryContext(ctx, `
+			SELECT id, provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
+			       input_usd_per_million, output_usd_per_million,
+			       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+			       priority_multiplier, long_context_threshold_tokens,
+			       long_context_input_usd_per_million, long_context_output_usd_per_million,
+			       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
+			       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
+			FROM model_prices
+			ORDER BY price_scope DESC, auto_synced ASC, lower(provider), lower(model)
+		`)
+	}
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanPrices(rows)
+}
+
+func isMissingBillingUnitColumnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "no such column") && strings.Contains(message, "billing_unit")
 }
 
 func (a *App) billingPriceIndex(ctx context.Context) (modelPriceBillingIndex, error) {
@@ -1907,16 +1951,36 @@ func geminiCatalogModelCandidates(candidates []string) []string {
 
 func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 	var prices []ModelPrice
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	hasBillingUnit := false
+	for _, column := range columns {
+		if strings.EqualFold(column, "billing_unit") {
+			hasBillingUnit = true
+			break
+		}
+	}
 	for rows.Next() {
 		var price ModelPrice
 		var channelAuthType, channelBrand, channelKey, sourceModel, lastSynced, updatedAt sql.NullString
 		var requestUSD, priorityMultiplier sql.NullFloat64
+		var billingUnit sql.NullString
 		var longContextThreshold sql.NullInt64
 		var longContextInput, longContextOutput, longContextCacheRead, longContextCacheCreation sql.NullFloat64
-		if err := rows.Scan(&price.ID, &price.Provider, &price.Model, &price.PriceScope, &channelAuthType, &channelBrand, &channelKey,
-			&price.InputUSDPerMillion, &price.OutputUSDPerMillion, &price.CacheReadUSDPerMillion, &price.CacheCreationUSDPerMillion, &requestUSD, &priorityMultiplier,
-			&longContextThreshold, &longContextInput, &longContextOutput, &longContextCacheRead, &longContextCacheCreation,
-			&price.Source, &sourceModel, &price.AutoSynced, &lastSynced, &updatedAt); err != nil {
+		scanTargets := []any{
+			&price.ID, &price.Provider, &price.Model, &price.PriceScope, &channelAuthType, &channelBrand, &channelKey,
+			&price.InputUSDPerMillion, &price.OutputUSDPerMillion, &price.CacheReadUSDPerMillion, &price.CacheCreationUSDPerMillion, &requestUSD,
+		}
+		if hasBillingUnit {
+			scanTargets = append(scanTargets, &billingUnit)
+		}
+		scanTargets = append(scanTargets,
+			&priorityMultiplier, &longContextThreshold, &longContextInput, &longContextOutput, &longContextCacheRead, &longContextCacheCreation,
+			&price.Source, &sourceModel, &price.AutoSynced, &lastSynced, &updatedAt,
+		)
+		if err := rows.Scan(scanTargets...); err != nil {
 			return nil, err
 		}
 		if requestUSD.Valid {
@@ -1948,7 +2012,11 @@ func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 				}
 			}
 		}
-		price.BillingUnit = billingUnitForModel(price.Model)
+		normalizedBillingUnit, err := billingUnitForStoredValue(billingUnit.String, price.Model)
+		if err != nil {
+			return nil, err
+		}
+		price.BillingUnit = normalizedBillingUnit
 		price.SourceModel = nullableString(sourceModel)
 		price.LastSyncedAt = timePtr(lastSynced)
 		if parsed, ok := parseDBTime(updatedAt.String); ok {
@@ -1963,7 +2031,7 @@ func (a *App) listModelPriceLibraryConflicts(ctx context.Context) ([]ModelPriceL
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT original_id, selected_price_id, conflict_reason, provider, model,
 		       input_usd_per_million, output_usd_per_million,
-		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
 		       priority_multiplier, long_context_threshold_tokens,
 		       long_context_input_usd_per_million, long_context_output_usd_per_million,
 		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
@@ -1988,7 +2056,7 @@ func scanModelPriceLibraryConflicts(rows *sql.Rows) ([]ModelPriceLibraryConflict
 			&conflict.Price.Provider, &conflict.Price.Model,
 			&conflict.Price.InputUSDPerMillion, &conflict.Price.OutputUSDPerMillion,
 			&conflict.Price.CacheReadUSDPerMillion, &conflict.Price.CacheCreationUSDPerMillion,
-			&conflict.requestUSD, &conflict.priorityMultiplier, &conflict.longContextThreshold,
+			&conflict.requestUSD, &conflict.billingUnit, &conflict.priorityMultiplier, &conflict.longContextThreshold,
 			&conflict.longContextInput, &conflict.longContextOutput,
 			&conflict.longContextCacheRead, &conflict.longContextCacheCreation,
 			&conflict.Price.Source, &sourceModel, &conflict.Price.AutoSynced,
@@ -2023,7 +2091,11 @@ func scanModelPriceLibraryConflicts(rows *sql.Rows) ([]ModelPriceLibraryConflict
 			}
 			conflict.Price.longContextInvalid = !conflict.longContextThreshold.Valid || !conflict.longContextInput.Valid || !conflict.longContextOutput.Valid || !conflict.longContextCacheRead.Valid || !conflict.longContextCacheCreation.Valid || !validLongContextPrice(conflict.Price.LongContext)
 		}
-		conflict.Price.BillingUnit = billingUnitForModel(conflict.Price.Model)
+		normalizedBillingUnit, err := billingUnitForStoredValue(conflict.billingUnit.String, conflict.Price.Model)
+		if err != nil {
+			return nil, err
+		}
+		conflict.Price.BillingUnit = normalizedBillingUnit
 		conflicts = append(conflicts, conflict)
 	}
 	return conflicts, rows.Err()
@@ -2040,7 +2112,7 @@ func getModelPriceLibraryConflictWithQuerier(ctx context.Context, querier priceR
 	rows, err := querier.QueryContext(ctx, `
 		SELECT original_id, selected_price_id, conflict_reason, provider, model,
 		       input_usd_per_million, output_usd_per_million,
-		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
 		       priority_multiplier, long_context_threshold_tokens,
 		       long_context_input_usd_per_million, long_context_output_usd_per_million,
 		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
@@ -2085,7 +2157,7 @@ func getPriceWithQuerier(ctx context.Context, querier priceRowsQuerier, id int) 
 	rows, err := querier.QueryContext(ctx, `
 		SELECT id, provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 		       input_usd_per_million, output_usd_per_million,
-		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
 		       priority_multiplier, long_context_threshold_tokens,
 		       long_context_input_usd_per_million, long_context_output_usd_per_million,
 		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
@@ -2111,6 +2183,9 @@ func (a *App) createPrice(ctx context.Context, payload modelPricePayload) (Model
 	if err != nil {
 		return ModelPrice{}, err
 	}
+	if err := validateManualPriceBillingUnit(payload); err != nil {
+		return ModelPrice{}, err
+	}
 	if payload.PreserveInvalidLongContext != nil && *payload.PreserveInvalidLongContext {
 		return ModelPrice{}, validationError("新价格不能保留历史部分长上下文字段")
 	}
@@ -2129,14 +2204,14 @@ func (a *App) createPrice(ctx context.Context, payload modelPricePayload) (Model
 		INSERT INTO model_prices (
 			provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 			input_usd_per_million, output_usd_per_million,
-			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
 			priority_multiplier, long_context_threshold_tokens,
 			long_context_input_usd_per_million, long_context_output_usd_per_million,
 			long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
 			source, source_model, auto_synced, last_synced_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
 	`, payload.Provider, payload.Model, payload.PriceScope, nullableStringArg(payload.ChannelAuthType), nullableStringArg(payload.ChannelBrand), nullableStringArg(payload.ChannelKey),
-		payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), nullableFloatArg(priorityMultiplier),
+		payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), payload.BillingUnit, nullableFloatArg(priorityMultiplier),
 		nullableLongContextThreshold(longContext), nullableLongContextInput(longContext), nullableLongContextOutput(longContext), nullableLongContextCacheRead(longContext), nullableLongContextCacheCreation(longContext), now)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
@@ -2158,6 +2233,9 @@ func modelPriceConflictMessage(payload modelPricePayload) string {
 func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload) (ModelPrice, error) {
 	payload, err := validatePricePayload(payload)
 	if err != nil {
+		return ModelPrice{}, err
+	}
+	if err := validateManualPriceBillingUnit(payload); err != nil {
 		return ModelPrice{}, err
 	}
 	tx, err := a.db.BeginTx(ctx, nil)
@@ -2232,13 +2310,13 @@ func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload
 		SET provider = ?, model = ?, price_scope = ?, channel_auth_type = ?, channel_brand = ?, channel_key = ?,
 		    input_usd_per_million = ?, output_usd_per_million = ?,
 		    cache_read_usd_per_million = ?, cache_creation_usd_per_million = ?,
-		    request_usd = ?, priority_multiplier = ?, long_context_threshold_tokens = ?,
+		    request_usd = ?, billing_unit = ?, priority_multiplier = ?, long_context_threshold_tokens = ?,
 		    long_context_input_usd_per_million = ?, long_context_output_usd_per_million = ?,
 		    long_context_cache_read_usd_per_million = ?, long_context_cache_creation_usd_per_million = ?, source = 'manual',
 		    source_model = NULL, auto_synced = 0, last_synced_at = NULL, updated_at = ?
 		WHERE id = ?
 	`, payload.Provider, payload.Model, payload.PriceScope, nullableStringArg(payload.ChannelAuthType), nullableStringArg(payload.ChannelBrand), nullableStringArg(payload.ChannelKey),
-		payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), nullableFloatArg(priorityMultiplier),
+		payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), payload.BillingUnit, nullableFloatArg(priorityMultiplier),
 		longContextThreshold, longContextInput, longContextOutput, longContextCacheRead, longContextCacheCreation, dbTime(time.Now()), id)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
@@ -2388,7 +2466,7 @@ func (a *App) replaceActiveModelPriceLibraryConflict(ctx context.Context, origin
 		INSERT INTO model_price_library_conflicts (
 			original_id, selected_price_id, conflict_reason, provider, model,
 			input_usd_per_million, output_usd_per_million,
-			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
 			priority_multiplier, long_context_threshold_tokens,
 			long_context_input_usd_per_million, long_context_output_usd_per_million,
 			long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
@@ -2396,7 +2474,7 @@ func (a *App) replaceActiveModelPriceLibraryConflict(ctx context.Context, origin
 		)
 		SELECT ?, ?, ?, provider, model,
 		       input_usd_per_million, output_usd_per_million,
-		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
 		       priority_multiplier, long_context_threshold_tokens,
 		       long_context_input_usd_per_million, long_context_output_usd_per_million,
 		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
@@ -2423,16 +2501,16 @@ func insertModelPriceLibraryConflictAsActive(ctx context.Context, tx *sql.Tx, co
 		INSERT INTO model_prices (
 			provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 			input_usd_per_million, output_usd_per_million,
-			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
 			priority_multiplier, long_context_threshold_tokens,
 			long_context_input_usd_per_million, long_context_output_usd_per_million,
 			long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
 			source, source_model, auto_synced, last_synced_at, updated_at
-		) VALUES (?, ?, 'library', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
+		) VALUES (?, ?, 'library', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
 	`, provider, model,
 		conflict.Price.InputUSDPerMillion, conflict.Price.OutputUSDPerMillion,
 		conflict.Price.CacheReadUSDPerMillion, conflict.Price.CacheCreationUSDPerMillion,
-		nullableSQLFloatArg(conflict.requestUSD), nullableSQLFloatArg(conflict.priorityMultiplier), nullableInt64Arg(conflict.longContextThreshold),
+		nullableSQLFloatArg(conflict.requestUSD), conflict.Price.BillingUnit, nullableSQLFloatArg(conflict.priorityMultiplier), nullableInt64Arg(conflict.longContextThreshold),
 		nullableSQLFloatArg(conflict.longContextInput), nullableSQLFloatArg(conflict.longContextOutput),
 		nullableSQLFloatArg(conflict.longContextCacheRead), nullableSQLFloatArg(conflict.longContextCacheCreation),
 		dbTime(time.Now()))
@@ -2451,7 +2529,7 @@ func updateActiveModelPriceFromLibraryConflict(ctx context.Context, tx *sql.Tx, 
 		UPDATE model_prices
 		SET provider = ?, model = ?, price_scope = 'library', channel_auth_type = NULL, channel_brand = NULL, channel_key = NULL,
 		    input_usd_per_million = ?, output_usd_per_million = ?,
-		    cache_read_usd_per_million = ?, cache_creation_usd_per_million = ?, request_usd = ?,
+		    cache_read_usd_per_million = ?, cache_creation_usd_per_million = ?, request_usd = ?, billing_unit = ?,
 		    priority_multiplier = ?, long_context_threshold_tokens = ?,
 		    long_context_input_usd_per_million = ?, long_context_output_usd_per_million = ?,
 		    long_context_cache_read_usd_per_million = ?, long_context_cache_creation_usd_per_million = ?,
@@ -2460,7 +2538,7 @@ func updateActiveModelPriceFromLibraryConflict(ctx context.Context, tx *sql.Tx, 
 	`, conflict.Price.Provider, conflict.Price.Model,
 		conflict.Price.InputUSDPerMillion, conflict.Price.OutputUSDPerMillion,
 		conflict.Price.CacheReadUSDPerMillion, conflict.Price.CacheCreationUSDPerMillion,
-		nullableSQLFloatArg(conflict.requestUSD), nullableSQLFloatArg(conflict.priorityMultiplier), nullableInt64Arg(conflict.longContextThreshold),
+		nullableSQLFloatArg(conflict.requestUSD), conflict.Price.BillingUnit, nullableSQLFloatArg(conflict.priorityMultiplier), nullableInt64Arg(conflict.longContextThreshold),
 		nullableSQLFloatArg(conflict.longContextInput), nullableSQLFloatArg(conflict.longContextOutput),
 		nullableSQLFloatArg(conflict.longContextCacheRead), nullableSQLFloatArg(conflict.longContextCacheCreation),
 		dbTime(time.Now()), activeID)
@@ -2606,13 +2684,13 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 			INSERT OR IGNORE INTO model_prices (
 				provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 				input_usd_per_million, output_usd_per_million,
-				cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
+				cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
 				priority_multiplier, long_context_threshold_tokens,
 				long_context_input_usd_per_million, long_context_output_usd_per_million,
 				long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
 				source, source_model, auto_synced, last_synced_at, updated_at
-			) VALUES (?, ?, 'library', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'litellm', ?, 1, ?, ?)
-		`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), nullableFloatArg(priorityMultiplier),
+			) VALUES (?, ?, 'library', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'litellm', ?, 1, ?, ?)
+		`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), payload.BillingUnit, nullableFloatArg(priorityMultiplier),
 			longContextThreshold, longContextInput, longContextOutput, longContextCacheRead, longContextCacheCreation, row.modelName, now, now)
 		if err != nil {
 			return nil, err
@@ -2708,6 +2786,7 @@ func litellmEntryToPrice(modelName string, rawEntry any) (modelPricePayload, boo
 	payload := modelPricePayload{
 		Provider:                   provider,
 		Model:                      model,
+		BillingUnit:                billingUnitForModel(model),
 		InputUSDPerMillion:         usdPerMillion(entry["input_cost_per_token"]),
 		OutputUSDPerMillion:        usdPerMillion(entry["output_cost_per_token"]),
 		CacheReadUSDPerMillion:     usdPerMillion(entry["cache_read_input_token_cost"]),
@@ -2763,10 +2842,13 @@ func pricesEqual(item ModelPrice, payload modelPricePayload) bool {
 	if itemScope == "" {
 		itemScope = modelPriceScopeLibrary
 	}
+	billingUnit, billingUnitValid := billingUnitForPrice(&item, item.Model)
 	return itemScope == payload.PriceScope &&
 		modelPriceChannelAuthType(item) == normalizeModelPriceChannelAuthType(aiProviderOptionalString(payload.ChannelAuthType)) &&
 		item.Provider == payload.Provider &&
 		item.Model == payload.Model &&
+		billingUnitValid &&
+		billingUnit == payload.BillingUnit &&
 		item.InputUSDPerMillion == payload.InputUSDPerMillion &&
 		item.OutputUSDPerMillion == payload.OutputUSDPerMillion &&
 		item.CacheReadUSDPerMillion == payload.CacheReadUSDPerMillion &&
@@ -3129,7 +3211,11 @@ func priorityMultiplierProducesRoundableCost(price ModelPrice, multiplier float6
 	if !finitePositive(multiplier) {
 		return false
 	}
-	if billingUnitForModel(price.Model) == modelBillingUnitRequest {
+	billingUnit, billingUnitValid := billingUnitForPrice(&price, price.Model)
+	if !billingUnitValid {
+		return false
+	}
+	if billingUnit == modelBillingUnitRequest {
 		if price.RequestUSD == nil {
 			return true
 		}
@@ -3195,8 +3281,17 @@ func calculateRecordCost(record UsageRecord, prices modelPriceIndex, collectItem
 func calculateRecordCostForMatch(record UsageRecord, price *ModelPrice, matchStatus string, channelBrand *aiProviderBrand, collectItems bool) usageCostBreakdown {
 	tokens := normalizedUsageTokenBreakdown(record, channelBrand)
 	contextInputTokens := usageAggregateInputTokens(record, channelBrand)
+	billingUnit := billingUnitForModelPtr(record.Model)
+	billingUnitValid := true
+	if price != nil {
+		fallbackModel := ""
+		if record.Model != nil {
+			fallbackModel = *record.Model
+		}
+		billingUnit, billingUnitValid = billingUnitForPrice(price, fallbackModel)
+	}
 	breakdown := usageCostBreakdown{
-		BillingUnit:         billingUnitForModelPtr(record.Model),
+		BillingUnit:         billingUnit,
 		NormalInputTokens:   tokens.NormalInputTokens,
 		CacheReadTokens:     tokens.CacheReadTokens,
 		CacheCreationTokens: tokens.CacheCreationTokens,
@@ -3210,7 +3305,11 @@ func calculateRecordCostForMatch(record UsageRecord, price *ModelPrice, matchSta
 		}
 		breakdown.Items = make([]usageCostBreakdownItem, 0, itemCapacity)
 	}
-	if price != nil && price.LongContext != nil && price.LongContext.ThresholdInputTokens > 0 {
+	if !billingUnitValid {
+		markCostBreakdownUnpriced(&breakdown, priceMatchStatusInvalidPrice)
+		return breakdown
+	}
+	if billingUnit == modelBillingUnitToken && price != nil && price.LongContext != nil && price.LongContext.ThresholdInputTokens > 0 {
 		threshold := price.LongContext.ThresholdInputTokens
 		breakdown.LongContextThresholdTokens = &threshold
 	}
@@ -3556,6 +3655,39 @@ func floatPtrEqual(left, right *float64) bool {
 	return *left == *right
 }
 
+func normalizeModelPriceBillingUnit(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case modelBillingUnitToken:
+		return modelBillingUnitToken
+	case modelBillingUnitRequest:
+		return modelBillingUnitRequest
+	default:
+		return ""
+	}
+}
+
+func billingUnitForStoredValue(value, fallbackModel string) (string, error) {
+	if strings.TrimSpace(value) == "" {
+		return billingUnitForModel(fallbackModel), nil
+	}
+	if normalized := normalizeModelPriceBillingUnit(value); normalized != "" {
+		return normalized, nil
+	}
+	return "", appError("invalid_stored_billing_unit", http.StatusInternalServerError, "已保存的模型价格计费方式无效")
+}
+
+func billingUnitForPrice(price *ModelPrice, fallbackModel string) (string, bool) {
+	if price == nil {
+		return billingUnitForModel(fallbackModel), true
+	}
+	model := price.Model
+	if strings.TrimSpace(model) == "" {
+		model = fallbackModel
+	}
+	billingUnit, err := billingUnitForStoredValue(price.BillingUnit, model)
+	return billingUnit, err == nil
+}
+
 func longContextPriceEqual(left, right *ModelPriceLongContext) bool {
 	if left == nil || right == nil {
 		return left == nil && right == nil
@@ -3589,7 +3721,11 @@ func modelPriceReadyForBilling(price *ModelPrice, fallbackModel string) bool {
 	if strings.TrimSpace(model) == "" {
 		model = fallbackModel
 	}
-	if billingUnitForModel(model) == modelBillingUnitRequest {
+	billingUnit, billingUnitValid := billingUnitForPrice(price, model)
+	if !billingUnitValid {
+		return false
+	}
+	if billingUnit == modelBillingUnitRequest {
 		return price.RequestUSD != nil
 	}
 	return true
