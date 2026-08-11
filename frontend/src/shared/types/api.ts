@@ -74,14 +74,17 @@ export interface ModelRequestTestResponse {
   usage?: Record<string, unknown>
 }
 
-export type AIProviderBrand = 'gemini' | 'codex' | 'claude' | 'openai_compatibility' | 'vertex'
+export type AIProviderBrand = 'gemini' | 'codex' | 'claude' | 'openai_compatibility' | 'vertex' | 'xai'
 
 export interface AIProviderModel {
   name: string
   alias?: string
+  display_name?: string | null
+  max_context_length?: number | null
   force_mapping?: boolean | null
+  is_compat?: boolean | null
   image?: boolean | null
-  thinking?: Record<string, unknown>
+  thinking?: Record<string, unknown> | null
 }
 
 export interface AIProviderHeader {
@@ -120,6 +123,7 @@ export interface AIProviderItem {
   auth_index?: string | null
   name?: string | null
   priority?: number | null
+  weight?: number | null
   disabled?: boolean | null
   prefix?: string | null
   base_url?: string | null
@@ -166,6 +170,7 @@ export interface AIProviderSummary {
   claude: number
   openai_compatibility: number
   vertex: number
+  xai: number
   recent_success: number
   recent_failure: number
 }

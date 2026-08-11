@@ -820,7 +820,7 @@ func TestBillingPriceIndexUsesCachedSelectorsWithoutChannelPrices(t *testing.T) 
 				"name":   "claude",
 				"models": []map[string]any{{"name": openAIModel}},
 			}})
-		case "/v0/management/codex-api-key", "/v0/management/claude-api-key":
+		case "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/xai-api-key":
 			_ = json.NewEncoder(w).Encode([]map[string]any{})
 		default:
 			http.NotFound(w, r)
@@ -939,7 +939,7 @@ func TestAIProviderConfigSnapshotRejectsInvalidatedInFlightStore(t *testing.T) {
 			default:
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			}
-		case "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key":
+		case "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key", "/v0/management/xai-api-key":
 			_ = json.NewEncoder(w).Encode([]map[string]any{})
 		default:
 			http.NotFound(w, r)
@@ -3664,6 +3664,66 @@ func TestModelPriceLibraryConflictAPIPreservesPartialLongContextFields(t *testin
 	}
 }
 
+func TestUpdatePriceRejectsRequestBillingWithPreservedLongContext(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	if _, err := app.db.Exec(`
+		INSERT INTO model_prices (
+			id, provider, model, price_scope, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million,
+			request_usd, billing_unit,
+			long_context_threshold_tokens, long_context_input_usd_per_million,
+			long_context_output_usd_per_million, long_context_cache_read_usd_per_million,
+			long_context_cache_creation_usd_per_million,
+			source, auto_synced, updated_at
+		) VALUES (930003, 'OpenAI', 'Partial-Request', 'library', NULL, NULL,
+			10, 11, 1, 2, NULL, 'token',
+			250000, NULL, 31, NULL, 4,
+			'manual', 0, '2026-07-15T10:00:00Z')
+	`); err != nil {
+		t.Fatalf("seed partial long-context price: %v", err)
+	}
+
+	requestUSD := 0.25
+	preserve := true
+	_, err = app.updatePrice(context.Background(), 930003, modelPricePayload{
+		Provider:                   "OpenAI",
+		Model:                      "Partial-Request",
+		PriceScope:                 modelPriceScopeLibrary,
+		BillingUnit:                modelBillingUnitRequest,
+		InputUSDPerMillion:         10,
+		OutputUSDPerMillion:        11,
+		CacheReadUSDPerMillion:     1,
+		CacheCreationUSDPerMillion: 2,
+		RequestUSD:                 &requestUSD,
+		PreserveInvalidLongContext: &preserve,
+	})
+	if appErr, ok := err.(*AppError); !ok || appErr.Status != http.StatusUnprocessableEntity || appErr.Message != "按次计费模型不支持保留历史部分长上下文字段" {
+		t.Fatalf("request-billed preserve error = %#v, want validation error", err)
+	}
+
+	var requestPrice, input, output, cacheRead, cacheCreation sql.NullFloat64
+	var billingUnit string
+	var threshold sql.NullInt64
+	if err := app.db.QueryRow(`
+		SELECT request_usd, billing_unit,
+		       long_context_threshold_tokens, long_context_input_usd_per_million,
+		       long_context_output_usd_per_million, long_context_cache_read_usd_per_million,
+		       long_context_cache_creation_usd_per_million
+		FROM model_prices WHERE id = ?
+	`, 930003).Scan(&requestPrice, &billingUnit, &threshold, &input, &output, &cacheRead, &cacheCreation); err != nil {
+		t.Fatalf("query rejected update: %v", err)
+	}
+	if requestPrice.Valid || billingUnit != modelBillingUnitToken || !threshold.Valid || threshold.Int64 != 250000 || input.Valid || !output.Valid || output.Float64 != 31 || cacheRead.Valid || !cacheCreation.Valid || cacheCreation.Float64 != 4 {
+		t.Fatalf("rejected update persisted request/long-context values = %#v/%q/%#v/%#v/%#v/%#v/%#v", requestPrice, billingUnit, threshold, input, output, cacheRead, cacheCreation)
+	}
+}
+
 func TestReplaceActiveModelPriceLibraryConflictPreservesPartialLongContextFields(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()
@@ -3875,6 +3935,86 @@ func TestCreateNativeChannelPriceResolvesExactConfiguredAuthIndex(t *testing.T) 
 	if breakdown.Unpriced || breakdown.TotalUSD != 2 {
 		t.Fatalf("created channel cost = %#v, want exact total 2", breakdown)
 	}
+}
+
+func TestModelPriceCatalogCreatesReadsAndUpdatesXAIChannelPrice(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	cpa := newModelPriceCatalogManagementServer(t, map[string]any{
+		"/v0/management/xai-api-key": []map[string]any{
+			{
+				"api-key":    "xai-secret-key",
+				"auth-index": "xai-auth-index",
+				"base-url":   "https://api.x.ai/v1",
+				"models":     []map[string]any{{"name": "grok-4.5"}},
+			},
+		},
+	})
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	cfg, err := app.loadConfig(context.Background())
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	cfg.Collector.CLIProxyURL = cpa.URL
+	cfg.Collector.ManagementKey = "test-management-key"
+	if err := app.saveConfig(context.Background(), cfg); err != nil {
+		t.Fatalf("saveConfig failed: %v", err)
+	}
+
+	handler := app.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "管理员",
+	}, nil, nil)
+	var catalog ModelPriceCatalogResponse
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/catalog", nil, cookies, &catalog)
+	if len(catalog.Models) != 1 {
+		t.Fatalf("xAI catalog models = %#v, want one model", catalog.Models)
+	}
+	item := catalog.Models[0]
+	if item.ChannelBrand != string(aiProviderBrandXAI) || item.ChannelKey != "xai-auth-index" || item.SuggestedProvider != string(aiProviderBrandXAI) || !strings.Contains(item.ChannelLabel, "...") {
+		t.Fatalf("xAI catalog item = %#v, want native xAI selector and label", item)
+	}
+
+	payload := map[string]any{
+		"provider":                       item.SuggestedProvider,
+		"model":                          item.Name,
+		"price_scope":                    modelPriceScopeChannel,
+		"channel_auth_type":              modelPriceChannelAuthTypeAPIKey,
+		"channel_brand":                  item.ChannelBrand,
+		"channel_key":                    item.ChannelKey,
+		"channel_identity_hash":          item.ChannelIdentityHash,
+		"input_usd_per_million":          2,
+		"output_usd_per_million":         8,
+		"cache_read_usd_per_million":     0.2,
+		"cache_creation_usd_per_million": 0,
+	}
+	var created ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPost, "/api/model-prices", payload, cookies, &created)
+	if created.ChannelBrand == nil || *created.ChannelBrand != string(aiProviderBrandXAI) || created.ChannelKey == nil || *created.ChannelKey != "xai-auth-index" {
+		t.Fatalf("created xAI channel price = %#v", created)
+	}
+
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/catalog", nil, cookies, &catalog)
+	if len(catalog.Models) != 1 || catalog.Models[0].Price == nil || catalog.Models[0].Price.ID != created.ID || catalog.Models[0].Price.InputUSDPerMillion != 2 {
+		t.Fatalf("catalog xAI price after create = %#v", catalog.Models)
+	}
+	payload["input_usd_per_million"] = 3
+	var updated ModelPrice
+	requestJSONForPricingTest(t, handler, http.MethodPut, fmt.Sprintf("/api/model-prices/%d", created.ID), payload, cookies, &updated)
+	if updated.ID != created.ID || updated.InputUSDPerMillion != 3 || updated.ChannelBrand == nil || *updated.ChannelBrand != string(aiProviderBrandXAI) {
+		t.Fatalf("updated xAI channel price = %#v", updated)
+	}
+
+	payload["channel_auth_type"] = modelPriceChannelAuthTypeOAuth
+	payload["channel_key"] = modelPriceOAuthPoolChannelKey
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices", payload, cookies, http.StatusUnprocessableEntity)
 }
 
 func TestModelPriceCatalogDistinguishesSharedNativeIdentityBySelector(t *testing.T) {
@@ -4402,7 +4542,7 @@ func TestModelPriceChannelSelectorUsesNameOnlyForOpenAICompatibility(t *testing.
 	masked := "sk-...1234"
 	authIndex := "auth-index"
 	name := "Named Vendor"
-	for _, brand := range []aiProviderBrand{aiProviderBrandGemini, aiProviderBrandCodex, aiProviderBrandClaude, aiProviderBrandVertex} {
+	for _, brand := range []aiProviderBrand{aiProviderBrandGemini, aiProviderBrandCodex, aiProviderBrandClaude, aiProviderBrandVertex, aiProviderBrandXAI} {
 		key, label, fallback := modelPriceChannelSelector(aiProviderItem{
 			Brand:        brand,
 			IdentityHash: "identity",
@@ -4535,7 +4675,7 @@ func newModelPriceCatalogManagementServer(t *testing.T, responses map[string]any
 			return
 		}
 		switch r.URL.Path {
-		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key":
+		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key", "/v0/management/xai-api-key":
 			_ = json.NewEncoder(w).Encode([]map[string]any{})
 		default:
 			http.NotFound(w, r)
@@ -4551,7 +4691,7 @@ func TestOAuthPoolCatalogAndBillingIgnoreAccountAuthIndex(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key":
+		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key", "/v0/management/xai-api-key":
 			_ = json.NewEncoder(w).Encode([]map[string]any{})
 		case "/v0/management/auth-files":
 			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{

@@ -231,6 +231,7 @@ func TestLoadCollectorBatchUsesDerivedHTTPManagementURLForRespQueue(t *testing.T
 		"http:/v0/management/claude-api-key",
 		"http:/v0/management/openai-compatibility",
 		"http:/v0/management/vertex-api-key",
+		"http:/v0/management/xai-api-key",
 		"resp:AUTH",
 		"resp:LPOP",
 	}
@@ -340,7 +341,7 @@ func TestCollectorSelectorRefreshLoopRunsWhenCollectionDisabled(t *testing.T) {
 	providerRequests := 0
 	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key":
+		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key", "/v0/management/xai-api-key":
 			mu.Lock()
 			providerRequests++
 			mu.Unlock()
@@ -397,12 +398,12 @@ func TestCollectorSelectorRefreshLoopRunsWhenCollectionDisabled(t *testing.T) {
 		t.Fatalf("provider requests = %d, want at least %d", got, want)
 	}
 
-	waitForProviderRequests(5)
+	waitForProviderRequests(6)
 	app.priceSelectors.mu.Lock()
 	app.priceSelectors.expiresAt = time.Now().Add(-time.Second)
 	app.priceSelectors.refreshAfter = time.Time{}
 	app.priceSelectors.mu.Unlock()
-	waitForProviderRequests(10)
+	waitForProviderRequests(12)
 	if _, available := app.priceSelectors.snapshotForConfig(modelPriceSelectorConfigKey(cfg)); !available {
 		t.Fatal("selector refresh loop did not restore an expired snapshot")
 	}
@@ -619,7 +620,7 @@ func TestLoadCollectorBatchLoadsSelectorsBeforeConsumingQueue(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key":
+		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key", "/v0/management/xai-api-key":
 			_ = json.NewEncoder(w).Encode([]map[string]any{})
 		case "/v0/management/usage-queue":
 			_ = json.NewEncoder(w).Encode([]any{})
@@ -672,6 +673,7 @@ func TestLoadCollectorBatchLoadsSelectorsBeforeConsumingQueue(t *testing.T) {
 		"/v0/management/claude-api-key",
 		"/v0/management/openai-compatibility",
 		"/v0/management/vertex-api-key",
+		"/v0/management/xai-api-key",
 		"/v0/management/usage-queue",
 		"/v0/management/usage-queue",
 	}

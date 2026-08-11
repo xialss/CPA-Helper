@@ -481,7 +481,7 @@ func TestQuotaUsesSuppliedBillingSnapshotWithoutReloadingProviders(t *testing.T)
 			_ = json.NewEncoder(w).Encode([]map[string]any{
 				{"name": "Vendor A", "models": []map[string]any{{"name": model}}},
 			})
-		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/vertex-api-key":
+		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/vertex-api-key", "/v0/management/xai-api-key":
 			_ = json.NewEncoder(w).Encode([]map[string]any{})
 		default:
 			http.NotFound(w, r)
