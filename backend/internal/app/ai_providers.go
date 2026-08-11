@@ -24,6 +24,7 @@ const (
 	aiProviderClockBucketMinutes   = 10
 	aiProviderHealthyRateNumerator = 9
 	aiProviderHealthyRateDenom     = 10
+	aiProviderMaxCredentialWeight  = 1_000_000
 )
 
 var aiProviderRecentRequestClockPattern = regexp.MustCompile(`(^|[^0-9])([01]?[0-9]|2[0-3]):([0-5][0-9])([^0-9]|$)`)
@@ -36,6 +37,7 @@ const (
 	aiProviderBrandClaude              aiProviderBrand = "claude"
 	aiProviderBrandOpenAICompatibility aiProviderBrand = "openai_compatibility"
 	aiProviderBrandVertex              aiProviderBrand = "vertex"
+	aiProviderBrandXAI                 aiProviderBrand = "xai"
 )
 
 type aiProviderBrandConfig struct {
@@ -52,6 +54,7 @@ var aiProviderBrandConfigs = []aiProviderBrandConfig{
 	{Brand: aiProviderBrandClaude, Label: "Claude", UpstreamPath: "/v0/management/claude-api-key", ConfigKey: "claude-api-key", DefaultBaseURL: "https://api.anthropic.com"},
 	{Brand: aiProviderBrandOpenAICompatibility, Label: "OpenAI-compatible", UpstreamPath: "/v0/management/openai-compatibility", ConfigKey: "openai-compatibility"},
 	{Brand: aiProviderBrandVertex, Label: "Vertex", UpstreamPath: "/v0/management/vertex-api-key", ConfigKey: "vertex-api-key"},
+	{Brand: aiProviderBrandXAI, Label: "xAI", UpstreamPath: "/v0/management/xai-api-key", ConfigKey: "xai-api-key", DefaultBaseURL: "https://api.x.ai/v1"},
 }
 
 type aiProvidersResponse struct {
@@ -68,6 +71,7 @@ type aiProviderSummary struct {
 	Claude        int `json:"claude"`
 	OpenAI        int `json:"openai_compatibility"`
 	Vertex        int `json:"vertex"`
+	XAI           int `json:"xai"`
 	RecentSuccess int `json:"recent_success"`
 	RecentFailure int `json:"recent_failure"`
 }
@@ -83,6 +87,8 @@ type aiProviderItem struct {
 	AuthIndex               *string                   `json:"auth_index,omitempty"`
 	Name                    *string                   `json:"name,omitempty"`
 	Priority                *int                      `json:"priority,omitempty"`
+	Weight                  *int                      `json:"-"`
+	WeightJSON              json.RawMessage           `json:"weight,omitempty"`
 	Disabled                *bool                     `json:"disabled,omitempty"`
 	Prefix                  *string                   `json:"prefix,omitempty"`
 	BaseURL                 *string                   `json:"base_url,omitempty"`
@@ -92,7 +98,8 @@ type aiProviderItem struct {
 	Headers                 []aiProviderHeader        `json:"headers"`
 	ExcludedModels          []string                  `json:"excluded_models"`
 	DisableCooling          *bool                     `json:"disable_cooling,omitempty"`
-	Websockets              *bool                     `json:"websockets,omitempty"`
+	Websockets              *bool                     `json:"-"`
+	WebsocketsJSON          json.RawMessage           `json:"websockets,omitempty"`
 	RebuildMidSystemMessage *bool                     `json:"rebuild_mid_system_message,omitempty"`
 	ExperimentalCCHSigning  *bool                     `json:"experimental_cch_signing,omitempty"`
 	Cloak                   *aiProviderCloak          `json:"cloak,omitempty"`
@@ -104,22 +111,36 @@ type aiProviderItem struct {
 	RecentRequests          []aiProviderRecentRequest `json:"recent_requests"`
 	Metadata                map[string]interface{}    `json:"metadata,omitempty"`
 
-	prioritySet bool
-	prefixSet   bool
-	baseURLSet  bool
-	proxyURLSet bool
-	headersSet  bool
-	entriesSet  bool
+	prioritySet   bool
+	weightSet     bool
+	prefixSet     bool
+	baseURLSet    bool
+	proxyURLSet   bool
+	headersSet    bool
+	entriesSet    bool
+	websocketsSet bool
 
 	excludedModelsSet bool
 }
 
 type aiProviderModel struct {
-	Name         string         `json:"name"`
-	Alias        string         `json:"alias,omitempty"`
-	ForceMapping *bool          `json:"force_mapping,omitempty"`
-	Image        *bool          `json:"image,omitempty"`
-	Thinking     map[string]any `json:"thinking,omitempty"`
+	Name                 string          `json:"name"`
+	Alias                string          `json:"alias,omitempty"`
+	DisplayName          *string         `json:"-"`
+	DisplayNameJSON      json.RawMessage `json:"display_name,omitempty"`
+	MaxContextLength     *int            `json:"-"`
+	MaxContextLengthJSON json.RawMessage `json:"max_context_length,omitempty"`
+	ForceMapping         *bool           `json:"force_mapping,omitempty"`
+	IsCompat             *bool           `json:"-"`
+	IsCompatJSON         json.RawMessage `json:"is_compat,omitempty"`
+	Image                *bool           `json:"image,omitempty"`
+	Thinking             map[string]any  `json:"-"`
+	ThinkingJSON         json.RawMessage `json:"thinking,omitempty"`
+
+	displayNameSet      bool
+	maxContextLengthSet bool
+	isCompatSet         bool
+	thinkingSet         bool
 }
 
 type aiProviderHeader struct {
@@ -161,13 +182,99 @@ func (item *aiProviderItem) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	_, item.prioritySet = raw["priority"]
+	weight, weightSet := raw["weight"]
+	item.weightSet = weightSet
+	if weightSet {
+		item.WeightJSON = append(json.RawMessage(nil), weight...)
+		if !aiProviderRawJSONIsNull(weight) {
+			var value int
+			if err := json.Unmarshal(weight, &value); err != nil {
+				return err
+			}
+			item.Weight = &value
+		}
+	}
 	_, item.prefixSet = raw["prefix"]
 	_, item.baseURLSet = raw["base_url"]
 	_, item.proxyURLSet = raw["proxy_url"]
 	_, item.headersSet = raw["headers"]
 	_, item.entriesSet = raw["api_key_entries"]
 	_, item.excludedModelsSet = raw["excluded_models"]
+	websockets, websocketsSet := raw["websockets"]
+	item.websocketsSet = websocketsSet
+	if websocketsSet {
+		item.WebsocketsJSON = append(json.RawMessage(nil), websockets...)
+		if !aiProviderRawJSONIsNull(websockets) {
+			var value bool
+			if err := json.Unmarshal(websockets, &value); err != nil {
+				return err
+			}
+			item.Websockets = &value
+		}
+	}
 	return nil
+}
+
+func (model *aiProviderModel) UnmarshalJSON(data []byte) error {
+	type alias aiProviderModel
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*model = aiProviderModel(decoded)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if displayName, set := raw["display_name"]; set {
+		model.displayNameSet = true
+		model.DisplayNameJSON = append(json.RawMessage(nil), displayName...)
+		if !aiProviderRawJSONIsNull(displayName) {
+			var value string
+			if err := json.Unmarshal(displayName, &value); err != nil {
+				return err
+			}
+			model.DisplayName = &value
+		}
+	}
+	if maxContextLength, set := raw["max_context_length"]; set {
+		model.maxContextLengthSet = true
+		model.MaxContextLengthJSON = append(json.RawMessage(nil), maxContextLength...)
+		if !aiProviderRawJSONIsNull(maxContextLength) {
+			var value int
+			if err := json.Unmarshal(maxContextLength, &value); err != nil {
+				return err
+			}
+			model.MaxContextLength = &value
+		}
+	}
+	if isCompat, set := raw["is_compat"]; set {
+		model.isCompatSet = true
+		model.IsCompatJSON = append(json.RawMessage(nil), isCompat...)
+		if !aiProviderRawJSONIsNull(isCompat) {
+			var value bool
+			if err := json.Unmarshal(isCompat, &value); err != nil {
+				return err
+			}
+			model.IsCompat = &value
+		}
+	}
+	if thinking, set := raw["thinking"]; set {
+		model.thinkingSet = true
+		model.ThinkingJSON = append(json.RawMessage(nil), thinking...)
+		if !aiProviderRawJSONIsNull(thinking) {
+			var value map[string]any
+			if err := json.Unmarshal(thinking, &value); err != nil {
+				return err
+			}
+			model.Thinking = value
+		}
+	}
+	return nil
+}
+
+func aiProviderRawJSONIsNull(value json.RawMessage) bool {
+	return strings.TrimSpace(string(value)) == "null"
 }
 
 func (entry *aiProviderKeyEntry) UnmarshalJSON(data []byte) error {
@@ -816,12 +923,27 @@ func aiProviderItemFromRaw(brandConfig aiProviderBrandConfig, index int, raw map
 	usesExcludedModelsDisabled := aiProviderUsesExcludedModelsDisabled(brandConfig.Brand)
 	excludedModels, disabledByExcludedModels := aiProviderExcludedModelsFromRaw(raw, usesExcludedModelsDisabled)
 	disabled := aiProviderBoolPtrFromKeys(raw, "disabled")
+	var weight *int
+	var weightJSON json.RawMessage
+	var weightSet bool
+	if brandConfig.Brand == aiProviderBrandXAI {
+		weight = aiProviderIntPtrFromKeys(raw, "weight")
+		weightJSON, weightSet = aiProviderRawJSONFromKeys(raw, "weight")
+	}
 	if usesExcludedModelsDisabled {
 		isDisabled := disabledByExcludedModels
 		if disabled != nil && *disabled {
 			isDisabled = true
 		}
 		disabled = &isDisabled
+	}
+	websockets := aiProviderBoolPtrFromKeys(raw, "websockets")
+	var websocketsJSON json.RawMessage
+	var websocketsSet bool
+	if brandConfig.Brand == aiProviderBrandXAI {
+		websocketsJSON, websocketsSet = aiProviderRawJSONFromKeys(raw, "websockets")
+	} else if websockets != nil {
+		websocketsJSON, _ = aiProviderRawJSONFromKeys(raw, "websockets")
 	}
 	return aiProviderItem{
 		Brand:                   brandConfig.Brand,
@@ -833,21 +955,26 @@ func aiProviderItemFromRaw(brandConfig aiProviderBrandConfig, index int, raw map
 		AuthIndex:               authIndex,
 		Name:                    name,
 		Priority:                aiProviderIntPtrFromKeys(raw, "priority"),
+		Weight:                  weight,
+		WeightJSON:              weightJSON,
 		Disabled:                disabled,
 		Prefix:                  aiProviderStringFromKeys(raw, "prefix"),
 		BaseURL:                 baseURL,
 		ProxyURL:                aiProviderStringFromKeys(raw, "proxy-url", "proxy_url"),
-		Models:                  aiProviderModelsFromAny(raw["models"], brandConfig.Brand == aiProviderBrandOpenAICompatibility),
+		Models:                  aiProviderModelsFromAny(raw["models"], brandConfig.Brand),
 		Headers:                 aiProviderHeadersFromAny(raw["headers"]),
 		ExcludedModels:          excludedModels,
 		DisableCooling:          aiProviderBoolPtrFromKeys(raw, "disable-cooling", "disable_cooling"),
-		Websockets:              aiProviderBoolPtrFromKeys(raw, "websockets"),
+		Websockets:              websockets,
+		WebsocketsJSON:          websocketsJSON,
 		RebuildMidSystemMessage: aiProviderBoolPtrFromKeys(raw, "rebuild-mid-system-message", "rebuild_mid_system_message"),
 		ExperimentalCCHSigning:  aiProviderBoolPtrFromKeys(raw, "experimental-cch-signing", "experimental_cch_signing"),
 		Cloak:                   aiProviderCloakFromAny(raw["cloak"]),
 		APIKeyEntries:           aiProviderKeyEntriesFromAny(raw["api-key-entries"]),
 		RecentStatus:            "unknown",
 		RecentRequests:          []aiProviderRecentRequest{},
+		weightSet:               weightSet,
+		websocketsSet:           websocketsSet,
 	}
 }
 
@@ -888,13 +1015,27 @@ func aiProviderPayloadToUpstream(brandConfig aiProviderBrandConfig, payload aiPr
 	} else if payload.Priority != nil {
 		next["priority"] = *payload.Priority
 	}
+	if brandConfig.Brand == aiProviderBrandXAI {
+		delete(next, "alpha-search")
+		delete(next, "alpha_search")
+		if payload.weightSet {
+			delete(next, "weight")
+			if payload.Weight == nil {
+				next["weight"] = nil
+			} else if *payload.Weight > aiProviderMaxCredentialWeight {
+				return nil, validationError(fmt.Sprintf("xAI weight 不能超过 %d", aiProviderMaxCredentialWeight))
+			} else {
+				next["weight"] = *payload.Weight
+			}
+		}
+	}
 	setOptionalStringField(next, "prefix", payload.Prefix, payload.prefixSet)
 	setOptionalStringField(next, "base-url", payload.BaseURL, payload.baseURLSet)
 	setOptionalStringField(next, "proxy-url", payload.ProxyURL, payload.proxyURLSet)
 	if err := validateAIProviderBaseURLForSave(brandConfig, next); err != nil {
 		return nil, err
 	}
-	next["models"] = aiProviderModelsToUpstream(payload.Models, brandConfig.Brand == aiProviderBrandOpenAICompatibility, current)
+	next["models"] = aiProviderModelsToUpstream(payload.Models, brandConfig.Brand, current)
 	next["headers"] = aiProviderHeadersToUpstream(payload.Headers)
 	if aiProviderUsesExcludedModelsDisabled(brandConfig.Brand) {
 		excludedModels := []string{}
@@ -913,6 +1054,13 @@ func aiProviderPayloadToUpstream(brandConfig aiProviderBrandConfig, payload aiPr
 	}
 	if brandConfig.Brand == aiProviderBrandCodex && payload.Websockets != nil {
 		next["websockets"] = *payload.Websockets
+	} else if brandConfig.Brand == aiProviderBrandXAI && payload.websocketsSet {
+		delete(next, "websockets")
+		if payload.Websockets == nil {
+			next["websockets"] = nil
+		} else {
+			next["websockets"] = *payload.Websockets
+		}
 	}
 	if brandConfig.Brand == aiProviderBrandClaude {
 		if payload.RebuildMidSystemMessage != nil {
@@ -941,7 +1089,7 @@ func preserveAIProviderAuthIndexReference(next map[string]any, current map[strin
 func validateAIProviderBaseURLForSave(brandConfig aiProviderBrandConfig, next map[string]any) error {
 	baseURL := strings.TrimSpace(aiProviderOptionalString(aiProviderStringFromKeys(next, "base-url", "base_url")))
 	if baseURL == "" {
-		if brandConfig.Brand == aiProviderBrandCodex || brandConfig.Brand == aiProviderBrandOpenAICompatibility || brandConfig.Brand == aiProviderBrandVertex {
+		if brandConfig.Brand == aiProviderBrandCodex || brandConfig.Brand == aiProviderBrandOpenAICompatibility || brandConfig.Brand == aiProviderBrandVertex || brandConfig.Brand == aiProviderBrandXAI {
 			return validationError(brandConfig.Label + " base_url 不能为空")
 		}
 		return nil
@@ -1083,11 +1231,13 @@ func aiProviderDiscoveryAPICall(brandConfig aiProviderBrandConfig, provider aiPr
 	case aiProviderBrandVertex:
 		headers["x-goog-api-key"] = credential
 		return aiProviderAPICallRequest{AuthIndex: authIndex, Method: http.MethodGet, URL: aiProviderVertexModelsEndpoint(baseURL), Header: headers}, nil
-	default:
+	case aiProviderBrandCodex, aiProviderBrandOpenAICompatibility, aiProviderBrandXAI:
 		if credential != "" {
 			headers["Authorization"] = "Bearer " + credential
 		}
 		return aiProviderAPICallRequest{AuthIndex: authIndex, Method: http.MethodGet, URL: aiProviderOpenAIBaseURL(baseURL) + "/models", Header: headers}, nil
+	default:
+		return aiProviderAPICallRequest{}, validationError("AI provider 类型无效")
 	}
 }
 
@@ -1119,16 +1269,18 @@ func aiProviderTestAPICall(brandConfig aiProviderBrandConfig, provider aiProvide
 		headers["x-goog-api-key"] = credential
 		target = aiProviderVertexModelEndpoint(baseURL, model) + ":generateContent"
 		body = map[string]any{"contents": []map[string]any{{"parts": []map[string]string{{"text": message}}}}}
-	case aiProviderBrandCodex:
+	case aiProviderBrandCodex, aiProviderBrandXAI:
 		headers["Authorization"] = "Bearer " + credential
 		target = aiProviderOpenAIBaseURL(baseURL) + "/responses"
 		body = map[string]any{"model": model, "input": message}
-	default:
+	case aiProviderBrandOpenAICompatibility:
 		if credential != "" {
 			headers["Authorization"] = "Bearer " + credential
 		}
 		target = aiProviderOpenAIBaseURL(baseURL) + "/chat/completions"
 		body = map[string]any{"model": model, "messages": []map[string]string{{"role": "user", "content": message}}, "stream": false}
+	default:
+		return aiProviderAPICallRequest{}, validationError("AI provider 类型无效")
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
@@ -1144,6 +1296,9 @@ func aiProviderActionRequiresCredential(brand aiProviderBrand) bool {
 func aiProviderBaseURL(brandConfig aiProviderBrandConfig, provider aiProviderItem) (string, error) {
 	baseURL := strings.TrimRight(strings.TrimSpace(aiProviderOptionalString(provider.BaseURL)), "/")
 	if baseURL == "" {
+		if brandConfig.Brand == aiProviderBrandXAI {
+			return "", validationError(brandConfig.Label + " base_url 不能为空")
+		}
 		baseURL = brandConfig.DefaultBaseURL
 	}
 	if baseURL == "" {
@@ -1297,6 +1452,11 @@ func parseAIProviderTestReply(body string, brandConfig aiProviderBrandConfig) st
 		return extractClaudeMessagesReply(raw)
 	case aiProviderBrandGemini, aiProviderBrandVertex:
 		return extractGeminiReply(raw)
+	case aiProviderBrandCodex, aiProviderBrandXAI:
+		if reply := extractResponsesReply(raw); reply != "" {
+			return reply
+		}
+		return extractChatCompletionReply(raw)
 	default:
 		return extractChatCompletionReply(raw)
 	}
@@ -1712,6 +1872,8 @@ func aiProviderSummaryFromItems(items []aiProviderItem) aiProviderSummary {
 			summary.OpenAI++
 		case aiProviderBrandVertex:
 			summary.Vertex++
+		case aiProviderBrandXAI:
+			summary.XAI++
 		}
 		summary.RecentSuccess += item.RecentSuccess
 		summary.RecentFailure += item.RecentFailure
@@ -1976,7 +2138,7 @@ func hasOpenAIProviderSubmittedKey(provider aiProviderItem) bool {
 	return false
 }
 
-func aiProviderModelsFromAny(value any, includeOpenAIFields bool) []aiProviderModel {
+func aiProviderModelsFromAny(value any, brand aiProviderBrand) []aiProviderModel {
 	items, err := aiProviderListFromAny(value, "models")
 	if err != nil {
 		return []aiProviderModel{}
@@ -1992,16 +2154,29 @@ func aiProviderModelsFromAny(value any, includeOpenAIFields bool) []aiProviderMo
 			Alias:        aiProviderOptionalString(aiProviderStringFromKeys(item, "alias")),
 			ForceMapping: aiProviderBoolPtrFromKeys(item, "force-mapping", "force_mapping"),
 		}
-		if includeOpenAIFields {
+		switch brand {
+		case aiProviderBrandOpenAICompatibility:
 			model.Image = aiProviderBoolPtrFromKeys(item, "image")
 			model.Thinking = aiProviderObjectFromAny(item["thinking"])
+			if model.Thinking != nil {
+				model.ThinkingJSON, _ = aiProviderRawJSONFromKeys(item, "thinking")
+			}
+		case aiProviderBrandXAI:
+			model.DisplayName = aiProviderStringFromKeys(item, "display-name", "display_name")
+			model.DisplayNameJSON, model.displayNameSet = aiProviderRawJSONFromKeys(item, "display-name", "display_name")
+			model.MaxContextLength = aiProviderIntPtrFromKeys(item, "max-context-length", "max_context_length")
+			model.MaxContextLengthJSON, model.maxContextLengthSet = aiProviderRawJSONFromKeys(item, "max-context-length", "max_context_length")
+			model.IsCompat = aiProviderBoolPtrFromKeys(item, "is-compat", "is_compat")
+			model.Thinking = aiProviderObjectFromAny(item["thinking"])
+			model.IsCompatJSON, model.isCompatSet = aiProviderRawJSONFromKeys(item, "is-compat", "is_compat")
+			model.ThinkingJSON, model.thinkingSet = aiProviderRawJSONFromKeys(item, "thinking")
 		}
 		models = append(models, model)
 	}
 	return models
 }
 
-func aiProviderModelsToUpstream(models []aiProviderModel, includeOpenAIFields bool, current map[string]any) []map[string]any {
+func aiProviderModelsToUpstream(models []aiProviderModel, brand aiProviderBrand, current map[string]any) []map[string]any {
 	currentModels := aiProviderRawModels(current)
 	usedCurrent := make([]bool, len(currentModels))
 	result := make([]map[string]any, 0, len(models))
@@ -2014,7 +2189,7 @@ func aiProviderModelsToUpstream(models []aiProviderModel, includeOpenAIFields bo
 		if currentModel := findAIProviderCurrentModel(name, currentModels, usedCurrent); currentModel != nil {
 			item = cloneAIProviderMap(currentModel)
 		}
-		removeAIProviderKnownModelFields(item, includeOpenAIFields)
+		removeAIProviderKnownModelFields(item, brand)
 		item["name"] = name
 		if strings.TrimSpace(model.Alias) != "" {
 			item["alias"] = strings.TrimSpace(model.Alias)
@@ -2022,12 +2197,49 @@ func aiProviderModelsToUpstream(models []aiProviderModel, includeOpenAIFields bo
 		if model.ForceMapping != nil {
 			item["force-mapping"] = *model.ForceMapping
 		}
-		if includeOpenAIFields {
+		switch brand {
+		case aiProviderBrandOpenAICompatibility:
 			if model.Image != nil {
 				item["image"] = *model.Image
 			}
 			if model.Thinking != nil {
 				item["thinking"] = model.Thinking
+			}
+		case aiProviderBrandXAI:
+			if model.displayNameSet {
+				delete(item, "display-name")
+				delete(item, "display_name")
+				if model.DisplayName == nil {
+					item["display-name"] = nil
+				} else {
+					item["display-name"] = *model.DisplayName
+				}
+			}
+			if model.maxContextLengthSet {
+				delete(item, "max-context-length")
+				delete(item, "max_context_length")
+				if model.MaxContextLength == nil {
+					item["max-context-length"] = nil
+				} else {
+					item["max-context-length"] = *model.MaxContextLength
+				}
+			}
+			if model.isCompatSet {
+				delete(item, "is-compat")
+				delete(item, "is_compat")
+				if model.IsCompat == nil {
+					item["is-compat"] = nil
+				} else {
+					item["is-compat"] = *model.IsCompat
+				}
+			}
+			if model.thinkingSet {
+				delete(item, "thinking")
+				if model.Thinking == nil {
+					item["thinking"] = nil
+				} else {
+					item["thinking"] = cloneAIProviderMap(model.Thinking)
+				}
 			}
 		}
 		result = append(result, item)
@@ -2071,12 +2283,17 @@ func normalizeAIProviderModelName(name string) string {
 	return name
 }
 
-func removeAIProviderKnownModelFields(item map[string]any, includeOpenAIFields bool) {
+func removeAIProviderKnownModelFields(item map[string]any, brand aiProviderBrand) {
 	for _, key := range []string{"alias", "force-mapping", "force_mapping"} {
 		delete(item, key)
 	}
-	if includeOpenAIFields {
+	switch brand {
+	case aiProviderBrandOpenAICompatibility:
 		for _, key := range []string{"image", "thinking"} {
+			delete(item, key)
+		}
+	case aiProviderBrandXAI:
+		for _, key := range []string{"alpha-search", "alpha_search"} {
 			delete(item, key)
 		}
 	}
@@ -2258,6 +2475,21 @@ func aiProviderObjectFromAny(value any) map[string]any {
 		return nil
 	}
 	return cloneAIProviderMap(object)
+}
+
+func aiProviderRawJSONFromKeys(raw map[string]any, keys ...string) (json.RawMessage, bool) {
+	for _, key := range keys {
+		value, ok := raw[key]
+		if !ok {
+			continue
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil, false
+		}
+		return json.RawMessage(encoded), true
+	}
+	return nil, false
 }
 
 func aiProviderStringFromKeys(raw map[string]any, keys ...string) *string {

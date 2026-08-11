@@ -225,6 +225,10 @@ try {
     localizedUsageChannelFallbackLabel('openai_compatibility', 'apikey'),
     'OpenAI-compatible channel (label unavailable)',
   )
+  assert.equal(
+    localizedUsageChannelFallbackLabel('xai', 'apikey'),
+    'xAI API Key (label unavailable)',
+  )
 
   setLanguage('zh')
   assert.equal(localizedApiErrorMessage('validation_error', null), '请求参数无效')
@@ -239,6 +243,7 @@ try {
     localizedUsageChannelFallbackLabel('openai_compatibility', 'apikey'),
     'OpenAI 兼容渠道（标签不可用）',
   )
+  assert.equal(localizedUsageChannelFallbackLabel('xai', 'apikey'), 'xAI API Key（标签不可用）')
   const { formatCompact, formatMultiplier } = await server.ssrLoadModule('/src/shared/utils/format.ts')
   assert.equal(formatCompact(12_300), '12.3K')
   assert.equal(formatCompact(52_646_000), '52.6M')

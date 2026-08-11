@@ -63,6 +63,8 @@ type ProviderEnabledFilter = 'all' | 'enabled' | 'disabled'
 
 type DiscoveryModelStatus = 'existing' | 'new' | 'conflict'
 
+type OptionalFieldState = 'omitted' | 'null' | 'value'
+
 interface BrandConfig {
   brand: AIProviderBrand
   label: string
@@ -72,9 +74,16 @@ interface BrandConfig {
 interface ModelDraft {
   name: string
   alias: string
+  display_name: string
+  display_name_state: OptionalFieldState
+  max_context_length: number | null
+  max_context_length_state: OptionalFieldState
   force_mapping: boolean
+  is_compat: boolean
+  is_compat_state: OptionalFieldState
   image: boolean
   thinking_text: string
+  thinking_state: OptionalFieldState
 }
 
 interface KeyEntryDraft {
@@ -129,6 +138,8 @@ interface ProviderDraft {
   auth_index: string | null
   name: string
   priority: number | null
+  weight: number | null
+  weight_state: OptionalFieldState
   disabled: boolean
   prefix: string
   base_url: string
@@ -139,6 +150,7 @@ interface ProviderDraft {
   excluded_models: string[]
   disable_cooling: boolean
   websockets: boolean
+  websockets_state: OptionalFieldState
   rebuild_mid_system_message: boolean
   experimental_cch_signing: boolean
   cloak: CloakDraft
@@ -155,6 +167,7 @@ const providerBrands: BrandConfig[] = [
   { brand: 'codex', label: 'Codex', keyLabel: 'Codex API key' },
   { brand: 'claude', label: 'Claude', keyLabel: 'Claude API key' },
   { brand: 'vertex', label: 'Vertex', keyLabel: 'Vertex API key' },
+  { brand: 'xai', label: 'xAI', keyLabel: 'xAI API key' },
   { brand: 'openai_compatibility', label: 'OpenAI-compatible', keyLabel: 'Provider API key' },
 ]
 
@@ -177,6 +190,7 @@ const emptySummary: AIProviderSummary = {
   claude: 0,
   openai_compatibility: 0,
   vertex: 0,
+  xai: 0,
   recent_success: 0,
   recent_failure: 0,
 }
@@ -243,7 +257,7 @@ const tableRows = computed(() => {
       provider.auth_index ?? '',
       provider.base_url ?? '',
       provider.prefix ?? '',
-      provider.models.map((model) => `${model.name} ${model.alias ?? ''}`).join(' '),
+      provider.models.map((model) => `${model.name} ${model.alias ?? ''} ${model.display_name ?? ''}`).join(' '),
     ]
       .join(' ')
       .toLowerCase()
@@ -281,9 +295,11 @@ function defaultDraft(brand: AIProviderBrand): ProviderDraft {
     auth_index: null,
     name: brand === 'openai_compatibility' ? '' : '',
     priority: null,
+    weight: null,
+    weight_state: 'omitted',
     disabled: false,
     prefix: '',
-    base_url: '',
+    base_url: brand === 'xai' ? 'https://api.x.ai/v1' : '',
     original_base_url: '',
     proxy_url: '',
     models: [],
@@ -291,6 +307,7 @@ function defaultDraft(brand: AIProviderBrand): ProviderDraft {
     excluded_models: [],
     disable_cooling: false,
     websockets: false,
+    websockets_state: brand === 'xai' ? 'omitted' : 'value',
     rebuild_mid_system_message: false,
     experimental_cch_signing: false,
     cloak: {
@@ -312,17 +329,30 @@ function defaultDraft(brand: AIProviderBrand): ProviderDraft {
 }
 
 function modelToDraft(model: AIProviderModel): ModelDraft {
+  const hasDisplayName = Object.prototype.hasOwnProperty.call(model, 'display_name')
+  const hasMaxContextLength = Object.prototype.hasOwnProperty.call(model, 'max_context_length')
+  const hasIsCompat = Object.prototype.hasOwnProperty.call(model, 'is_compat')
+  const hasThinking = Object.prototype.hasOwnProperty.call(model, 'thinking')
   return {
     name: model.name,
     alias: model.alias ?? '',
+    display_name: model.display_name ?? '',
+    display_name_state: !hasDisplayName ? 'omitted' : model.display_name === null ? 'null' : 'value',
+    max_context_length: model.max_context_length ?? null,
+    max_context_length_state: !hasMaxContextLength ? 'omitted' : model.max_context_length === null ? 'null' : 'value',
     force_mapping: model.force_mapping ?? false,
+    is_compat: model.is_compat ?? false,
+    is_compat_state: !hasIsCompat ? 'omitted' : model.is_compat === null ? 'null' : 'value',
     image: model.image ?? false,
-    thinking_text: model.thinking ? JSON.stringify(model.thinking, null, 2) : '',
+    thinking_text: model.thinking === null || model.thinking === undefined ? '' : JSON.stringify(model.thinking, null, 2),
+    thinking_state: !hasThinking ? 'omitted' : model.thinking === null ? 'null' : 'value',
   }
 }
 
 function providerToDraft(provider: AIProviderItem): ProviderDraft {
   const draft = defaultDraft(provider.brand)
+  const hasWeight = Object.prototype.hasOwnProperty.call(provider, 'weight')
+  const hasWebsockets = Object.prototype.hasOwnProperty.call(provider, 'websockets')
   return {
     ...draft,
     brand_label: provider.brand_label,
@@ -333,6 +363,8 @@ function providerToDraft(provider: AIProviderItem): ProviderDraft {
     auth_index: provider.auth_index ?? null,
     name: provider.name ?? '',
     priority: provider.priority ?? null,
+    weight: provider.weight ?? null,
+    weight_state: !hasWeight ? 'omitted' : provider.weight === null ? 'null' : 'value',
     disabled: provider.disabled ?? false,
     prefix: provider.prefix ?? '',
     base_url: provider.base_url ?? '',
@@ -343,6 +375,8 @@ function providerToDraft(provider: AIProviderItem): ProviderDraft {
     excluded_models: provider.excluded_models.filter((item) => !providerUsesExcludedModelsDisabled(provider.brand) || item.trim() !== '*'),
     disable_cooling: provider.disable_cooling ?? false,
     websockets: provider.websockets ?? false,
+    websockets_state:
+      provider.brand === 'xai' ? (!hasWebsockets ? 'omitted' : provider.websockets === null ? 'null' : 'value') : 'value',
     rebuild_mid_system_message: provider.rebuild_mid_system_message ?? false,
     experimental_cch_signing: provider.experimental_cch_signing ?? false,
     cloak: {
@@ -427,11 +461,62 @@ function handleBrandChange(value: string) {
 }
 
 function addModel(name = '') {
-  form.value.models.push({ name, alias: '', force_mapping: false, image: false, thinking_text: '' })
+  form.value.models.push({
+    name,
+    alias: '',
+    display_name: '',
+    display_name_state: 'omitted',
+    max_context_length: null,
+    max_context_length_state: 'omitted',
+    force_mapping: false,
+    is_compat: false,
+    is_compat_state: 'omitted',
+    image: false,
+    thinking_text: '',
+    thinking_state: 'omitted',
+  })
 }
 
 function removeModel(index: number) {
   form.value.models.splice(index, 1)
+}
+
+function updateModelIsCompat(model: ModelDraft, value: boolean) {
+  model.is_compat = value
+  model.is_compat_state = 'value'
+}
+
+function updateModelDisplayName(model: ModelDraft, value: string) {
+  model.display_name = value
+  model.display_name_state = 'value'
+}
+
+function updateModelMaxContextLength(model: ModelDraft, value: number | null) {
+  model.max_context_length = value
+  model.max_context_length_state = value === null ? 'null' : 'value'
+}
+
+function updateModelThinking(model: ModelDraft, value: string) {
+  model.thinking_text = value
+  model.thinking_state = value.trim() === '' ? 'null' : 'value'
+}
+
+function updateModelThinkingText(model: ModelDraft, value: string) {
+  if (form.value.brand === 'xai') {
+    updateModelThinking(model, value)
+    return
+  }
+  model.thinking_text = value
+}
+
+function updateWebsockets(value: boolean) {
+  form.value.websockets = value
+  form.value.websockets_state = 'value'
+}
+
+function updateWeight(value: number | null) {
+  form.value.weight = value
+  form.value.weight_state = value === null ? 'null' : 'value'
 }
 
 function addHeader() {
@@ -509,11 +594,40 @@ function draftToPayload(draft: ProviderDraft, mode: 'create' | 'edit' = editorMo
       if (alias) {
         payload.alias = alias
       }
+      if (draft.brand === 'xai') {
+        if (model.display_name_state === 'null') {
+          payload.display_name = null
+        } else if (model.display_name_state === 'value') {
+          payload.display_name = model.display_name
+        }
+        if (model.max_context_length_state === 'null') {
+          payload.max_context_length = null
+        } else if (model.max_context_length_state === 'value') {
+          payload.max_context_length = model.max_context_length
+        }
+        if (model.is_compat_state === 'null') {
+          payload.is_compat = null
+        } else if (model.is_compat_state === 'value') {
+          payload.is_compat = model.is_compat
+        }
+      }
       if (draft.brand === 'openai_compatibility') {
         payload.image = model.image
+      }
+      if (draft.brand === 'openai_compatibility') {
         const thinking = parseThinking(model.thinking_text)
         if (thinking) {
           payload.thinking = thinking
+        }
+      }
+      if (draft.brand === 'xai') {
+        if (model.thinking_state === 'null') {
+          payload.thinking = null
+        } else if (model.thinking_state === 'value') {
+          const thinking = parseThinking(model.thinking_text)
+          if (thinking) {
+            payload.thinking = thinking
+          }
         }
       }
       return payload
@@ -543,7 +657,6 @@ function draftToPayload(draft: ProviderDraft, mode: 'create' | 'edit' = editorMo
       .map((item) => item.trim())
       .filter((item) => item !== '' && (!providerUsesExcludedModelsDisabled(draft.brand) || item !== '*')),
     disable_cooling: draft.brand === 'vertex' ? null : draft.disable_cooling,
-    websockets: draft.brand === 'codex' ? draft.websockets : null,
     rebuild_mid_system_message: draft.brand === 'claude' ? draft.rebuild_mid_system_message : null,
     experimental_cch_signing: draft.brand === 'claude' ? draft.experimental_cch_signing : null,
     cloak:
@@ -572,8 +685,38 @@ function draftToPayload(draft: ProviderDraft, mode: 'create' | 'edit' = editorMo
     recent_status_available: draft.recent_status_available,
     recent_requests: draft.recent_requests,
   }
+  if (draft.brand === 'codex') {
+    payload.websockets = draft.websockets
+  } else if (draft.brand === 'xai') {
+    if (draft.websockets_state === 'null') {
+      payload.websockets = null
+    } else if (draft.websockets_state === 'value') {
+      payload.websockets = draft.websockets
+    }
+  }
+  if (draft.brand === 'xai') {
+    if (draft.weight_state === 'null') {
+      payload.weight = null
+    } else if (draft.weight_state === 'value') {
+      payload.weight = draft.weight
+    }
+  }
   if (draft.brand === 'openai_compatibility' && !payload.name) {
     throw new Error(t('Provider 名称不能为空', 'Provider name is required'))
+  }
+  if (draft.brand === 'xai') {
+    const baseURL = draft.base_url.trim()
+    if (!baseURL) {
+      throw new Error(t('xAI Base URL 不能为空', 'xAI Base URL is required'))
+    }
+    try {
+      const parsed = new URL(baseURL)
+      if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:') || !parsed.hostname) {
+        throw new Error('invalid protocol')
+      }
+    } catch {
+      throw new Error(t('xAI Base URL 必须是有效的 HTTP/HTTPS URL', 'xAI Base URL must be a valid HTTP/HTTPS URL'))
+    }
   }
   if (draft.brand !== 'openai_compatibility' && mode === 'create' && !payload.api_key) {
     throw new Error(t('新建 provider 必须填写 API key', 'A new provider requires an API key'))
@@ -1425,7 +1568,7 @@ onMounted(refresh)
         <div class="metric-icon"><Bot :size="20" /></div>
         <div class="metric-label">{{ t('Provider 总数', 'Providers') }}</div>
         <div class="metric-value">{{ formatInteger(summary.total) }}</div>
-        <div class="metric-footnote">{{ t(`启用 ${formatInteger(enabledProviderCount)} 个 · 五类 provider 实时读取`, `${formatInteger(enabledProviderCount)} enabled · Loaded from five provider groups`) }}</div>
+        <div class="metric-footnote">{{ t(`启用 ${formatInteger(enabledProviderCount)} 个 · 六类 provider 实时读取`, `${formatInteger(enabledProviderCount)} enabled · Loaded from six provider groups`) }}</div>
       </div>
       <div class="metric-card is-success">
         <div class="metric-icon"><CheckCircle2 :size="20" /></div>
@@ -1444,9 +1587,11 @@ onMounted(refresh)
     <section class="panel provider-panel-shell">
       <div class="panel-inner provider-panel">
         <div class="provider-toolbar">
-          <NTabs v-model:value="activeBrand" type="segment" class="provider-brand-tabs">
-            <NTabPane v-for="item in providerBrands" :key="item.brand" :name="item.brand" :tab="item.label" />
-          </NTabs>
+          <div class="provider-brand-tabs-scroll">
+            <NTabs v-model:value="activeBrand" type="segment" class="provider-brand-tabs">
+              <NTabPane v-for="item in providerBrands" :key="item.brand" :name="item.brand" :tab="item.label" />
+            </NTabs>
+          </div>
           <NSelect v-model:value="enabledFilter" class="provider-enabled-filter" :options="enabledFilterOptions" />
           <NInput v-model:value="search" class="provider-search" clearable :placeholder="t('搜索名称、服务地址、模型', 'Search name, service URL, or model')">
             <template #prefix><NIcon :component="Search" /></template>
@@ -1485,10 +1630,13 @@ onMounted(refresh)
               <NFormItem :label="t('优先级', 'Priority')">
                 <NInputNumber v-model:value="form.priority" clearable />
               </NFormItem>
+              <NFormItem v-if="form.brand === 'xai'" :label="t('权重', 'Weight')">
+                <NInputNumber :value="form.weight" clearable :max="1000000" :precision="0" @update:value="(value) => updateWeight(value as number | null)" />
+              </NFormItem>
               <NFormItem :label="t('前缀 Prefix', 'Prefix')">
                 <NInput v-model:value="form.prefix" clearable />
               </NFormItem>
-              <NFormItem :label="t('Base URL', 'Base URL')">
+              <NFormItem :label="t('Base URL', 'Base URL')" :required="form.brand === 'xai'">
                 <NInput v-model:value="form.base_url" clearable />
               </NFormItem>
               <NFormItem v-if="form.brand !== 'openai_compatibility'" :label="t('代理 URL', 'Proxy URL')">
@@ -1514,8 +1662,8 @@ onMounted(refresh)
               <NFormItem v-if="form.brand !== 'vertex'" :label="t('禁用冷却调度', 'Disable cooling')">
                 <NSwitch v-model:value="form.disable_cooling" />
               </NFormItem>
-              <NFormItem v-if="form.brand === 'codex'" :label="t('WebSockets', 'WebSockets')">
-                <NSwitch v-model:value="form.websockets" />
+              <NFormItem v-if="form.brand === 'codex' || form.brand === 'xai'" :label="t('WebSockets', 'WebSockets')">
+                <NSwitch :value="form.websockets" @update:value="(value) => updateWebsockets(value as boolean)" />
               </NFormItem>
               <NFormItem v-if="form.brand === 'claude'" :label="t('重建 mid system message', 'Rebuild mid system message')">
                 <NSwitch v-model:value="form.rebuild_mid_system_message" />
@@ -1548,19 +1696,41 @@ onMounted(refresh)
               <h3>{{ t('模型', 'Models') }}</h3>
               <NButton size="small" secondary @click="addModel()">{{ t('新增模型', 'Add model') }}</NButton>
             </div>
-            <div v-for="(model, index) in form.models" :key="index" class="model-row">
+            <div v-for="(model, index) in form.models" :key="index" class="model-row" :class="{ 'is-xai': form.brand === 'xai' }">
               <NInput v-model:value="model.name" :placeholder="t('模型名称', 'Model name')" />
               <NInput v-model:value="model.alias" clearable :placeholder="t('Alias', 'Alias')" />
+              <NInput
+                v-if="form.brand === 'xai'"
+                :value="model.display_name"
+                clearable
+                :placeholder="t('显示名称', 'Display name')"
+                @update:value="(value) => updateModelDisplayName(model, value)"
+              />
+              <NInputNumber
+                v-if="form.brand === 'xai'"
+                :value="model.max_context_length"
+                clearable
+                :min="0"
+                :precision="0"
+                :placeholder="t('最大上下文长度', 'Max context length')"
+                @update:value="(value) => updateModelMaxContextLength(model, value as number | null)"
+              />
               <label class="inline-switch"><span>force-mapping</span><NSwitch v-model:value="model.force_mapping" /></label>
+              <label v-if="form.brand === 'xai'" class="inline-switch">
+                <span>is-compat</span>
+                <NSwitch :value="model.is_compat" @update:value="(value) => updateModelIsCompat(model, value as boolean)" />
+              </label>
               <label v-if="form.brand === 'openai_compatibility'" class="inline-switch"><span>image</span><NSwitch v-model:value="model.image" /></label>
               <NInput
-                v-if="form.brand === 'openai_compatibility'"
-                v-model:value="model.thinking_text"
+                v-if="form.brand === 'openai_compatibility' || form.brand === 'xai'"
+                :value="model.thinking_text"
+                :class="{ 'xai-model-thinking': form.brand === 'xai' }"
                 type="textarea"
                 :autosize="{ minRows: 2, maxRows: 5 }"
                 :placeholder="t('thinking JSON object', 'thinking JSON object')"
+                @update:value="(value) => updateModelThinkingText(model, value)"
               />
-              <NButton tertiary type="error" @click="removeModel(index)">{{ t('删除', 'Delete') }}</NButton>
+              <NButton :class="{ 'xai-model-delete': form.brand === 'xai' }" tertiary type="error" @click="removeModel(index)">{{ t('删除', 'Delete') }}</NButton>
             </div>
           </section>
 
@@ -1710,15 +1880,21 @@ onMounted(refresh)
   align-items: flex-start;
 }
 
-.provider-brand-tabs,
+.provider-brand-tabs-scroll,
 .provider-enabled-filter,
 .provider-search {
   min-width: 0;
 }
 
-.provider-brand-tabs {
+.provider-brand-tabs-scroll {
   flex: 1 1 640px;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+
+.provider-brand-tabs {
+  min-width: 760px;
 }
 
 .provider-enabled-filter {
@@ -2023,6 +2199,20 @@ onMounted(refresh)
   grid-template-columns: minmax(160px, 1.2fr) minmax(120px, 0.9fr) minmax(116px, auto) minmax(80px, auto) minmax(180px, 1fr) auto;
 }
 
+.model-row.is-xai {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+}
+
+.model-row.is-xai .xai-model-thinking,
+.model-row.is-xai .xai-model-delete {
+  grid-column: 1 / -1;
+}
+
+.model-row.is-xai .xai-model-delete {
+  justify-self: end;
+}
+
 .inline-switch {
   display: inline-flex;
   align-items: center;
@@ -2123,6 +2313,10 @@ onMounted(refresh)
     grid-template-columns: 1fr;
   }
 
+  .model-row.is-xai {
+    grid-template-columns: 1fr;
+  }
+
   .settings-alert-content,
   .drawer-actions,
   .discovery-toolbar {
@@ -2130,7 +2324,7 @@ onMounted(refresh)
     flex-direction: column;
   }
 
-  .provider-brand-tabs,
+  .provider-brand-tabs-scroll,
   .provider-enabled-filter,
   .provider-search,
   .discovery-toolbar > :first-child {

@@ -23,6 +23,7 @@ func TestAIProvidersSnapshotReusesOneManagementConfig(t *testing.T) {
 		"/v0/management/claude-api-key":       true,
 		"/v0/management/openai-compatibility": true,
 		"/v0/management/vertex-api-key":       true,
+		"/v0/management/xai-api-key":          true,
 	}
 	providerStarted := make(chan struct{})
 	releaseProvider := make(chan struct{})
@@ -146,11 +147,32 @@ func TestAIProvidersSnapshotReusesOneManagementConfig(t *testing.T) {
 
 type aiProvidersTestResponse struct {
 	Providers []struct {
-		Brand                 string   `json:"brand"`
-		Index                 int      `json:"index"`
-		IdentityHash          string   `json:"identity_hash"`
-		APIKeyHash            string   `json:"api_key_hash"`
-		APIKeyMasked          string   `json:"api_key_masked"`
+		Brand          string `json:"brand"`
+		BrandLabel     string `json:"brand_label"`
+		Index          int    `json:"index"`
+		IdentityHash   string `json:"identity_hash"`
+		APIKeyHash     string `json:"api_key_hash"`
+		APIKeyMasked   string `json:"api_key_masked"`
+		Priority       *int   `json:"priority"`
+		Weight         *int   `json:"weight"`
+		Prefix         string `json:"prefix"`
+		BaseURL        string `json:"base_url"`
+		ProxyURL       string `json:"proxy_url"`
+		Websockets     *bool  `json:"websockets"`
+		DisableCooling *bool  `json:"disable_cooling"`
+		Models         []struct {
+			Name             string         `json:"name"`
+			Alias            string         `json:"alias"`
+			DisplayName      string         `json:"display_name"`
+			MaxContextLength *int           `json:"max_context_length"`
+			ForceMapping     *bool          `json:"force_mapping"`
+			IsCompat         *bool          `json:"is_compat"`
+			Thinking         map[string]any `json:"thinking"`
+		} `json:"models"`
+		Headers []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		} `json:"headers"`
 		Disabled              *bool    `json:"disabled"`
 		ExcludedModels        []string `json:"excluded_models"`
 		RecentSuccess         int      `json:"recent_success"`
@@ -165,6 +187,7 @@ type aiProvidersTestResponse struct {
 	} `json:"providers"`
 	Summary struct {
 		Total         int `json:"total"`
+		XAI           int `json:"xai"`
 		RecentSuccess int `json:"recent_success"`
 		RecentFailure int `json:"recent_failure"`
 	} `json:"summary"`
@@ -197,6 +220,7 @@ func newFakeAIProviderManagement(t *testing.T) (*fakeAIProviderManagement, *http
 			"claude-api-key":       []map[string]any{},
 			"openai-compatibility": []map[string]any{},
 			"vertex-api-key":       []map[string]any{},
+			"xai-api-key":          []map[string]any{},
 		},
 		usage: []map[string]any{},
 	}
@@ -215,6 +239,7 @@ func (f *fakeAIProviderManagement) handle(w http.ResponseWriter, r *http.Request
 		"/v0/management/claude-api-key":       "claude-api-key",
 		"/v0/management/openai-compatibility": "openai-compatibility",
 		"/v0/management/vertex-api-key":       "vertex-api-key",
+		"/v0/management/xai-api-key":          "xai-api-key",
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -244,6 +269,13 @@ func (f *fakeAIProviderManagement) handle(w http.ResponseWriter, r *http.Request
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"status_code": 200,
 				"body":        `{"data":[{"id":"gpt-test"}]}`,
+			})
+			return
+		}
+		if strings.Contains(targetURL, "/responses") && strings.EqualFold(payload["method"].(string), http.MethodPost) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status_code": 200,
+				"body":        `{"output_text":"responses ok"}`,
 			})
 			return
 		}
@@ -372,6 +404,716 @@ func TestAIProvidersSnapshotMasksSecretsAndMapsUsage(t *testing.T) {
 	}
 	if !strings.Contains(text, "gemini") || !strings.Contains(text, "custom-openai") {
 		t.Fatalf("response missing provider identity: %s", text)
+	}
+}
+
+func TestAIProviderOpenAICompatibilityThinkingSurvivesUnrelatedUpdate(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["openai-compatibility"] = []map[string]any{
+		{
+			"name":            "custom-openai",
+			"base-url":        "https://openai.example",
+			"api-key-entries": []map[string]any{},
+			"models": []map[string]any{
+				{
+					"name":     "gpt-thinking",
+					"alias":    "before",
+					"thinking": map[string]any{"type": "enabled", "budget_tokens": 2048},
+				},
+			},
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	snapshotBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	responseModels := aiProviderResponseModelsByName(t, snapshotBody)
+	thinking, ok := responseModels["gpt-thinking"]["thinking"].(map[string]any)
+	if !ok || thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(2048) {
+		t.Fatalf("snapshot OpenAI-compatible thinking = %#v", responseModels["gpt-thinking"]["thinking"])
+	}
+
+	snapshot := aiProvidersTestResponse{}
+	if err := json.Unmarshal(snapshotBody, &snapshot); err != nil {
+		t.Fatalf("decode OpenAI-compatible snapshot: %v", err)
+	}
+	if len(snapshot.Providers) != 1 || len(snapshot.Providers[0].Models) != 1 {
+		t.Fatalf("snapshot providers = %#v, want one provider with one model", snapshot.Providers)
+	}
+	provider := snapshot.Providers[0]
+	requestJSON(t, handler, http.MethodPut, "/api/ai-providers/openai_compatibility/0", map[string]any{
+		"brand":           "openai_compatibility",
+		"identity_hash":   provider.IdentityHash,
+		"name":            "custom-openai",
+		"prefix":          "saved-prefix",
+		"base_url":        "https://openai.example",
+		"api_key_entries": []map[string]any{},
+		"models": []map[string]any{
+			{
+				"name":     provider.Models[0].Name,
+				"alias":    provider.Models[0].Alias,
+				"thinking": provider.Models[0].Thinking,
+			},
+		},
+		"headers": []map[string]any{},
+	}, cookies, nil)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	items := fake.config["openai-compatibility"].([]map[string]any)
+	if items[0]["prefix"] != "saved-prefix" {
+		t.Fatalf("saved OpenAI-compatible prefix = %#v, want saved-prefix", items[0]["prefix"])
+	}
+	models, ok := items[0]["models"].([]any)
+	if !ok || len(models) != 1 {
+		t.Fatalf("saved OpenAI-compatible models = %#v, want one model", items[0]["models"])
+	}
+	savedModel, ok := models[0].(map[string]any)
+	if !ok {
+		t.Fatalf("saved OpenAI-compatible model = %#v, want object", models[0])
+	}
+	savedThinking, ok := savedModel["thinking"].(map[string]any)
+	if !ok || savedThinking["type"] != "enabled" || savedThinking["budget_tokens"] != float64(2048) {
+		t.Fatalf("saved OpenAI-compatible thinking = %#v", savedModel["thinking"])
+	}
+}
+
+func TestAIProviderXAIFieldsRoundTripAndDisableSentinel(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["xai-api-key"] = []map[string]any{
+		{
+			"api-key":         "xai-secret-key",
+			"priority":        3,
+			"weight":          5,
+			"prefix":          "team-xai",
+			"base-url":        "https://api.x.ai/v1",
+			"websockets":      true,
+			"proxy-url":       "http://proxy.example",
+			"headers":         map[string]any{"X-XAI-Test": "before"},
+			"excluded-models": []string{"grok-legacy", "*"},
+			"disable-cooling": true,
+			"alpha-search":    true,
+			"alpha_search":    true,
+			"future-option":   map[string]any{"route": "keep"},
+			"models": []map[string]any{
+				{
+					"name":                "grok-4.5",
+					"alias":               "grok-latest",
+					"display-name":        "Grok Latest",
+					"max-context-length":  131072,
+					"force-mapping":       true,
+					"is-compat":           false,
+					"thinking":            map[string]any{"type": "enabled", "budget_tokens": 2048},
+					"alpha-search":        true,
+					"alpha_search":        true,
+					"future-model-option": map[string]any{"mode": "keep"},
+				},
+			},
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	responseBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	if strings.Contains(string(responseBody), "xai-secret-key") {
+		t.Fatalf("snapshot leaked xAI API key: %s", string(responseBody))
+	}
+	snapshot := aiProvidersTestResponse{}
+	if err := json.Unmarshal(responseBody, &snapshot); err != nil {
+		t.Fatalf("decode xAI snapshot: %v", err)
+	}
+	if len(snapshot.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(snapshot.Providers))
+	}
+	provider := snapshot.Providers[0]
+	if provider.Brand != "xai" || provider.BrandLabel != "xAI" {
+		t.Fatalf("xAI brand = %q/%q, want xai/xAI", provider.Brand, provider.BrandLabel)
+	}
+	if snapshot.Summary.Total != 1 || snapshot.Summary.XAI != 1 {
+		t.Fatalf("xAI summary = total %d xai %d, want 1/1", snapshot.Summary.Total, snapshot.Summary.XAI)
+	}
+	if provider.APIKeyHash == "" || provider.APIKeyMasked == "" {
+		t.Fatalf("xAI safe key selectors missing: hash=%q masked=%q", provider.APIKeyHash, provider.APIKeyMasked)
+	}
+	if provider.Weight == nil || *provider.Weight != 5 {
+		t.Fatalf("xAI weight = %#v, want 5", provider.Weight)
+	}
+	if provider.Priority == nil || *provider.Priority != 3 || provider.Prefix != "team-xai" {
+		t.Fatalf("xAI priority/prefix = %#v/%q", provider.Priority, provider.Prefix)
+	}
+	if provider.BaseURL != "https://api.x.ai/v1" || provider.ProxyURL != "http://proxy.example" || provider.Websockets == nil || !*provider.Websockets {
+		t.Fatalf("xAI base/proxy/websockets = %q/%q/%#v", provider.BaseURL, provider.ProxyURL, provider.Websockets)
+	}
+	if provider.DisableCooling == nil || !*provider.DisableCooling {
+		t.Fatalf("xAI disable_cooling = %#v, want true", provider.DisableCooling)
+	}
+	if provider.Disabled == nil || !*provider.Disabled {
+		t.Fatalf("xAI disabled = %#v, want true from wildcard", provider.Disabled)
+	}
+	if len(provider.ExcludedModels) != 1 || provider.ExcludedModels[0] != "grok-legacy" {
+		t.Fatalf("xAI excluded models = %#v, want wildcard filtered", provider.ExcludedModels)
+	}
+	if len(provider.Headers) != 1 || provider.Headers[0].Name != "X-XAI-Test" || provider.Headers[0].Value != "before" {
+		t.Fatalf("xAI headers = %#v", provider.Headers)
+	}
+	if len(provider.Models) != 1 {
+		t.Fatalf("xAI models length = %d, want 1", len(provider.Models))
+	}
+	model := provider.Models[0]
+	if model.Name != "grok-4.5" || model.Alias != "grok-latest" || model.DisplayName != "Grok Latest" {
+		t.Fatalf("xAI model identity = %#v", model)
+	}
+	if model.MaxContextLength == nil || *model.MaxContextLength != 131072 || model.ForceMapping == nil || !*model.ForceMapping || model.IsCompat == nil || *model.IsCompat {
+		t.Fatalf("xAI model options = %#v", model)
+	}
+	if model.Thinking["type"] != "enabled" || model.Thinking["budget_tokens"] != float64(2048) {
+		t.Fatalf("xAI thinking = %#v", model.Thinking)
+	}
+
+	updatePayload := map[string]any{
+		"brand":           "xai",
+		"identity_hash":   provider.IdentityHash,
+		"api_key_hash":    provider.APIKeyHash,
+		"api_key":         "",
+		"priority":        0,
+		"weight":          0,
+		"prefix":          "team-xai-next",
+		"base_url":        "https://api.x.ai/v1",
+		"websockets":      false,
+		"proxy_url":       "http://proxy-next.example",
+		"headers":         []map[string]any{{"name": "X-XAI-Test", "value": "after"}},
+		"excluded_models": []string{"grok-legacy", "grok-preview"},
+		"disabled":        false,
+		"disable_cooling": false,
+		"models": []map[string]any{
+			{
+				"name":               "grok-4.5",
+				"alias":              "grok-stable",
+				"display_name":       "Grok Stable",
+				"max_context_length": 0,
+				"force_mapping":      false,
+				"is_compat":          true,
+				"thinking":           map[string]any{"type": "adaptive"},
+			},
+		},
+	}
+	updateBody := requestRawJSON(t, handler, http.MethodPut, "/api/ai-providers/xai/0", updatePayload, cookies, http.StatusOK)
+	if strings.Contains(string(updateBody), "xai-secret-key") {
+		t.Fatalf("update response leaked xAI API key: %s", string(updateBody))
+	}
+
+	fake.mu.Lock()
+	items := fake.config["xai-api-key"].([]map[string]any)
+	got := items[0]
+	if got["api-key"] != "xai-secret-key" || got["weight"] != float64(0) || got["websockets"] != false {
+		fake.mu.Unlock()
+		t.Fatalf("saved xAI credential fields = %#v", got)
+	}
+	if got["priority"] != float64(0) || got["prefix"] != "team-xai-next" || got["base-url"] != "https://api.x.ai/v1" || got["proxy-url"] != "http://proxy-next.example" || got["disable-cooling"] != false {
+		fake.mu.Unlock()
+		t.Fatalf("saved xAI routing fields = %#v", got)
+	}
+	headers, ok := got["headers"].(map[string]any)
+	if !ok || headers["X-XAI-Test"] != "after" {
+		fake.mu.Unlock()
+		t.Fatalf("saved xAI headers = %#v", got["headers"])
+	}
+	if _, ok := got["disabled"]; ok {
+		fake.mu.Unlock()
+		t.Fatalf("saved xAI provider kept provider-level disabled: %#v", got)
+	}
+	for _, key := range []string{"alpha-search", "alpha_search"} {
+		if _, ok := got[key]; ok {
+			fake.mu.Unlock()
+			t.Fatalf("saved xAI provider kept Codex-only %s: %#v", key, got)
+		}
+	}
+	excluded, ok := got["excluded-models"].([]any)
+	if !ok || len(excluded) != 2 || excluded[0] != "grok-legacy" || excluded[1] != "grok-preview" {
+		fake.mu.Unlock()
+		t.Fatalf("saved xAI excluded-models = %#v", got["excluded-models"])
+	}
+	future, ok := got["future-option"].(map[string]any)
+	if !ok || future["route"] != "keep" {
+		fake.mu.Unlock()
+		t.Fatalf("saved xAI future option = %#v", got["future-option"])
+	}
+	models, ok := got["models"].([]any)
+	if !ok || len(models) != 1 {
+		fake.mu.Unlock()
+		t.Fatalf("saved xAI models = %#v", got["models"])
+	}
+	savedModel, ok := models[0].(map[string]any)
+	if !ok {
+		fake.mu.Unlock()
+		t.Fatalf("saved xAI model = %#v, want object", models[0])
+	}
+	if savedModel["display-name"] != "Grok Stable" || savedModel["max-context-length"] != float64(0) || savedModel["force-mapping"] != false || savedModel["is-compat"] != true {
+		fake.mu.Unlock()
+		t.Fatalf("saved xAI model fields = %#v", savedModel)
+	}
+	for _, key := range []string{"alpha-search", "alpha_search"} {
+		if _, ok := savedModel[key]; ok {
+			fake.mu.Unlock()
+			t.Fatalf("saved xAI model kept Codex-only %s: %#v", key, savedModel)
+		}
+	}
+	futureModel, ok := savedModel["future-model-option"].(map[string]any)
+	if !ok || futureModel["mode"] != "keep" {
+		fake.mu.Unlock()
+		t.Fatalf("saved xAI model lost unknown field: %#v", savedModel)
+	}
+	thinking, ok := savedModel["thinking"].(map[string]any)
+	if !ok || thinking["type"] != "adaptive" {
+		fake.mu.Unlock()
+		t.Fatalf("saved xAI thinking = %#v", savedModel["thinking"])
+	}
+	fake.mu.Unlock()
+
+	delete(updatePayload, "weight")
+	updatePayload["disabled"] = true
+	requestJSON(t, handler, http.MethodPut, "/api/ai-providers/xai/0", updatePayload, cookies, nil)
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	got = fake.config["xai-api-key"].([]map[string]any)[0]
+	if got["weight"] != float64(0) {
+		t.Fatalf("omitted xAI weight = %#v, want preserved explicit zero", got["weight"])
+	}
+	excluded, ok = got["excluded-models"].([]any)
+	if !ok || len(excluded) != 3 || excluded[0] != "grok-legacy" || excluded[1] != "grok-preview" || excluded[2] != "*" {
+		t.Fatalf("disabled xAI excluded-models = %#v, want wildcard appended", got["excluded-models"])
+	}
+}
+
+func TestAIProviderXAIIsCompatUpdatePresence(t *testing.T) {
+	tests := []struct {
+		name                 string
+		remoteKey            string
+		remoteValue          any
+		submit               bool
+		submittedValue       any
+		wantHyphenatedSet    bool
+		wantHyphenatedValue  any
+		wantUnderscoredSet   bool
+		wantUnderscoredValue any
+		wantResponseSet      bool
+		wantResponseValue    any
+	}{
+		{
+			name: "omitted preserves absence",
+		},
+		{
+			name:              "omitted preserves hyphenated null",
+			remoteKey:         "is-compat",
+			remoteValue:       nil,
+			wantHyphenatedSet: true,
+			wantResponseSet:   true,
+		},
+		{
+			name:                 "omitted preserves underscored false",
+			remoteKey:            "is_compat",
+			remoteValue:          false,
+			wantUnderscoredSet:   true,
+			wantUnderscoredValue: false,
+			wantResponseSet:      true,
+			wantResponseValue:    false,
+		},
+		{
+			name:              "explicit null replaces current value",
+			remoteKey:         "is_compat",
+			remoteValue:       true,
+			submit:            true,
+			submittedValue:    nil,
+			wantHyphenatedSet: true,
+			wantResponseSet:   true,
+		},
+		{
+			name:                "explicit false writes false",
+			remoteKey:           "is-compat",
+			remoteValue:         nil,
+			submit:              true,
+			submittedValue:      false,
+			wantHyphenatedSet:   true,
+			wantHyphenatedValue: false,
+			wantResponseSet:     true,
+			wantResponseValue:   false,
+		},
+		{
+			name:                "explicit true writes true",
+			submit:              true,
+			submittedValue:      true,
+			wantHyphenatedSet:   true,
+			wantHyphenatedValue: true,
+			wantResponseSet:     true,
+			wantResponseValue:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake, server := newFakeAIProviderManagement(t)
+			defer server.Close()
+			remoteModel := map[string]any{
+				"name":                "grok-4.5",
+				"alias":               "before",
+				"future-model-option": "keep",
+			}
+			if tc.remoteKey != "" {
+				remoteModel[tc.remoteKey] = tc.remoteValue
+			}
+			fake.config["xai-api-key"] = []map[string]any{
+				{
+					"api-key":  "xai-update-presence-key",
+					"base-url": "https://api.x.ai/v1",
+					"models":   []map[string]any{remoteModel},
+				},
+			}
+
+			handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+			defer closeApp()
+			snapshot := aiProvidersTestResponse{}
+			requestJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, &snapshot)
+			if len(snapshot.Providers) != 1 {
+				t.Fatalf("providers length = %d, want 1", len(snapshot.Providers))
+			}
+			provider := snapshot.Providers[0]
+			modelPayload := map[string]any{
+				"name":  "grok-4.5",
+				"alias": "after",
+			}
+			if tc.submit {
+				modelPayload["is_compat"] = tc.submittedValue
+			}
+			responseBody := requestRawJSON(t, handler, http.MethodPut, "/api/ai-providers/xai/0", map[string]any{
+				"brand":         "xai",
+				"identity_hash": provider.IdentityHash,
+				"api_key_hash":  provider.APIKeyHash,
+				"api_key":       "",
+				"base_url":      "https://api.x.ai/v1",
+				"models":        []map[string]any{modelPayload},
+				"headers":       []map[string]any{},
+			}, cookies, http.StatusOK)
+
+			fake.mu.Lock()
+			savedModels, ok := fake.config["xai-api-key"].([]map[string]any)[0]["models"].([]any)
+			if !ok || len(savedModels) != 1 {
+				fake.mu.Unlock()
+				t.Fatalf("saved xAI models = %#v, want one model", fake.config["xai-api-key"])
+			}
+			savedModel, ok := savedModels[0].(map[string]any)
+			fake.mu.Unlock()
+			if !ok {
+				t.Fatalf("saved xAI model = %#v, want object", savedModels[0])
+			}
+			if savedModel["alias"] != "after" || savedModel["future-model-option"] != "keep" {
+				t.Fatalf("saved unrelated model fields = %#v, want updated alias and preserved unknown field", savedModel)
+			}
+			assertAIProviderJSONField(t, savedModel, "is-compat", tc.wantHyphenatedSet, tc.wantHyphenatedValue)
+			assertAIProviderJSONField(t, savedModel, "is_compat", tc.wantUnderscoredSet, tc.wantUnderscoredValue)
+
+			responseModel := firstAIProviderResponseModel(t, responseBody)
+			assertAIProviderJSONField(t, responseModel, "is_compat", tc.wantResponseSet, tc.wantResponseValue)
+		})
+	}
+}
+
+func TestAIProviderXAIIsCompatCreatePresence(t *testing.T) {
+	tests := []struct {
+		name           string
+		submit         bool
+		submittedValue any
+		wantSet        bool
+		wantValue      any
+	}{
+		{name: "omitted stays absent"},
+		{name: "explicit null stays null", submit: true, wantSet: true},
+		{name: "explicit false stays false", submit: true, submittedValue: false, wantSet: true, wantValue: false},
+		{name: "explicit true stays true", submit: true, submittedValue: true, wantSet: true, wantValue: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake, server := newFakeAIProviderManagement(t)
+			defer server.Close()
+			handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+			defer closeApp()
+
+			modelPayload := map[string]any{"name": "grok-4.5"}
+			if tc.submit {
+				modelPayload["is_compat"] = tc.submittedValue
+			}
+			responseBody := requestRawJSON(t, handler, http.MethodPost, "/api/ai-providers/xai", map[string]any{
+				"brand":    "xai",
+				"api_key":  "xai-create-presence-key",
+				"base_url": "https://api.x.ai/v1",
+				"models":   []map[string]any{modelPayload},
+				"headers":  []map[string]any{},
+			}, cookies, http.StatusOK)
+
+			fake.mu.Lock()
+			savedModels, ok := fake.config["xai-api-key"].([]map[string]any)[0]["models"].([]any)
+			if !ok || len(savedModels) != 1 {
+				fake.mu.Unlock()
+				t.Fatalf("saved xAI models = %#v, want one model", fake.config["xai-api-key"])
+			}
+			savedModel, ok := savedModels[0].(map[string]any)
+			fake.mu.Unlock()
+			if !ok {
+				t.Fatalf("saved xAI model = %#v, want object", savedModels[0])
+			}
+			assertAIProviderJSONField(t, savedModel, "is-compat", tc.wantSet, tc.wantValue)
+			assertAIProviderJSONField(t, savedModel, "is_compat", false, nil)
+
+			responseModel := firstAIProviderResponseModel(t, responseBody)
+			assertAIProviderJSONField(t, responseModel, "is_compat", tc.wantSet, tc.wantValue)
+		})
+	}
+}
+
+func TestAIProviderXAINullableModelFieldsSurviveUnrelatedUpdate(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["xai-api-key"] = []map[string]any{
+		{
+			"api-key":  "xai-nullable-model-key",
+			"base-url": "https://api.x.ai/v1",
+			"models": []map[string]any{
+				{
+					"name":               "grok-nullable",
+					"alias":              "before-nullable",
+					"display-name":       nil,
+					"max-context-length": nil,
+					"thinking":           nil,
+				},
+				{
+					"name":     "grok-empty-thinking",
+					"alias":    "before-empty",
+					"thinking": map[string]any{},
+				},
+			},
+		},
+	}
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	snapshotBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	snapshot := aiProvidersTestResponse{}
+	if err := json.Unmarshal(snapshotBody, &snapshot); err != nil {
+		t.Fatalf("decode xAI snapshot: %v", err)
+	}
+	if len(snapshot.Providers) != 1 {
+		t.Fatalf("providers length = %d, want 1", len(snapshot.Providers))
+	}
+	responseModels := aiProviderResponseModelsByName(t, snapshotBody)
+	nullableModel := responseModels["grok-nullable"]
+	assertAIProviderJSONField(t, nullableModel, "display_name", true, nil)
+	assertAIProviderJSONField(t, nullableModel, "max_context_length", true, nil)
+	assertAIProviderJSONField(t, nullableModel, "thinking", true, nil)
+	emptyThinkingModel := responseModels["grok-empty-thinking"]
+	emptyThinking, ok := emptyThinkingModel["thinking"].(map[string]any)
+	if !ok || len(emptyThinking) != 0 {
+		t.Fatalf("empty thinking response = %#v, want empty object", emptyThinkingModel["thinking"])
+	}
+
+	provider := snapshot.Providers[0]
+	requestJSON(t, handler, http.MethodPut, "/api/ai-providers/xai/0", map[string]any{
+		"brand":         "xai",
+		"identity_hash": provider.IdentityHash,
+		"api_key_hash":  provider.APIKeyHash,
+		"api_key":       "",
+		"base_url":      "https://api.x.ai/v1",
+		"models": []map[string]any{
+			{"name": "grok-nullable", "alias": "after-nullable"},
+			{"name": "grok-empty-thinking", "alias": "after-empty"},
+		},
+		"headers": []map[string]any{},
+	}, cookies, nil)
+
+	fake.mu.Lock()
+	savedModels, ok := fake.config["xai-api-key"].([]map[string]any)[0]["models"].([]any)
+	fake.mu.Unlock()
+	if !ok || len(savedModels) != 2 {
+		t.Fatalf("saved xAI models = %#v, want two models", fake.config["xai-api-key"])
+	}
+	savedByName := map[string]map[string]any{}
+	for _, saved := range savedModels {
+		model, ok := saved.(map[string]any)
+		if !ok {
+			t.Fatalf("saved xAI model = %#v, want object", saved)
+		}
+		name, _ := model["name"].(string)
+		savedByName[name] = model
+	}
+	assertAIProviderJSONField(t, savedByName["grok-nullable"], "display-name", true, nil)
+	assertAIProviderJSONField(t, savedByName["grok-nullable"], "max-context-length", true, nil)
+	assertAIProviderJSONField(t, savedByName["grok-nullable"], "thinking", true, nil)
+	if thinking, ok := savedByName["grok-empty-thinking"]["thinking"].(map[string]any); !ok || len(thinking) != 0 {
+		t.Fatalf("saved empty thinking = %#v, want empty object", savedByName["grok-empty-thinking"]["thinking"])
+	}
+
+	requestJSON(t, handler, http.MethodPut, "/api/ai-providers/xai/0", map[string]any{
+		"brand":         "xai",
+		"identity_hash": provider.IdentityHash,
+		"api_key_hash":  provider.APIKeyHash,
+		"api_key":       "",
+		"base_url":      "https://api.x.ai/v1",
+		"models": []map[string]any{
+			{
+				"name":               "grok-nullable",
+				"alias":              "after-nullable-explicit",
+				"display_name":       nil,
+				"max_context_length": nil,
+				"thinking":           nil,
+			},
+			{
+				"name":     "grok-empty-thinking",
+				"alias":    "after-empty-explicit",
+				"thinking": map[string]any{},
+			},
+		},
+		"headers": []map[string]any{},
+	}, cookies, nil)
+
+	fake.mu.Lock()
+	savedModels, ok = fake.config["xai-api-key"].([]map[string]any)[0]["models"].([]any)
+	fake.mu.Unlock()
+	if !ok || len(savedModels) != 2 {
+		t.Fatalf("saved xAI models after explicit update = %#v, want two models", fake.config["xai-api-key"])
+	}
+	savedByName = map[string]map[string]any{}
+	for _, saved := range savedModels {
+		model, ok := saved.(map[string]any)
+		if !ok {
+			t.Fatalf("saved xAI model after explicit update = %#v, want object", saved)
+		}
+		name, _ := model["name"].(string)
+		savedByName[name] = model
+	}
+	assertAIProviderJSONField(t, savedByName["grok-nullable"], "display-name", true, nil)
+	assertAIProviderJSONField(t, savedByName["grok-nullable"], "max-context-length", true, nil)
+	assertAIProviderJSONField(t, savedByName["grok-nullable"], "thinking", true, nil)
+	if thinking, ok := savedByName["grok-empty-thinking"]["thinking"].(map[string]any); !ok || len(thinking) != 0 {
+		t.Fatalf("saved explicit empty thinking = %#v, want empty object", savedByName["grok-empty-thinking"]["thinking"])
+	}
+}
+
+func TestAIProviderXAIWebsocketsPresenceSurvivesUnrelatedUpdate(t *testing.T) {
+	tests := []struct {
+		name        string
+		remoteSet   bool
+		remoteValue any
+		wantSet     bool
+		wantValue   any
+	}{
+		{name: "omitted remains omitted"},
+		{name: "null remains null", remoteSet: true, wantSet: true},
+		{name: "explicit false remains false", remoteSet: true, remoteValue: false, wantSet: true, wantValue: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake, server := newFakeAIProviderManagement(t)
+			defer server.Close()
+			provider := map[string]any{
+				"api-key":  "xai-websockets-key",
+				"base-url": "https://api.x.ai/v1",
+				"models":   []map[string]any{{"name": "grok-websockets"}},
+			}
+			if tc.remoteSet {
+				provider["websockets"] = tc.remoteValue
+			}
+			fake.config["xai-api-key"] = []map[string]any{provider}
+
+			handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+			defer closeApp()
+			snapshotBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+			responseProviders := aiProviderResponseProviders(t, snapshotBody)
+			assertAIProviderJSONField(t, responseProviders[0], "websockets", tc.wantSet, tc.wantValue)
+			snapshot := aiProvidersTestResponse{}
+			if err := json.Unmarshal(snapshotBody, &snapshot); err != nil {
+				t.Fatalf("decode xAI snapshot: %v", err)
+			}
+			updatePayload := map[string]any{
+				"brand":         "xai",
+				"identity_hash": snapshot.Providers[0].IdentityHash,
+				"api_key_hash":  snapshot.Providers[0].APIKeyHash,
+				"api_key":       "",
+				"base_url":      "https://api.x.ai/v1",
+				"priority":      3,
+				"models":        []map[string]any{{"name": "grok-websockets"}},
+				"headers":       []map[string]any{},
+			}
+			if tc.remoteSet {
+				updatePayload["websockets"] = tc.remoteValue
+			}
+			requestJSON(t, handler, http.MethodPut, "/api/ai-providers/xai/0", updatePayload, cookies, nil)
+
+			fake.mu.Lock()
+			saved := fake.config["xai-api-key"].([]map[string]any)[0]
+			fake.mu.Unlock()
+			assertAIProviderJSONField(t, saved, "websockets", tc.wantSet, tc.wantValue)
+		})
+	}
+}
+
+func TestAIProviderXAIWeightPresenceSurvivesUnrelatedUpdate(t *testing.T) {
+	tests := []struct {
+		name        string
+		remoteSet   bool
+		remoteValue any
+		wantSet     bool
+		wantValue   any
+	}{
+		{name: "omitted remains omitted"},
+		{name: "null remains null", remoteSet: true, wantSet: true},
+		{name: "explicit zero remains zero", remoteSet: true, remoteValue: 0, wantSet: true, wantValue: float64(0)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake, server := newFakeAIProviderManagement(t)
+			defer server.Close()
+			provider := map[string]any{
+				"api-key":  "xai-weight-key",
+				"base-url": "https://api.x.ai/v1",
+				"models":   []map[string]any{{"name": "grok-weight"}},
+			}
+			if tc.remoteSet {
+				provider["weight"] = tc.remoteValue
+			}
+			fake.config["xai-api-key"] = []map[string]any{provider}
+
+			handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+			defer closeApp()
+			snapshotBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+			responseProviders := aiProviderResponseProviders(t, snapshotBody)
+			assertAIProviderJSONField(t, responseProviders[0], "weight", tc.wantSet, tc.wantValue)
+			snapshot := aiProvidersTestResponse{}
+			if err := json.Unmarshal(snapshotBody, &snapshot); err != nil {
+				t.Fatalf("decode xAI snapshot: %v", err)
+			}
+			updatePayload := map[string]any{
+				"brand":         "xai",
+				"identity_hash": snapshot.Providers[0].IdentityHash,
+				"api_key_hash":  snapshot.Providers[0].APIKeyHash,
+				"api_key":       "",
+				"base_url":      "https://api.x.ai/v1",
+				"priority":      3,
+				"models":        []map[string]any{{"name": "grok-weight"}},
+				"headers":       []map[string]any{},
+			}
+			if tc.remoteSet {
+				updatePayload["weight"] = tc.remoteValue
+			}
+			requestJSON(t, handler, http.MethodPut, "/api/ai-providers/xai/0", updatePayload, cookies, nil)
+
+			fake.mu.Lock()
+			saved := fake.config["xai-api-key"].([]map[string]any)[0]
+			fake.mu.Unlock()
+			assertAIProviderJSONField(t, saved, "weight", tc.wantSet, tc.wantValue)
+		})
 	}
 }
 
@@ -1803,7 +2545,7 @@ func TestAIProviderUpdatePreservesAuthIndexCredential(t *testing.T) {
 	}
 }
 
-func TestAIProviderSaveRequiresBaseURLForCodexOpenAICompatibleAndVertex(t *testing.T) {
+func TestAIProviderSaveRequiresBaseURLForCodexOpenAICompatibleVertexAndXAI(t *testing.T) {
 	fake, server := newFakeAIProviderManagement(t)
 	defer server.Close()
 	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
@@ -1831,6 +2573,20 @@ func TestAIProviderSaveRequiresBaseURLForCodexOpenAICompatibleAndVertex(t *testi
 		"models":  []map[string]any{},
 		"headers": []map[string]any{},
 	}, cookies, http.StatusUnprocessableEntity)
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/ai-providers/xai", map[string]any{
+		"brand":   "xai",
+		"api_key": "xai-secret-key",
+		"models":  []map[string]any{},
+		"headers": []map[string]any{},
+	}, cookies, http.StatusUnprocessableEntity)
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/ai-providers/xai", map[string]any{
+		"brand":    "xai",
+		"api_key":  "xai-secret-key",
+		"base_url": "https://api.x.ai/v1",
+		"weight":   1000001,
+		"models":   []map[string]any{},
+		"headers":  []map[string]any{},
+	}, cookies, http.StatusUnprocessableEntity)
 
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
@@ -1842,6 +2598,51 @@ func TestAIProviderSaveRequiresBaseURLForCodexOpenAICompatibleAndVertex(t *testi
 	}
 	if got := len(fake.config["vertex-api-key"].([]map[string]any)); got != 0 {
 		t.Fatalf("vertex providers length = %d, want 0", got)
+	}
+	if got := len(fake.config["xai-api-key"].([]map[string]any)); got != 0 {
+		t.Fatalf("xAI providers length = %d, want 0", got)
+	}
+}
+
+func TestAIProviderXAICreateAndDelete(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+
+	createBody := requestRawJSON(t, handler, http.MethodPost, "/api/ai-providers/xai", map[string]any{
+		"brand":           "xai",
+		"api_key":         "created-xai-secret",
+		"base_url":        "https://api.x.ai/v1",
+		"weight":          0,
+		"models":          []map[string]any{{"name": "grok-4.5"}},
+		"headers":         []map[string]any{},
+		"excluded_models": []string{},
+	}, cookies, http.StatusOK)
+	if strings.Contains(string(createBody), "created-xai-secret") {
+		t.Fatalf("create response leaked xAI API key: %s", string(createBody))
+	}
+	created := aiProvidersTestResponse{}
+	if err := json.Unmarshal(createBody, &created); err != nil {
+		t.Fatalf("decode created xAI snapshot: %v", err)
+	}
+	if len(created.Providers) != 1 || created.Providers[0].Brand != "xai" {
+		t.Fatalf("created xAI providers = %#v", created.Providers)
+	}
+	if created.Providers[0].Weight == nil || *created.Providers[0].Weight != 0 {
+		t.Fatalf("created xAI weight = %#v, want explicit zero", created.Providers[0].Weight)
+	}
+
+	deletePath := fmt.Sprintf("/api/ai-providers/xai/0?identity_hash=%s", created.Providers[0].IdentityHash)
+	deleted := aiProvidersTestResponse{}
+	requestJSON(t, handler, http.MethodDelete, deletePath, nil, cookies, &deleted)
+	if len(deleted.Providers) != 0 || deleted.Summary.Total != 0 || deleted.Summary.XAI != 0 {
+		t.Fatalf("deleted xAI snapshot = %#v", deleted)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if got := len(fake.config["xai-api-key"].([]map[string]any)); got != 0 {
+		t.Fatalf("xAI providers length after delete = %d, want 0", got)
 	}
 }
 
@@ -2232,6 +3033,80 @@ func TestAIProviderCodexConnectivityUsesResponsesAPI(t *testing.T) {
 	}
 }
 
+func TestAIProviderXAIActionsUseModelsAndResponses(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+
+	provider := map[string]any{
+		"brand":      "xai",
+		"api_key":    "unsaved-xai-secret",
+		"auth_index": "attacker-auth-index",
+		"base_url":   "https://api.x.ai/v1",
+		"models":     []map[string]any{{"name": "grok-4.5"}},
+		"headers":    []map[string]any{{"name": "X-XAI-Test", "value": "yes"}},
+	}
+	discovery := aiProviderActionTestResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/ai-providers/discover-models", map[string]any{
+		"brand":    "xai",
+		"provider": provider,
+	}, cookies, &discovery)
+	if !discovery.OK || len(discovery.Models) != 1 || discovery.Models[0].Name != "gpt-test" {
+		t.Fatalf("xAI discovery response = %#v, want gpt-test", discovery)
+	}
+	connectivity := aiProviderActionTestResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/ai-providers/test", map[string]any{
+		"brand":    "xai",
+		"provider": provider,
+		"model":    "grok-4.5",
+		"message":  "ping xai",
+	}, cookies, &connectivity)
+	if !connectivity.OK || connectivity.Reply != "responses ok" {
+		t.Fatalf("xAI connectivity response = %#v, want Responses reply", connectivity)
+	}
+	encoded, err := json.Marshal([]aiProviderActionTestResponse{discovery, connectivity})
+	if err != nil {
+		t.Fatalf("marshal xAI action responses: %v", err)
+	}
+	if strings.Contains(string(encoded), "unsaved-xai-secret") {
+		t.Fatalf("xAI action response leaked submitted key: %s", string(encoded))
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.apiCallBodies) != 2 {
+		t.Fatalf("xAI api-call count = %d, want 2", len(fake.apiCallBodies))
+	}
+	discoveryBody := fake.apiCallBodies[0]
+	if discoveryBody["method"] != http.MethodGet || discoveryBody["url"] != "https://api.x.ai/v1/models" {
+		t.Fatalf("xAI discovery request = %#v, want /v1/models", discoveryBody)
+	}
+	testBody := fake.apiCallBodies[1]
+	if testBody["method"] != http.MethodPost || testBody["url"] != "https://api.x.ai/v1/responses" {
+		t.Fatalf("xAI connectivity request = %#v, want /v1/responses", testBody)
+	}
+	for index, body := range fake.apiCallBodies {
+		if body["auth_index"] != nil {
+			t.Fatalf("xAI api-call %d auth_index = %#v, want omitted for unsaved key", index, body["auth_index"])
+		}
+		header, ok := body["header"].(map[string]any)
+		if !ok || header["Authorization"] != "Bearer unsaved-xai-secret" || header["X-XAI-Test"] != "yes" {
+			t.Fatalf("xAI api-call %d headers = %#v", index, body["header"])
+		}
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(testBody["data"].(string)), &data); err != nil {
+		t.Fatalf("decode xAI Responses payload: %v", err)
+	}
+	if data["model"] != "grok-4.5" || data["input"] != "ping xai" {
+		t.Fatalf("xAI Responses payload = %#v", data)
+	}
+	if _, ok := data["messages"]; ok {
+		t.Fatalf("xAI Responses payload = %#v, want no chat messages", data)
+	}
+}
+
 func TestAIProviderActionRespectsSubmittedEmptyHeaders(t *testing.T) {
 	fake, server := newFakeAIProviderManagement(t)
 	defer server.Close()
@@ -2480,6 +3355,69 @@ func TestAIProviderVertexAPICallUsesVertexCompatibleShape(t *testing.T) {
 		if header["Authorization"] != nil {
 			t.Fatalf("api-call %d Authorization = %#v, want omitted for Vertex API key", index, header["Authorization"])
 		}
+	}
+}
+
+func firstAIProviderResponseModel(t *testing.T, body []byte) map[string]any {
+	t.Helper()
+	var response struct {
+		Providers []struct {
+			Models []map[string]any `json:"models"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatalf("decode AI provider response: %v", err)
+	}
+	if len(response.Providers) != 1 || len(response.Providers[0].Models) != 1 {
+		t.Fatalf("AI provider response models = %#v, want one provider with one model", response.Providers)
+	}
+	return response.Providers[0].Models[0]
+}
+
+func aiProviderResponseProviders(t *testing.T, body []byte) []map[string]any {
+	t.Helper()
+	var response struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatalf("decode AI provider response: %v", err)
+	}
+	if len(response.Providers) == 0 {
+		t.Fatalf("AI provider response providers = %#v, want at least one provider", response.Providers)
+	}
+	return response.Providers
+}
+
+func aiProviderResponseModelsByName(t *testing.T, body []byte) map[string]map[string]any {
+	t.Helper()
+	providers := aiProviderResponseProviders(t, body)
+	models, ok := providers[0]["models"].([]any)
+	if !ok {
+		t.Fatalf("AI provider response models = %#v, want array", providers[0]["models"])
+	}
+	result := make(map[string]map[string]any, len(models))
+	for _, value := range models {
+		model, ok := value.(map[string]any)
+		if !ok {
+			t.Fatalf("AI provider response model = %#v, want object", value)
+		}
+		name, ok := model["name"].(string)
+		if !ok {
+			t.Fatalf("AI provider response model name = %#v, want string", model["name"])
+		}
+		result[name] = model
+	}
+	return result
+}
+
+func assertAIProviderJSONField(t *testing.T, object map[string]any, key string, wantSet bool, wantValue any) {
+	t.Helper()
+	got, set := object[key]
+	if set != wantSet {
+		t.Fatalf("%s presence = %v, want %v in %#v", key, set, wantSet, object)
+	}
+	if wantSet && got != wantValue {
+		t.Fatalf("%s = %#v, want %#v in %#v", key, got, wantValue, object)
 	}
 }
 

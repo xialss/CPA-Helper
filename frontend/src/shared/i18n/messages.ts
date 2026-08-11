@@ -532,6 +532,8 @@ function channelBrandLabels(brand: string): readonly [zh: string, en: string] {
       return ['Claude', 'Claude']
     case 'vertex':
       return ['Vertex', 'Vertex']
+    case 'xai':
+      return ['xAI', 'xAI']
     case 'openai_compatibility':
       return ['OpenAI 兼容', 'OpenAI-compatible']
     default:

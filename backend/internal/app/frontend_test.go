@@ -175,12 +175,28 @@ func TestModelMonitorViewUsesIndependentSourceRefresh(t *testing.T) {
 		"getModelMonitorSource",
 		"updateModelMonitorSettings",
 		"const sourceStates = reactive<Record<string, ModelMonitorSourceViewState>>({})",
-		"async function refreshSource(id: string)",
-		"function refreshAllSources(): void",
+		"const refreshAllPending = ref(false)",
+		"let refreshAllQueued = false",
+		"refreshPromise: Promise<void> | null",
+		"function refreshSource(id: string): Promise<void>",
+		"const refresh = runSourceRefresh(id, state)",
+		"state.refreshPromise = refresh",
+		"return refresh",
+		"async function runSourceRefresh(id: string, state: ModelMonitorSourceViewState): Promise<void>",
+		"throw new Error(`Missing pending refresh promise for model monitor source ${id}`)",
+		"function refreshAllSources(trigger: 'manual' | 'configuration' = 'manual'): void",
+		"if (refreshAllPending.value) {",
+		"if (trigger === 'configuration') refreshAllQueued = true",
+		"refreshAllPending.value = true",
+		"void Promise.all(refreshes).finally(() => {",
+		"refreshAllPending.value = false",
+		"if (refreshAllQueued) {",
+		"refreshAllQueued = false",
+		"refreshAllSources('configuration')",
 		"async function loadModelMonitorSettings(): Promise<void>",
 		"const settings = await getModelMonitorSettings()",
 		"const source = await getModelMonitorSource(id)",
-		`@click="refreshAllSources"`,
+		`@click="refreshAllSources()"`,
 		`@click="refreshSource(slot.definition.id)"`,
 		"模型监控来源配置",
 		"enabled_source_ids:",
@@ -199,6 +215,8 @@ func TestModelMonitorViewUsesIndependentSourceRefresh(t *testing.T) {
 		"monitorReloadQueued",
 		"getModelMonitor()",
 		"loadMonitor(true)",
+		`:loading="refreshing"`,
+		"void refreshSource(id)",
 		"t('内置', 'Built-in')",
 		`<div v-else-if="source.services.length" class="service-list">`,
 		`<NCollapse v-else-if="source.groups.length" class="group-list">`,
@@ -210,7 +228,9 @@ func TestModelMonitorViewUsesIndependentSourceRefresh(t *testing.T) {
 	for _, expected := range []string{
 		"<NButton secondary @click=\"openSourceSettings\">",
 		"<NButton secondary @click=\"openProxySettings\">",
-		"<NButton secondary :loading=\"refreshing\"",
+		`:aria-busy="refreshAllPending"`,
+		`:disabled="settingsLoading || refreshAllPending || enabledSourceSlots.length === 0"`,
+		`:class="{ 'is-spinning': refreshAllPending }"`,
 		"arrow-placement=\"right\"",
 		".service-list + .group-list { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--cpa-border); }",
 		".group-services { display: grid; gap: 8px; padding: 2px 0 8px 30px; }",
@@ -231,14 +251,21 @@ func TestModelMonitorViewUsesIndependentSourceRefresh(t *testing.T) {
 		}
 	}
 	assertOrdered(
-		"per-source queue",
+		"per-source queue promise",
 		"if (state.pending) {",
 		"state.queued = true",
+		"if (!state.refreshPromise) {",
+		"throw new Error(`Missing pending refresh promise for model monitor source ${id}`)",
+		"return state.refreshPromise",
+	)
+	assertOrdered(
+		"per-source refresh completion",
 		"state.pending = true",
 		"const source = await getModelMonitorSource(id)",
 		"state.pending = false",
 		"if (state.queued && isSourceEnabled(id))",
-		"void refreshSource(id)",
+		"state.queued = false",
+		"await refreshSource(id)",
 	)
 	assertOrdered(
 		"source collection-error retention",
@@ -257,7 +284,35 @@ func TestModelMonitorViewUsesIndependentSourceRefresh(t *testing.T) {
 		"settings then fan-out",
 		"const settings = await getModelMonitorSettings()",
 		"applyModelMonitorSettings(settings)",
-		"refreshAllSources()",
+		"refreshAllSources('configuration')",
+	)
+	assertOrdered(
+		"configuration refresh queue",
+		"if (refreshAllPending.value) {",
+		"if (trigger === 'configuration') refreshAllQueued = true",
+		"void Promise.all(refreshes).finally(() => {",
+		"if (refreshAllQueued) {",
+		"refreshAllQueued = false",
+		"refreshAllSources('configuration')",
+	)
+	assertOrdered(
+		"refresh-all source completion",
+		"const refreshes = enabledSourceSlots.value.map((slot) => refreshSource(slot.definition.id))",
+		"void Promise.all(refreshes).finally(() => {",
+		"refreshAllPending.value = false",
+	)
+	assertOrdered(
+		"source-settings save refresh",
+		"const saved = await updateModelMonitorSettings(payload)",
+		"applyModelMonitorSettings(saved)",
+		"message.success(t('来源配置已保存', 'Source settings saved'))",
+		"refreshAllSources('configuration')",
+	)
+	assertOrdered(
+		"proxy-settings save refresh",
+		"const saved = await updateModelMonitorProxySettings(payload)",
+		"message.success(t('代理配置已保存', 'Proxy settings saved'))",
+		"refreshAllSources('configuration')",
 	)
 	assertOrdered(
 		"source-settings close bootstrap recovery",
@@ -280,4 +335,59 @@ func TestModelMonitorViewUsesIndependentSourceRefresh(t *testing.T) {
 		`<div v-if="source.services.length" class="service-list">`,
 		`<NCollapse v-if="source.groups.length" class="group-list" arrow-placement="right">`,
 	)
+}
+
+func TestAIProviderViewPreservesXAIIsCompatPresence(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "frontend", "src", "features", "ai-providers", "views", "AIProvidersView.vue")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(body)
+	for _, expected := range []string{
+		"is_compat_state: OptionalFieldState",
+		"Object.prototype.hasOwnProperty.call(model, 'is_compat')",
+		"is_compat_state: !hasIsCompat ? 'omitted' : model.is_compat === null ? 'null' : 'value'",
+		"model.is_compat_state = 'value'",
+		"if (model.is_compat_state === 'null')",
+		"payload.is_compat = null",
+		"else if (model.is_compat_state === 'value')",
+		"payload.is_compat = model.is_compat",
+	} {
+		if !strings.Contains(source, expected) {
+			t.Fatalf("AIProvidersView.vue missing xAI is-compat presence contract %q", expected)
+		}
+	}
+}
+
+func TestAIProviderViewPreservesXAIOptionalFieldPresence(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "frontend", "src", "features", "ai-providers", "views", "AIProvidersView.vue")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(body)
+	for _, expected := range []string{
+		"display_name_state: OptionalFieldState",
+		"max_context_length_state: OptionalFieldState",
+		"thinking_state: OptionalFieldState",
+		"weight_state: OptionalFieldState",
+		"websockets_state: OptionalFieldState",
+		"Object.prototype.hasOwnProperty.call(model, 'display_name')",
+		"Object.prototype.hasOwnProperty.call(model, 'max_context_length')",
+		"Object.prototype.hasOwnProperty.call(model, 'thinking')",
+		"Object.prototype.hasOwnProperty.call(provider, 'weight')",
+		"Object.prototype.hasOwnProperty.call(provider, 'websockets')",
+		"if (model.display_name_state === 'null')",
+		"if (model.max_context_length_state === 'null')",
+		"if (model.thinking_state === 'null')",
+		"if (draft.weight_state === 'null')",
+		"if (draft.websockets_state === 'null')",
+		"payload.weight = draft.weight",
+		"payload.websockets = draft.websockets",
+	} {
+		if !strings.Contains(source, expected) {
+			t.Fatalf("AIProvidersView.vue missing xAI optional-field presence contract %q", expected)
+		}
+	}
 }

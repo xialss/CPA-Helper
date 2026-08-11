@@ -685,8 +685,8 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 		if !isModelPriceChannelBrand(brand) {
 			return payload, validationError("渠道品牌无效")
 		}
-		if authType == modelPriceChannelAuthTypeOAuth && aiProviderBrand(brand) == aiProviderBrandOpenAICompatibility {
-			return payload, validationError("OpenAI 兼容渠道不支持 OAuth 账号池计费")
+		if authType == modelPriceChannelAuthTypeOAuth && (aiProviderBrand(brand) == aiProviderBrandOpenAICompatibility || aiProviderBrand(brand) == aiProviderBrandXAI) {
+			return payload, validationError(modelPriceChannelBrandLabel(aiProviderBrand(brand)) + " 渠道不支持 OAuth 账号池计费")
 		}
 		key := canonicalModelPriceChannelKey(brand, aiProviderOptionalString(payload.ChannelKey))
 		if key == "" || strings.ContainsRune(key, '\x00') {
@@ -783,7 +783,7 @@ func modelPriceChannelAuthType(price ModelPrice) string {
 
 func isModelPriceChannelBrand(brand string) bool {
 	switch aiProviderBrand(brand) {
-	case aiProviderBrandGemini, aiProviderBrandCodex, aiProviderBrandClaude, aiProviderBrandOpenAICompatibility, aiProviderBrandVertex:
+	case aiProviderBrandGemini, aiProviderBrandCodex, aiProviderBrandClaude, aiProviderBrandOpenAICompatibility, aiProviderBrandVertex, aiProviderBrandXAI:
 		return true
 	default:
 		return false
@@ -1476,7 +1476,7 @@ func modelPriceOAuthFileList(raw any) ([]map[string]any, bool) {
 func modelPriceOAuthBrand(file map[string]any) (aiProviderBrand, bool) {
 	value := strings.ToLower(strings.TrimSpace(modelPriceString(file, "provider", "type")))
 	for _, config := range aiProviderBrandConfigs {
-		if config.Brand == aiProviderBrandOpenAICompatibility {
+		if config.Brand == aiProviderBrandOpenAICompatibility || config.Brand == aiProviderBrandXAI {
 			continue
 		}
 		if aiProviderUsageLabelsEqual(value, string(config.Brand)) || aiProviderUsageLabelsEqual(value, config.ConfigKey) || aiProviderUsageLabelsEqual(value, config.Label) {
@@ -1608,6 +1608,8 @@ func modelPriceChannelBrandLabel(brand aiProviderBrand) string {
 		return "Claude"
 	case aiProviderBrandVertex:
 		return "Vertex"
+	case aiProviderBrandXAI:
+		return "xAI"
 	case aiProviderBrandOpenAICompatibility:
 		return "OpenAI 兼容"
 	default:
@@ -1743,6 +1745,8 @@ func suggestedPriceProviderForChannel(brand aiProviderBrand, channelLabel, model
 		return string(aiProviderBrandCodex)
 	case aiProviderBrandClaude:
 		return string(aiProviderBrandClaude)
+	case aiProviderBrandXAI:
+		return string(aiProviderBrandXAI)
 	case aiProviderBrandOpenAICompatibility:
 		if index := strings.Index(model, "/"); index > 0 {
 			return strings.TrimSpace(model[:index])
@@ -2237,6 +2241,9 @@ func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload
 	}
 	if err := validateManualPriceBillingUnit(payload); err != nil {
 		return ModelPrice{}, err
+	}
+	if payload.BillingUnit == modelBillingUnitRequest && payload.PreserveInvalidLongContext != nil && *payload.PreserveInvalidLongContext {
+		return ModelPrice{}, validationError("按次计费模型不支持保留历史部分长上下文字段")
 	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {

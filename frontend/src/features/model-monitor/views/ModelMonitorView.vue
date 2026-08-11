@@ -82,6 +82,7 @@ interface ModelMonitorSourceViewState {
   loading: boolean
   pending: boolean
   queued: boolean
+  refreshPromise: Promise<void> | null
   generation: number
 }
 
@@ -128,7 +129,8 @@ const enabledSourceSlots = computed<ModelMonitorSourceSlot[]>(() => {
   }
   return slots
 })
-const refreshing = computed(() => enabledSourceSlots.value.some((slot) => slot.state.pending))
+const refreshAllPending = ref(false)
+let refreshAllQueued = false
 const totalCount = computed(() => enabledSourceSlots.value.length)
 const failedCount = computed(
   () =>
@@ -162,6 +164,7 @@ function createSourceViewState(): ModelMonitorSourceViewState {
     loading: false,
     pending: false,
     queued: false,
+    refreshPromise: null,
     generation: 0,
   }
 }
@@ -222,14 +225,23 @@ function sourceSlotHealthIcon(slot: ModelMonitorSourceSlot) {
   return sourceHealthIcon(slot.state.source)
 }
 
-async function refreshSource(id: string): Promise<void> {
+function refreshSource(id: string): Promise<void> {
   const state = sourceStates[id]
-  if (!state || !isSourceEnabled(id)) return
+  if (!state || !isSourceEnabled(id)) return Promise.resolve()
   if (state.pending) {
     state.queued = true
-    return
+    if (!state.refreshPromise) {
+      throw new Error(`Missing pending refresh promise for model monitor source ${id}`)
+    }
+    return state.refreshPromise
   }
 
+  const refresh = runSourceRefresh(id, state)
+  state.refreshPromise = refresh
+  return refresh
+}
+
+async function runSourceRefresh(id: string, state: ModelMonitorSourceViewState): Promise<void> {
   state.pending = true
   state.loading = true
   state.error = null
@@ -267,16 +279,29 @@ async function refreshSource(id: string): Promise<void> {
       state.loading = false
       if (state.queued && isSourceEnabled(id)) {
         state.queued = false
-        void refreshSource(id)
+        await refreshSource(id)
       }
     }
   }
 }
 
-function refreshAllSources(): void {
-  for (const slot of enabledSourceSlots.value) {
-    void refreshSource(slot.definition.id)
+function refreshAllSources(trigger: 'manual' | 'configuration' = 'manual'): void {
+  if (refreshAllPending.value) {
+    if (trigger === 'configuration') refreshAllQueued = true
+    return
   }
+
+  // Keep Refresh All available during a manual source refresh so that source
+  // can queue once while the other sources begin immediately.
+  refreshAllPending.value = true
+  const refreshes = enabledSourceSlots.value.map((slot) => refreshSource(slot.definition.id))
+  void Promise.all(refreshes).finally(() => {
+    refreshAllPending.value = false
+    if (refreshAllQueued) {
+      refreshAllQueued = false
+      refreshAllSources('configuration')
+    }
+  })
 }
 
 async function loadModelMonitorSettings(): Promise<void> {
@@ -287,7 +312,7 @@ async function loadModelMonitorSettings(): Promise<void> {
     const settings = await getModelMonitorSettings()
     if (requestGeneration !== modelMonitorSettingsRequestGeneration) return
     applyModelMonitorSettings(settings)
-    refreshAllSources()
+    refreshAllSources('configuration')
   } catch (error) {
     if (requestGeneration !== modelMonitorSettingsRequestGeneration) return
     const localizedError = errorText(error, '加载模型监控配置失败', 'Failed to load model monitoring settings')
@@ -318,7 +343,7 @@ async function openSourceSettings(): Promise<void> {
     sourceSettingsDraft.value = cloneSourceSettings(settings.sources)
     sourceSettingsLoadSucceeded.value = true
     settingsLoading.value = false
-    if (settingsChanged) refreshAllSources()
+    if (settingsChanged) refreshAllSources('configuration')
   } catch (error) {
     if (generation !== sourceSettingsModalGeneration || !sourceSettingsModalOpen.value) return
     const localizedError = errorText(error, '加载来源配置失败', 'Failed to load source settings')
@@ -393,7 +418,7 @@ async function saveSourceSettings(): Promise<void> {
     applyModelMonitorSettings(saved)
     sourceSettingsModalOpen.value = false
     message.success(t('来源配置已保存', 'Source settings saved'))
-    refreshAllSources()
+    refreshAllSources('configuration')
   } catch (error) {
     message.error(errorText(error, '保存来源配置失败', 'Failed to save source settings'))
   } finally {
@@ -440,7 +465,7 @@ async function saveProxySettings() {
     proxyForm.proxy_url = saved.proxy_url
     proxyModalOpen.value = false
     message.success(t('代理配置已保存', 'Proxy settings saved'))
-    refreshAllSources()
+    refreshAllSources('configuration')
   } catch (error) {
     message.error(errorText(error, '保存代理配置失败', 'Failed to save proxy settings'))
   } finally {
@@ -596,8 +621,13 @@ watch(sourceSettingsModalOpen, (open) => {
           <template #icon><NIcon><Settings2 /></NIcon></template>
           {{ t('代理配置', 'Proxy settings') }}
         </NButton>
-        <NButton secondary :loading="refreshing" :disabled="settingsLoading || enabledSourceSlots.length === 0" @click="refreshAllSources">
-          <template #icon><NIcon><RefreshCw /></NIcon></template>
+        <NButton
+          secondary
+          :aria-busy="refreshAllPending"
+          :disabled="settingsLoading || refreshAllPending || enabledSourceSlots.length === 0"
+          @click="refreshAllSources()"
+        >
+          <template #icon><NIcon class="refresh-all-icon" :class="{ 'is-spinning': refreshAllPending }"><RefreshCw /></NIcon></template>
           {{ t('刷新全部', 'Refresh all') }}
         </NButton>
       </NSpace>
@@ -942,6 +972,8 @@ watch(sourceSettingsModalOpen, (open) => {
 .source-title-row h2 { min-width: 0; margin: 0; overflow-wrap: anywhere; color: var(--cpa-text-strong); font-size: 19px; }
 .source-heading p { margin: 5px 0 0; color: var(--cpa-text-muted); font-size: 13px; }
 .source-actions { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; }
+.refresh-all-icon.is-spinning { animation: refresh-all-spin 0.9s linear infinite; }
+@keyframes refresh-all-spin { to { transform: rotate(360deg); } }
 .source-health { display: flex; align-items: center; gap: 8px; margin: 12px 0 10px; padding: 9px 11px; color: var(--source-health-color); border: 1px solid color-mix(in srgb, var(--source-health-color) 25%, var(--cpa-border)); border-radius: 7px; background: color-mix(in srgb, var(--source-health-color) 8%, var(--cpa-surface)); }
 .source-health strong { color: inherit; font-size: 14px; }
 .source-loading-placeholder { min-height: 72px; display: flex; align-items: center; justify-content: center; color: var(--cpa-text-muted); font-size: 13px; }
@@ -981,5 +1013,8 @@ watch(sourceSettingsModalOpen, (open) => {
   .source-actions { justify-content: space-between; }
   .group-services { padding-left: 18px; }
   .incident-row { flex-direction: column; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .refresh-all-icon.is-spinning { animation: none; }
 }
 </style>

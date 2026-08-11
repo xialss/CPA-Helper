@@ -4,6 +4,7 @@
 
 整理时间：2026-05-06
 源码基准：`router-for-me/CLIProxyAPI` commit `ed1458aa6d3430ba59538aeb980b8934f0e80c1f`
+xAI provider management 补充核验：2026-08-09，commit `2e6b1d83f6c304a102aa33c1faf0a4f94d0d331e`
 
 > 说明：这里聚焦运行时 HTTP 接口和 Redis-compatible usage queue。Go SDK 的嵌入式接口只做简要说明，具体 SDK 用法建议继续看上游仓库 `docs/sdk-*.md`。
 
@@ -330,6 +331,7 @@ curl -sS -X PUT http://127.0.0.1:8317/v0/management/usage-statistics-enabled \
 | `GET`, `PUT`, `PATCH`, `DELETE` | `/codex-api-key` | Codex/OpenAI API key 配置 |
 | `GET`, `PUT`, `PATCH`, `DELETE` | `/openai-compatibility` | OpenAI-compatible provider 配置 |
 | `GET`, `PUT`, `PATCH`, `DELETE` | `/vertex-api-key` | Vertex-compatible key 配置 |
+| `GET`, `PUT`, `PATCH`, `DELETE` | `/xai-api-key` | xAI API key 配置 |
 | `GET`, `PUT`, `PATCH`, `DELETE` | `/oauth-excluded-models` | OAuth provider 排除模型 |
 | `GET`, `PUT`, `PATCH`, `DELETE` | `/oauth-model-alias` | OAuth provider 模型 alias |
 

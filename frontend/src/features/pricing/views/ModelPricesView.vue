@@ -298,6 +298,8 @@ function channelBrandLabel(brand: string | null): string {
       return 'Claude'
     case 'vertex':
       return 'Vertex'
+    case 'xai':
+      return 'xAI'
     case 'openai_compatibility':
       return t('OpenAI 兼容', 'OpenAI-compatible')
     default:
