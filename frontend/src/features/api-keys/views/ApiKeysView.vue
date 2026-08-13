@@ -79,7 +79,7 @@ const requestTestError = ref<string | null>(null)
 const isAvailableModelsLoading = ref(false)
 const isRequestTesting = ref(false)
 const editingApiKeyHash = ref<string | null>(null)
-const apiKeyDescription = ref('VSCode')
+const apiKeyDescription = ref('Default')
 const generatedApiKey = ref<string | null>(null)
 const generatedApiKeyHash = ref<string | null>(null)
 const visibleApiKeyHashes = ref<Set<string>>(new Set())
@@ -510,7 +510,7 @@ function openCreateDialog() {
     return
   }
   editingApiKeyHash.value = null
-  apiKeyDescription.value = 'VSCode'
+  apiKeyDescription.value = 'Default'
   generatedApiKey.value = null
   generatedApiKeyHash.value = null
   editorVisible.value = true
