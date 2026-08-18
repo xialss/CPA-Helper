@@ -71,6 +71,14 @@ interface MetricCardConfig {
   footnote: string
 }
 
+interface RealtimeMinuteSummaries {
+  current: UsageSummary | null
+  previous: UsageSummary | null
+  currentFailed: boolean
+  previousFailed: boolean
+  firstFailure: unknown | null
+}
+
 interface DistributionLegendItem {
   key: string
   label: string
@@ -113,7 +121,7 @@ const AUTO_REFRESH_INTERVAL_MS = 5000
 const AUXILIARY_REFRESH_INTERVAL_MS = 60 * 1000
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
-const THIRTY_MINUTES_MS = 30 * 60 * 1000
+const MINUTE_MS = 60 * 1000
 const ALL_USAGE_START_PARAM = '0001-01-01T00:00:00+08:00'
 const ALL_USAGE_END_PARAM = '9999-12-31T23:59:59+08:00'
 const DISTRIBUTION_CHART_COLORS = [
@@ -139,6 +147,9 @@ const filtersExpanded = ref(false)
 const summary = ref<UsageSummary | null>(null)
 const quotaStatus = ref<UserQuotaStatus | null>(null)
 const realtimeSummary = ref<UsageSummary | null>(null)
+const previousRealtimeSummary = ref<UsageSummary | null>(null)
+const realtimeSummaryFailed = ref(false)
+const previousRealtimeSummaryFailed = ref(false)
 const todayTrends = ref<TrendPoint[]>([])
 const failedSummary = ref<UsageSummary | null>(null)
 const failedTrends = ref<TrendPoint[]>([])
@@ -215,9 +226,62 @@ function todayRange(): [number, number] {
   return [start.getTime(), tomorrow.getTime()]
 }
 
-function rollingRange(durationMs: number): [number, number] {
-  const end = Date.now()
+function rollingRange(durationMs: number, end = Date.now()): [number, number] {
   return [end - durationMs, end]
+}
+
+function realtimeMinuteRanges(anchor = Date.now()): {
+  current: [number, number]
+  previous: [number, number]
+} {
+  const current = rollingRange(MINUTE_MS, anchor)
+  return {
+    current,
+    previous: rollingRange(MINUTE_MS, current[0]),
+  }
+}
+
+async function getRealtimeMinuteSummaries(filters: UsageFilters): Promise<RealtimeMinuteSummaries> {
+  const ranges = realtimeMinuteRanges()
+  const [currentResult, previousResult] = await Promise.allSettled([
+    getUsageSummary({
+      ...filters,
+      start: formatLocalDateTimeParam(ranges.current[0]),
+      end: formatLocalDateTimeParam(ranges.current[1]),
+    }),
+    getUsageSummary({
+      ...filters,
+      start: formatLocalDateTimeParam(ranges.previous[0]),
+      end: formatLocalDateTimeParam(ranges.previous[1]),
+    }),
+  ])
+  const currentFailed = currentResult.status === 'rejected'
+  const previousFailed = previousResult.status === 'rejected'
+  return {
+    current: currentResult.status === 'fulfilled' ? currentResult.value : null,
+    previous: previousResult.status === 'fulfilled' ? previousResult.value : null,
+    currentFailed,
+    previousFailed,
+    firstFailure: currentFailed
+      ? currentResult.reason
+      : previousFailed
+        ? previousResult.reason
+        : null,
+  }
+}
+
+function applyRealtimeMinuteSummaries(nextSummaries: RealtimeMinuteSummaries) {
+  realtimeSummary.value = nextSummaries.current
+  previousRealtimeSummary.value = nextSummaries.previous
+  realtimeSummaryFailed.value = nextSummaries.currentFailed
+  previousRealtimeSummaryFailed.value = nextSummaries.previousFailed
+}
+
+function clearRealtimeMinuteSummaries() {
+  realtimeSummary.value = null
+  previousRealtimeSummary.value = null
+  realtimeSummaryFailed.value = false
+  previousRealtimeSummaryFailed.value = false
 }
 
 function isTodayRange(range: [number, number] | null): boolean {
@@ -414,10 +478,6 @@ const dashboardRangeLabel = computed(() => {
   return `${formatMetricRangeTime(range[0])} - ${formatMetricRangeTime(range[1])}`
 })
 
-const rateRangeLabel = computed(() =>
-  activeQuickRange.value === 'today' ? t('近 30 分钟', 'Last 30 minutes') : dashboardRangeLabel.value,
-)
-
 function formatMetricRangeTime(value: number): string {
   return new Intl.DateTimeFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
     timeZone: BEIJING_TIME_ZONE,
@@ -589,7 +649,6 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
     const filters = buildFilters()
     const usedServerDefaultRange = filters.start === undefined && filters.end === undefined
     const [todayStart, todayEnd] = todayRange()
-    const [realtimeStart, realtimeEnd] = rollingRange(THIRTY_MINUTES_MS)
     const todayFilters: UsageFilters = {
       ...filters,
       start: formatLocalDateTimeParam(todayStart),
@@ -668,27 +727,16 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
     }
 
     if (includeRealtime) {
-      try {
-        const nextRealtimeSummary = await getUsageSummary(
-          {
-            ...filters,
-            start: formatLocalDateTimeParam(realtimeStart),
-            end: formatLocalDateTimeParam(realtimeEnd),
-          },
-        )
-        if (refreshId !== refreshVersion) {
-          return
-        }
-        realtimeSummary.value = nextRealtimeSummary
-      } catch {
-        if (refreshId !== refreshVersion) {
-          return
-        }
-        realtimeSummary.value = null
+      const nextRealtimeSummaries = await getRealtimeMinuteSummaries(filters)
+      if (refreshId !== refreshVersion) {
+        return
+      }
+      applyRealtimeMinuteSummaries(nextRealtimeSummaries)
+      if (nextRealtimeSummaries.currentFailed || nextRealtimeSummaries.previousFailed) {
         auxiliaryFailed = true
       }
     } else {
-      realtimeSummary.value = null
+      clearRealtimeMinuteSummaries()
     }
 
     if (isAccountScope.value) {
@@ -780,30 +828,20 @@ async function refreshSummary() {
 
     let realtimeError: string | null = null
     if (includeRealtime) {
-      const [realtimeStart, realtimeEnd] = rollingRange(THIRTY_MINUTES_MS)
-      try {
-        const nextRealtimeSummary = await getUsageSummary({
-          ...filters,
-          start: formatLocalDateTimeParam(realtimeStart),
-          end: formatLocalDateTimeParam(realtimeEnd),
-        })
-        if (refreshId !== refreshVersion) {
-          return
-        }
-        realtimeSummary.value = nextRealtimeSummary
-      } catch (error) {
-        if (refreshId !== refreshVersion) {
-          return
-        }
-        realtimeSummary.value = null
+      const nextRealtimeSummaries = await getRealtimeMinuteSummaries(filters)
+      if (refreshId !== refreshVersion) {
+        return
+      }
+      applyRealtimeMinuteSummaries(nextRealtimeSummaries)
+      if (nextRealtimeSummaries.currentFailed || nextRealtimeSummaries.previousFailed) {
         realtimeError = errorText(
-          error,
+          nextRealtimeSummaries.firstFailure,
           '刷新近实时用量失败',
           'Failed to refresh near-real-time usage',
         )
       }
     } else {
-      realtimeSummary.value = null
+      clearRealtimeMinuteSummaries()
     }
 
     autoRefreshError.value = realtimeError
@@ -967,13 +1005,36 @@ const failedRate = computed(() => {
   return currentSummary.failed_records / currentSummary.total_records
 })
 
-const rateSummary = computed(() =>
-  activeQuickRange.value === 'today' && realtimeSummary.value ? realtimeSummary.value : summary.value,
-)
-
-const requestsPerMinute = computed(() => {
-  const currentSummary = rateSummary.value
+const requestsPerMinute = computed<number | null>(() => {
+  if (activeQuickRange.value === 'today') {
+    return realtimeSummary.value?.total_records ?? null
+  }
+  const currentSummary = summary.value
   return (currentSummary?.total_records ?? 0) / summaryDurationMinutes(currentSummary)
+})
+
+const requestsPerMinuteText = computed(() => {
+  const rate = requestsPerMinute.value
+  if (rate !== null) {
+    return formatRate(rate)
+  }
+  return realtimeSummaryFailed.value ? t('不可用', 'Unavailable') : t('加载中', 'Loading')
+})
+
+const requestsPerMinuteFootnote = computed(() => {
+  if (activeQuickRange.value !== 'today') {
+    return dashboardRangeLabel.value
+  }
+  const previousRequestsPerMinute = previousRealtimeSummary.value?.total_records
+  if (previousRequestsPerMinute === undefined) {
+    return previousRealtimeSummaryFailed.value
+      ? t('上一分钟不可用', 'Previous minute unavailable')
+      : t('上一分钟加载中', 'Previous minute loading')
+  }
+  return t(
+    `上一分钟 ${formatRate(previousRequestsPerMinute)} RPM`,
+    `Previous minute ${formatRate(previousRequestsPerMinute)} RPM`,
+  )
 })
 
 function quotaValueText(quota: UserQuotaStatus | null): string {
@@ -1057,10 +1118,10 @@ const metricCards = computed<MetricCardConfig[]>(() => {
     {
       key: 'rpm',
       label: 'RPM',
-      value: formatRate(requestsPerMinute.value),
+      value: requestsPerMinuteText.value,
       icon: Gauge,
       tone: 'orange',
-      footnote: rateRangeLabel.value,
+      footnote: requestsPerMinuteFootnote.value,
     },
     {
       key: 'average_ttft',
@@ -3230,5 +3291,18 @@ onBeforeUnmount(() => {
     overflow: visible;
   }
 
+}
+
+@media (max-width: 360px) {
+  .dashboard-metric-card {
+    min-height: 106px;
+  }
+
+  .usage-metric-footnote {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
 }
 </style>
