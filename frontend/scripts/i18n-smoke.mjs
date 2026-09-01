@@ -73,6 +73,54 @@ try {
     timeStyle: 'short',
   })
 
+  const { minuteHistoryStripItems } = await server.ssrLoadModule(
+    '/src/features/model-monitor/utils/historyStrip.ts',
+  )
+  const minuteSamples = [
+    { timestamp: '2026-08-31T12:00:00Z' },
+    { timestamp: '2026-08-31T12:01:00Z' },
+    { timestamp: '2026-08-31T12:01:00Z' },
+  ]
+  const paddedMinuteItems = minuteHistoryStripItems(minuteSamples, 'minute')
+  assert.equal(paddedMinuteItems.length, 60)
+  assert.ok(paddedMinuteItems.slice(0, 57).every((item) => item.sample === null))
+  assert.deepEqual(
+    paddedMinuteItems.slice(-3).map((item) => item.sample),
+    minuteSamples,
+  )
+  assert.equal(new Set(paddedMinuteItems.map((item) => item.key)).size, 60)
+  assert.notEqual(paddedMinuteItems[58].key, paddedMinuteItems[59].key)
+
+  const fullMinuteSamples = Array.from(
+    { length: 60 },
+    (_, index) => ({ timestamp: new Date(Date.UTC(2026, 7, 31, 12, index)).toISOString() }),
+  )
+  const fullMinuteItems = minuteHistoryStripItems(fullMinuteSamples, 'minute')
+  assert.equal(fullMinuteItems.length, 60)
+  assert.ok(fullMinuteItems.every((item) => item.sample !== null))
+  assert.deepEqual(
+    fullMinuteItems.map((item) => item.sample),
+    fullMinuteSamples,
+  )
+
+  const overflowMinuteSamples = [
+    ...fullMinuteSamples,
+    { timestamp: '2026-08-31T13:00:00.000Z' },
+  ]
+  const overflowMinuteItems = minuteHistoryStripItems(overflowMinuteSamples, 'minute')
+  assert.equal(overflowMinuteItems.length, overflowMinuteSamples.length)
+  assert.deepEqual(
+    overflowMinuteItems.map((item) => item.sample),
+    overflowMinuteSamples,
+  )
+
+  const dayItems = minuteHistoryStripItems(minuteSamples, 'day')
+  assert.equal(dayItems.length, minuteSamples.length)
+  assert.deepEqual(
+    dayItems.map((item) => item.sample),
+    minuteSamples,
+  )
+
   const { usageRecordsLatestRange, usageRecordsRetentionStart } = await server.ssrLoadModule(
     '/src/features/usage/recordsRetention.ts',
   )

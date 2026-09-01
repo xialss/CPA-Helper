@@ -47,6 +47,7 @@ import {
   modelMonitorSampleTimeFormatOptions,
   modelMonitorTimestampFormatOptions,
 } from '@/features/model-monitor/utils/timeFormat'
+import { minuteHistoryStripItems } from '@/features/model-monitor/utils/historyStrip'
 import { useI18n } from '@/shared/i18n'
 import type {
   ModelMonitorBuiltInSource,
@@ -75,6 +76,7 @@ const modelMonitorTooltipThemeOverrides = {
 }
 const message = useMessage()
 const { errorText, language, serverText, t } = useI18n()
+const noUpstreamSampleLabel = computed(() => t('暂无上游样本', 'No upstream sample'))
 
 interface ModelMonitorSourceViewState {
   source: ModelMonitorSourceStatus | null
@@ -710,7 +712,21 @@ watch(sourceSettingsModalOpen, (open) => {
                         <span v-if="service.last_latency_ms !== null" class="service-stat">{{ Math.round(service.last_latency_ms) }} ms</span>
                       </div>
                       <NAlert v-if="service.last_error" type="error" :show-icon="false" class="last-error">{{ service.last_error }}</NAlert>
-                      <div v-if="service.samples.length" class="sample-strip" :class="`is-${source.history_granularity}`">
+                      <div v-if="service.samples.length && source.history_granularity === 'minute'" class="sample-strip is-minute">
+                        <template v-for="item in minuteHistoryStripItems(service.samples, source.history_granularity)" :key="item.key">
+                          <NTooltip v-if="item.sample" trigger="hover" :theme-overrides="modelMonitorTooltipThemeOverrides">
+                            <template #trigger><span class="sample-bar" :class="`is-${item.sample.status}`" role="img" :aria-label="sampleTooltip(item.sample, source)" /></template>
+                            <div class="sample-tooltip-content">
+                              <span v-for="(line, lineIndex) in sampleTooltipLines(item.sample, source)" :key="lineIndex">{{ line }}</span>
+                            </div>
+                          </NTooltip>
+                          <NTooltip v-else trigger="hover" :theme-overrides="modelMonitorTooltipThemeOverrides">
+                            <template #trigger><span class="sample-bar is-empty" role="img" :aria-label="noUpstreamSampleLabel" /></template>
+                            {{ noUpstreamSampleLabel }}
+                          </NTooltip>
+                        </template>
+                      </div>
+                      <div v-else-if="service.samples.length" class="sample-strip" :class="`is-${source.history_granularity}`">
                         <NTooltip v-for="(sample, sampleIndex) in service.samples" :key="`${sample.timestamp}-${sampleIndex}`" trigger="hover" :theme-overrides="modelMonitorTooltipThemeOverrides">
                           <template #trigger><span class="sample-bar" :class="`is-${sample.status}`" role="img" :aria-label="sampleTooltip(sample, source)" /></template>
                           <div class="sample-tooltip-content">
@@ -998,6 +1014,7 @@ watch(sourceSettingsModalOpen, (open) => {
 .sample-bar.is-degraded_performance, .sample-bar.is-maintenance { background: var(--cpa-warning); }
 .sample-bar.is-partial_outage { background: var(--cpa-accent-orange); }
 .sample-bar.is-major_outage { background: var(--cpa-danger); }
+.sample-bar.is-empty { background: var(--cpa-border-strong); }
 .incidents { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--cpa-border); }
 .incidents h3 { margin: 0 0 10px; color: var(--cpa-text-strong); font-size: 14px; }
 .incident-row { display: flex; justify-content: space-between; gap: 12px; padding: 9px 0; color: inherit; text-decoration: none; border-top: 1px solid var(--cpa-border); }
