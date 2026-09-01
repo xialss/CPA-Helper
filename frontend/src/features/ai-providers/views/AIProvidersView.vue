@@ -28,6 +28,8 @@ import {
 import {
   Bot,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Edit3,
   FlaskConical,
   Plus,
@@ -44,9 +46,11 @@ import {
   deleteAIProvider,
   discoverAIProviderModels,
   listAIProviders,
+  reorderAIProviders,
   testAIProvider,
   updateAIProvider,
 } from '@/features/ai-providers/api/aiProvidersApi'
+import { isApiRequestError } from '@/shared/api/apiClient'
 import { useI18n } from '@/shared/i18n'
 import type {
   AIProviderActionResponse,
@@ -54,12 +58,15 @@ import type {
   AIProviderHeader,
   AIProviderItem,
   AIProviderModel,
+  AIProviderOrderItem,
   AIProviderRecentRequestBucket,
   AIProviderSummary,
 } from '@/shared/types/api'
 import { formatInteger } from '@/shared/utils/format'
 
 type ProviderEnabledFilter = 'all' | 'enabled' | 'disabled'
+
+type ProviderMutationKind = 'save' | 'delete' | 'toggle' | 'reorder'
 
 type DiscoveryModelStatus = 'existing' | 'new' | 'conflict'
 
@@ -215,6 +222,10 @@ const form = ref<ProviderDraft>(defaultDraft('gemini'))
 const originalFormText = ref('')
 const originalDisabled = ref(false)
 const isSaving = ref(false)
+const reorderingProviderKey = ref<string | null>(null)
+const reorderingDirection = ref<-1 | 1 | null>(null)
+const providerSnapshotGeneration = ref(0)
+const providerMutation = ref<ProviderMutationKind | null>(null)
 const isDiscovering = ref(false)
 const isTesting = ref(false)
 const discoveredModels = ref<AIProviderModel[]>([])
@@ -264,11 +275,18 @@ const tableRows = computed(() => {
       .includes(keyword)
   })
 })
+const isProviderMutationPending = computed(() => providerMutation.value !== null)
+const providerWriteControlsDisabled = computed(() => isLoading.value || isProviderMutationPending.value)
+const reorderControlsDisabled = computed(
+  () => providerWriteControlsDisabled.value || search.value.trim() !== '' || enabledFilter.value !== 'all',
+)
 const drawerTitle = computed(() =>
   editorMode.value === 'edit' ? t('编辑 AI 提供商', 'Edit AI provider') : t('新建 AI 提供商', 'New AI provider'),
 )
 const formDirty = computed(() => JSON.stringify(form.value) !== originalFormText.value)
-const canSave = computed(() => !isSaving.value && (editorMode.value === 'create' || formDirty.value))
+const canSave = computed(
+  () => !isSaving.value && !providerWriteControlsDisabled.value && (editorMode.value === 'create' || formDirty.value),
+)
 
 function brandConfig(brand: AIProviderBrand): BrandConfig {
   const found = providerBrands.find((item) => item.brand === brand)
@@ -402,28 +420,63 @@ function providerToDraft(provider: AIProviderItem): ProviderDraft {
   }
 }
 
-function setSnapshot(next: { providers: AIProviderItem[]; summary: AIProviderSummary; usage_error?: string | null }) {
+function beginProviderMutation(kind: ProviderMutationKind): number | null {
+  if (isLoading.value || isProviderMutationPending.value) {
+    return null
+  }
+  providerMutation.value = kind
+  providerSnapshotGeneration.value += 1
+  return providerSnapshotGeneration.value
+}
+
+function finishProviderMutation(generation: number): void {
+  if (providerSnapshotGeneration.value === generation) {
+    providerMutation.value = null
+  }
+}
+
+function setSnapshot(
+  next: { providers: AIProviderItem[]; summary: AIProviderSummary; usage_error?: string | null },
+  generation: number,
+): boolean {
+  if (generation !== providerSnapshotGeneration.value) {
+    return false
+  }
   providers.value = next.providers
   summary.value = next.summary
   usageError.value = next.usage_error ?? null
   loadError.value = null
+  return true
 }
 
 async function refresh() {
+  if (isProviderMutationPending.value) {
+    return
+  }
+  const generation = providerSnapshotGeneration.value + 1
+  providerSnapshotGeneration.value = generation
   isLoading.value = true
   loadError.value = null
   try {
-    setSnapshot(await listAIProviders())
+    setSnapshot(await listAIProviders(), generation)
   } catch (error) {
+    if (generation !== providerSnapshotGeneration.value) {
+      return
+    }
     providers.value = []
     summary.value = { ...emptySummary }
     loadError.value = errorText(error, '加载 AI 提供商失败', 'Failed to load AI providers')
   } finally {
-    isLoading.value = false
+    if (generation === providerSnapshotGeneration.value) {
+      isLoading.value = false
+    }
   }
 }
 
 function openCreateDialog() {
+  if (providerWriteControlsDisabled.value) {
+    return
+  }
   editorMode.value = 'create'
   form.value = defaultDraft(activeBrand.value)
   originalFormText.value = JSON.stringify(form.value)
@@ -437,6 +490,9 @@ function openCreateDialog() {
 }
 
 function openEditDialog(provider: AIProviderItem) {
+  if (providerWriteControlsDisabled.value) {
+    return
+  }
   editorMode.value = 'edit'
   form.value = providerToDraft(provider)
   originalFormText.value = JSON.stringify(form.value)
@@ -743,19 +799,25 @@ async function saveProvider() {
 }
 
 async function persistProvider(payload: AIProviderItem) {
+  const generation = beginProviderMutation('save')
+  if (generation === null) {
+    return
+  }
   isSaving.value = true
   try {
     const response =
       editorMode.value === 'edit'
         ? await updateAIProvider(payload)
         : await createAIProvider(payload.brand, payload)
-    setSnapshot(response)
-    message.success(editorMode.value === 'edit' ? t('AI provider 已保存', 'AI provider saved') : t('AI provider 已创建', 'AI provider created'))
-    drawerOpen.value = false
+    if (setSnapshot(response, generation)) {
+      message.success(editorMode.value === 'edit' ? t('AI provider 已保存', 'AI provider saved') : t('AI provider 已创建', 'AI provider created'))
+      drawerOpen.value = false
+    }
   } catch (error) {
     message.error(errorText(error, '保存 AI provider 失败', 'Failed to save AI provider'))
   } finally {
     isSaving.value = false
+    finishProviderMutation(generation)
   }
 }
 
@@ -778,6 +840,9 @@ function confirmDisableProvider(provider: AIProviderItem, onConfirm: () => void)
 }
 
 function confirmDelete(provider: AIProviderItem) {
+  if (providerWriteControlsDisabled.value) {
+    return
+  }
   const identity = providerIdentityLabel(provider)
   dialog.warning({
     title: t('删除 AI provider', 'Delete AI provider'),
@@ -787,18 +852,31 @@ function confirmDelete(provider: AIProviderItem) {
     ),
     positiveText: t('删除', 'Delete'),
     negativeText: t('取消', 'Cancel'),
-    onPositiveClick: async () => {
-      try {
-        setSnapshot(await deleteAIProvider(provider))
-        message.success(t('AI provider 已删除', 'AI provider deleted'))
-      } catch (error) {
-        message.error(errorText(error, '删除 AI provider 失败', 'Failed to delete AI provider'))
-      }
-    },
+    onPositiveClick: () => deleteProvider(provider),
   })
 }
 
+async function deleteProvider(provider: AIProviderItem): Promise<void> {
+  const generation = beginProviderMutation('delete')
+  if (generation === null) {
+    return
+  }
+  try {
+    const response = await deleteAIProvider(provider)
+    if (setSnapshot(response, generation)) {
+      message.success(t('AI provider 已删除', 'AI provider deleted'))
+    }
+  } catch (error) {
+    message.error(errorText(error, '删除 AI provider 失败', 'Failed to delete AI provider'))
+  } finally {
+    finishProviderMutation(generation)
+  }
+}
+
 async function toggleProviderDisabled(provider: AIProviderItem) {
+  if (providerWriteControlsDisabled.value) {
+    return
+  }
   const draft = providerToDraft(provider)
   draft.disabled = !draft.disabled
   let payload: AIProviderItem
@@ -809,11 +887,19 @@ async function toggleProviderDisabled(provider: AIProviderItem) {
     return
   }
   const execute = async () => {
+    const generation = beginProviderMutation('toggle')
+    if (generation === null) {
+      return
+    }
     try {
-      setSnapshot(await updateAIProvider(payload))
-      message.success(draft.disabled ? t('Provider 已禁用', 'Provider disabled') : t('Provider 已启用', 'Provider enabled'))
+      const response = await updateAIProvider(payload)
+      if (setSnapshot(response, generation)) {
+        message.success(draft.disabled ? t('Provider 已禁用', 'Provider disabled') : t('Provider 已启用', 'Provider enabled'))
+      }
     } catch (error) {
       message.error(errorText(error, '更新启用状态失败', 'Failed to update enabled state'))
+    } finally {
+      finishProviderMutation(generation)
     }
   }
   if (draft.disabled) {
@@ -1453,7 +1539,120 @@ function providerTableRowProps(row: AIProviderItem) {
   }
 }
 
-const columns = computed<DataTableColumns<AIProviderItem>>(() => [
+function providerRowSelector(row: AIProviderItem): string {
+  const selector = [row.identity_hash, row.api_key_hash, row.auth_index, row.name, row.base_url].map((value) =>
+    typeof value === 'string' ? value.trim() : '',
+  )
+  if (!selector.some((value) => value !== '')) {
+    return ''
+  }
+  return `${row.brand}:${JSON.stringify(selector)}`
+}
+
+function providerRowKey(row: AIProviderItem): string {
+  const selector = providerRowSelector(row)
+  if (!selector) {
+    return `${row.brand}:index:${row.index}`
+  }
+  // Stable selectors keep the key attached to the provider as its remote
+  // position changes. Only duplicate selector tuples fall back to the index;
+  // the backend rejects those as ambiguous when no additional selector is
+  // supplied, but the table still needs a unique key while displaying them.
+  const duplicate = providers.value.some((candidate) => candidate !== row && providerRowSelector(candidate) === selector)
+  return duplicate ? `${selector}:index:${row.index}` : selector
+}
+
+function providerPosition(provider: AIProviderItem): { list: AIProviderItem[]; index: number } {
+  const list = providers.value.filter((item) => item.brand === provider.brand)
+  const referenceIndex = list.indexOf(provider)
+  if (referenceIndex >= 0) {
+    return { list, index: referenceIndex }
+  }
+  const key = providerRowKey(provider)
+  return { list, index: list.findIndex((item) => providerRowKey(item) === key) }
+}
+
+function providerOrderItem(provider: AIProviderItem): AIProviderOrderItem {
+  const item: AIProviderOrderItem = { index: provider.index }
+  const identityHash = provider.identity_hash?.trim()
+  const apiKeyHash = provider.api_key_hash?.trim()
+  const name = provider.name?.trim()
+  const baseURL = provider.base_url?.trim()
+  if (identityHash) {
+    item.identity_hash = identityHash
+  }
+  if (apiKeyHash) {
+    item.api_key_hash = apiKeyHash
+  }
+  if (name) {
+    item.name = name
+  }
+  if (baseURL) {
+    item.base_url = baseURL
+  }
+  return item
+}
+
+function canMoveProvider(provider: AIProviderItem, direction: -1 | 1): boolean {
+  if (reorderControlsDisabled.value || provider.brand !== activeBrand.value) {
+    return false
+  }
+  const { list, index } = providerPosition(provider)
+  return index >= 0 && index + direction >= 0 && index + direction < list.length
+}
+
+async function moveProvider(provider: AIProviderItem, direction: -1 | 1): Promise<void> {
+  if (!canMoveProvider(provider, direction)) {
+    return
+  }
+  const { list, index } = providerPosition(provider)
+  const targetIndex = index + direction
+  const reordered = list.slice()
+  const [moved] = reordered.splice(index, 1)
+  if (!moved) {
+    return
+  }
+  reordered.splice(targetIndex, 0, moved)
+
+  const generation = beginProviderMutation('reorder')
+  if (generation === null) {
+    return
+  }
+  const providerKey = providerRowKey(provider)
+  reorderingProviderKey.value = providerKey
+  reorderingDirection.value = direction
+  let refreshRequired = false
+  try {
+    const response = await reorderAIProviders(provider.brand, reordered.map(providerOrderItem))
+    if (setSnapshot(response, generation)) {
+      message.success(t('AI provider 顺序已更新', 'AI provider order updated'))
+    }
+  } catch (error) {
+    if (isApiRequestError(error) && error.code === 'provider_order_committed_refresh_required') {
+      providers.value = []
+      summary.value = { ...emptySummary }
+      usageError.value = null
+      message.warning(t('AI provider 顺序已写入远端，正在重新加载列表', 'AI provider order was saved remotely. Reloading the list.'))
+      refreshRequired = true
+    } else {
+      message.error(errorText(error, '调整 AI provider 顺序失败', 'Failed to reorder AI providers'))
+    }
+  } finally {
+    reorderingProviderKey.value = null
+    reorderingDirection.value = null
+    finishProviderMutation(generation)
+  }
+  if (refreshRequired) {
+    await refresh()
+  }
+}
+
+const columns = computed<DataTableColumns<AIProviderItem>>(() => {
+  const moveControlsDisabled = reorderControlsDisabled.value
+  const writeControlsDisabled = providerWriteControlsDisabled.value
+  const activeReorderingKey = reorderingProviderKey.value
+  const activeReorderingDirection = reorderingDirection.value
+  return [
   {
     title: t('密钥', 'Key'),
     key: 'key',
@@ -1498,36 +1697,96 @@ const columns = computed<DataTableColumns<AIProviderItem>>(() => [
     key: 'actions',
     width: 230,
     fixed: 'right',
-    render: (row) =>
-      h(NSpace, { size: 6 }, {
-        default: () => [
+    render: (row) => {
+      const rowKey = providerRowKey(row)
+      return h('div', { class: 'provider-actions' }, [
+        h('div', { class: 'provider-order-actions' }, [
           h(
-            NButton,
+            NTooltip,
+            { trigger: 'hover' },
             {
-              size: 'small',
-              secondary: true,
-              type: row.disabled ? 'success' : 'warning',
-              onClick: () => void toggleProviderDisabled(row),
+              trigger: () =>
+                h(
+                  NButton,
+                  {
+                    size: 'small',
+                    quaternary: true,
+                    circle: true,
+                    disabled: moveControlsDisabled || !canMoveProvider(row, -1),
+                    loading: activeReorderingKey === rowKey && activeReorderingDirection === -1,
+                    'aria-label': t(`上移 ${providerIdentityLabel(row)}`, `Move ${providerIdentityLabel(row)} up`),
+                    onClick: () => void moveProvider(row, -1),
+                  },
+                  { icon: () => h(NIcon, { component: ChevronUp }) },
+                ),
+              default: () => t('上移', 'Move up'),
             },
+          ),
+          h(
+            NTooltip,
+            { trigger: 'hover' },
             {
-              icon: () => h(NIcon, { component: row.disabled ? CheckCircle2 : XCircle }),
-              default: () => (row.disabled ? t('启用', 'Enable') : t('禁用', 'Disable')),
+              trigger: () =>
+                h(
+                  NButton,
+                  {
+                    size: 'small',
+                    quaternary: true,
+                    circle: true,
+                    disabled: moveControlsDisabled || !canMoveProvider(row, 1),
+                    loading: activeReorderingKey === rowKey && activeReorderingDirection === 1,
+                    'aria-label': t(`下移 ${providerIdentityLabel(row)}`, `Move ${providerIdentityLabel(row)} down`),
+                    onClick: () => void moveProvider(row, 1),
+                  },
+                  { icon: () => h(NIcon, { component: ChevronDown }) },
+                ),
+              default: () => t('下移', 'Move down'),
             },
           ),
-          h(
-            NButton,
-            { size: 'small', quaternary: true, onClick: () => openEditDialog(row) },
-            { icon: () => h(NIcon, { component: Edit3 }), default: () => t('编辑', 'Edit') },
-          ),
-          h(
-            NButton,
-            { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDelete(row) },
-            { icon: () => h(NIcon, { component: Trash2 }), default: () => t('删除', 'Delete') },
-          ),
-        ],
-      }),
+        ]),
+        h(
+          NButton,
+          {
+            class: 'provider-toggle-action',
+            size: 'small',
+            secondary: true,
+            type: row.disabled ? 'success' : 'warning',
+            disabled: writeControlsDisabled,
+            onClick: () => void toggleProviderDisabled(row),
+          },
+          {
+            icon: () => h(NIcon, { component: row.disabled ? CheckCircle2 : XCircle }),
+            default: () => (row.disabled ? t('启用', 'Enable') : t('禁用', 'Disable')),
+          },
+        ),
+        h(
+          NButton,
+          {
+            class: 'provider-edit-action',
+            size: 'small',
+            quaternary: true,
+            disabled: writeControlsDisabled,
+            onClick: () => openEditDialog(row),
+          },
+          { icon: () => h(NIcon, { component: Edit3 }), default: () => t('编辑', 'Edit') },
+        ),
+        h(
+          NButton,
+          {
+            class: 'provider-delete-action',
+            size: 'small',
+            quaternary: true,
+            type: 'error',
+            disabled: writeControlsDisabled,
+            onClick: () => confirmDelete(row),
+          },
+          { icon: () => h(NIcon, { component: Trash2 }), default: () => t('删除', 'Delete') },
+        ),
+      ])
+    },
   },
-])
+  ]
+})
 
 onMounted(refresh)
 </script>
@@ -1540,11 +1799,11 @@ onMounted(refresh)
         <p class="page-subtitle">{{ t('实时管理 CLIProxyAPI 远端 provider 配置', 'Manage remote CLIProxyAPI provider configuration in real time') }}</p>
       </div>
       <NSpace>
-        <NButton secondary :loading="isLoading" @click="refresh">
+        <NButton secondary :loading="isLoading" :disabled="providerWriteControlsDisabled" @click="refresh">
           <template #icon><NIcon :component="RefreshCw" /></template>
           {{ t('刷新', 'Refresh') }}
         </NButton>
-        <NButton type="primary" :disabled="missingSettings" @click="openCreateDialog">
+        <NButton type="primary" :disabled="missingSettings || providerWriteControlsDisabled" @click="openCreateDialog">
           <template #icon><NIcon :component="Plus" /></template>
           {{ t('新建 Provider', 'New provider') }}
         </NButton>
@@ -1604,6 +1863,7 @@ onMounted(refresh)
           :loading="isLoading"
           :columns="columns"
           :data="tableRows"
+          :row-key="providerRowKey"
           :row-props="providerTableRowProps"
           :pagination="{ pageSize: 10 }"
           table-layout="fixed"
@@ -1952,6 +2212,41 @@ onMounted(refresh)
 .provider-config-counts {
   flex-wrap: wrap;
   gap: 6px;
+}
+
+:global(.provider-order-actions) {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+:global(.provider-actions) {
+  display: grid;
+  grid-template-areas:
+    'move toggle'
+    'edit delete';
+  grid-template-columns: max-content max-content;
+  gap: 6px;
+  width: fit-content;
+  min-width: 0;
+}
+
+:global(.provider-order-actions) {
+  grid-area: move;
+}
+
+:global(.provider-toggle-action) {
+  grid-area: toggle;
+  justify-self: end;
+}
+
+:global(.provider-edit-action) {
+  grid-area: edit;
+}
+
+:global(.provider-delete-action) {
+  grid-area: delete;
+  justify-self: end;
 }
 
 :global(.provider-status-cell) {

@@ -4,6 +4,7 @@ import type {
   AIProviderActionResponse,
   AIProviderBrand,
   AIProviderItem,
+  AIProviderOrderItem,
   AIProvidersResponse,
 } from '@/shared/types/api'
 
@@ -39,6 +40,10 @@ export function createAIProvider(brand: AIProviderBrand, payload: AIProviderItem
 
 export function updateAIProvider(provider: AIProviderItem): Promise<AIProvidersResponse> {
   return apiClient.put<AIProvidersResponse>(providerPath(provider.brand, provider.index), provider)
+}
+
+export function reorderAIProviders(brand: AIProviderBrand, order: AIProviderOrderItem[]): Promise<AIProvidersResponse> {
+  return apiClient.put<AIProvidersResponse>(`/ai-providers/${encodeURIComponent(brand)}/order`, { order })
 }
 
 export function deleteAIProvider(provider: AIProviderItem): Promise<AIProvidersResponse> {

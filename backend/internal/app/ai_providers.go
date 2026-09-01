@@ -1,10 +1,12 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -19,6 +21,7 @@ const (
 	aiProviderActionTimeout     = 45 * time.Second
 
 	aiProviderMissingConfigMessage = "AI 提供商管理需要先到「系统设置」填写 CLIProxyAPI 地址和管理密钥。"
+	aiProviderOrderRefreshCode     = "provider_order_committed_refresh_required"
 	aiProviderAPICallToken         = "$TOKEN$"
 	aiProviderDisableAllModelsRule = "*"
 	aiProviderClockBucketMinutes   = 10
@@ -316,6 +319,21 @@ type aiProviderActionRequest struct {
 	Message  string          `json:"message"`
 }
 
+// aiProviderOrderRequest carries the complete order for one provider brand.
+// The references intentionally contain selectors only; raw provider payloads
+// (including credentials and unknown fields) stay on the management server.
+type aiProviderOrderRequest struct {
+	Order *[]aiProviderOrderItem `json:"order"`
+}
+
+type aiProviderOrderItem struct {
+	Index        *int    `json:"index"`
+	IdentityHash *string `json:"identity_hash,omitempty"`
+	APIKeyHash   *string `json:"api_key_hash,omitempty"`
+	Name         *string `json:"name,omitempty"`
+	BaseURL      *string `json:"base_url,omitempty"`
+}
+
 type aiProviderActionResponse struct {
 	OK         bool              `json:"ok"`
 	Status     string            `json:"status"`
@@ -422,6 +440,21 @@ func (a *App) handleAIProviderByPath(w http.ResponseWriter, r *http.Request) err
 		if err != nil {
 			return err
 		}
+		if parts[1] == "order" {
+			if err := requireMethod(r, http.MethodPut); err != nil {
+				return err
+			}
+			var payload aiProviderOrderRequest
+			if err := decodeJSON(r, &payload); err != nil {
+				return err
+			}
+			response, err := a.reorderAIProviders(r.Context(), brandConfig, payload)
+			if err != nil {
+				return err
+			}
+			writeJSON(w, http.StatusOK, response)
+			return nil
+		}
 		index, err := parseAIProviderIndex(parts[1])
 		if err != nil {
 			return err
@@ -458,6 +491,12 @@ func (a *App) aiProvidersSnapshot(ctx context.Context) (aiProvidersResponse, err
 	if err != nil {
 		return aiProvidersResponse{}, err
 	}
+	return a.aiProvidersSnapshotForConfig(ctx, cfg)
+}
+
+// aiProvidersSnapshotForConfig keeps every request in a response snapshot on
+// the same CLIProxyAPI deployment and management key as the initiating action.
+func (a *App) aiProvidersSnapshotForConfig(ctx context.Context, cfg AppConfig) (aiProvidersResponse, error) {
 	providers, err := a.aiProviderConfigSnapshotForConfig(ctx, cfg)
 	if err != nil {
 		return aiProvidersResponse{}, err
@@ -524,6 +563,9 @@ func (a *App) aiProviderConfigSnapshotWithConfig(ctx context.Context, cfg AppCon
 }
 
 func (a *App) createAIProvider(ctx context.Context, brandConfig aiProviderBrandConfig, payload aiProviderItem) (aiProvidersResponse, error) {
+	a.aiProviderWriteMu.Lock()
+	defer a.aiProviderWriteMu.Unlock()
+
 	cfg, rawConfig, err := a.aiProviderRemoteConfig(ctx)
 	if err != nil {
 		return aiProvidersResponse{}, err
@@ -540,10 +582,13 @@ func (a *App) createAIProvider(ctx context.Context, brandConfig aiProviderBrandC
 	if err := a.putAIProviderList(ctx, cfg, brandConfig, list); err != nil {
 		return aiProvidersResponse{}, err
 	}
-	return a.aiProvidersSnapshot(ctx)
+	return a.aiProvidersSnapshotForConfig(ctx, cfg)
 }
 
 func (a *App) updateAIProvider(ctx context.Context, brandConfig aiProviderBrandConfig, index int, payload aiProviderItem) (aiProvidersResponse, error) {
+	a.aiProviderWriteMu.Lock()
+	defer a.aiProviderWriteMu.Unlock()
+
 	cfg, rawConfig, err := a.aiProviderRemoteConfig(ctx)
 	if err != nil {
 		return aiProvidersResponse{}, err
@@ -564,10 +609,13 @@ func (a *App) updateAIProvider(ctx context.Context, brandConfig aiProviderBrandC
 	if err := a.putAIProviderList(ctx, cfg, brandConfig, list); err != nil {
 		return aiProvidersResponse{}, err
 	}
-	return a.aiProvidersSnapshot(ctx)
+	return a.aiProvidersSnapshotForConfig(ctx, cfg)
 }
 
 func (a *App) deleteAIProvider(ctx context.Context, brandConfig aiProviderBrandConfig, index int, selector aiProviderSelector) (aiProvidersResponse, error) {
+	a.aiProviderWriteMu.Lock()
+	defer a.aiProviderWriteMu.Unlock()
+
 	cfg, rawConfig, err := a.aiProviderRemoteConfig(ctx)
 	if err != nil {
 		return aiProvidersResponse{}, err
@@ -584,7 +632,144 @@ func (a *App) deleteAIProvider(ctx context.Context, brandConfig aiProviderBrandC
 	if err := a.putAIProviderList(ctx, cfg, brandConfig, list); err != nil {
 		return aiProvidersResponse{}, err
 	}
-	return a.aiProvidersSnapshot(ctx)
+	return a.aiProvidersSnapshotForConfig(ctx, cfg)
+}
+
+// reorderAIProviders applies a complete permutation of one remote provider
+// list. Each reference is checked against the exact index read from the
+// management config so an old browser snapshot cannot silently overwrite a
+// concurrent add, delete, or move.
+func (a *App) reorderAIProviders(ctx context.Context, brandConfig aiProviderBrandConfig, payload aiProviderOrderRequest) (aiProvidersResponse, error) {
+	a.aiProviderWriteMu.Lock()
+	defer a.aiProviderWriteMu.Unlock()
+
+	cfg, rawConfig, err := a.aiProviderRemoteConfig(ctx)
+	if err != nil {
+		return aiProvidersResponse{}, err
+	}
+	list, err := rawAIProviderList(rawConfig, brandConfig.ConfigKey)
+	if err != nil {
+		return aiProvidersResponse{}, validationError(brandConfig.Label + " provider 响应不是有效列表")
+	}
+	if payload.Order == nil {
+		return aiProvidersResponse{}, validationError("AI provider 排序顺序不能为空")
+	}
+	order := *payload.Order
+	// Validate the request shape before comparing lengths so malformed entries
+	// (missing, negative, out-of-range, or duplicate indexes) are reported as
+	// validation errors even when the remote list has changed size.
+	seenOrderIndexes := make(map[int]struct{}, len(order))
+	for _, reference := range order {
+		if reference.Index == nil {
+			return aiProvidersResponse{}, validationError("AI provider 排序项缺少索引")
+		}
+		index := *reference.Index
+		if index < 0 || index >= len(list) {
+			return aiProvidersResponse{}, validationError("AI provider 排序索引无效")
+		}
+		if _, exists := seenOrderIndexes[index]; exists {
+			return aiProvidersResponse{}, validationError("AI provider 排序索引不能重复")
+		}
+		seenOrderIndexes[index] = struct{}{}
+	}
+	if len(order) != len(list) {
+		return aiProvidersResponse{}, conflictError("AI provider 列表已变化，请刷新后重试")
+	}
+	if len(list) == 0 {
+		// An explicit empty order is a valid no-op for an empty remote list.
+		return a.aiProvidersSnapshotForConfig(ctx, cfg)
+	}
+
+	seenIndexes := make([]bool, len(list))
+	seenStableSelectors := make(map[string]struct{}, len(list))
+	reordered := make([]map[string]any, 0, len(list))
+	for _, reference := range order {
+		if reference.Index == nil {
+			return aiProvidersResponse{}, validationError("AI provider 排序项缺少索引")
+		}
+		index := *reference.Index
+		if index < 0 || index >= len(list) {
+			return aiProvidersResponse{}, validationError("AI provider 排序索引无效")
+		}
+		if seenIndexes[index] {
+			return aiProvidersResponse{}, validationError("AI provider 排序索引不能重复")
+		}
+		seenIndexes[index] = true
+
+		selector := selectorFromAIProviderOrderItem(reference)
+		if !selector.validForOrder(brandConfig) {
+			return aiProvidersResponse{}, validationError("AI provider selector 缺少非密钥标识，请刷新后重试")
+		}
+		raw := list[index]
+		if !matchesAIProviderSelector(brandConfig, raw, index, selector) {
+			return aiProvidersResponse{}, conflictError("AI provider 列表已变化，请刷新后重试")
+		}
+		if aiProviderUsesFallbackOrderIdentity(brandConfig, aiProviderItemFromRaw(brandConfig, index, raw)) {
+			// A fallback identity contains the old array index. It cannot make a
+			// duplicated name/base-url selector safe by itself, so verify the
+			// submitted non-index fields independently of that identity.
+			nonIndexSelector := aiProviderSelector{
+				Name:    selector.Name,
+				BaseURL: selector.BaseURL,
+			}
+			if !nonIndexSelector.validForOrder(brandConfig) {
+				return aiProvidersResponse{}, validationError("AI provider selector 缺少非密钥标识，请刷新后重试")
+			}
+			nonIndexMatches := 0
+			for currentIndex, current := range list {
+				if matchesAIProviderSelector(brandConfig, current, currentIndex, nonIndexSelector) {
+					nonIndexMatches++
+				}
+			}
+			if nonIndexMatches != 1 {
+				return aiProvidersResponse{}, conflictError("AI provider selector 存在歧义，请刷新后重试")
+			}
+		}
+		matchingItems := 0
+		for currentIndex, current := range list {
+			if matchesAIProviderSelector(brandConfig, current, currentIndex, selector) {
+				matchingItems++
+			}
+		}
+		if matchingItems != 1 {
+			return aiProvidersResponse{}, conflictError("AI provider selector 存在歧义，请刷新后重试")
+		}
+		stableKey, ok := aiProviderStableOrderSelector(brandConfig, raw, index, selector)
+		if !ok {
+			return aiProvidersResponse{}, conflictError("目标 AI provider 缺少稳定标识，请刷新后重试")
+		}
+		if _, exists := seenStableSelectors[stableKey]; exists {
+			return aiProvidersResponse{}, conflictError("AI provider selector 存在歧义，请刷新后重试")
+		}
+		seenStableSelectors[stableKey] = struct{}{}
+		reordered = append(reordered, raw)
+	}
+
+	// Length, range, and uniqueness checks above imply every current index was
+	// referenced exactly once. Avoid an upstream write when the order is
+	// already canonical; this also avoids needless cache invalidation.
+	changed := false
+	for position, reference := range order {
+		if reference.Index == nil || position != *reference.Index {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return a.aiProvidersSnapshotForConfig(ctx, cfg)
+	}
+	if err := a.putAIProviderList(ctx, cfg, brandConfig, reordered); err != nil {
+		return aiProvidersResponse{}, err
+	}
+	response, err := a.aiProvidersSnapshotForConfig(ctx, cfg)
+	if err != nil {
+		return aiProvidersResponse{}, appError(
+			aiProviderOrderRefreshCode,
+			http.StatusConflict,
+			"AI provider 顺序已写入远端，列表需要刷新后才能继续操作",
+		)
+	}
+	return response, nil
 }
 
 func (a *App) discoverAIProviderModels(ctx context.Context, payload aiProviderActionRequest) (aiProviderActionResponse, error) {
@@ -778,7 +963,12 @@ func (a *App) aiProviderRemoteConfig(ctx context.Context) (AppConfig, map[string
 		return AppConfig{}, nil, err
 	}
 	var raw map[string]any
-	if err := json.Unmarshal(payload, &raw); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&raw); err != nil {
+		return AppConfig{}, nil, validationError("CLIProxyAPI 配置响应不是有效 JSON object")
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return AppConfig{}, nil, validationError("CLIProxyAPI 配置响应不是有效 JSON object")
 	}
 	return cfg, raw, nil
@@ -1167,6 +1357,21 @@ func (selector aiProviderSelector) validFor(brandConfig aiProviderBrandConfig) b
 	return strings.TrimSpace(selector.IdentityHash) != "" || strings.TrimSpace(selector.APIKeyHash) != ""
 }
 
+func (selector aiProviderSelector) validForOrder(brandConfig aiProviderBrandConfig) bool {
+	if selector.validFor(brandConfig) {
+		return true
+	}
+	// OpenAI-compatible records normally identify themselves by name, but a
+	// provider-level API-key hash is also a valid non-secret selector when an
+	// upstream configuration supplies one. Keep order validation consistent
+	// with matchesAIProviderSelector instead of rejecting that reference before
+	// it can be checked against the freshly-read list.
+	if brandConfig.Brand == aiProviderBrandOpenAICompatibility && strings.TrimSpace(selector.APIKeyHash) != "" {
+		return true
+	}
+	return strings.TrimSpace(selector.Name) != "" || strings.TrimSpace(selector.BaseURL) != ""
+}
+
 func matchesAIProviderSelector(brandConfig aiProviderBrandConfig, raw map[string]any, index int, selector aiProviderSelector) bool {
 	item := aiProviderItemFromRaw(brandConfig, index, raw)
 	if selector.IdentityHash != "" && item.IdentityHash != selector.IdentityHash {
@@ -1198,6 +1403,91 @@ func selectorFromAIProviderPayload(payload aiProviderItem) aiProviderSelector {
 		selector.Name = aiProviderOptionalString(payload.Name)
 	}
 	return selector
+}
+
+func selectorFromAIProviderOrderItem(item aiProviderOrderItem) aiProviderSelector {
+	selector := aiProviderSelector{}
+	if item.IdentityHash != nil {
+		selector.IdentityHash = strings.TrimSpace(*item.IdentityHash)
+	}
+	if item.APIKeyHash != nil {
+		selector.APIKeyHash = strings.TrimSpace(*item.APIKeyHash)
+	}
+	if item.Name != nil {
+		selector.Name = strings.TrimSpace(*item.Name)
+	}
+	if item.BaseURL != nil {
+		selector.BaseURL = strings.TrimSpace(*item.BaseURL)
+	}
+	return selector
+}
+
+// aiProviderStableOrderSelector returns a deduplication key for the current
+// order validation. Stable credential/name identities survive a reorder. A
+// native fallback identity derived from the array index is accepted only when
+// another non-index field distinguishes the record; otherwise callers reject
+// it as ambiguous.
+func aiProviderStableOrderSelector(brandConfig aiProviderBrandConfig, raw map[string]any, index int, selector aiProviderSelector) (string, bool) {
+	item := aiProviderItemFromRaw(brandConfig, index, raw)
+	stableIdentity := ""
+	if item.APIKeyHash != nil {
+		stableIdentity = strings.TrimSpace(*item.APIKeyHash)
+	}
+	if stableIdentity == "" {
+		if authIndex := strings.TrimSpace(aiProviderOptionalString(item.AuthIndex)); authIndex != "" {
+			stableIdentity = hashAPIKey(fmt.Sprintf("%s:auth-index:%s", brandConfig.Brand, authIndex))
+		}
+	}
+	if stableIdentity == "" && brandConfig.Brand == aiProviderBrandOpenAICompatibility {
+		if name := strings.TrimSpace(aiProviderOptionalString(item.Name)); name != "" {
+			stableIdentity = hashAPIKey("openai_compatibility:" + strings.ToLower(name))
+		}
+	}
+	if stableIdentity == "" {
+		// Native records without a key or auth-index receive an identity derived
+		// from their array index. That identity is valid only for this exact
+		// position (already checked by matchesAIProviderSelector). Allow such a
+		// record when another non-index field makes it distinguishable, while
+		// rejecting a list of otherwise identical fallback records as ambiguous.
+		name := strings.ToLower(strings.TrimSpace(aiProviderOptionalString(item.Name)))
+		baseURL := strings.TrimSpace(aiProviderOptionalString(item.BaseURL))
+		if strings.TrimSpace(selector.Name) == "" && strings.TrimSpace(selector.BaseURL) == "" {
+			return "", false
+		}
+		return strings.Join([]string{
+			"fallback",
+			name,
+			baseURL,
+		}, "\x00"), true
+	}
+
+	// Build the deduplication key from the remote item rather than from optional
+	// client-supplied fields. This prevents a caller from omitting a secondary
+	// selector to bypass ambiguity detection for duplicate records.
+	apiKeyHash := ""
+	if item.APIKeyHash != nil {
+		apiKeyHash = strings.TrimSpace(*item.APIKeyHash)
+	}
+	return strings.Join([]string{
+		stableIdentity,
+		strings.TrimSpace(item.IdentityHash),
+		apiKeyHash,
+		strings.ToLower(strings.TrimSpace(aiProviderOptionalString(item.Name))),
+		strings.TrimSpace(aiProviderOptionalString(item.BaseURL)),
+	}, "\x00"), true
+}
+
+func aiProviderUsesFallbackOrderIdentity(brandConfig aiProviderBrandConfig, item aiProviderItem) bool {
+	if strings.TrimSpace(aiProviderOptionalString(item.APIKeyHash)) != "" {
+		return false
+	}
+	if strings.TrimSpace(aiProviderOptionalString(item.AuthIndex)) != "" {
+		return false
+	}
+	if brandConfig.Brand == aiProviderBrandOpenAICompatibility && strings.TrimSpace(aiProviderOptionalString(item.Name)) != "" {
+		return false
+	}
+	return true
 }
 
 func aiProviderSelectorFromQuery(query url.Values) aiProviderSelector {
