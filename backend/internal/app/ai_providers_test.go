@@ -145,6 +145,214 @@ func TestAIProvidersSnapshotReusesOneManagementConfig(t *testing.T) {
 	}
 }
 
+func TestAIProvidersReorderSnapshotUsesWriteTargetConfig(t *testing.T) {
+	providerPathToKey := map[string]string{
+		"/v0/management/gemini-api-key":       "gemini-api-key",
+		"/v0/management/codex-api-key":        "codex-api-key",
+		"/v0/management/claude-api-key":       "claude-api-key",
+		"/v0/management/openai-compatibility": "openai-compatibility",
+		"/v0/management/vertex-api-key":       "vertex-api-key",
+		"/v0/management/xai-api-key":          "xai-api-key",
+	}
+	var oldConfigMu sync.Mutex
+	oldConfig := map[string]any{
+		"gemini-api-key": []map[string]any{
+			{"api-key": "old-first-secret", "name": "old-first", "base-url": "https://old-first.example"},
+			{"api-key": "old-second-secret", "name": "old-second", "base-url": "https://old-second.example"},
+		},
+		"codex-api-key":        []map[string]any{},
+		"claude-api-key":       []map[string]any{},
+		"openai-compatibility": []map[string]any{},
+		"vertex-api-key":       []map[string]any{},
+		"xai-api-key":          []map[string]any{},
+	}
+	putReceived := make(chan struct{})
+	releasePut := make(chan struct{})
+	var putReceivedOnce sync.Once
+	var releasePutOnce sync.Once
+	releasePendingPut := func() {
+		releasePutOnce.Do(func() { close(releasePut) })
+	}
+	defer releasePendingPut()
+
+	oldServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-management-key" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v0/management/config" && r.Method == http.MethodGet {
+			oldConfigMu.Lock()
+			defer oldConfigMu.Unlock()
+			_ = json.NewEncoder(w).Encode(oldConfig)
+			return
+		}
+		if r.URL.Path == "/v0/management/api-key-usage" && r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		}
+		key, ok := providerPathToKey[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			oldConfigMu.Lock()
+			defer oldConfigMu.Unlock()
+			_ = json.NewEncoder(w).Encode(oldConfig[key])
+			return
+		case http.MethodPut:
+			if key != "gemini-api-key" {
+				http.Error(w, "unexpected provider write", http.StatusMethodNotAllowed)
+				return
+			}
+			var next []map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&next); err != nil {
+				t.Fatalf("decode reorder PUT: %v", err)
+			}
+			oldConfigMu.Lock()
+			oldConfig[key] = next
+			oldConfigMu.Unlock()
+			putReceivedOnce.Do(func() { close(putReceived) })
+			<-releasePut
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			return
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	}))
+	defer oldServer.Close()
+
+	var newManagementRequests atomic.Int32
+	newServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-management-key" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		newManagementRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v0/management/config" && r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"gemini-api-key":       []map[string]any{{"api-key": "new-secret", "name": "new-target", "base-url": "https://new.example"}},
+				"codex-api-key":        []map[string]any{},
+				"claude-api-key":       []map[string]any{},
+				"openai-compatibility": []map[string]any{},
+				"vertex-api-key":       []map[string]any{},
+				"xai-api-key":          []map[string]any{},
+			})
+			return
+		}
+		if r.URL.Path == "/v0/management/api-key-usage" && r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		}
+		if key, ok := providerPathToKey[r.URL.Path]; ok && r.Method == http.MethodGet {
+			if key == "gemini-api-key" {
+				_ = json.NewEncoder(w).Encode([]map[string]any{{"api-key": "new-secret", "name": "new-target", "base-url": "https://new.example"}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer newServer.Close()
+
+	handler, cookies, closeApp := setupAIProviderTestApp(t, oldServer.URL)
+	defer closeApp()
+	initialBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	var initial struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(initialBody, &initial); err != nil {
+		t.Fatalf("decode initial provider snapshot: %v", err)
+	}
+	refs := make([]map[string]any, 0, 2)
+	for _, provider := range initial.Providers {
+		if provider["brand"] != "gemini" {
+			continue
+		}
+		refs = append(refs, map[string]any{
+			"index":         provider["index"],
+			"identity_hash": provider["identity_hash"],
+			"api_key_hash":  provider["api_key_hash"],
+			"name":          provider["name"],
+			"base_url":      provider["base_url"],
+		})
+	}
+	if len(refs) != 2 {
+		t.Fatalf("initial reorder references = %#v, want two Gemini providers", refs)
+	}
+
+	type responseResult struct {
+		status int
+		body   []byte
+	}
+	resultCh := make(chan responseResult, 1)
+	go func() {
+		body, err := json.Marshal(map[string]any{"order": []map[string]any{refs[1], refs[0]}})
+		if err != nil {
+			resultCh <- responseResult{status: 0, body: []byte(err.Error())}
+			return
+		}
+		request := httptest.NewRequest(http.MethodPut, "/api/ai-providers/gemini/order", bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		resultCh <- responseResult{status: recorder.Code, body: append([]byte(nil), recorder.Body.Bytes()...)}
+	}()
+	select {
+	case <-putReceived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reorder PUT did not reach the old CLIProxyAPI target")
+	}
+
+	requestJSON(t, handler, http.MethodPut, "/api/settings", map[string]any{
+		"cliaproxy_url":     newServer.URL,
+		"management_key":    "test-management-key",
+		"collector_enabled": false,
+	}, cookies, nil)
+	releasePendingPut()
+	var result responseResult
+	select {
+	case result = <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reorder request did not finish")
+	}
+	if result.status != http.StatusOK {
+		t.Fatalf("reorder returned %d: %s", result.status, string(result.body))
+	}
+	var response struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(result.body, &response); err != nil {
+		t.Fatalf("decode reorder response: %v", err)
+	}
+	orderedGemini := make([]map[string]any, 0, 2)
+	for _, provider := range response.Providers {
+		if provider["brand"] == "gemini" {
+			orderedGemini = append(orderedGemini, provider)
+		}
+	}
+	if len(orderedGemini) != 2 || orderedGemini[0]["name"] != "old-second" || orderedGemini[1]["name"] != "old-first" {
+		t.Fatalf("reorder response Gemini providers = %#v, want old-second/old-first", orderedGemini)
+	}
+	if newManagementRequests.Load() != 0 {
+		t.Fatalf("new CLIProxyAPI received %d request(s), want none", newManagementRequests.Load())
+	}
+	oldConfigMu.Lock()
+	defer oldConfigMu.Unlock()
+	remoteList := oldConfig["gemini-api-key"].([]map[string]any)
+	if len(remoteList) != 2 || remoteList[0]["name"] != "old-second" || remoteList[1]["name"] != "old-first" {
+		t.Fatalf("old CLIProxyAPI remote order = %#v, want old-second/old-first", remoteList)
+	}
+}
+
 type aiProvidersTestResponse struct {
 	Providers []struct {
 		Brand          string `json:"brand"`
@@ -203,11 +411,15 @@ type aiProviderActionTestResponse struct {
 }
 
 type fakeAIProviderManagement struct {
-	t             *testing.T
-	mu            sync.Mutex
-	config        map[string]any
-	usage         any
-	apiCallBodies []map[string]any
+	t                 *testing.T
+	mu                sync.Mutex
+	config            map[string]any
+	usage             any
+	apiCallBodies     []map[string]any
+	providerPutCount  int
+	providerPutBodies []json.RawMessage
+	providerPutStatus int
+	providerGetStatus int
 }
 
 func newFakeAIProviderManagement(t *testing.T) (*fakeAIProviderManagement, *httptest.Server) {
@@ -288,12 +500,28 @@ func (f *fakeAIProviderManagement) handle(w http.ResponseWriter, r *http.Request
 	if key, ok := pathToKey[r.URL.Path]; ok {
 		switch r.Method {
 		case http.MethodGet:
+			if f.providerGetStatus >= 300 {
+				w.WriteHeader(f.providerGetStatus)
+				_ = json.NewEncoder(w).Encode(map[string]string{"status": "failed"})
+				return
+			}
 			_ = json.NewEncoder(w).Encode(f.config[key])
 			return
 		case http.MethodPut:
-			var next []map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&next); err != nil {
+			var rawBody json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&rawBody); err != nil {
 				f.t.Fatalf("decode provider PUT body: %v", err)
+			}
+			var next []map[string]any
+			if err := json.Unmarshal(rawBody, &next); err != nil {
+				f.t.Fatalf("decode provider PUT body: %v", err)
+			}
+			f.providerPutCount++
+			f.providerPutBodies = append(f.providerPutBodies, append(json.RawMessage(nil), rawBody...))
+			if f.providerPutStatus >= 300 {
+				w.WriteHeader(f.providerPutStatus)
+				_ = json.NewEncoder(w).Encode(map[string]string{"status": "failed"})
+				return
 			}
 			f.config[key] = next
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -3355,6 +3583,557 @@ func TestAIProviderVertexAPICallUsesVertexCompatibleShape(t *testing.T) {
 		if header["Authorization"] != nil {
 			t.Fatalf("api-call %d Authorization = %#v, want omitted for Vertex API key", index, header["Authorization"])
 		}
+	}
+}
+
+func TestAIProvidersReorderPersistsRemoteOrderAndPreservesRawFields(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{
+			"api-key":          "gemini-first-secret",
+			"name":             "first",
+			"base-url":         "https://first.example",
+			"models":           []map[string]any{{"name": "first-model"}},
+			"unknown":          map[string]any{"keep": true},
+			"unknown-large-id": json.Number("9007199254740993"),
+			"unknown-nested":   map[string]any{"timestamp": json.Number("9007199254740993")},
+			"priority":         7,
+			"headers":          map[string]any{"X-First": "one"},
+		},
+		{
+			"api-key":  "gemini-second-secret",
+			"name":     "second",
+			"base-url": "https://second.example",
+			"models":   []map[string]any{{"name": "second-model"}},
+			"unknown":  "preserve-second",
+			"priority": 3,
+		},
+	}
+	fake.config["codex-api-key"] = []map[string]any{{
+		"api-key":  "codex-secret",
+		"base-url": "https://codex.example",
+		"unknown":  "untouched-codex",
+	}}
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+
+	initialBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	var initial struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(initialBody, &initial); err != nil {
+		t.Fatalf("decode initial provider snapshot: %v", err)
+	}
+	gemini := make([]map[string]any, 0, 2)
+	for _, provider := range initial.Providers {
+		if provider["brand"] == "gemini" {
+			gemini = append(gemini, provider)
+		}
+	}
+	if len(gemini) != 2 {
+		t.Fatalf("initial Gemini providers = %#v, want 2", gemini)
+	}
+	order := make([]map[string]any, 0, len(gemini))
+	for index := len(gemini) - 1; index >= 0; index-- {
+		provider := gemini[index]
+		reference := map[string]any{"index": provider["index"], "identity_hash": provider["identity_hash"]}
+		for _, key := range []string{"api_key_hash", "name", "base_url"} {
+			if value, ok := provider[key]; ok && value != nil {
+				reference[key] = value
+			}
+		}
+		order = append(order, reference)
+	}
+	responseBody := requestRawJSON(t, handler, http.MethodPut, "/api/ai-providers/gemini/order", map[string]any{
+		"order": order,
+	}, cookies, http.StatusOK)
+
+	fake.mu.Lock()
+	remoteList, ok := fake.config["gemini-api-key"].([]map[string]any)
+	if !ok || len(remoteList) != 2 {
+		fake.mu.Unlock()
+		t.Fatalf("remote Gemini list after reorder = %#v, want two objects", fake.config["gemini-api-key"])
+	}
+	if got := remoteList[0]["api-key"]; got != "gemini-second-secret" {
+		t.Fatalf("remote first API key = %#v, want second secret", got)
+	}
+	if got := remoteList[0]["unknown"].(string); got != "preserve-second" {
+		t.Fatalf("remote first unknown field = %#v, want preserved", got)
+	}
+	if got := remoteList[1]["api-key"]; got != "gemini-first-secret" {
+		t.Fatalf("remote second API key = %#v, want first secret", got)
+	}
+	if got := remoteList[1]["unknown"].(map[string]any)["keep"]; got != true {
+		t.Fatalf("remote second nested unknown field = %#v, want true", got)
+	}
+	if len(fake.providerPutBodies) != 1 {
+		t.Fatalf("provider PUT bodies = %d, want 1", len(fake.providerPutBodies))
+	}
+	providerPutBody := append(json.RawMessage(nil), fake.providerPutBodies[0]...)
+	codexList := fake.config["codex-api-key"].([]map[string]any)
+	if got := codexList[0]["unknown"]; got != "untouched-codex" {
+		t.Fatalf("other brand unknown field = %#v, want untouched", got)
+	}
+	fake.mu.Unlock()
+
+	var persisted []map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(providerPutBody))
+	decoder.UseNumber()
+	if err := decoder.Decode(&persisted); err != nil {
+		t.Fatalf("decode reordered provider PUT body: %v", err)
+	}
+	if len(persisted) != 2 {
+		t.Fatalf("reordered provider PUT entries = %#v, want two entries", persisted)
+	}
+	if got, ok := persisted[1]["unknown-large-id"].(json.Number); !ok || got.String() != "9007199254740993" {
+		t.Fatalf("reordered unknown large ID = %#v, want 9007199254740993", persisted[1]["unknown-large-id"])
+	}
+	nested, ok := persisted[1]["unknown-nested"].(map[string]any)
+	if !ok {
+		t.Fatalf("reordered nested unknown field = %#v, want object", persisted[1]["unknown-nested"])
+	}
+	if got, ok := nested["timestamp"].(json.Number); !ok || got.String() != "9007199254740993" {
+		t.Fatalf("reordered nested unknown large ID = %#v, want 9007199254740993", nested["timestamp"])
+	}
+
+	var response struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode reorder response: %v", err)
+	}
+	orderedGemini := make([]map[string]any, 0, 2)
+	for _, provider := range response.Providers {
+		if provider["brand"] == "gemini" {
+			orderedGemini = append(orderedGemini, provider)
+		}
+	}
+	if len(orderedGemini) != 2 || orderedGemini[0]["name"] != "second" || orderedGemini[1]["name"] != "first" {
+		t.Fatalf("reorder response Gemini order = %#v, want second/first", orderedGemini)
+	}
+	for index, provider := range orderedGemini {
+		if provider["index"] != float64(index) {
+			t.Fatalf("reorder response provider %d index = %#v, want %d", index, provider["index"], index)
+		}
+	}
+	for _, secret := range []string{"gemini-first-secret", "gemini-second-secret", "test-management-key"} {
+		if strings.Contains(string(responseBody), secret) {
+			t.Fatalf("reorder response leaked secret %q: %s", secret, responseBody)
+		}
+	}
+}
+
+func TestAIProvidersReorderNoOpSkipsRemotePut(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{"api-key": "gemini-first-secret", "base-url": "https://first.example"},
+		{"api-key": "gemini-second-secret", "base-url": "https://second.example"},
+	}
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+
+	initialBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	var initial struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(initialBody, &initial); err != nil {
+		t.Fatalf("decode initial provider snapshot: %v", err)
+	}
+	order := make([]map[string]any, 0, 2)
+	for _, provider := range initial.Providers {
+		if provider["brand"] != "gemini" {
+			continue
+		}
+		reference := map[string]any{
+			"index":         provider["index"],
+			"identity_hash": provider["identity_hash"],
+			"base_url":      provider["base_url"],
+		}
+		if value, ok := provider["api_key_hash"]; ok && value != nil {
+			reference["api_key_hash"] = value
+		}
+		order = append(order, reference)
+	}
+	if len(order) != 2 {
+		t.Fatalf("initial canonical order = %#v, want 2 Gemini providers", order)
+	}
+
+	fake.mu.Lock()
+	before := fake.providerPutCount
+	fake.mu.Unlock()
+	requestRawJSON(t, handler, http.MethodPut, "/api/ai-providers/gemini/order", map[string]any{"order": order}, cookies, http.StatusOK)
+	fake.mu.Lock()
+	after := fake.providerPutCount
+	fake.mu.Unlock()
+	if after != before {
+		t.Fatalf("no-op reorder provider PUT count = %d, want unchanged at %d", after, before)
+	}
+}
+
+func TestAIProvidersReorderPropagatesRemotePutFailure(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{"api-key": "gemini-first-secret", "name": "first", "base-url": "https://first.example"},
+		{"api-key": "gemini-second-secret", "name": "second", "base-url": "https://second.example"},
+	}
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+
+	initialBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	var initial struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(initialBody, &initial); err != nil {
+		t.Fatalf("decode initial provider snapshot: %v", err)
+	}
+	order := make([]map[string]any, 0, 2)
+	for index := len(initial.Providers) - 1; index >= 0; index-- {
+		provider := initial.Providers[index]
+		if provider["brand"] != "gemini" {
+			continue
+		}
+		order = append(order, map[string]any{
+			"index":         provider["index"],
+			"identity_hash": provider["identity_hash"],
+			"api_key_hash":  provider["api_key_hash"],
+			"name":          provider["name"],
+			"base_url":      provider["base_url"],
+		})
+	}
+	if len(order) != 2 {
+		t.Fatalf("initial reorder references = %#v, want two Gemini providers", order)
+	}
+
+	fake.mu.Lock()
+	fake.providerPutStatus = http.StatusBadGateway
+	before := fake.config["gemini-api-key"].([]map[string]any)
+	fake.mu.Unlock()
+	responseBody := requestRawJSON(t, handler, http.MethodPut, "/api/ai-providers/gemini/order", map[string]any{
+		"order": order,
+	}, cookies, http.StatusUnprocessableEntity)
+	if !strings.Contains(string(responseBody), "HTTP 502") {
+		t.Fatalf("reorder failure response = %s, want upstream status", responseBody)
+	}
+	for _, secret := range []string{"gemini-first-secret", "gemini-second-secret", "test-management-key"} {
+		if strings.Contains(string(responseBody), secret) {
+			t.Fatalf("reorder failure response leaked secret %q: %s", secret, responseBody)
+		}
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	after := fake.config["gemini-api-key"].([]map[string]any)
+	if len(after) != len(before) || after[0]["name"] != "first" || after[1]["name"] != "second" {
+		t.Fatalf("remote list after failed reorder = %#v, want unchanged first/second", after)
+	}
+	if fake.providerPutCount == 0 {
+		t.Fatalf("provider PUT count = %d, want attempted upstream write", fake.providerPutCount)
+	}
+}
+
+func TestAIProvidersReorderReportsCommittedWriteWhenSnapshotRefreshFails(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{"api-key": "gemini-first-secret", "name": "first", "base-url": "https://first.example"},
+		{"api-key": "gemini-second-secret", "name": "second", "base-url": "https://second.example"},
+	}
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+
+	initialBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	var initial struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(initialBody, &initial); err != nil {
+		t.Fatalf("decode initial provider snapshot: %v", err)
+	}
+	refs := make([]map[string]any, 0, 2)
+	for _, provider := range initial.Providers {
+		if provider["brand"] != "gemini" {
+			continue
+		}
+		refs = append(refs, map[string]any{
+			"index":         provider["index"],
+			"identity_hash": provider["identity_hash"],
+			"api_key_hash":  provider["api_key_hash"],
+			"name":          provider["name"],
+			"base_url":      provider["base_url"],
+		})
+	}
+	if len(refs) != 2 {
+		t.Fatalf("initial reorder references = %#v, want two Gemini providers", refs)
+	}
+
+	fake.mu.Lock()
+	fake.providerGetStatus = http.StatusBadGateway
+	fake.mu.Unlock()
+	responseBody := requestRawJSON(t, handler, http.MethodPut, "/api/ai-providers/gemini/order", map[string]any{
+		"order": []map[string]any{refs[1], refs[0]},
+	}, cookies, http.StatusConflict)
+	var failure struct {
+		Detail struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"detail"`
+	}
+	if err := json.Unmarshal(responseBody, &failure); err != nil {
+		t.Fatalf("decode committed reorder response: %v", err)
+	}
+	if failure.Detail.Code != "provider_order_committed_refresh_required" {
+		t.Fatalf("committed reorder error code = %q, want provider_order_committed_refresh_required", failure.Detail.Code)
+	}
+	if !strings.Contains(failure.Detail.Message, "已写入远端") || !strings.Contains(failure.Detail.Message, "刷新") {
+		t.Fatalf("committed reorder message = %q, want committed refresh guidance", failure.Detail.Message)
+	}
+	for _, secret := range []string{"gemini-first-secret", "gemini-second-secret", "test-management-key"} {
+		if strings.Contains(string(responseBody), secret) {
+			t.Fatalf("committed reorder response leaked secret %q: %s", secret, responseBody)
+		}
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	items := fake.config["gemini-api-key"].([]map[string]any)
+	if len(items) != 2 || items[0]["name"] != "second" || items[1]["name"] != "first" {
+		t.Fatalf("remote order after committed refresh failure = %#v, want second/first", items)
+	}
+	if fake.providerPutCount != 1 {
+		t.Fatalf("provider PUT count = %d, want one committed write", fake.providerPutCount)
+	}
+}
+
+func TestAIProvidersReorderRejectsStaleOrAmbiguousOrder(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{"api-key": "gemini-first-secret", "base-url": "https://first.example"},
+		{"api-key": "gemini-second-secret", "base-url": "https://second.example"},
+	}
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	initialBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	var initial struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(initialBody, &initial); err != nil {
+		t.Fatalf("decode initial provider snapshot: %v", err)
+	}
+	refs := make([]map[string]any, 0, 2)
+	for _, provider := range initial.Providers {
+		if provider["brand"] != "gemini" {
+			continue
+		}
+		refs = append(refs, map[string]any{
+			"index":         provider["index"],
+			"identity_hash": provider["identity_hash"],
+			"api_key_hash":  provider["api_key_hash"],
+			"base_url":      provider["base_url"],
+		})
+	}
+	if len(refs) != 2 {
+		t.Fatalf("initial order references = %#v, want 2", refs)
+	}
+	requestJSONExpectStatus(t, handler, http.MethodPut, "/api/ai-providers/gemini/order", map[string]any{
+		"order": []map[string]any{
+			{"identity_hash": refs[0]["identity_hash"]},
+			refs[1],
+		},
+	}, cookies, http.StatusUnprocessableEntity)
+
+	// A concurrent reorder changes the selector at each original index. The
+	// stale request must fail without writing either provider.
+	fake.mu.Lock()
+	current := fake.config["gemini-api-key"].([]map[string]any)
+	fake.config["gemini-api-key"] = []map[string]any{current[1], current[0]}
+	fake.mu.Unlock()
+	requestJSONExpectStatus(t, handler, http.MethodPut, "/api/ai-providers/gemini/order", map[string]any{"order": refs}, cookies, http.StatusConflict)
+	fake.mu.Lock()
+	current = fake.config["gemini-api-key"].([]map[string]any)
+	if current[0]["api-key"] != "gemini-second-secret" || current[1]["api-key"] != "gemini-first-secret" {
+		t.Fatalf("stale reorder changed remote list = %#v", current)
+	}
+	fake.mu.Unlock()
+
+	// Duplicate references are malformed even when their selectors otherwise
+	// match, and must not reach the upstream PUT.
+	fake.mu.Lock()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{"api-key": "gemini-first-secret", "base-url": "https://first.example"},
+		{"api-key": "gemini-second-secret", "base-url": "https://second.example"},
+	}
+	fake.mu.Unlock()
+	requestJSONExpectStatus(t, handler, http.MethodPut, "/api/ai-providers/gemini/order", map[string]any{
+		"order": []map[string]any{
+			{"identity_hash": refs[0]["identity_hash"], "api_key_hash": refs[0]["api_key_hash"], "base_url": refs[0]["base_url"]},
+			refs[1],
+		},
+	}, cookies, http.StatusUnprocessableEntity)
+	requestJSONExpectStatus(t, handler, http.MethodPut, "/api/ai-providers/gemini/order", map[string]any{
+		"order": []map[string]any{refs[0], refs[0]},
+	}, cookies, http.StatusUnprocessableEntity)
+
+	// Optional secondary selectors must not let duplicate remote records evade
+	// ambiguity detection by submitting only the shared identity hash.
+	fake.mu.Lock()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{"api-key": "shared-secret", "base-url": "https://same.example"},
+		{"api-key": "shared-secret", "base-url": "https://same.example"},
+	}
+	fake.mu.Unlock()
+	duplicateBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	var duplicateSnapshot struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(duplicateBody, &duplicateSnapshot); err != nil {
+		t.Fatalf("decode duplicate snapshot: %v", err)
+	}
+	duplicateRefs := make([]map[string]any, 0, 2)
+	for _, provider := range duplicateSnapshot.Providers {
+		if provider["brand"] == "gemini" {
+			duplicateRefs = append(duplicateRefs, map[string]any{
+				"index":         provider["index"],
+				"identity_hash": provider["identity_hash"],
+			})
+		}
+	}
+	if len(duplicateRefs) != 2 {
+		t.Fatalf("duplicate order references = %#v, want 2", duplicateRefs)
+	}
+	requestJSONExpectStatus(t, handler, http.MethodPut, "/api/ai-providers/gemini/order", map[string]any{
+		"order": []map[string]any{duplicateRefs[1], duplicateRefs[0]},
+	}, cookies, http.StatusConflict)
+}
+
+func TestAIProvidersReorderAllowsUniqueFallbackIdentity(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{"name": "first", "base-url": "https://first.example", "marker": "first"},
+		{"name": "second", "base-url": "https://second.example", "marker": "second"},
+	}
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	initialBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	var initial struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(initialBody, &initial); err != nil {
+		t.Fatalf("decode initial provider snapshot: %v", err)
+	}
+	refs := make([]map[string]any, 0, 2)
+	for _, provider := range initial.Providers {
+		if provider["brand"] != "gemini" {
+			continue
+		}
+		refs = append(refs, map[string]any{
+			"index":    provider["index"],
+			"name":     provider["name"],
+			"base_url": provider["base_url"],
+		})
+	}
+	if len(refs) != 2 {
+		t.Fatalf("fallback order references = %#v, want 2", refs)
+	}
+	requestRawJSON(t, handler, http.MethodPut, "/api/ai-providers/gemini/order", map[string]any{
+		"order": []map[string]any{refs[1], refs[0]},
+	}, cookies, http.StatusOK)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	items := fake.config["gemini-api-key"].([]map[string]any)
+	if len(items) != 2 || items[0]["marker"] != "second" || items[1]["marker"] != "first" {
+		t.Fatalf("fallback remote order = %#v, want second/first", items)
+	}
+}
+
+func TestAIProvidersReorderRejectsAmbiguousFallbackIdentity(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{"base-url": "https://same.example", "marker": "first"},
+		{"base-url": "https://same.example", "marker": "second"},
+	}
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	initialBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	var initial struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(initialBody, &initial); err != nil {
+		t.Fatalf("decode initial provider snapshot: %v", err)
+	}
+	refs := make([]map[string]any, 0, 2)
+	for _, provider := range initial.Providers {
+		if provider["brand"] != "gemini" {
+			continue
+		}
+		refs = append(refs, map[string]any{
+			"index":         provider["index"],
+			"identity_hash": provider["identity_hash"],
+			"base_url":      provider["base_url"],
+		})
+	}
+	if len(refs) != 2 {
+		t.Fatalf("ambiguous fallback order references = %#v, want 2", refs)
+	}
+	requestJSONExpectStatus(t, handler, http.MethodPut, "/api/ai-providers/gemini/order", map[string]any{
+		"order": []map[string]any{refs[1], refs[0]},
+	}, cookies, http.StatusConflict)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	items := fake.config["gemini-api-key"].([]map[string]any)
+	if len(items) != 2 || items[0]["marker"] != "first" || items[1]["marker"] != "second" {
+		t.Fatalf("ambiguous fallback remote order = %#v, want first/second", items)
+	}
+}
+
+func TestAIProvidersReorderRequiresUniqueSubmittedFallbackSelector(t *testing.T) {
+	fake, server := newFakeAIProviderManagement(t)
+	defer server.Close()
+	fake.config["gemini-api-key"] = []map[string]any{
+		{"name": "first", "base-url": "https://shared.example", "marker": "first"},
+		{"name": "second", "base-url": "https://shared.example", "marker": "second"},
+	}
+	handler, cookies, closeApp := setupAIProviderTestApp(t, server.URL)
+	defer closeApp()
+	initialBody := requestRawJSON(t, handler, http.MethodGet, "/api/ai-providers", nil, cookies, http.StatusOK)
+	var initial struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(initialBody, &initial); err != nil {
+		t.Fatalf("decode initial provider snapshot: %v", err)
+	}
+	refs := make([]map[string]any, 0, 2)
+	for _, provider := range initial.Providers {
+		if provider["brand"] != "gemini" {
+			continue
+		}
+		// The fallback identity is index-derived. Supplying only the shared
+		// base URL must not let that index make an ambiguous selector appear
+		// unique.
+		refs = append(refs, map[string]any{
+			"index":         provider["index"],
+			"identity_hash": provider["identity_hash"],
+			"base_url":      provider["base_url"],
+		})
+	}
+	if len(refs) != 2 {
+		t.Fatalf("fallback selector references = %#v, want two", refs)
+	}
+	requestJSONExpectStatus(t, handler, http.MethodPut, "/api/ai-providers/gemini/order", map[string]any{
+		"order": []map[string]any{refs[1], refs[0]},
+	}, cookies, http.StatusConflict)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	items := fake.config["gemini-api-key"].([]map[string]any)
+	if len(items) != 2 || items[0]["marker"] != "first" || items[1]["marker"] != "second" {
+		t.Fatalf("non-unique fallback selector changed remote order = %#v", items)
 	}
 }
 

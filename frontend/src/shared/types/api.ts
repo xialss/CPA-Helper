@@ -182,6 +182,15 @@ export interface AIProvidersResponse {
   usage_error?: string | null
 }
 
+/** Non-secret optimistic-concurrency reference used when reordering a provider list. */
+export interface AIProviderOrderItem {
+  index: number
+  identity_hash?: string | null
+  api_key_hash?: string | null
+  name?: string | null
+  base_url?: string | null
+}
+
 export interface AIProviderActionPayload {
   brand: AIProviderBrand
   provider: AIProviderItem

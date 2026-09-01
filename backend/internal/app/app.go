@@ -60,6 +60,7 @@ type App struct {
 	usageHourlyMu          sync.Mutex
 	keeperUsageCache       keeperWindowUsageCache
 	priceSelectors         modelPriceSelectorSnapshotCache
+	aiProviderWriteMu      sync.Mutex // serialize provider read/validate/write mutations
 	modelMonitorHTTPClient func(ModelMonitorProxyConfig) (*http.Client, error)
 }
 
