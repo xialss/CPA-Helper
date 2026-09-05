@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { Component } from 'vue'
 import { computed, h, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import {
   NAlert,
   NButton,
@@ -19,11 +20,13 @@ import {
 } from 'naive-ui'
 import { CircleDollarSign, KeyRound, ShieldCheck, UserRound } from 'lucide-vue-next'
 
+import { getMe } from '@/features/auth/api/authApi'
+import { setCurrentUser, useCurrentUser } from '@/features/auth/state/currentUser'
 import {
   createUser,
   disableUser,
   enableUser,
-  listUsers,
+  listUsersPage,
   updateUser,
   updateUserQuota,
 } from '@/features/users/api/usersApi'
@@ -33,19 +36,41 @@ import { formatCompact, formatDateTime, formatInteger, formatUsd } from '@/share
 
 const message = useMessage()
 const { errorText, t } = useI18n()
+const { currentUser } = useCurrentUser()
+const router = useRouter()
 const isLoading = ref(false)
 const isSavingUser = ref(false)
 const users = ref<UserSummary[]>([])
+const userPage = ref(1)
+const userPageSize = 12
+const userTotal = ref(0)
 const editorVisible = ref(false)
 const editingUserId = ref<number | null>(null)
 const userAccount = ref('')
 const userPassword = ref('')
+const userPasswordConfirm = ref('')
 const isUserAdmin = ref(false)
+const isUserSuperAdmin = ref(false)
+const initialUserAdmin = ref(false)
+const initialUserSuperAdmin = ref(false)
 const userNickname = ref('')
 const quotaUnlimited = ref(true)
 const quotaLifetimeUsd = ref(0)
 const quotaMonthlyUsd = ref(0)
-const isEditingFirstUser = computed(() => editingUserId.value === 1)
+const initialQuotaUnlimited = ref(true)
+const initialQuotaLifetimeUsd = ref<number | null>(null)
+const initialQuotaMonthlyUsd = ref<number | null>(null)
+const quotaLifetimeTouched = ref(false)
+const quotaMonthlyTouched = ref(false)
+const canEditQuota = computed(() => currentUser.value?.is_super_admin === true)
+const canEditSuperAdminRole = computed(() => currentUser.value?.is_super_admin === true)
+const isDemotingSelf = computed(
+  () =>
+    currentUser.value?.id === editingUserId.value &&
+    currentUser.value?.is_super_admin === true &&
+    !isUserSuperAdmin.value,
+)
+const canEditDraftQuota = computed(() => canEditQuota.value && !isDemotingSelf.value)
 
 interface UserMetricCard {
   key: string
@@ -64,15 +89,15 @@ const userMetrics = computed<UserMetricCard[]>(() => {
   return [
     {
       key: 'active',
-      label: t('启用用户', 'Active users'),
+      label: t('本页启用用户', 'Active users on page'),
       value: formatInteger(activeUsers),
-      footnote: t(`共 ${formatInteger(users.value.length)} 个账号`, `${formatInteger(users.value.length)} accounts total`),
+      footnote: t(`共 ${formatInteger(userTotal.value)} 个账号`, `${formatInteger(userTotal.value)} accounts total`),
       tone: 'teal',
       icon: UserRound,
     },
     {
       key: 'admins',
-      label: t('管理员', 'Admins'),
+      label: t('本页管理员', 'Admins on page'),
       value: formatInteger(adminUsers),
       footnote: t('拥有管理权限', 'Have admin access'),
       tone: 'purple',
@@ -80,15 +105,15 @@ const userMetrics = computed<UserMetricCard[]>(() => {
     },
     {
       key: 'keys',
-      label: t('绑定 Key', 'Bound keys'),
+      label: t('本页绑定 Key', 'Bound keys on page'),
       value: formatInteger(boundKeys),
-      footnote: t('当前用户集合', 'Current users'),
+      footnote: t('当前分页', 'Current page'),
       tone: 'blue',
       icon: KeyRound,
     },
     {
       key: 'cost',
-      label: t('今日费用', 'Today cost'),
+      label: t('本页今日费用', 'Today cost on page'),
       value: formatUsd(todayCost),
       footnote: t('按现价估算', 'Estimated at current prices'),
       tone: 'green',
@@ -102,11 +127,10 @@ function userLabel(row: UserSummary): string {
 }
 
 function quotaBalanceValue(row: UserSummary, bucket: 'monthly' | 'lifetime'): string {
-  if (row.quota.unlimited) {
-    return t('无限制', 'Unlimited')
-  }
-
   const value = bucket === 'monthly' ? row.quota.monthly_remaining_usd : row.quota.lifetime_remaining_usd
+  if (value === null || value === undefined) {
+    return t('未限制', 'Not limited')
+  }
   return formatUsd(value)
 }
 
@@ -163,11 +187,28 @@ function lastProviderLabel(row: UserSummary): string {
 }
 
 function setQuotaLifetimeUsd(value: number | null) {
+  quotaLifetimeTouched.value = true
   quotaLifetimeUsd.value = value ?? 0
 }
 
 function setQuotaMonthlyUsd(value: number | null) {
+  quotaMonthlyTouched.value = true
   quotaMonthlyUsd.value = value ?? 0
+}
+
+function setQuotaUnlimited(value: boolean) {
+  quotaUnlimited.value = value
+  if (!value && initialQuotaUnlimited.value) {
+    quotaLifetimeTouched.value = true
+    quotaMonthlyTouched.value = true
+  }
+}
+
+function setSuperAdmin(value: boolean) {
+  isUserSuperAdmin.value = value
+  if (value) {
+    isUserAdmin.value = true
+  }
 }
 
 function resetEditor() {
@@ -175,15 +216,24 @@ function resetEditor() {
   userAccount.value = ''
   userPassword.value = ''
   isUserAdmin.value = false
+  isUserSuperAdmin.value = false
+  initialUserAdmin.value = false
+  initialUserSuperAdmin.value = false
   userNickname.value = ''
   quotaUnlimited.value = true
   quotaLifetimeUsd.value = 0
   quotaMonthlyUsd.value = 0
+  initialQuotaUnlimited.value = true
+  initialQuotaLifetimeUsd.value = null
+  initialQuotaMonthlyUsd.value = null
+  quotaLifetimeTouched.value = false
+  quotaMonthlyTouched.value = false
 }
 
 function openCreateUser() {
   resetEditor()
-  userPassword.value = 'password'
+  userPassword.value = ''
+  userPasswordConfirm.value = ''
   editorVisible.value = true
 }
 
@@ -191,18 +241,29 @@ function editUser(row: UserSummary) {
   editingUserId.value = row.id
   userAccount.value = row.username
   userPassword.value = ''
-  isUserAdmin.value = row.id === 1 ? true : row.is_admin
+  userPasswordConfirm.value = ''
+  isUserAdmin.value = row.is_admin
+  isUserSuperAdmin.value = row.is_super_admin
+  initialUserAdmin.value = row.is_admin
+  initialUserSuperAdmin.value = row.is_super_admin
   userNickname.value = row.nickname
   quotaUnlimited.value = row.quota.unlimited
   quotaLifetimeUsd.value = row.quota.lifetime_quota_usd ?? 0
   quotaMonthlyUsd.value = row.quota.monthly_quota_usd ?? 0
+  initialQuotaUnlimited.value = row.quota.unlimited
+  initialQuotaLifetimeUsd.value = row.quota.lifetime_quota_usd
+  initialQuotaMonthlyUsd.value = row.quota.monthly_quota_usd
+  quotaLifetimeTouched.value = false
+  quotaMonthlyTouched.value = false
   editorVisible.value = true
 }
 
 async function refresh() {
   isLoading.value = true
   try {
-    users.value = await listUsers()
+    const result = await listUsersPage(userPage.value, userPageSize)
+    users.value = result.items
+    userTotal.value = result.total
   } catch (error) {
     message.error(errorText(error, '加载用户列表失败', 'Failed to load users'))
   } finally {
@@ -214,27 +275,47 @@ function isUserDisabled(row: UserSummary): boolean {
   return row.disabled_at !== null
 }
 
+function onUserPageChange(page: number) {
+  userPage.value = page
+  void refresh()
+}
+
+function canManageUser(row: UserSummary): boolean {
+  return canEditSuperAdminRole.value || (!row.is_admin && !row.is_super_admin)
+}
+
+const operatingUserIds = ref<Set<number>>(new Set())
+
 async function disableUserRow(row: UserSummary) {
+  if (operatingUserIds.value.has(row.id)) return
+  operatingUserIds.value = new Set(operatingUserIds.value).add(row.id)
   try {
     await disableUser(row.id)
     message.success(t('用户已禁用', 'User disabled'))
     await refresh()
   } catch (error) {
     message.error(errorText(error, '禁用用户失败', 'Failed to disable user'))
+  } finally {
+    const next = new Set(operatingUserIds.value); next.delete(row.id); operatingUserIds.value = next
   }
 }
 
 async function enableUserRow(row: UserSummary) {
+  if (operatingUserIds.value.has(row.id)) return
+  operatingUserIds.value = new Set(operatingUserIds.value).add(row.id)
   try {
     await enableUser(row.id)
     message.success(t('用户已启用', 'User enabled'))
     await refresh()
   } catch (error) {
     message.error(errorText(error, '启用用户失败', 'Failed to enable user'))
+  } finally {
+    const next = new Set(operatingUserIds.value); next.delete(row.id); operatingUserIds.value = next
   }
 }
 
 async function saveUser() {
+  if (isSavingUser.value) return
   const nickname = userNickname.value.trim()
   if (!nickname) {
     message.error(t('用户昵称不能为空', 'User nickname is required'))
@@ -246,9 +327,15 @@ async function saveUser() {
     return
   }
   const isEditing = editingUserId.value !== null
+  const wasEditing = isEditing
   const password = userPassword.value.trim()
+  const passwordConfirm = userPasswordConfirm.value.trim()
   if (!isEditing && !password) {
     message.error(t('密码不能为空', 'Password is required'))
+    return
+  }
+  if (password && password !== passwordConfirm) {
+    message.error(t('两次输入的密码不一致', 'Passwords do not match'))
     return
   }
   isSavingUser.value = true
@@ -256,21 +343,57 @@ async function saveUser() {
     const payload = {
       username,
       password: password || undefined,
-      is_admin: isEditingFirstUser.value ? true : isUserAdmin.value,
+      is_admin: canEditSuperAdminRole.value ? (isUserAdmin.value || isUserSuperAdmin.value) : initialUserAdmin.value,
+      is_super_admin: canEditSuperAdminRole.value ? isUserSuperAdmin.value : initialUserSuperAdmin.value,
       nickname,
     }
     const saved =
       editingUserId.value !== null
         ? await updateUser(editingUserId.value, payload)
-        : await createUser(payload)
-    await updateUserQuota(saved.id, {
-      lifetime_quota_usd: quotaUnlimited.value ? null : quotaLifetimeUsd.value,
-      monthly_quota_usd: quotaUnlimited.value ? null : quotaMonthlyUsd.value,
-    })
-    message.success(isEditing ? t('用户已保存', 'User saved') : t('用户已创建', 'User created'))
+        : await createUser({
+            ...payload,
+            lifetime_quota_usd: canEditDraftQuota.value ? (quotaUnlimited.value ? null : quotaLifetimeUsd.value) : undefined,
+            monthly_quota_usd: canEditDraftQuota.value ? (quotaUnlimited.value ? null : quotaMonthlyUsd.value) : undefined,
+          })
+    if (!isEditing) {
+      editingUserId.value = saved.id
+    }
+    const quotaPayload = {
+      lifetime_quota_usd:
+        quotaUnlimited.value || (!quotaLifetimeTouched.value && initialQuotaLifetimeUsd.value === null)
+          ? null
+          : quotaLifetimeUsd.value,
+      monthly_quota_usd:
+        quotaUnlimited.value || (!quotaMonthlyTouched.value && initialQuotaMonthlyUsd.value === null)
+          ? null
+          : quotaMonthlyUsd.value,
+    }
+    const quotaChanged =
+      quotaUnlimited.value !== initialQuotaUnlimited.value ||
+      quotaPayload.lifetime_quota_usd !== initialQuotaLifetimeUsd.value ||
+      quotaPayload.monthly_quota_usd !== initialQuotaMonthlyUsd.value
+    const shouldUpdateSavedUserQuota = canEditDraftQuota.value && isEditing && quotaChanged
+    if (shouldUpdateSavedUserQuota) {
+      await updateUserQuota(saved.id, quotaPayload)
+    }
+    let redirectPath: string | null = null
+    if (currentUser.value?.id === saved.id) {
+      const refreshedUser = await getMe()
+      setCurrentUser(refreshedUser)
+      if (refreshedUser.must_change_password) {
+        redirectPath = '/change-credentials'
+      } else if (!refreshedUser.is_admin) {
+        redirectPath = '/account/settings'
+      }
+    }
+    message.success(wasEditing ? t('用户已保存', 'User saved') : t('用户已创建', 'User created'))
     editorVisible.value = false
     resetEditor()
-    await refresh()
+    if (redirectPath) {
+      await router.push(redirectPath)
+    } else {
+      await refresh()
+    }
   } catch (error) {
     message.error(errorText(error, '保存用户失败', 'Failed to save user'))
   } finally {
@@ -294,8 +417,13 @@ const columns = computed<DataTableColumns<UserSummary>>(() => [
   {
     title: t('角色', 'Role'),
     key: 'is_admin',
-    width: 90,
-    render: (row) => (row.is_admin ? t('管理员', 'Admin') : t('普通用户', 'Standard user')),
+    width: 120,
+    render: (row) =>
+      row.is_super_admin
+        ? t('超级管理员', 'Super admin')
+        : row.is_admin
+          ? t('管理员', 'Admin')
+          : t('普通用户', 'Standard user'),
   },
   {
     title: t('状态', 'Status'),
@@ -342,7 +470,7 @@ const columns = computed<DataTableColumns<UserSummary>>(() => [
   {
     title: t('API KEY 数量', 'API keys'),
     key: 'key_count',
-    width: 95,
+    width: 130,
     render: (row) => t(`${formatInteger(row.key_count)} 个`, `${formatInteger(row.key_count)} keys`),
   },
   {
@@ -394,6 +522,22 @@ const columns = computed<DataTableColumns<UserSummary>>(() => [
       ]),
   },
   {
+    title: t('总费用', 'Total cost'),
+    key: 'total_estimated_cost_usd',
+    width: 150,
+    render: (row) =>
+      h('div', { class: 'metric-stack' }, [
+        h('span', { class: 'metric-primary' }, formatUsd(row.total_estimated_cost_usd)),
+        h(
+          'span',
+          { class: ['metric-muted', { 'is-error': row.total_unpriced_records > 0 }] },
+          row.total_unpriced_records > 0
+            ? t(`未计价 ${formatInteger(row.total_unpriced_records)}`, `${formatInteger(row.total_unpriced_records)} unpriced`)
+            : t('账号建立以来', 'Since account creation'),
+        ),
+      ]),
+  },
+  {
     title: t('最近模型', 'Recent model'),
     key: 'last_model',
     width: 160,
@@ -406,16 +550,19 @@ const columns = computed<DataTableColumns<UserSummary>>(() => [
   {
     title: t('最近使用', 'Last used'),
     key: 'last_seen_at',
-    width: 150,
-    render: (row) => formatDateTime(row.last_seen_at),
+    width: 180,
+    render: (row) => h('span', { class: 'last-seen-value' }, formatDateTime(row.last_seen_at)),
   },
   {
     title: '',
     key: 'actions',
     width: 90,
     fixed: 'right',
-    render: (row) =>
-      h(
+    render: (row) => {
+      if (!canManageUser(row)) {
+        return null
+      }
+      return h(
         NSpace,
         { size: 4 },
         {
@@ -425,7 +572,7 @@ const columns = computed<DataTableColumns<UserSummary>>(() => [
               { size: 'small', quaternary: true, onClick: () => editUser(row) },
               { default: () => t('编辑', 'Edit') },
             ),
-            row.id === 1
+            row.id === currentUser.value?.id
               ? null
               : isUserDisabled(row)
                 ? h(
@@ -435,7 +582,13 @@ const columns = computed<DataTableColumns<UserSummary>>(() => [
                       trigger: () =>
                         h(
                           NButton,
-                          { size: 'small', quaternary: true, type: 'primary' },
+                          {
+                            size: 'small',
+                            quaternary: true,
+                            type: 'primary',
+                            loading: operatingUserIds.value.has(row.id),
+                            disabled: operatingUserIds.value.has(row.id),
+                          },
                           { default: () => t('启用', 'Enable') },
                         ),
                       default: () => t(`启用用户 ${userLabel(row)} 并恢复其 API KEY？`, `Enable user ${userLabel(row)} and restore their API keys?`),
@@ -448,7 +601,13 @@ const columns = computed<DataTableColumns<UserSummary>>(() => [
                       trigger: () =>
                         h(
                           NButton,
-                          { size: 'small', quaternary: true, type: 'warning' },
+                          {
+                            size: 'small',
+                            quaternary: true,
+                            type: 'warning',
+                            loading: operatingUserIds.value.has(row.id),
+                            disabled: operatingUserIds.value.has(row.id),
+                          },
                           { default: () => t('禁用', 'Disable') },
                         ),
                       default: () => t(`禁用用户 ${userLabel(row)} 并从 CPA 移除其 API KEY？`, `Disable user ${userLabel(row)} and remove their API keys from CPA?`),
@@ -456,7 +615,8 @@ const columns = computed<DataTableColumns<UserSummary>>(() => [
                   ),
           ],
         },
-      ),
+      )
+    },
   },
 ])
 
@@ -493,9 +653,9 @@ onMounted(refresh)
         :loading="isLoading"
         :columns="columns"
         :data="users"
-        :pagination="{ pageSize: 12 }"
+        :pagination="{ page: userPage, pageSize: userPageSize, itemCount: userTotal, onUpdatePage: onUserPageChange }"
         table-layout="fixed"
-        :scroll-x="2000"
+        :scroll-x="2250"
       />
     </section>
 
@@ -538,23 +698,49 @@ onMounted(refresh)
             @keyup.enter="saveUser"
           />
         </NFormItem>
-        <NFormItem :label="t('是否设为管理员', 'Set as admin')">
-          <NSwitch v-model:value="isUserAdmin" :disabled="isEditingFirstUser" />
+        <NFormItem :label="t('确认密码', 'Confirm password')" :required="editingUserId === null">
+          <NInput
+            v-model:value="userPasswordConfirm"
+            type="password"
+            show-password-on="mousedown"
+            autocomplete="new-password"
+            :placeholder="editingUserId ? t('仅在修改密码时填写', 'Fill only when changing the password') : t('请再次输入登录密码', 'Enter the sign-in password again')"
+            @keyup.enter="saveUser"
+          />
         </NFormItem>
-        <NFormItem :label="t('余额设置', 'Balance settings')">
+        <NFormItem :label="t('管理员角色', 'Admin role')">
+          <NSwitch v-model:value="isUserAdmin" :disabled="isUserSuperAdmin || !canEditSuperAdminRole" />
+          <span class="role-switch-label">{{ isUserAdmin ? t('管理员', 'Admin') : t('普通用户', 'Standard user') }}</span>
+        </NFormItem>
+        <NFormItem v-if="canEditSuperAdminRole" :label="t('是否设为超级管理员', 'Set as super admin')">
+          <NSwitch
+            v-model:value="isUserSuperAdmin"
+            :disabled="!canEditSuperAdminRole"
+            @update:value="setSuperAdmin"
+          />
+          <span class="role-switch-label">{{ isUserSuperAdmin ? t('超级管理员', 'Super admin') : t('普通管理员或普通用户', 'Admin or standard user') }}</span>
+        </NFormItem>
+        <NAlert v-if="isDemotingSelf" type="warning" :bordered="false" class="quota-editor-hint">
+          {{ t('取消自己的超级管理员身份后，余额设置将不可用，本次输入的余额修改不会保存。', 'After removing your own super-admin role, balance settings are unavailable and balance changes entered here will not be saved.') }}
+        </NAlert>
+        <NFormItem v-if="canEditQuota" :label="t('余额设置', 'Balance settings')">
           <div class="quota-unlimited-row">
             <div>
               <div class="quota-unlimited-title">{{ t('不限制余额', 'Unlimited balance') }}</div>
               <div class="quota-unlimited-desc">{{ t('开启后不扣余额，也不会因余额暂停 API Key。', 'When enabled, balances are not deducted and API keys are not paused due to balance.') }}</div>
             </div>
-            <NSwitch v-model:value="quotaUnlimited" />
+            <NSwitch
+              :value="quotaUnlimited"
+              :disabled="!canEditDraftQuota"
+              @update:value="setQuotaUnlimited"
+            />
           </div>
         </NFormItem>
-        <div class="form-grid quota-editor-grid">
+        <div v-if="canEditQuota" class="form-grid quota-editor-grid">
           <NFormItem :label="t('不限时余额 USD', 'Lifetime balance USD')">
             <NInputNumber
               :value="quotaLifetimeUsd"
-              :disabled="quotaUnlimited"
+              :disabled="quotaUnlimited || !canEditDraftQuota"
               :min="0"
               :precision="8"
               placeholder="0"
@@ -564,7 +750,7 @@ onMounted(refresh)
           <NFormItem :label="t('每月余额 USD', 'Monthly balance USD')">
             <NInputNumber
               :value="quotaMonthlyUsd"
-              :disabled="quotaUnlimited"
+              :disabled="quotaUnlimited || !canEditDraftQuota"
               :min="0"
               :precision="8"
               placeholder="0"
@@ -572,7 +758,7 @@ onMounted(refresh)
             />
           </NFormItem>
         </div>
-        <NAlert type="info" :bordered="false" class="quota-editor-hint">
+        <NAlert v-if="canEditDraftQuota" type="info" :bordered="false" class="quota-editor-hint">
           {{ t('关闭不限制后，扣费顺序：先扣每月余额，不足部分再扣不限时余额；两者都无剩余时暂停该用户的 API Key。', 'After unlimited balance is disabled, charges are deducted from monthly balance first, then lifetime balance. If neither has remaining balance, the user API keys are paused.') }}
         </NAlert>
         <div class="user-editor-actions">
@@ -635,6 +821,12 @@ onMounted(refresh)
   color: var(--cpa-muted);
   font-size: 12px;
   line-height: 1.35;
+}
+
+.role-switch-label {
+  margin-left: 8px;
+  color: var(--cpa-muted);
+  font-size: 12px;
 }
 
 :global(.metric-stack) {
@@ -724,6 +916,11 @@ onMounted(refresh)
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:global(.last-seen-value) {
+  display: inline-block;
   white-space: nowrap;
 }
 

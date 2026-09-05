@@ -4,6 +4,7 @@
 .agents
 .codex
 .playwright-cli
+.agent
 
 data
 docs

@@ -155,6 +155,14 @@ try {
   )
   assert.equal(localizedApiErrorMessage(null, null), 'Request failed')
   assert.equal(localizedServerMessage('巡检完成'), 'Inspection complete')
+  assert.equal(
+    localizedServerMessage('用户状态已变化，请刷新后重试'),
+    'User state changed. Refresh and try again.',
+  )
+  assert.equal(
+    localizedServerMessage('禁用用户时用户状态已变化'),
+    'User state changed while disabling the user.',
+  )
   const modelMonitorErrors = [
     ['模型监控上游返回 HTTP 502', 'Model monitoring upstream returned HTTP 502'],
     ['模型监控上游返回了不支持的内容类型 "text/html"', 'Model monitoring upstream returned unsupported content type "text/html"'],
@@ -398,6 +406,10 @@ try {
     new URL('../src/features/usage/views/UsageRecordsView.vue', import.meta.url),
     'utf8',
   )
+  const userManagementView = await readFile(
+    new URL('../src/features/users/views/UserManagementView.vue', import.meta.url),
+    'utf8',
+  )
   const usageHistoryView = await readFile(
     new URL('../src/features/usage/views/UsageHistoryView.vue', import.meta.url),
     'utf8',
@@ -433,6 +445,30 @@ try {
   assert.match(
     usageRecordsView,
     /if \(requestGeneration !== refreshGeneration\) \{\s*return\s*\}/,
+  )
+  assert.match(
+    userManagementView,
+    /function canManageUser\(row: UserSummary\): boolean \{\s*return canEditSuperAdminRole\.value \|\| \(!row\.is_admin && !row\.is_super_admin\)\s*\}/,
+  )
+  assert.match(userManagementView, /if \(!canManageUser\(row\)\) \{\s*return null\s*\}/)
+  assert.match(
+    userManagementView,
+    /const isDemotingSelf = computed\(\s*\(\) =>\s*currentUser\.value\?\.id === editingUserId\.value &&\s*currentUser\.value\?\.is_super_admin === true &&\s*!isUserSuperAdmin\.value,\s*\)/,
+  )
+  assert.match(
+    userManagementView,
+    /const canEditDraftQuota = computed\(\(\) => canEditQuota\.value && !isDemotingSelf\.value\)/,
+  )
+  assert.match(userManagementView, /const shouldUpdateSavedUserQuota = canEditDraftQuota\.value/)
+  assert.match(
+    userManagementView,
+    /if \(shouldUpdateSavedUserQuota\) \{\s*await updateUserQuota\(saved\.id,/,
+  )
+  assert.match(userManagementView, /:disabled="!canEditDraftQuota"/)
+  assert.match(userManagementView, /余额设置将不可用，本次输入的余额修改不会保存。/)
+  assert.match(
+    userManagementView,
+    /After removing your own super-admin role, balance settings are unavailable and balance changes entered here will not be saved\./,
   )
   globalThis.fetch = async () => ({
     ok: false,

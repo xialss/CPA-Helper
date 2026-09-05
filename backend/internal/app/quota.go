@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log"
 	"math"
 	"net/http"
 	"strings"
@@ -51,6 +52,11 @@ func (a *App) handleCurrentUserQuota(w http.ResponseWriter, r *http.Request) err
 }
 
 func (a *App) updateUserQuota(ctx context.Context, userID int, payload userQuotaPayload) (UserQuotaStatusResponse, error) {
+	defer a.lockUserMutation(userID)()
+	return a.updateUserQuotaLocked(ctx, userID, payload)
+}
+
+func (a *App) updateUserQuotaLocked(ctx context.Context, userID int, payload userQuotaPayload) (UserQuotaStatusResponse, error) {
 	user, err := a.getUser(ctx, userID)
 	if err != nil {
 		return UserQuotaStatusResponse{}, err
@@ -96,41 +102,79 @@ func (a *App) updateUserQuota(ctx context.Context, userID int, payload userQuota
 	if err != nil {
 		return UserQuotaStatusResponse{}, err
 	}
+	var syncErr error
 	if quotaHasAvailable(user) {
-		_ = a.restoreQuotaPausedUserIfAvailable(ctx, user.ID)
+		syncErr = a.restoreQuotaPausedUserIfAvailableLocked(ctx, user.ID)
 	} else {
-		_ = a.pauseUserKeysForQuota(ctx, user.ID, quotaPauseReasonExhausted)
+		syncErr = a.pauseUserKeysForQuotaLocked(ctx, user.ID, quotaPauseReasonExhausted)
 	}
-	return a.userQuotaStatus(ctx, userID)
+	status, statusErr := a.userQuotaStatusLocked(ctx, userID)
+	if statusErr != nil {
+		return UserQuotaStatusResponse{}, statusErr
+	}
+	if syncErr != nil {
+		return status, syncErr
+	}
+	return status, nil
 }
 
 func (a *App) userQuotaStatus(ctx context.Context, userID int) (UserQuotaStatusResponse, error) {
+	defer a.lockUserMutation(userID)()
+	return a.userQuotaStatusLocked(ctx, userID)
+}
+
+func (a *App) userQuotaStatusLocked(ctx context.Context, userID int) (UserQuotaStatusResponse, error) {
 	user, err := a.getUser(ctx, userID)
 	if err != nil {
 		return UserQuotaStatusResponse{}, err
 	}
+	return a.userQuotaStatusForRecordLocked(ctx, user)
+}
+
+func (a *App) userQuotaStatusForRecordLocked(ctx context.Context, user UserRecord) (UserQuotaStatusResponse, error) {
+	var err error
 	user, err = a.ensureQuotaMonth(ctx, user)
 	if err != nil {
 		return UserQuotaStatusResponse{}, err
 	}
 	if user.QuotaPausedAt != nil {
-		_ = a.restoreQuotaPausedUserIfAvailable(ctx, user.ID)
-		user, err = a.getUser(ctx, userID)
+		var syncErr error
+		syncAction := "restore"
+		if quotaHasAvailable(user) {
+			syncErr = a.restoreQuotaPausedUserIfAvailableLocked(ctx, user.ID)
+		} else {
+			syncAction = "pause"
+			// A previous pause can leave a persisted sync error while the account
+			// remains exhausted. Retry the remote removal on reads so a transient
+			// CPA failure can converge without requiring a second quota mutation.
+			syncErr = a.pauseUserKeysForQuotaLocked(ctx, user.ID, quotaPauseReasonExhausted)
+		}
+		user, err = a.getUser(ctx, user.ID)
 		if err != nil {
 			return UserQuotaStatusResponse{}, err
 		}
+		if syncErr != nil {
+			// Remote sync failures are persisted on the user and returned as
+			// part of the status, so a GET never silently discards them.
+			log.Printf("%s quota-paused user %d during status read failed: %v", syncAction, user.ID, syncErr)
+			return quotaStatusFromUser(user), nil
+		}
 	} else if !quotaIsUnlimited(user) && !quotaHasAvailable(user) {
-		_ = a.pauseUserKeysForQuota(ctx, user.ID, quotaPauseReasonExhausted)
-		user, err = a.getUser(ctx, userID)
+		syncErr := a.pauseUserKeysForQuotaLocked(ctx, user.ID, quotaPauseReasonExhausted)
+		user, err = a.getUser(ctx, user.ID)
 		if err != nil {
 			return UserQuotaStatusResponse{}, err
+		}
+		if syncErr != nil {
+			log.Printf("pause quota-exhausted user %d during status read failed: %v", user.ID, syncErr)
+			return quotaStatusFromUser(user), nil
 		}
 	}
 	return quotaStatusFromUser(user), nil
 }
 
 func (a *App) ensureUserQuotaReadyForKeys(ctx context.Context, userID int) error {
-	status, err := a.userQuotaStatus(ctx, userID)
+	status, err := a.userQuotaStatusLocked(ctx, userID)
 	if err != nil {
 		return err
 	}
@@ -151,14 +195,33 @@ func (a *App) applyQuotaCharge(ctx context.Context, record UsageRecord, pricing 
 	if err != nil {
 		return err
 	}
+	userID := user.ID
+	unlock := a.lockUserMutation(userID)
+	defer unlock()
+	// The username lookup above only identifies the lock key. Re-read inside
+	// the critical section so concurrent charges always build on the latest
+	// quota snapshot instead of overwriting a sibling update.
+	user, err = a.getUser(ctx, userID)
+	if err != nil {
+		return err
+	}
 	user, err = a.ensureQuotaMonth(ctx, user)
 	if err != nil {
 		return err
 	}
-	if quotaIsUnlimited(user) {
-		if user.QuotaPausedAt != nil {
-			_ = a.restoreQuotaPausedUserIfAvailable(ctx, user.ID)
+	if user.QuotaPausedAt != nil && user.DisabledAt == nil && quotaHasAvailable(user) {
+		if user.QuotaPauseReason != nil && *user.QuotaPauseReason == quotaPauseReasonExhausted {
+			if syncErr := a.restoreQuotaPausedUserIfAvailableLocked(ctx, user.ID); syncErr != nil {
+				log.Printf("restore quota-paused user %d during usage charge failed: %v", user.ID, syncErr)
+			}
+			reloaded, reloadErr := a.getUser(ctx, user.ID)
+			if reloadErr != nil {
+				return reloadErr
+			}
+			user = reloaded
 		}
+	}
+	if quotaIsUnlimited(user) {
 		return nil
 	}
 
@@ -187,6 +250,11 @@ func (a *App) applyQuotaCharge(ctx context.Context, record UsageRecord, pricing 
 			nextLifetime := mathRound(*user.QuotaLifetimeUSD-lifetimeDeducted, 8)
 			user.QuotaLifetimeUSD = &nextLifetime
 			remaining = mathRound(remaining-lifetimeDeducted, 8)
+		}
+		if remaining > 0 && (user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD <= 0) {
+			user.QuotaMonthUsedUSD = mathRound(user.QuotaMonthUsedUSD+remaining, 8)
+			monthlyDeducted = mathRound(monthlyDeducted+remaining, 8)
+			remaining = 0
 		}
 	}
 	if unpriced {
@@ -232,7 +300,12 @@ func (a *App) applyQuotaCharge(ctx context.Context, record UsageRecord, pricing 
 	committed = true
 
 	if remaining > 0 || !quotaHasAvailable(user) {
-		_ = a.pauseUserKeysForQuota(ctx, user.ID, quotaPauseReasonExhausted)
+		// Keep the usage record/ledger commit independent from CPA availability.
+		// pauseUserKeysForQuota persists any synchronization failure on the
+		// account; status endpoints expose that error instead of dropping it.
+		if syncErr := a.pauseUserKeysForQuotaLocked(ctx, user.ID, quotaPauseReasonExhausted); syncErr != nil {
+			log.Printf("pause quota-exhausted user %d during usage charge failed: %v", user.ID, syncErr)
+		}
 	}
 	return nil
 }
@@ -253,41 +326,100 @@ func (a *App) ensureQuotaMonth(ctx context.Context, user UserRecord) (UserRecord
 	if err != nil {
 		return UserRecord{}, err
 	}
-	return a.getUser(ctx, user.ID)
+	updated, err := a.getUser(ctx, user.ID)
+	if err != nil {
+		return UserRecord{}, err
+	}
+	if user.QuotaPausedAt != nil && user.DisabledAt == nil && quotaHasAvailable(updated) {
+		if user.QuotaPauseReason != nil && *user.QuotaPauseReason == quotaPauseReasonExhausted {
+			if syncErr := a.restoreQuotaPausedUserIfAvailableLocked(ctx, user.ID); syncErr != nil {
+				log.Printf("auto restore quota-exhausted user %d on month rollover failed: %v", user.ID, syncErr)
+			}
+			reloaded, reloadErr := a.getUser(ctx, user.ID)
+			if reloadErr != nil {
+				return UserRecord{}, reloadErr
+			}
+			return reloaded, nil
+		}
+	}
+	return updated, nil
 }
 
 func (a *App) pauseUserKeysForQuota(ctx context.Context, userID int, reason string) error {
+	defer a.lockUserMutation(userID)()
+	return a.pauseUserKeysForQuotaLocked(ctx, userID, reason)
+}
+
+func (a *App) pauseUserKeysForQuotaLocked(ctx context.Context, userID int, reason string) error {
 	user, err := a.getUser(ctx, userID)
 	if err != nil {
+		return err
+	}
+	// Disabled users have already had their keys removed by disableUser. Keep
+	// the local pause marker in sync, but do not mutate the remote list.
+	if user.DisabledAt != nil {
+		now := dbTime(time.Now())
+		_, err := a.db.ExecContext(ctx, `UPDATE users SET quota_paused_at = COALESCE(quota_paused_at, ?), quota_pause_reason = ?, updated_at = ? WHERE id = ?`, now, reason, now, userID)
 		return err
 	}
 	if user.QuotaPausedAt != nil && user.QuotaSyncError == nil {
 		return nil
 	}
 	now := dbTime(time.Now())
-	_, err = a.db.ExecContext(ctx, `
+	result, err := a.db.ExecContext(ctx, `
 		UPDATE users
 		SET quota_paused_at = COALESCE(quota_paused_at, ?),
 		    quota_pause_reason = ?, quota_sync_error = NULL, updated_at = ?
-		WHERE id = ?
+		WHERE id = ? AND disabled_at IS NULL
 	`, now, reason, now, userID)
 	if err != nil {
 		return err
 	}
-	keys, err := a.userAPIKeys(ctx, userID)
-	if err != nil {
+	if affected, err := result.RowsAffected(); err != nil {
 		return err
-	}
-	for _, key := range keys {
-		if err := a.removeRemoteAPIKeyHash(ctx, key.APIKeyHash); err != nil {
-			_ = a.setQuotaSyncError(ctx, userID, err)
+	} else if affected != 1 {
+		current, currentErr := a.getUser(ctx, userID)
+		if currentErr != nil {
+			return currentErr
+		}
+		if current.DisabledAt != nil {
 			return nil
 		}
+		return conflictError("暂停用户额度时用户状态已变化")
+	}
+	keys, err := a.userAPIKeys(ctx, userID)
+	if err != nil {
+		persistCtx := context.WithoutCancel(ctx)
+		if persistErr := a.setQuotaSyncError(persistCtx, userID, err); persistErr != nil {
+			return combineUserMutationErrors(err, persistErr)
+		}
+		return err
+	}
+	var syncErr error
+	for _, key := range keys {
+		_, keySyncErr := a.removeRemoteAPIKeyHashWithChange(ctx, key.APIKeyHash)
+		if keySyncErr != nil {
+			syncErr = combineUserMutationErrors(syncErr, keySyncErr)
+		}
+	}
+	if syncErr != nil {
+		// Keep the local account paused and attempt every key so a transient
+		// failure for one binding does not leave the remaining bindings active.
+		persistCtx := context.WithoutCancel(ctx)
+		if persistErr := a.setQuotaSyncError(persistCtx, userID, syncErr); persistErr != nil {
+			syncErr = combineUserMutationErrors(syncErr, persistErr)
+		}
+		return syncErr
 	}
 	return nil
 }
 
 func (a *App) restoreQuotaPausedUserIfAvailable(ctx context.Context, userID int) error {
+	defer a.lockUserMutation(userID)()
+	return a.restoreQuotaPausedUserIfAvailableLocked(ctx, userID)
+}
+
+func (a *App) restoreQuotaPausedUserIfAvailableLocked(ctx context.Context, userID int) error {
 	user, err := a.getUser(ctx, userID)
 	if err != nil {
 		return err
@@ -301,11 +433,20 @@ func (a *App) restoreQuotaPausedUserIfAvailable(ctx context.Context, userID int)
 	}
 	keys, err := a.userAPIKeys(ctx, userID)
 	if err != nil {
+		persistCtx := context.WithoutCancel(ctx)
+		if persistErr := a.setQuotaSyncError(persistCtx, userID, err); persistErr != nil {
+			return combineUserMutationErrors(err, persistErr)
+		}
 		return err
 	}
 	for _, key := range keys {
 		if key.APIKey == nil {
-			return a.setQuotaSyncMessage(ctx, userID, "存在无法恢复的 API KEY，请重新绑定后再恢复")
+			missingKeyErr := conflictError("存在无法恢复的 API KEY，请重新绑定后再恢复")
+			persistCtx := context.WithoutCancel(ctx)
+			if persistErr := a.setQuotaSyncError(persistCtx, userID, missingKeyErr); persistErr != nil {
+				return combineUserMutationErrors(missingKeyErr, persistErr)
+			}
+			return missingKeyErr
 		}
 	}
 	restored := []string{}
@@ -313,22 +454,69 @@ func (a *App) restoreQuotaPausedUserIfAvailable(ctx context.Context, userID int)
 		if key.APIKey == nil {
 			continue
 		}
-		if err := a.addRemoteAPIKey(ctx, *key.APIKey); err != nil {
-			for _, hash := range restored {
-				_ = a.removeRemoteAPIKeyHash(ctx, hash)
-			}
-			_ = a.setQuotaSyncError(ctx, userID, err)
-			return nil
+		changed, syncErr := a.addRemoteAPIKeyWithChange(ctx, *key.APIKey)
+		if changed {
+			restored = append(restored, key.APIKeyHash)
 		}
-		restored = append(restored, key.APIKeyHash)
+		if syncErr != nil {
+			persistCtx := context.WithoutCancel(ctx)
+			compensationErr := a.removeRestoredUserAPIKeys(persistCtx, restored)
+			combinedErr := combineUserMutationErrors(syncErr, compensationErr)
+			if persistErr := a.setQuotaSyncError(persistCtx, userID, combinedErr); persistErr != nil {
+				combinedErr = combineUserMutationErrors(combinedErr, persistErr)
+			}
+			return combinedErr
+		}
 	}
-	_, err = a.db.ExecContext(ctx, `
+	result, err := a.db.ExecContext(ctx, `
 		UPDATE users
 		SET quota_paused_at = NULL, quota_pause_reason = NULL,
 		    quota_sync_error = NULL, updated_at = ?
-		WHERE id = ?
-	`, dbTime(time.Now()), userID)
-	return err
+		WHERE id = ? AND disabled_at IS NULL AND quota_paused_at = ?
+	`, dbTime(time.Now()), userID, dbTimePtr(user.QuotaPausedAt))
+	if err != nil {
+		persistCtx := context.WithoutCancel(ctx)
+		compensationErr := a.removeRestoredUserAPIKeys(persistCtx, restored)
+		combinedErr := combineUserMutationErrors(err, compensationErr)
+		if persistErr := a.setQuotaSyncError(persistCtx, userID, combinedErr); persistErr != nil {
+			combinedErr = combineUserMutationErrors(combinedErr, persistErr)
+		}
+		return combinedErr
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		persistCtx := context.WithoutCancel(ctx)
+		compensationErr := a.removeRestoredUserAPIKeys(persistCtx, restored)
+		combinedErr := combineUserMutationErrors(err, compensationErr)
+		if persistErr := a.setQuotaSyncError(persistCtx, userID, combinedErr); persistErr != nil {
+			combinedErr = combineUserMutationErrors(combinedErr, persistErr)
+		}
+		return combinedErr
+	}
+	if affected != 1 {
+		current, currentErr := a.getUser(ctx, userID)
+		if currentErr != nil {
+			persistCtx := context.WithoutCancel(ctx)
+			compensationErr := a.removeRestoredUserAPIKeys(persistCtx, restored)
+			combinedErr := combineUserMutationErrors(currentErr, compensationErr)
+			if persistErr := a.setQuotaSyncError(persistCtx, userID, combinedErr); persistErr != nil {
+				combinedErr = combineUserMutationErrors(combinedErr, persistErr)
+			}
+			return combinedErr
+		}
+		if current.DisabledAt == nil && current.QuotaPausedAt == nil {
+			return nil
+		}
+		persistCtx := context.WithoutCancel(ctx)
+		compensationErr := a.removeRestoredUserAPIKeys(persistCtx, restored)
+		guardErr := conflictError("恢复额度用户时用户状态已变化")
+		combinedErr := combineUserMutationErrors(guardErr, compensationErr)
+		if persistErr := a.setQuotaSyncError(persistCtx, userID, combinedErr); persistErr != nil {
+			combinedErr = combineUserMutationErrors(combinedErr, persistErr)
+		}
+		return combinedErr
+	}
+	return nil
 }
 
 func (a *App) setQuotaSyncError(ctx context.Context, userID int, err error) error {

@@ -189,7 +189,7 @@ func TestRequireSchemaShapeRejectsMissingModelMonitorColumns(t *testing.T) {
 			db.SetMaxOpenConns(1)
 			statements := []string{
 				appSettingsSchemaForStartupTest(missing),
-				`CREATE TABLE users (username TEXT)`,
+				`CREATE TABLE users (username TEXT, is_super_admin BOOLEAN, must_change_password BOOLEAN, session_version INTEGER)`,
 				`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
 				codexKeeperAuthStateSchemaForStartupTest,
 				modelPriceSchemaForStartupTest,
@@ -240,7 +240,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceChannelColumns(t *testing.T) 
 			}
 			statements := []string{
 				appSettingsSchemaForStartupTest(""),
-				`CREATE TABLE users (username TEXT)`,
+				`CREATE TABLE users (username TEXT, is_super_admin BOOLEAN, must_change_password BOOLEAN, session_version INTEGER)`,
 				`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
 				codexKeeperAuthStateSchemaForStartupTest,
 				`CREATE TABLE model_prices (` + strings.Join(columns, ", ") + `)`,
@@ -270,7 +270,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceLibraryConflictsTable(t *test
 	db.SetMaxOpenConns(1)
 	statements := []string{
 		appSettingsSchemaForStartupTest(""),
-		`CREATE TABLE users (username TEXT)`,
+		`CREATE TABLE users (username TEXT, is_super_admin BOOLEAN, must_change_password BOOLEAN, session_version INTEGER)`,
 		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
 		codexKeeperAuthStateSchemaForStartupTest,
 		`CREATE TABLE model_prices (
@@ -302,7 +302,7 @@ func TestRequireSchemaShapeRejectsMissingKeeperAuthIndex(t *testing.T) {
 	db.SetMaxOpenConns(1)
 	statements := []string{
 		appSettingsSchemaForStartupTest(""),
-		`CREATE TABLE users (username TEXT)`,
+		`CREATE TABLE users (username TEXT, is_super_admin BOOLEAN, must_change_password BOOLEAN, session_version INTEGER)`,
 		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
 		`CREATE TABLE codex_keeper_auth_states (auth_name TEXT)`,
 		`CREATE TABLE model_prices (

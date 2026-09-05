@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"database/sql"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,6 +106,9 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if !testColumnExists(t, app.db, "users", "quota_monthly_usd") {
 		t.Fatal("users.quota_monthly_usd was not created")
 	}
+	if !testColumnExists(t, app.db, "users", "is_super_admin") {
+		t.Fatal("users.is_super_admin was not created")
+	}
 	if !testTableExists(t, app.db, "user_quota_charges") {
 		t.Fatal("user_quota_charges was not created")
 	}
@@ -182,6 +187,235 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	}
 }
 
+func TestRunMigrationsUserSuperAdminSelectsLowestActiveAdministrator(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	dbPath := prepareMigrationTestDatabase(t, dataDir, 202608090001)
+
+	db, err := sql.Open("sqlite", sqliteDSN(dbPath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	_, err = db.Exec(`
+		INSERT INTO users (id, username, is_admin, nickname, disabled_at, created_at, updated_at)
+		VALUES
+			(1, 'disabled-admin', 1, 'Disabled admin', '2026-09-01 00:00:00', '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+			(2, 'active-user', 0, 'Active user', NULL, '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+			(3, 'active-admin', 1, 'Active admin', NULL, '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+			(4, 'second-active-admin', 1, 'Second active admin', NULL, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+	`)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("seed previous-head users: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	app, err := NewWithOptions(ctx, NewOptions{Migrate: true, StartBackground: false})
+	if err != nil {
+		t.Fatalf("upgrade previous-head database: %v", err)
+	}
+	defer app.Close()
+
+	if !testColumnExists(t, app.db, "users", "is_super_admin") {
+		t.Fatal("users.is_super_admin was not added during upgrade")
+	}
+	for _, expected := range []struct {
+		id           int
+		isAdmin      bool
+		isSuperAdmin bool
+	}{
+		{id: 1, isAdmin: true, isSuperAdmin: false},
+		{id: 2, isAdmin: false, isSuperAdmin: false},
+		{id: 3, isAdmin: true, isSuperAdmin: true},
+		{id: 4, isAdmin: true, isSuperAdmin: false},
+	} {
+		var isAdmin, isSuperAdmin bool
+		if err := app.db.QueryRowContext(ctx, `SELECT is_admin, is_super_admin FROM users WHERE id = ?`, expected.id).Scan(&isAdmin, &isSuperAdmin); err != nil {
+			t.Fatalf("query user %d roles: %v", expected.id, err)
+		}
+		if isAdmin != expected.isAdmin || isSuperAdmin != expected.isSuperAdmin {
+			t.Fatalf("user %d roles = admin=%t super_admin=%t, want admin=%t super_admin=%t", expected.id, isAdmin, isSuperAdmin, expected.isAdmin, expected.isSuperAdmin)
+		}
+	}
+}
+
+func TestRunMigrationsUserSuperAdminAllowsFirstSetupAfterEmptyUpgrade(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	prepareMigrationTestDatabase(t, dataDir, 202608090001)
+
+	app, err := NewWithOptions(context.Background(), NewOptions{Migrate: true, StartBackground: false})
+	if err != nil {
+		t.Fatalf("upgrade empty previous-head database: %v", err)
+	}
+	defer app.Close()
+
+	var count int
+	if err := app.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count); err != nil {
+		t.Fatalf("count users after empty upgrade: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("users after empty upgrade = %d, want 0", count)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/setup", strings.NewReader(`{"username":"first-admin","password":"password123","nickname":"First admin"}`))
+	app.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("create first admin status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var isAdmin, isSuperAdmin bool
+	if err := app.db.QueryRow(`SELECT is_admin, is_super_admin FROM users WHERE username = 'first-admin'`).Scan(&isAdmin, &isSuperAdmin); err != nil {
+		t.Fatalf("query first admin roles: %v", err)
+	}
+	if !isAdmin || !isSuperAdmin {
+		t.Fatalf("first admin roles = admin=%t super_admin=%t, want both true", isAdmin, isSuperAdmin)
+	}
+}
+
+func TestRunMigrationsUserSuperAdminPreservesDisabledFirstUser(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	dbPath := prepareMigrationTestDatabase(t, dataDir, 202608090001)
+
+	db, err := sql.Open("sqlite", sqliteDSN(dbPath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	_, err = db.Exec(`
+		INSERT INTO users (id, username, is_admin, nickname, disabled_at, created_at, updated_at)
+		VALUES
+			(1, 'disabled-admin', 1, 'Disabled admin', '2026-09-01 00:00:00', '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+			(2, 'active-user', 0, 'Active user', NULL, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+	`)
+	if err != nil {
+		t.Fatalf("seed users without an active administrator: %v", err)
+	}
+
+	goose.SetBaseFS(backendMigrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	err = goose.UpToContext(context.Background(), db, ".", backendMigrations.LatestVersion)
+	if err != nil {
+		t.Fatalf("upgrade with only a disabled administrator failed: %v", err)
+	}
+
+	var maxVersion int64
+	if err := db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version WHERE is_applied = 1`).Scan(&maxVersion); err != nil {
+		t.Fatalf("query applied migration version: %v", err)
+	}
+	if maxVersion != backendMigrations.LatestVersion {
+		t.Fatalf("applied migration version = %d, want %d", maxVersion, backendMigrations.LatestVersion)
+	}
+
+	var isAdmin, isSuperAdmin bool
+	var disabledAt sql.NullString
+	if err := db.QueryRow(`SELECT is_admin, is_super_admin, disabled_at FROM users WHERE id = 1`).Scan(&isAdmin, &isSuperAdmin, &disabledAt); err != nil {
+		t.Fatalf("query recovered administrator: %v", err)
+	}
+	if !isAdmin || !isSuperAdmin || !disabledAt.Valid {
+		t.Fatalf("first user = admin=%t super_admin=%t disabled_at=%q, want super-admin with disabled state preserved", isAdmin, isSuperAdmin, disabledAt.String)
+	}
+	var activeUserSuperAdmin bool
+	if err := db.QueryRow(`SELECT is_super_admin FROM users WHERE id = 2`).Scan(&activeUserSuperAdmin); err != nil {
+		t.Fatalf("query ordinary user role: %v", err)
+	}
+	if activeUserSuperAdmin {
+		t.Fatal("migration promoted ordinary active user to super administrator")
+	}
+}
+
+func TestRunMigrationsUserSuperAdminBootstrapsImportedUsersWithoutAdministrator(t *testing.T) {
+	dataDir := t.TempDir()
+	dbPath := prepareMigrationTestDatabase(t, dataDir, 202608090001)
+
+	db, err := sql.Open("sqlite", sqliteDSN(dbPath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	_, err = db.Exec(`
+		INSERT INTO users (id, username, password_hash, password_salt, is_admin, nickname, disabled_at, created_at, updated_at)
+		VALUES
+			(1, 'imported-active', 'hash', 'salt', 0, 'Imported active', NULL, '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+			(2, 'imported-disabled', NULL, NULL, 0, 'Imported disabled', '2026-09-01 00:00:00', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+	`)
+	if err != nil {
+		t.Fatalf("seed imported users without administrator: %v", err)
+	}
+
+	goose.SetBaseFS(backendMigrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpToContext(context.Background(), db, ".", backendMigrations.LatestVersion); err != nil {
+		t.Fatalf("upgrade imported database without administrator failed: %v", err)
+	}
+
+	var isAdmin, isSuperAdmin bool
+	var disabledAt sql.NullString
+	if err := db.QueryRow(`SELECT is_admin, is_super_admin, disabled_at FROM users WHERE id = 1`).Scan(&isAdmin, &isSuperAdmin, &disabledAt); err != nil {
+		t.Fatalf("query bootstrapped imported user: %v", err)
+	}
+	if !isAdmin || !isSuperAdmin || disabledAt.Valid {
+		t.Fatalf("bootstrapped imported user = admin=%t super_admin=%t disabled_at=%q, want admin/super-admin enabled", isAdmin, isSuperAdmin, disabledAt.String)
+	}
+}
+
+func TestRunMigrationsUserSuperAdminPromotesFirstImportedUser(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	dbPath := prepareMigrationTestDatabase(t, dataDir, 202608090001)
+
+	db, err := sql.Open("sqlite", sqliteDSN(dbPath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	_, err = db.Exec(`
+		INSERT INTO users (id, username, password_hash, password_salt, is_admin, nickname, disabled_at, created_at, updated_at)
+		VALUES
+			(1, 'active-without-credentials', NULL, NULL, 0, 'Active user', NULL, '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+			(2, 'disabled-with-credentials', 'hash', 'salt', 0, 'Disabled user', '2026-09-01 00:00:00', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+	`)
+	if err != nil {
+		t.Fatalf("seed imported users with mixed credential availability: %v", err)
+	}
+
+	goose.SetBaseFS(backendMigrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpToContext(context.Background(), db, ".", backendMigrations.LatestVersion); err != nil {
+		t.Fatalf("upgrade imported database with mixed credential availability failed: %v", err)
+	}
+
+	var isAdmin, isSuperAdmin bool
+	var disabledAt sql.NullString
+	if err := db.QueryRow(`SELECT is_admin, is_super_admin, disabled_at FROM users WHERE id = 1`).Scan(&isAdmin, &isSuperAdmin, &disabledAt); err != nil {
+		t.Fatalf("query first imported user: %v", err)
+	}
+	if !isAdmin || !isSuperAdmin || disabledAt.Valid {
+		t.Fatalf("first imported user = admin=%t super_admin=%t disabled_at=%q, want admin/super-admin enabled", isAdmin, isSuperAdmin, disabledAt.String)
+	}
+	if err := db.QueryRow(`SELECT is_super_admin FROM users WHERE id = 2`).Scan(&isSuperAdmin); err != nil {
+		t.Fatalf("query later imported user role: %v", err)
+	}
+	if isSuperAdmin {
+		t.Fatal("migration promoted a later imported user over the first user")
+	}
+}
+
 func TestUsageHistoryRangeQueriesUseCompositeIndexes(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 
@@ -245,6 +479,12 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 	apiKey := "sk-old-test"
 	apiKeyHash := hashAPIKey(apiKey)
 	oldSQL := []string{
+		`CREATE TABLE app_settings (
+			id INTEGER PRIMARY KEY,
+			account_username VARCHAR(120),
+			account_password_hash VARCHAR(200),
+			account_password_salt VARCHAR(64)
+		)`,
 		`CREATE TABLE usage_records (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			created_at DATETIME NOT NULL,
@@ -296,6 +536,8 @@ func TestRunMigrationsRepairsOldPythonSchemaWithoutOldCode(t *testing.T) {
 		`CREATE TABLE alembic_version (
 			version_num VARCHAR(32) NOT NULL
 		)`,
+		`INSERT INTO app_settings (id, account_username, account_password_hash, account_password_salt)
+			VALUES (1, 'legacy-admin', 'legacy-password-hash', 'legacy-password-salt')`,
 		`INSERT INTO alembic_version (version_num) VALUES ('20260513_0001')`,
 	}
 	for _, statement := range oldSQL {

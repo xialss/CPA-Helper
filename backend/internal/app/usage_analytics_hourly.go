@@ -357,22 +357,19 @@ func (a *App) rebuildUsageAnalyticsHourlyLocked(ctx context.Context, pricing mod
 	if err != nil {
 		return modelPriceBillingIndex{}, usageAnalyticsState{}, err
 	}
+	defer rows.Close()
 	builder := newUsageAnalyticsHourlyBuilder(pricing.Prices, pricing.MatchContext)
 	for rows.Next() {
 		record, err := scanUsageAnalyticsFactRecord(rows)
 		if err != nil {
-			_ = rows.Close()
 			return modelPriceBillingIndex{}, usageAnalyticsState{}, err
 		}
 		builder.add(record)
 	}
 	if err := rows.Err(); err != nil {
-		_ = rows.Close()
 		return modelPriceBillingIndex{}, usageAnalyticsState{}, err
 	}
-	if err := rows.Close(); err != nil {
-		return modelPriceBillingIndex{}, usageAnalyticsState{}, err
-	}
+	_ = rows.Close()
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_analytics_hourly`); err != nil {
 		return modelPriceBillingIndex{}, usageAnalyticsState{}, err
@@ -741,6 +738,9 @@ func (a *App) collectUsageAnalyticsHourlySnapshot(ctx context.Context, plan usag
 }
 
 func (collector *usageAnalyticsCollector) AddHourly(value usageAnalyticsHourlyContribution) {
+	if collector.userSummaries != nil {
+		collector.userSummaries.addHourly(value)
+	}
 	if collector.summary != nil {
 		collector.summary.addHourly(value)
 	}

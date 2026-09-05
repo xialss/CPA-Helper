@@ -17,6 +17,7 @@ export function isAuthUser(value: unknown): value is AuthUser {
     typeof record.id === 'number' &&
     typeof record.username === 'string' &&
     typeof record.is_admin === 'boolean' &&
+    typeof record.is_super_admin === 'boolean' &&
     typeof record.must_change_password === 'boolean'
   )
 }

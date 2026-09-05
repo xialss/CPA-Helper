@@ -1317,6 +1317,156 @@ func TestRecordCostUsesExactNativeChannelAuthIndex(t *testing.T) {
 	}
 }
 
+func TestRecordCostMatchesPrefixedOpenAICompatibleRuntimeProvider(t *testing.T) {
+	model := "gemini-3.1-flash-lite"
+	brand := string(aiProviderBrandOpenAICompatibility)
+	authType := modelPriceChannelAuthTypeAPIKey
+	channels := []struct {
+		name    string
+		runtime string
+		input   float64
+	}{
+		{
+			name:    "翻译 - gemini - 1",
+			runtime: "openai-compatible-翻译 - gemini - 1",
+			input:   0.25,
+		},
+		{
+			name:    "翻译 - gemini - 2",
+			runtime: "openai-compatible-翻译 - gemini - 2",
+			input:   0.75,
+		},
+	}
+	prices := modelPriceIndex{}
+	providers := make([]aiProviderItem, 0, len(channels))
+	for index, channel := range channels {
+		name := channel.name
+		prefix := "翻译"
+		prices[channelModelPriceKey(authType, brand, channel.name, model)] = ModelPrice{
+			ID:                 index + 1,
+			Provider:           channel.name,
+			Model:              model,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelAuthType:    &authType,
+			ChannelBrand:       &brand,
+			ChannelKey:         &name,
+			InputUSDPerMillion: channel.input,
+		}
+		providers = append(providers, aiProviderItem{
+			Brand:  aiProviderBrandOpenAICompatibility,
+			Name:   &name,
+			Prefix: &prefix,
+			Models: []aiProviderModel{{Name: model}},
+		})
+	}
+	matchContext := modelPriceMatchContext{
+		Selectors:          modelPriceChannelSelectors(providers),
+		SelectorsRequired:  true,
+		SelectorsAvailable: true,
+	}
+
+	for _, channel := range channels {
+		runtimeProvider := channel.runtime
+		breakdown := calculateRecordCostBreakdown(UsageRecord{
+			Provider:    &runtimeProvider,
+			Model:       &model,
+			InputTokens: 1_000_000,
+			TotalTokens: 1_000_000,
+		}, prices, matchContext)
+		if breakdown.Unpriced || breakdown.TotalUSD != channel.input {
+			t.Fatalf("prefixed OpenAI-compatible %q breakdown = %#v, want priced total %v", runtimeProvider, breakdown, channel.input)
+		}
+	}
+
+	// A normal OpenAI-compatible provider name remains an exact stored-price
+	// match when it is not carrying the runtime brand prefix.
+	exactProvider := channels[0].name
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &exactProvider,
+		Model:       &model,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, prices)
+	if breakdown.Unpriced || breakdown.TotalUSD != channels[0].input {
+		t.Fatalf("exact OpenAI-compatible provider breakdown = %#v, want priced total %v", breakdown, channels[0].input)
+	}
+}
+
+func TestRecordCostFailsClosedForPrefixedOpenAICompatibleProviderAmbiguity(t *testing.T) {
+	model := "gemini-3.1-flash-lite-ambiguous"
+	runtimeProvider := "openai-compatible-翻译 - gemini - 1"
+	configuredName := "翻译 - gemini - 1"
+	exactName := runtimeProvider
+	brand := string(aiProviderBrandOpenAICompatibility)
+	authType := modelPriceChannelAuthTypeAPIKey
+	prefix := "翻译"
+	prices := modelPriceIndex{}
+	for index, channelName := range []string{configuredName, exactName} {
+		name := channelName
+		prices[channelModelPriceKey(authType, brand, channelName, model)] = ModelPrice{
+			ID:                 index + 1,
+			Provider:           channelName,
+			Model:              model,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelAuthType:    &authType,
+			ChannelBrand:       &brand,
+			ChannelKey:         &name,
+			InputUSDPerMillion: float64(index + 1),
+		}
+	}
+	record := UsageRecord{
+		Provider:    &runtimeProvider,
+		Model:       &model,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}
+
+	stored := calculateRecordCostBreakdown(record, prices)
+	if !stored.Unpriced || stored.TotalUSD != 0 || stored.UnpricedReason == nil || *stored.UnpricedReason != priceMatchStatusChannelConflict {
+		t.Fatalf("prefixed stored ambiguity breakdown = %#v, want channel_conflict", stored)
+	}
+
+	providers := []aiProviderItem{
+		{Brand: aiProviderBrandOpenAICompatibility, Name: &configuredName, Prefix: &prefix, Models: []aiProviderModel{{Name: model}}},
+		{Brand: aiProviderBrandOpenAICompatibility, Name: &exactName, Prefix: &prefix, Models: []aiProviderModel{{Name: model}}},
+	}
+	configured := calculateRecordCostBreakdown(record, prices, modelPriceMatchContext{
+		Selectors:          modelPriceChannelSelectors(providers),
+		SelectorsRequired:  true,
+		SelectorsAvailable: true,
+	})
+	if !configured.Unpriced || configured.TotalUSD != 0 || configured.UnpricedReason == nil || *configured.UnpricedReason != priceMatchStatusChannelConflict {
+		t.Fatalf("prefixed configured ambiguity breakdown = %#v, want channel_conflict", configured)
+	}
+}
+
+func TestOpenAICompatibleRuntimeProviderCandidatesDoNotDoubleStrip(t *testing.T) {
+	runtimeProvider := "openai-compatible-openai-compatible-foo"
+	configuredProvider := "openai-compatible-foo"
+	model := "double-prefixed-model"
+	brand := string(aiProviderBrandOpenAICompatibility)
+	prices := modelPriceIndex{
+		priceKey(configuredProvider, model): {
+			ID:                 1,
+			Provider:           configuredProvider,
+			Model:              model,
+			PriceScope:         modelPriceScopeChannel,
+			ChannelBrand:       &brand,
+			ChannelKey:         &configuredProvider,
+			InputUSDPerMillion: 2,
+		},
+	}
+	breakdown := calculateRecordCostBreakdown(UsageRecord{
+		Provider:    &runtimeProvider,
+		Model:       &model,
+		InputTokens: 1_000_000,
+		TotalTokens: 1_000_000,
+	}, prices)
+	if !breakdown.Unpriced || breakdown.TotalUSD != 0 || breakdown.UnpricedReason == nil || *breakdown.UnpricedReason != priceMatchStatusChannelUnpriced {
+		t.Fatalf("double-prefixed provider breakdown = %#v, want channel_unpriced", breakdown)
+	}
+}
+
 func TestRecordCostDoesNotUseSameNamedCompatibleChannelWhenNativeAuthIndexIsMissing(t *testing.T) {
 	provider := "gemini"
 	model := "gemini-missing-auth-compatible-conflict"

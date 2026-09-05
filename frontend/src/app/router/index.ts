@@ -89,7 +89,7 @@ export const router = createRouter({
           path: 'admin/settings',
           name: 'admin-settings',
           component: () => import('@/features/settings/views/SettingsView.vue'),
-          meta: { requiresAdmin: true },
+          meta: { requiresAdmin: true, requiresSuperAdmin: true },
         },
         {
           path: 'account/usage',
@@ -172,9 +172,15 @@ router.beforeEach(async (to) => {
     if (!user.must_change_password && to.name === 'change-credentials') {
       return homePath(user)
     }
+    if (to.name === 'legacy-settings' && user.is_admin && !user.is_super_admin) {
+      return { path: '/account/settings', query: to.query }
+    }
     const target = user.is_admin ? stringMeta(to, 'adminTarget') : stringMeta(to, 'accountTarget')
     if (target) {
       return { path: target, query: to.query }
+    }
+    if (to.meta.requiresSuperAdmin && !user.is_super_admin) {
+      return { path: user.is_admin ? '/admin/usage' : '/account/usage' }
     }
     if (to.meta.requiresAdmin && !user.is_admin) {
       return { path: '/account/usage' }

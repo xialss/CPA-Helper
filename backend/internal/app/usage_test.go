@@ -898,6 +898,10 @@ func TestUsageRecordDetailRedactsAccountSourceForNonAdminOnly(t *testing.T) {
 		"username": "member",
 		"password": "member-password",
 	}, nil, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/auth/change-credentials", map[string]any{
+		"current_password": "member-password",
+		"password":         "member-new-password",
+	}, memberCookies, nil)
 	window := newUsageTestTimeWindow()
 	start, end := window.rangeValues()
 

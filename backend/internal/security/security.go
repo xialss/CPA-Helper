@@ -21,8 +21,9 @@ const (
 )
 
 type Identity struct {
-	UserID   *int
-	Username *string
+	UserID         *int
+	Username       *string
+	SessionVersion int
 }
 
 func CreateSalt() (string, error) {
@@ -76,7 +77,15 @@ func MaskSecret(value *string) string {
 }
 
 func SetSessionCookie(w http.ResponseWriter, userID int, secret string) error {
-	token, err := createSessionToken(userID, secret)
+	return SetSessionCookieWithVersion(w, userID, secret, 0)
+}
+
+func SetSessionCookieWithVersion(w http.ResponseWriter, userID int, secret string, sessionVersion int) error {
+	return SetSessionCookieWithVersionAndSecure(w, userID, secret, sessionVersion, true)
+}
+
+func SetSessionCookieWithVersionAndSecure(w http.ResponseWriter, userID int, secret string, sessionVersion int, secure bool) error {
+	token, err := createSessionToken(userID, secret, sessionVersion)
 	if err != nil {
 		return err
 	}
@@ -86,18 +95,24 @@ func SetSessionCookie(w http.ResponseWriter, userID int, secret string) error {
 		Path:     "/",
 		MaxAge:   sessionMaxAgeSeconds,
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 	return nil
 }
 
 func ClearSessionCookie(w http.ResponseWriter) {
+	ClearSessionCookieWithSecure(w, true)
+}
+
+func ClearSessionCookieWithSecure(w http.ResponseWriter, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 }
@@ -139,10 +154,10 @@ func ReadSessionToken(token, secret string) (*Identity, bool) {
 		if err != nil {
 			return nil, false
 		}
-		return &Identity{UserID: &id}, true
+		return &Identity{UserID: &id, SessionVersion: sessionVersion(payload)}, true
 	}
 	if sub != "" {
-		return &Identity{Username: &sub}, true
+		return &Identity{Username: &sub, SessionVersion: sessionVersion(payload)}, true
 	}
 	return nil, false
 }
@@ -159,11 +174,12 @@ func randomHex(size int) (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-func createSessionToken(userID int, secret string) (string, error) {
+func createSessionToken(userID int, secret string, sessionVersion int) (string, error) {
 	payload := map[string]any{
 		"sub": strconv.Itoa(userID),
 		"typ": "user_id",
 		"exp": time.Now().Add(sessionMaxAgeSeconds * time.Second).Unix(),
+		"ver": sessionVersion,
 	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -174,4 +190,12 @@ func createSessionToken(userID int, secret string) (string, error) {
 	mac.Write([]byte(payloadPart))
 	signature := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	return payloadPart + "." + signature, nil
+}
+
+func sessionVersion(payload map[string]any) int {
+	value, ok := payload["ver"].(float64)
+	if !ok || value < 0 {
+		return 0
+	}
+	return int(value)
 }

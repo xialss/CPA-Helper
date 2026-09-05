@@ -58,10 +58,44 @@ type App struct {
 	keeper                 *KeeperRunner
 	usageMaintenance       *usageMaintenanceRunner
 	usageHourlyMu          sync.Mutex
+	userMutationMu         sync.Mutex // serialize mutations that do not yet have a user ID (create/setup)
+	userMutationLocks      sync.Map   // map[int]*sync.Mutex; serialize state and remote-key mutations per user
+	remoteAPIKeyListLocks  sync.Map   // map[string]*sync.Mutex; serialize full-list API-key operations per CPA configuration
 	keeperUsageCache       keeperWindowUsageCache
 	priceSelectors         modelPriceSelectorSnapshotCache
 	aiProviderWriteMu      sync.Mutex // serialize provider read/validate/write mutations
 	modelMonitorHTTPClient func(ModelMonitorProxyConfig) (*http.Client, error)
+	loginAttemptsMu        sync.Mutex
+	loginFailures          map[string]loginFailureRecord
+}
+
+type loginFailureRecord struct {
+	count       int
+	lastAttempt time.Time
+}
+
+// lockUserMutation serializes state and remote API-key changes for one user.
+// A keyed lock keeps a slow CPA request for one account from blocking unrelated
+// accounts while preserving the ordering guarantees required by each account's
+// lifecycle and quota state machine.
+func (a *App) lockUserMutation(userID int) func() {
+	created := &sync.Mutex{}
+	actual, _ := a.userMutationLocks.LoadOrStore(userID, created)
+	lock := actual.(*sync.Mutex)
+	lock.Lock()
+	return lock.Unlock
+}
+
+// lockRemoteAPIKeyList serializes read-modify-write operations for one CPA
+// endpoint and management credential. Independent CPA configurations should
+// not block one another, while callers still get a consistent remote list.
+func (a *App) lockRemoteAPIKeyList(cfg AppConfig) func() {
+	key := strings.TrimRight(strings.TrimSpace(cfg.Collector.CLIProxyURL), "/") + "\x00" + strings.TrimSpace(cfg.Collector.ManagementKey)
+	created := &sync.Mutex{}
+	actual, _ := a.remoteAPIKeyListLocks.LoadOrStore(key, created)
+	lock := actual.(*sync.Mutex)
+	lock.Lock()
+	return lock.Unlock
 }
 
 type AppError struct {
@@ -134,6 +168,7 @@ func NewWithOptions(ctx context.Context, options NewOptions) (*App, error) {
 		frontendFS:             frontendFS,
 		frontendEnv:            frontendEnv,
 		modelMonitorHTTPClient: newModelMonitorBuiltinHTTPClient,
+		loginFailures:          map[string]loginFailureRecord{},
 	}
 	if options.Migrate {
 		if err := app.runMigrations(ctx); err != nil {
@@ -981,7 +1016,9 @@ type AuthUser struct {
 	ID                 int    `json:"id"`
 	Username           string `json:"username"`
 	IsAdmin            bool   `json:"is_admin"`
+	IsSuperAdmin       bool   `json:"is_super_admin"`
 	MustChangePassword bool   `json:"must_change_password"`
+	SessionVersion     int    `json:"-"`
 }
 
 func (a *App) currentUser(ctx context.Context, r *http.Request) (*AuthUser, error) {
@@ -999,18 +1036,21 @@ func (a *App) currentUser(ctx context.Context, r *http.Request) (*AuthUser, erro
 	}
 	var row *sql.Row
 	if identity.UserID != nil {
-		row = a.db.QueryRowContext(ctx, `SELECT id, username, is_admin FROM users WHERE id = ? AND disabled_at IS NULL`, *identity.UserID)
+		row = a.db.QueryRowContext(ctx, `SELECT id, username, is_admin, is_super_admin, must_change_password, session_version FROM users WHERE id = ? AND disabled_at IS NULL`, *identity.UserID)
 	} else if identity.Username != nil {
-		row = a.db.QueryRowContext(ctx, `SELECT id, username, is_admin FROM users WHERE username = ? AND disabled_at IS NULL`, *identity.Username)
+		row = a.db.QueryRowContext(ctx, `SELECT id, username, is_admin, is_super_admin, must_change_password, session_version FROM users WHERE username = ? AND disabled_at IS NULL`, *identity.Username)
 	} else {
 		return nil, authenticationError("登录会话已失效")
 	}
 	user := AuthUser{}
-	if err := row.Scan(&user.ID, &user.Username, &user.IsAdmin); err != nil {
+	if err := row.Scan(&user.ID, &user.Username, &user.IsAdmin, &user.IsSuperAdmin, &user.MustChangePassword, &user.SessionVersion); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, authenticationError("登录会话已失效")
 		}
 		return nil, err
+	}
+	if identity.SessionVersion != user.SessionVersion {
+		return nil, authenticationError("登录会话已失效")
 	}
 	return &user, nil
 }
@@ -1037,12 +1077,37 @@ func (a *App) adminUser(ctx context.Context, r *http.Request) (*AuthUser, error)
 	return user, nil
 }
 
-func setSessionCookie(w http.ResponseWriter, userID int, secret string) error {
-	return security.SetSessionCookie(w, userID, secret)
+func (a *App) superAdminUser(ctx context.Context, r *http.Request) (*AuthUser, error) {
+	user, err := a.adminUser(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	if !user.IsSuperAdmin {
+		return nil, forbiddenError("需要超级管理员权限")
+	}
+	return user, nil
 }
 
-func clearSessionCookie(w http.ResponseWriter) {
-	security.ClearSessionCookie(w)
+func setSessionCookie(w http.ResponseWriter, r *http.Request, userID int, secret string) error {
+	return security.SetSessionCookieWithVersionAndSecure(w, userID, secret, 0, sessionCookieSecure(r))
+}
+
+func setSessionCookieWithVersion(w http.ResponseWriter, r *http.Request, userID int, secret string, sessionVersion int) error {
+	return security.SetSessionCookieWithVersionAndSecure(w, userID, secret, sessionVersion, sessionCookieSecure(r))
+}
+
+func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	security.ClearSessionCookieWithSecure(w, sessionCookieSecure(r))
+}
+
+func sessionCookieSecure(r *http.Request) bool {
+	if r == nil {
+		return true
+	}
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
 }
 
 func nonBlank(value, fallback string) string {
@@ -1100,6 +1165,10 @@ func httpClient(timeout time.Duration) *http.Client {
 	return cpahttp.Client(timeout)
 }
 
+func publicHTTPClient(timeout time.Duration) *http.Client {
+	return cpahttp.PublicClient(timeout)
+}
+
 func managementHeaders(key string) http.Header {
 	return cpahttp.ManagementHeaders(key)
 }
@@ -1115,6 +1184,13 @@ func doJSON(ctx context.Context, client *http.Client, method, target string, hea
 func ensureHTTPSURL(sourceURL string) error {
 	if err := cpahttp.EnsureHTTPSURL(sourceURL); err != nil {
 		return validationError("URL 必须是有效的 HTTP/HTTPS 地址")
+	}
+	return nil
+}
+
+func ensurePublicHTTPSURL(sourceURL string) error {
+	if err := cpahttp.EnsurePublicHTTPSURL(sourceURL); err != nil {
+		return validationError("URL 必须是有效的公网 HTTPS 地址")
 	}
 	return nil
 }

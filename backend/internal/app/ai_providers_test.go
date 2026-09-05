@@ -584,6 +584,10 @@ func TestAIProvidersAreAdminOnly(t *testing.T) {
 		"username": "member",
 		"password": "member-password",
 	}, nil, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/auth/change-credentials", map[string]any{
+		"current_password": "member-password",
+		"password":         "member-new-password",
+	}, memberCookies, nil)
 
 	requestJSONExpectStatus(t, handler, http.MethodGet, "/api/ai-providers", nil, memberCookies, http.StatusForbidden)
 }

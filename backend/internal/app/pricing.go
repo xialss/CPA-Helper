@@ -39,6 +39,7 @@ const priceMatchStatusChannelUnpriced = "channel_unpriced"
 const priceMatchStatusChannelConflict = "channel_conflict"
 const priceMatchStatusChannelConfigUnavailable = "channel_config_unavailable"
 const priceMatchStatusInvalidPrice = "invalid_price"
+const modelPriceOpenAICompatibleRuntimePrefix = "openai-compatible-"
 const modelPriceChannelStatusReady = "ready"
 const modelPriceChannelStatusMissingSelector = "missing_selector"
 const modelPriceChannelStatusConflict = "conflict"
@@ -259,6 +260,8 @@ type modelPriceChannelIdentity struct {
 
 type modelPriceChannelSelectorIndex map[modelPriceChannelIdentity]int
 
+type modelPriceNativeCandidateIndex map[string]map[aiProviderBrand]struct{}
+
 type modelPriceChannelGroupIdentity struct {
 	AuthType   string
 	Brand      aiProviderBrand
@@ -273,10 +276,11 @@ type modelPriceChannelDisplay struct {
 type modelPriceChannelLabelIndex map[modelPriceChannelGroupIdentity]modelPriceChannelDisplay
 
 type modelPriceMatchContext struct {
-	Selectors          modelPriceChannelSelectorIndex
-	ChannelLabels      modelPriceChannelLabelIndex
-	SelectorsRequired  bool
-	SelectorsAvailable bool
+	Selectors             modelPriceChannelSelectorIndex
+	ChannelLabels         modelPriceChannelLabelIndex
+	NativePriceCandidates modelPriceNativeCandidateIndex
+	SelectorsRequired     bool
+	SelectorsAvailable    bool
 }
 
 type modelPriceBillingIndex struct {
@@ -472,6 +476,9 @@ func (a *App) handleModelPrices(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	case http.MethodPost:
 		if strings.HasSuffix(r.URL.Path, "/sync/litellm") {
+			if _, err := a.adminUser(r.Context(), r); err != nil {
+				return err
+			}
 			return a.handleSyncLiteLLMPrices(w, r)
 		}
 		var payload modelPricePayload
@@ -1100,6 +1107,7 @@ func (a *App) billingPriceIndexWithoutSelectors(ctx context.Context) (modelPrice
 		return modelPriceBillingIndex{}, err
 	}
 	result := modelPriceBillingIndex{Prices: channelPricesByKey(prices)}
+	result.MatchContext.NativePriceCandidates = nativeModelPriceCandidatesByModel(result.Prices)
 	result.MatchContext.SelectorsRequired = modelPriceIndexNeedsConfiguredSelectors(result.Prices)
 	return result, nil
 }
@@ -1116,6 +1124,7 @@ func usageAnalyticsBillingPriceIndex(ctx context.Context, queryer modelPriceQuer
 		Prices:       channelPricesByKey(prices),
 		MatchContext: matchContext,
 	}
+	result.MatchContext.NativePriceCandidates = nativeModelPriceCandidatesByModel(result.Prices)
 	result.MatchContext.SelectorsRequired = modelPriceIndexNeedsConfiguredSelectors(result.Prices)
 	return result, nil
 }
@@ -1228,6 +1237,27 @@ func modelPriceIndexNeedsConfiguredSelectors(prices modelPriceIndex) bool {
 		}
 	}
 	return false
+}
+
+func nativeModelPriceCandidatesByModel(prices modelPriceIndex) modelPriceNativeCandidateIndex {
+	result := modelPriceNativeCandidateIndex{}
+	for _, price := range prices {
+		if !modelPriceIsNativeChannel(price) || price.ChannelBrand == nil {
+			continue
+		}
+		model := strings.ToLower(normalizeModelPriceChannelModel(price.Model))
+		if model == "" {
+			continue
+		}
+		brand := aiProviderBrand(strings.TrimSpace(*price.ChannelBrand))
+		brands := result[model]
+		if brands == nil {
+			brands = map[aiProviderBrand]struct{}{}
+			result[model] = brands
+		}
+		brands[brand] = struct{}{}
+	}
+	return result
 }
 
 func (a *App) libraryPriceMap(ctx context.Context) (libraryPriceIndex, error) {
@@ -2580,10 +2610,10 @@ func (a *App) handleSyncLiteLLMPrices(w http.ResponseWriter, r *http.Request) er
 	if payload.SourceURL != nil && strings.TrimSpace(*payload.SourceURL) != "" {
 		sourceURL = strings.TrimSpace(*payload.SourceURL)
 	}
-	if err := ensureHTTPSURL(sourceURL); err != nil {
+	if err := ensurePublicHTTPSURL(sourceURL); err != nil {
 		return err
 	}
-	client := httpClient(30 * time.Second)
+	client := publicHTTPClient(30 * time.Second)
 	response, rawPayload, err := doJSON(r.Context(), client, http.MethodGet, sourceURL, nil, nil)
 	if err != nil {
 		return validationError("下载 LiteLLM 价格数据失败")
@@ -2906,11 +2936,12 @@ func findMatchingChannelPrice(prices modelPriceIndex, record UsageRecord, matchC
 	}
 	if len(matchContexts) > 0 {
 		if matchContexts[0].SelectorsAvailable {
-			return findMatchingConfiguredChannelPrice(prices, matchContexts[0].Selectors, provider, model, record.AuthIndex)
+			return findMatchingConfiguredChannelPrice(prices, matchContexts[0].Selectors, provider, model, record.AuthIndex, matchContexts[0].NativePriceCandidates)
 		}
-		if modelPriceRecordRequiresConfiguredSelectors(prices, provider, model, record.AuthIndex) {
+		if modelPriceRecordRequiresConfiguredSelectors(prices, provider, model, record.AuthIndex, matchContexts[0].NativePriceCandidates) {
 			return nil, priceMatchStatusChannelConfigUnavailable
 		}
+		return findMatchingStoredChannelPrice(prices, provider, model, record.AuthIndex, matchContexts[0].NativePriceCandidates)
 	}
 	return findMatchingStoredChannelPrice(prices, provider, model, record.AuthIndex)
 }
@@ -2930,12 +2961,12 @@ func findMatchingOAuthPoolPrice(prices modelPriceIndex, provider, model string) 
 	return &price, priceMatchStatusMatched
 }
 
-func modelPriceRecordRequiresConfiguredSelectors(prices modelPriceIndex, provider, model string, authIndexValue *string) bool {
-	_, status := findMatchingStoredChannelPrice(prices, provider, model, authIndexValue)
+func modelPriceRecordRequiresConfiguredSelectors(prices modelPriceIndex, provider, model string, authIndexValue *string, nativeIndexes ...modelPriceNativeCandidateIndex) bool {
+	_, status := findMatchingStoredChannelPrice(prices, provider, model, authIndexValue, nativeIndexes...)
 	return status == priceMatchStatusMatched || status == priceMatchStatusChannelConflict
 }
 
-func findMatchingConfiguredChannelPrice(prices modelPriceIndex, selectors modelPriceChannelSelectorIndex, provider, model string, authIndexValue *string) (*ModelPrice, string) {
+func findMatchingConfiguredChannelPrice(prices modelPriceIndex, selectors modelPriceChannelSelectorIndex, provider, model string, authIndexValue *string, nativeIndexes ...modelPriceNativeCandidateIndex) (*ModelPrice, string) {
 	authIndex := strings.TrimSpace(aiProviderOptionalString(authIndexValue))
 	if authIndex == "" {
 		openAICompatibleCount, nativeCount := configuredMissingAuthModelPriceCandidateCounts(selectors, provider, model)
@@ -2951,7 +2982,7 @@ func findMatchingConfiguredChannelPrice(prices modelPriceIndex, selectors modelP
 		return nil, priceMatchStatusChannelConflict
 	}
 	if matchCount == 0 {
-		return findMatchingStoredChannelPrice(prices, provider, model, authIndexValue)
+		return findMatchingStoredChannelPrice(prices, provider, model, authIndexValue, nativeIndexes...)
 	}
 
 	key := channelModelPriceKey(modelPriceChannelAuthTypeAPIKey, string(matchedIdentity.Brand), matchedIdentity.ChannelKey, matchedIdentity.Model)
@@ -2963,7 +2994,16 @@ func findMatchingConfiguredChannelPrice(prices modelPriceIndex, selectors modelP
 }
 
 func configuredMissingAuthModelPriceCandidateCounts(selectors modelPriceChannelSelectorIndex, provider, model string) (int, int) {
-	openAICompatibleCount := selectors[modelPriceChannelIdentityKey(aiProviderBrandOpenAICompatibility, provider, model)]
+	openAICompatibleCount := 0
+	seen := map[modelPriceChannelIdentity]bool{}
+	for _, candidate := range openAICompatibleRuntimeProviderCandidates(provider) {
+		identity := modelPriceChannelIdentityKey(aiProviderBrandOpenAICompatibility, candidate, model)
+		if seen[identity] {
+			continue
+		}
+		seen[identity] = true
+		openAICompatibleCount += selectors[identity]
+	}
 	nativeCount := configuredNativeModelPriceCandidateCount(selectors, matchingNativePriceBrands(provider), model)
 	return openAICompatibleCount, nativeCount
 }
@@ -3001,7 +3041,9 @@ func configuredModelPriceCandidates(selectors modelPriceChannelSelectorIndex, pr
 		}
 		matchCount += count
 	}
-	appendIdentity(modelPriceChannelIdentityKey(aiProviderBrandOpenAICompatibility, provider, model))
+	for _, candidate := range openAICompatibleRuntimeProviderCandidates(provider) {
+		appendIdentity(modelPriceChannelIdentityKey(aiProviderBrandOpenAICompatibility, candidate, model))
+	}
 	authIndex := strings.TrimSpace(aiProviderOptionalString(authIndexValue))
 	if authIndex != "" {
 		for _, brand := range matchingNativePriceBrands(provider) {
@@ -3011,7 +3053,7 @@ func configuredModelPriceCandidates(selectors modelPriceChannelSelectorIndex, pr
 	return matchedIdentity, matchCount
 }
 
-func findMatchingStoredChannelPrice(prices modelPriceIndex, provider, model string, authIndexValue *string) (*ModelPrice, string) {
+func findMatchingStoredChannelPrice(prices modelPriceIndex, provider, model string, authIndexValue *string, nativeIndexes ...modelPriceNativeCandidateIndex) (*ModelPrice, string) {
 	type candidate struct {
 		key   [2]string
 		price ModelPrice
@@ -3039,7 +3081,9 @@ func findMatchingStoredChannelPrice(prices modelPriceIndex, provider, model stri
 		candidates = append(candidates, candidate{key: key, price: price})
 	}
 
-	appendCandidate(channelModelPriceKey(modelPriceChannelAuthTypeAPIKey, string(aiProviderBrandOpenAICompatibility), provider, model), false)
+	for _, candidateProvider := range openAICompatibleRuntimeProviderCandidates(provider) {
+		appendCandidate(channelModelPriceKey(modelPriceChannelAuthTypeAPIKey, string(aiProviderBrandOpenAICompatibility), candidateProvider, model), false)
+	}
 	for _, fallback := range legacyPriceProviderCandidates(provider) {
 		appendCandidate(channelModelPriceKey(modelPriceChannelAuthTypeAPIKey, string(aiProviderBrandOpenAICompatibility), fallback, model), true)
 	}
@@ -3050,7 +3094,7 @@ func findMatchingStoredChannelPrice(prices modelPriceIndex, provider, model stri
 		for _, brand := range nativeBrands {
 			appendCandidate(nativeModelPriceKey(string(brand), authIndex, model), false)
 		}
-	} else if storedNativeModelPriceCandidateExists(prices, nativeBrands, model) {
+	} else if storedNativeModelPriceCandidateExists(prices, nativeBrands, model, nativeIndexes...) {
 		if len(candidates) > 0 {
 			return nil, priceMatchStatusChannelConflict
 		}
@@ -3073,11 +3117,19 @@ func findMatchingStoredChannelPrice(prices modelPriceIndex, provider, model stri
 	return nil, priceMatchStatusChannelUnpriced
 }
 
-func storedNativeModelPriceCandidateExists(prices modelPriceIndex, brands []aiProviderBrand, model string) bool {
+func storedNativeModelPriceCandidateExists(prices modelPriceIndex, brands []aiProviderBrand, model string, nativeIndexes ...modelPriceNativeCandidateIndex) bool {
 	if len(brands) == 0 {
 		return false
 	}
 	modelKey := strings.ToLower(normalizeModelPriceChannelModel(model))
+	if len(nativeIndexes) > 0 && nativeIndexes[0] != nil {
+		for _, brand := range brands {
+			if _, ok := nativeIndexes[0][modelKey][brand]; ok {
+				return true
+			}
+		}
+		return false
+	}
 	for key, price := range prices {
 		if key[1] != modelKey || !modelPriceIsNativeChannel(price) {
 			continue
@@ -3111,6 +3163,33 @@ func legacyPriceProviderCandidates(provider string) []string {
 	default:
 		return nil
 	}
+}
+
+// openAICompatibleRuntimeProviderCandidates returns the exact provider label
+// first, followed by the configured OpenAI-compatible name when the runtime
+// prepends its provider brand. The exact candidate preserves ordinary named
+// channels, while the normalized fallback keeps historical usage records
+// billable after the runtime label is expanded to "openai-compatible-<name>".
+func openAICompatibleRuntimeProviderCandidates(provider string) []string {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		return nil
+	}
+	candidates := []string{provider}
+	if len(provider) <= len(modelPriceOpenAICompatibleRuntimePrefix) ||
+		!strings.EqualFold(provider[:len(modelPriceOpenAICompatibleRuntimePrefix)], modelPriceOpenAICompatibleRuntimePrefix) {
+		return candidates
+	}
+	configuredName := strings.TrimSpace(provider[len(modelPriceOpenAICompatibleRuntimePrefix):])
+	// CLIProxyAPI preserves names that already carry this namespace, so a
+	// second namespace is not the inverse of its runtime normalization.
+	if strings.HasPrefix(strings.ToLower(configuredName), modelPriceOpenAICompatibleRuntimePrefix) {
+		return candidates
+	}
+	if configuredName != "" && !strings.EqualFold(configuredName, provider) {
+		candidates = append(candidates, configuredName)
+	}
+	return candidates
 }
 
 func matchingNativePriceBrands(provider string) []aiProviderBrand {
