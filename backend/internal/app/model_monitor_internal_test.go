@@ -1795,6 +1795,7 @@ func TestModelMonitorRouteRequiresAdmin(t *testing.T) {
 	}
 	modelMonitorRequest(t, handler, http.MethodPost, "/api/users", map[string]any{"username": "member", "password": "member-password", "nickname": "Member", "is_admin": false}, adminCookies, http.StatusOK, nil)
 	memberCookies := modelMonitorRequest(t, handler, http.MethodPost, "/api/auth/login", map[string]any{"username": "member", "password": "member-password"}, nil, http.StatusOK, nil)
+	memberCookies = modelMonitorRequest(t, handler, http.MethodPost, "/api/auth/change-credentials", map[string]any{"current_password": "member-password", "password": "member-new-password"}, memberCookies, http.StatusOK, nil)
 	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor", nil, memberCookies, http.StatusForbidden, nil)
 	modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor/settings", nil, memberCookies, http.StatusForbidden, nil)
 	modelMonitorRequest(t, handler, http.MethodPut, "/api/model-monitor/settings", map[string]any{"enabled_source_ids": []string{}}, memberCookies, http.StatusForbidden, nil)
@@ -1944,7 +1945,20 @@ func modelMonitorRequest(t *testing.T, handler http.Handler, method, target stri
 			t.Fatal(err)
 		}
 	}
-	return append(cookies, recorder.Result().Cookies()...)
+	for _, updated := range recorder.Result().Cookies() {
+		replaced := false
+		for index, existing := range cookies {
+			if existing != nil && existing.Name == updated.Name {
+				cookies[index] = updated
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			cookies = append(cookies, updated)
+		}
+	}
+	return cookies
 }
 
 func readModelMonitorFixture(t *testing.T, name string) []byte {

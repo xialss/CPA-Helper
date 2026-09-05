@@ -20,6 +20,7 @@ type usageAnalyticsCollector struct {
 	matchContext  modelPriceMatchContext
 	users         map[string]userInfo
 	priceMatches  map[usageAnalyticsPriceMatchKey]usageAnalyticsPriceMatch
+	userSummaries *userUsageSummaryAccumulator
 	summary       *usageSummaryAccumulator
 	trends        *usageTrendAccumulator
 	rankings      map[string]*usageRankingAccumulator
@@ -87,6 +88,9 @@ func (c *usageAnalyticsCollector) Add(record UsageRecord) {
 	}
 	if c.summary != nil {
 		c.summary.add(value)
+	}
+	if c.userSummaries != nil {
+		c.userSummaries.add(value)
 	}
 	if c.trends != nil {
 		c.trends.add(value)

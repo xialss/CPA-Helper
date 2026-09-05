@@ -12,13 +12,20 @@ const { errorText, t } = useI18n()
 const isLoading = ref(false)
 const isSaving = ref(false)
 const isAdmin = ref(false)
+const isSuperAdmin = ref(false)
 
 const accountForm = reactive({
   username: '',
   password: '',
+  password_confirm: '',
   current_password: '',
 })
-const roleText = computed(() => (isAdmin.value ? t('管理员', 'Admin') : t('普通账户', 'Standard account')))
+const roleText = computed(() => {
+  if (isSuperAdmin.value) {
+    return t('超级管理员', 'Super admin')
+  }
+  return isAdmin.value ? t('管理员', 'Admin') : t('普通账户', 'Standard account')
+})
 
 async function refresh() {
   isLoading.value = true
@@ -27,6 +34,7 @@ async function refresh() {
     setCurrentUser(user)
     accountForm.username = user.username
     isAdmin.value = user.is_admin
+    isSuperAdmin.value = user.is_super_admin
   } catch (error) {
     message.error(errorText(error, '加载账户失败', 'Failed to load account'))
   } finally {
@@ -35,6 +43,11 @@ async function refresh() {
 }
 
 async function saveAccount() {
+  if (isSaving.value) return
+  if (accountForm.password && accountForm.password !== accountForm.password_confirm) {
+    message.error(t('两次输入的密码不一致', 'Passwords do not match'))
+    return
+  }
   isSaving.value = true
   try {
     const user = await changeCredentials({
@@ -45,6 +58,7 @@ async function saveAccount() {
     window.dispatchEvent(new CustomEvent('cpa:account-updated', { detail: user }))
     accountForm.username = user.username
     accountForm.password = ''
+    accountForm.password_confirm = ''
     accountForm.current_password = ''
     message.success(t('账户已更新', 'Account updated'))
   } catch (error) {
@@ -108,6 +122,15 @@ onMounted(refresh)
             <NFormItem :label="t('新密码', 'New password')">
               <NInput
                 v-model:value="accountForm.password"
+                type="password"
+                show-password-on="mousedown"
+                autocomplete="new-password"
+                @keyup.enter="saveAccount"
+              />
+            </NFormItem>
+            <NFormItem :label="t('确认新密码', 'Confirm new password')">
+              <NInput
+                v-model:value="accountForm.password_confirm"
                 type="password"
                 show-password-on="mousedown"
                 autocomplete="new-password"

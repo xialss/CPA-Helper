@@ -34,6 +34,7 @@ type UsageFilters struct {
 	End               *time.Time
 	UserID            *int
 	UsageUsername     *string
+	UsageUsernames    []string
 	APIKeyDescription *string
 	Provider          *string
 	Model             *string

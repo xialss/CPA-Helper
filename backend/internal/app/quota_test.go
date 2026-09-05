@@ -24,6 +24,12 @@ type quotaAPIStatusResponse struct {
 	CanCreateKeys    bool     `json:"can_create_keys"`
 }
 
+type userRoleResponse struct {
+	ID           int  `json:"id"`
+	IsAdmin      bool `json:"is_admin"`
+	IsSuperAdmin bool `json:"is_super_admin"`
+}
+
 func TestQuotaAPIPermissionsAndAccountStatus(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 
@@ -66,6 +72,10 @@ func TestQuotaAPIPermissionsAndAccountStatus(t *testing.T) {
 		"username": "member",
 		"password": "member-password",
 	}, nil, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/auth/change-credentials", map[string]any{
+		"current_password": "member-password",
+		"password":         "member-new-password",
+	}, memberCookies, nil)
 
 	accountQuota := quotaAPIStatusResponse{}
 	requestJSON(t, handler, http.MethodGet, "/api/account/quota", nil, memberCookies, &accountQuota)
@@ -102,4 +112,81 @@ func TestQuotaExhaustedAccountCannotCreateAPIKey(t *testing.T) {
 	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/api-keys", map[string]any{
 		"description": "VSCode",
 	}, cookies, http.StatusConflict)
+}
+
+func TestSuperAdminControlsQuotaAndSuperAdminRole(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	superAdminCookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "root",
+		"password": "test-password",
+		"nickname": "Root",
+	}, nil, nil)
+
+	manager := userRoleResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/users", map[string]any{
+		"username": "manager",
+		"password": "manager-password",
+		"nickname": "Manager",
+		"is_admin": true,
+	}, superAdminCookies, &manager)
+	if !manager.IsAdmin || manager.IsSuperAdmin {
+		t.Fatalf("new manager role = %#v, want admin-only", manager)
+	}
+
+	managerCookies := requestJSON(t, handler, http.MethodPost, "/api/auth/login", map[string]any{
+		"username": "manager",
+		"password": "manager-password",
+	}, nil, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/auth/change-credentials", map[string]any{
+		"current_password": "manager-password",
+		"password":         "manager-new-password",
+	}, managerCookies, nil)
+	requestJSONExpectStatus(t, handler, http.MethodPut, "/api/users/1/quota", map[string]any{
+		"lifetime_quota_usd": 1.25,
+	}, managerCookies, http.StatusForbidden)
+	requestJSONExpectStatus(t, handler, http.MethodPut, "/api/users/2", map[string]any{
+		"username":       "manager",
+		"nickname":       "Manager",
+		"is_admin":       true,
+		"is_super_admin": true,
+	}, managerCookies, http.StatusForbidden)
+
+	promoted := userRoleResponse{}
+	requestJSON(t, handler, http.MethodPut, "/api/users/2", map[string]any{
+		"username":       "manager",
+		"nickname":       "Manager",
+		"is_admin":       true,
+		"is_super_admin": true,
+	}, superAdminCookies, &promoted)
+	if !promoted.IsAdmin || !promoted.IsSuperAdmin {
+		t.Fatalf("promoted manager role = %#v, want super admin", promoted)
+	}
+
+	managerCookies = requestJSON(t, handler, http.MethodPost, "/api/auth/login", map[string]any{
+		"username": "manager",
+		"password": "manager-new-password",
+	}, nil, nil)
+	updated := quotaAPIStatusResponse{}
+	requestJSON(t, handler, http.MethodPut, "/api/users/1/quota", map[string]any{
+		"lifetime_quota_usd": 1.25,
+	}, managerCookies, &updated)
+	if updated.LifetimeQuotaUSD == nil || *updated.LifetimeQuotaUSD != 1.25 {
+		t.Fatalf("super admin quota = %#v, want 1.25 lifetime quota", updated)
+	}
+
+	requestJSON(t, handler, http.MethodPut, "/api/users/1", map[string]any{
+		"username":       "root",
+		"nickname":       "Root",
+		"is_admin":       true,
+		"is_super_admin": false,
+	}, managerCookies, nil)
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/users/2/disable", nil, managerCookies, http.StatusConflict)
 }

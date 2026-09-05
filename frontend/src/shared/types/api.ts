@@ -4,6 +4,7 @@ export interface AuthUser {
   id: number
   username: string
   is_admin: boolean
+  is_super_admin: boolean
   must_change_password: boolean
 }
 
@@ -764,6 +765,7 @@ export interface UserSummary {
   id: number
   username: string
   is_admin: boolean
+  is_super_admin: boolean
   nickname: string
   disabled_at: string | null
   password_set: boolean
@@ -785,6 +787,8 @@ export interface UserSummary {
   today_total_tokens: number
   today_estimated_cost_usd: number
   today_unpriced_records: number
+  total_estimated_cost_usd: number
+  total_unpriced_records: number
   first_seen_at: string | null
   last_seen_at: string | null
   last_provider: string | null
@@ -798,7 +802,17 @@ export interface UserPayload {
   username: string
   password?: string | undefined
   is_admin: boolean
+  is_super_admin: boolean
   nickname: string
+  lifetime_quota_usd?: number | null | undefined
+  monthly_quota_usd?: number | null | undefined
+}
+
+export interface UserListPage {
+  items: UserSummary[]
+  total: number
+  page: number
+  page_size: number
 }
 
 export interface UserQuotaPayload {

@@ -119,14 +119,19 @@ function renderIcon(icon: Component) {
     )
 }
 
-const adminMenuItems = computed<MenuOption[]>(() => [
-  { label: t('历史用量', 'Usage History'), key: '/admin/usage', icon: renderIcon(BarChart3) },
-  { label: t('请求明细', 'Request Records'), key: '/admin/records', icon: renderIcon(List) },
-  { label: t('用户管理', 'Users'), key: '/admin/users', icon: renderIcon(Users) },
-  { label: t('模型价格', 'Model Prices'), key: '/admin/pricing', icon: renderIcon(DollarSign) },
-  { label: t('AI 提供商', 'AI Providers'), key: '/admin/ai-providers', icon: renderIcon(Network) },
-  { label: t('系统设置', 'System Settings'), key: '/admin/settings', icon: renderIcon(Settings) },
-])
+const adminMenuItems = computed<MenuOption[]>(() => {
+  const items: MenuOption[] = [
+    { label: t('历史用量', 'Usage History'), key: '/admin/usage', icon: renderIcon(BarChart3) },
+    { label: t('请求明细', 'Request Records'), key: '/admin/records', icon: renderIcon(List) },
+    { label: t('用户管理', 'Users'), key: '/admin/users', icon: renderIcon(Users) },
+    { label: t('模型价格', 'Model Prices'), key: '/admin/pricing', icon: renderIcon(DollarSign) },
+    { label: t('AI 提供商', 'AI Providers'), key: '/admin/ai-providers', icon: renderIcon(Network) },
+  ]
+  if (currentUser.value?.is_super_admin) {
+    items.push({ label: t('系统设置', 'System Settings'), key: '/admin/settings', icon: renderIcon(Settings) })
+  }
+  return items
+})
 
 const accountInspectionMenuItems = computed<MenuOption[]>(() => [
   {
@@ -155,7 +160,12 @@ const isAdmin = computed(() => {
   }
   return false
 })
-const roleText = computed(() => (isAdmin.value ? t('管理员', 'Admin') : t('普通用户', 'User')))
+const roleText = computed(() => {
+  if (currentUser.value?.is_super_admin) {
+    return t('超级管理员', 'Super admin')
+  }
+  return isAdmin.value ? t('管理员', 'Admin') : t('普通用户', 'User')
+})
 const accountText = computed(() => currentUser.value?.username || t('当前账号', 'Current account'))
 
 function formatAppVersion(value: string | undefined): string {

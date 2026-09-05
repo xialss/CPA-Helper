@@ -19,6 +19,9 @@ coverage/
 *.tsbuildinfo
 data/
 .tmp/usage-db-compat-20260801/
+/.tmp/
+/backend/.tmp/
+/.agent/
 *.pyc
 *.pyo
 *.pyd

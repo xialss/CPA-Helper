@@ -463,6 +463,10 @@ func TestAccountModelRequestTestRejectsOtherUserAPIKey(t *testing.T) {
 		"username": "member",
 		"password": "member-password",
 	}, nil, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/auth/change-credentials", map[string]any{
+		"current_password": "member-password",
+		"password":         "member-new-password",
+	}, memberCookies, nil)
 
 	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/account/model-request/test", map[string]any{
 		"api_key_hash": created.APIKeyHash,

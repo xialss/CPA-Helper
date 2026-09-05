@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -35,6 +36,12 @@ const (
 	modelRequestEndpointChatCompletions = "chat_completions"
 	modelRequestEndpointResponses       = "responses"
 	modelRequestEndpointClaudeMessages  = "claude_messages"
+	maxLoginFailureRecords              = 2000
+)
+
+const (
+	dummyPasswordSalt = "0123456789abcdef0123456789abcdef"
+	dummyPasswordHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 )
 
 const apiKeySyncMissingConfigMessage = "CPA 配置未完成：请先到「系统设置」填写 CLIProxyAPI 地址和管理密钥，再返回 API 密钥页操作。"
@@ -74,12 +81,97 @@ func (a *App) handleAuth(w http.ResponseWriter, r *http.Request) error {
 		if err := requireMethod(r, http.MethodPost); err != nil {
 			return err
 		}
-		clearSessionCookie(w)
+		// Logout is intentionally idempotent for an expired or malformed cookie,
+		// but a valid session must be revoked server-side before the browser cookie
+		// is cleared so a copied token cannot remain usable for its full lifetime.
+		current, currentErr := a.currentUser(r.Context(), r)
+		if currentErr != nil {
+			var authErr *AppError
+			if !errors.As(currentErr, &authErr) {
+				return currentErr
+			}
+		} else if _, revokeErr := a.db.ExecContext(r.Context(), `UPDATE users SET session_version = session_version + 1, updated_at = ? WHERE id = ?`, dbTime(time.Now()), current.ID); revokeErr != nil {
+			return revokeErr
+		}
+		clearSessionCookie(w, r)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return nil
 	default:
 		return notFoundError("Not Found")
 	}
+}
+
+func validatePasswordBaseline(password string) error {
+	if len(password) < 8 {
+		return validationError("密码长度不能少于 8 位")
+	}
+	lower := strings.ToLower(strings.TrimSpace(password))
+	weakPasswords := map[string]bool{
+		"12345678":  true,
+		"password":  true,
+		"admin123":  true,
+		"11111111":  true,
+		"88888888":  true,
+		"123456789": true,
+	}
+	if weakPasswords[lower] {
+		return validationError("密码过于简单，不能使用常见弱密码")
+	}
+	return nil
+}
+
+// recordLoginFailure keeps all authentication failure buckets bounded. The
+// map is process-local, so expiring stale entries and evicting the oldest live
+// entry are both required to prevent attacker-controlled key cardinality from
+// growing without limit.
+func (a *App) recordLoginFailure(key string) {
+	a.loginAttemptsMu.Lock()
+	defer a.loginAttemptsMu.Unlock()
+	if a.loginFailures == nil {
+		a.loginFailures = map[string]loginFailureRecord{}
+	}
+	now := time.Now()
+	if len(a.loginFailures) >= maxLoginFailureRecords {
+		var oldestKey string
+		var oldest time.Time
+		for candidate, record := range a.loginFailures {
+			if now.Sub(record.lastAttempt) >= 5*time.Minute {
+				delete(a.loginFailures, candidate)
+				continue
+			}
+			// Keep buckets that already reached the lockout threshold. Evicting
+			// one would let an attacker reset a protected account by flooding
+			// unrelated usernames.
+			if record.count >= 10 {
+				continue
+			}
+			if oldestKey == "" || record.lastAttempt.Before(oldest) {
+				oldestKey, oldest = candidate, record.lastAttempt
+			}
+		}
+		if len(a.loginFailures) >= maxLoginFailureRecords && oldestKey != "" {
+			delete(a.loginFailures, oldestKey)
+		}
+		if len(a.loginFailures) >= maxLoginFailureRecords {
+			oldestKey = ""
+			oldest = time.Time{}
+			for candidate, record := range a.loginFailures {
+				if oldestKey == "" || record.lastAttempt.Before(oldest) {
+					oldestKey, oldest = candidate, record.lastAttempt
+				}
+			}
+			if oldestKey != "" && oldestKey != key {
+				delete(a.loginFailures, oldestKey)
+			}
+		}
+	}
+	record := a.loginFailures[key]
+	if now.Sub(record.lastAttempt) >= 5*time.Minute {
+		record.count = 0
+	}
+	record.count++
+	record.lastAttempt = now
+	a.loginFailures[key] = record
 }
 
 func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) error {
@@ -91,6 +183,24 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) error {
 	if username == "" || strings.TrimSpace(payload.Password) == "" {
 		return validationError("账号和密码不能为空")
 	}
+
+	ip := loginClientIP(r)
+	loginKey := ip + ":" + username
+
+	a.loginAttemptsMu.Lock()
+	rec, hasRec := a.loginFailures[loginKey]
+	if hasRec {
+		if time.Since(rec.lastAttempt) < 5*time.Minute {
+			if rec.count >= 10 {
+				a.loginAttemptsMu.Unlock()
+				return forbiddenError("登录失败次数过多，请稍后再试")
+			}
+		} else {
+			delete(a.loginFailures, loginKey)
+		}
+	}
+	a.loginAttemptsMu.Unlock()
+
 	count, err := a.userCount(r.Context())
 	if err != nil {
 		return err
@@ -101,22 +211,57 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) error {
 	user, hash, salt, disabled, err := a.userCredentialsByUsername(r.Context(), username)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			a.recordLoginFailure(loginKey)
+			_ = verifyPassword(payload.Password, dummyPasswordSalt, dummyPasswordHash)
 			return authenticationError("用户名或密码不正确")
 		}
 		return err
 	}
-	if disabled || hash == nil || salt == nil || !verifyPassword(payload.Password, *salt, *hash) {
+	passwordValid := false
+	if hash != nil && salt != nil {
+		passwordValid = verifyPassword(payload.Password, *salt, *hash)
+	} else {
+		_ = verifyPassword(payload.Password, dummyPasswordSalt, dummyPasswordHash)
+	}
+	if disabled || !passwordValid {
+		a.recordLoginFailure(loginKey)
 		return authenticationError("用户名或密码不正确")
 	}
+
+	a.loginAttemptsMu.Lock()
+	delete(a.loginFailures, loginKey)
+	a.loginAttemptsMu.Unlock()
+
 	cfg, err := a.loadConfig(r.Context())
 	if err != nil {
 		return err
 	}
-	if err := setSessionCookie(w, user.ID, cfg.SessionSecret); err != nil {
+	if err := setSessionCookieWithVersion(w, r, user.ID, cfg.SessionSecret, user.SessionVersion); err != nil {
 		return err
 	}
 	writeJSON(w, http.StatusOK, user)
 	return nil
+}
+
+// loginClientIP trusts forwarded headers only when the immediate peer is a
+// local/private proxy. Direct public clients cannot spoof the rate-limit key.
+func loginClientIP(r *http.Request) string {
+	ip := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		ip = host
+	}
+	parsed := net.ParseIP(strings.TrimSpace(ip))
+	if parsed != nil && parsed.IsLoopback() {
+		for _, header := range []string{"X-Forwarded-For", "X-Real-IP"} {
+			for _, value := range strings.Split(r.Header.Get(header), ",") {
+				candidate := strings.TrimSpace(value)
+				if net.ParseIP(candidate) != nil {
+					return candidate
+				}
+			}
+		}
+	}
+	return ip
 }
 
 func (a *App) handleSetupState(w http.ResponseWriter, r *http.Request) error {
@@ -138,9 +283,14 @@ func (a *App) handleSetupFirstAdmin(w http.ResponseWriter, r *http.Request) erro
 	if username == "" || nickname == "" {
 		return validationError("账号和昵称不能为空")
 	}
-	if len(payload.Password) < 8 {
-		return validationError("密码长度不能少于 8 位")
+	if err := validatePasswordBaseline(payload.Password); err != nil {
+		return err
 	}
+	// The setup endpoint is the only path that can create an account without
+	// an existing actor. Serialize the empty-database check with the insert so
+	// concurrent first-admin requests cannot both pass the check.
+	a.userMutationMu.Lock()
+	defer a.userMutationMu.Unlock()
 	count, err := a.userCount(r.Context())
 	if err != nil {
 		return err
@@ -154,8 +304,8 @@ func (a *App) handleSetupFirstAdmin(w http.ResponseWriter, r *http.Request) erro
 	}
 	now := dbTime(time.Now())
 	result, err := a.db.ExecContext(r.Context(), `
-		INSERT INTO users (username, password_hash, password_salt, is_admin, nickname, created_at, updated_at)
-		VALUES (?, ?, ?, 1, ?, ?, ?)
+		INSERT INTO users (username, password_hash, password_salt, is_admin, is_super_admin, nickname, must_change_password, created_at, updated_at)
+		VALUES (?, ?, ?, 1, 1, ?, 0, ?, ?)
 	`, username, hashPassword(payload.Password, salt), salt, nickname, now, now)
 	if err != nil {
 		return err
@@ -165,10 +315,10 @@ func (a *App) handleSetupFirstAdmin(w http.ResponseWriter, r *http.Request) erro
 	if err != nil {
 		return err
 	}
-	if err := setSessionCookie(w, int(id), cfg.SessionSecret); err != nil {
+	if err := setSessionCookie(w, r, int(id), cfg.SessionSecret); err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusOK, AuthUser{ID: int(id), Username: username, IsAdmin: true})
+	writeJSON(w, http.StatusOK, AuthUser{ID: int(id), Username: username, IsAdmin: true, IsSuperAdmin: true, MustChangePassword: false})
 	return nil
 }
 
@@ -177,16 +327,29 @@ func (a *App) handleChangeCredentials(w http.ResponseWriter, r *http.Request) er
 	if err != nil {
 		return err
 	}
+	unlock := a.lockUserMutation(current.ID)
+	defer unlock()
+	_, err = a.getUser(r.Context(), current.ID)
+	if err != nil {
+		return err
+	}
 	var payload changeCredentialsRequest
 	if err := decodeJSON(r, &payload); err != nil {
 		return err
 	}
-	if len(payload.Password) < 8 {
-		return validationError("密码长度不能少于 8 位")
+	if err := validatePasswordBaseline(payload.Password); err != nil {
+		return err
 	}
 	if payload.CurrentPassword == nil {
 		return forbiddenError("需要提供当前密码")
 	}
+	rateKey := fmt.Sprintf("change:%d", current.ID)
+	a.loginAttemptsMu.Lock()
+	if rec, ok := a.loginFailures[rateKey]; ok && time.Since(rec.lastAttempt) < 5*time.Minute && rec.count >= 5 {
+		a.loginAttemptsMu.Unlock()
+		return forbiddenError("密码修改失败次数过多，请稍后再试")
+	}
+	a.loginAttemptsMu.Unlock()
 	var passwordHash, passwordSalt sql.NullString
 	err = a.db.QueryRowContext(r.Context(), `SELECT password_hash, password_salt FROM users WHERE id = ? AND disabled_at IS NULL`, current.ID).Scan(&passwordHash, &passwordSalt)
 	if err != nil {
@@ -196,13 +359,20 @@ func (a *App) handleChangeCredentials(w http.ResponseWriter, r *http.Request) er
 		return err
 	}
 	if !passwordHash.Valid || !passwordSalt.Valid || !verifyPassword(*payload.CurrentPassword, passwordSalt.String, passwordHash.String) {
+		a.recordLoginFailure(rateKey)
 		return authenticationError("当前密码不正确")
 	}
+	if *payload.CurrentPassword == payload.Password {
+		return validationError("新密码不能与当前密码相同")
+	}
+	a.loginAttemptsMu.Lock()
+	delete(a.loginFailures, rateKey)
+	a.loginAttemptsMu.Unlock()
 	salt, err := createSalt()
 	if err != nil {
 		return err
 	}
-	_, err = a.db.ExecContext(r.Context(), `UPDATE users SET password_hash = ?, password_salt = ?, updated_at = ? WHERE id = ?`, hashPassword(payload.Password, salt), salt, dbTime(time.Now()), current.ID)
+	_, err = a.db.ExecContext(r.Context(), `UPDATE users SET password_hash = ?, password_salt = ?, must_change_password = 0, session_version = session_version + 1, updated_at = ? WHERE id = ?`, hashPassword(payload.Password, salt), salt, dbTime(time.Now()), current.ID)
 	if err != nil {
 		return err
 	}
@@ -210,9 +380,14 @@ func (a *App) handleChangeCredentials(w http.ResponseWriter, r *http.Request) er
 	if err != nil {
 		return err
 	}
-	if err := setSessionCookie(w, current.ID, cfg.SessionSecret); err != nil {
+	var sessionVersion int
+	if err := a.db.QueryRowContext(r.Context(), `SELECT session_version FROM users WHERE id = ?`, current.ID).Scan(&sessionVersion); err != nil {
 		return err
 	}
+	if err := setSessionCookieWithVersion(w, r, current.ID, cfg.SessionSecret, sessionVersion); err != nil {
+		return err
+	}
+	current.MustChangePassword = false
 	writeJSON(w, http.StatusOK, current)
 	return nil
 }
@@ -225,7 +400,7 @@ func (a *App) userCount(ctx context.Context) (int, error) {
 
 func (a *App) firstActiveUserID(ctx context.Context) (*int, error) {
 	var id int
-	err := a.db.QueryRowContext(ctx, `SELECT id FROM users WHERE disabled_at IS NULL ORDER BY id LIMIT 1`).Scan(&id)
+	err := a.db.QueryRowContext(ctx, `SELECT id FROM users WHERE disabled_at IS NULL AND is_admin = 1 ORDER BY id LIMIT 1`).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -249,7 +424,7 @@ func (a *App) ensureUsersInitialized(ctx context.Context) error {
 func (a *App) userCredentialsByUsername(ctx context.Context, username string) (AuthUser, *string, *string, bool, error) {
 	var user AuthUser
 	var passwordHash, passwordSalt, disabledAt sql.NullString
-	err := a.db.QueryRowContext(ctx, `SELECT id, username, is_admin, password_hash, password_salt, disabled_at FROM users WHERE username = ?`, username).Scan(&user.ID, &user.Username, &user.IsAdmin, &passwordHash, &passwordSalt, &disabledAt)
+	err := a.db.QueryRowContext(ctx, `SELECT id, username, is_admin, is_super_admin, password_hash, password_salt, disabled_at, must_change_password, session_version FROM users WHERE username = ?`, username).Scan(&user.ID, &user.Username, &user.IsAdmin, &user.IsSuperAdmin, &passwordHash, &passwordSalt, &disabledAt, &user.MustChangePassword, &user.SessionVersion)
 	if err != nil {
 		return AuthUser{}, nil, nil, false, err
 	}
@@ -284,7 +459,7 @@ type modelRequestTestResponse struct {
 }
 
 func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) error {
-	if _, err := a.adminUser(r.Context(), r); err != nil {
+	if _, err := a.superAdminUser(r.Context(), r); err != nil {
 		return err
 	}
 	switch r.Method {
@@ -319,7 +494,10 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) error {
 			cfg.ModelRequestURL = value
 		}
 		if payload.ManagementKey != nil {
-			cfg.Collector.ManagementKey = strings.TrimSpace(*payload.ManagementKey)
+			trimmed := strings.TrimSpace(*payload.ManagementKey)
+			if trimmed != "" {
+				cfg.Collector.ManagementKey = trimmed
+			}
 		}
 		if payload.CollectorEnabled != nil {
 			cfg.Collector.Enabled = *payload.CollectorEnabled
@@ -364,7 +542,7 @@ func settingsResponse(cfg AppConfig) map[string]any {
 	return map[string]any{
 		"cliaproxy_url":          collector.CLIProxyURL,
 		"model_request_url":      cfg.ModelRequestURL,
-		"management_key":         collector.ManagementKey,
+		"management_key":         "",
 		"management_key_set":     strings.TrimSpace(collector.ManagementKey) != "",
 		"collector_enabled":      collector.Enabled,
 		"queue_name":             collector.QueueName,
@@ -378,7 +556,7 @@ func (a *App) handleCurrentModelRequestGuide(w http.ResponseWriter, r *http.Requ
 	if err := requireMethod(r, http.MethodGet); err != nil {
 		return err
 	}
-	if _, err := a.currentUser(r.Context(), r); err != nil {
+	if _, err := a.readyUser(r.Context(), r); err != nil {
 		return err
 	}
 	cfg, err := a.loadConfig(r.Context())
@@ -774,6 +952,8 @@ func (a *App) addRemoteAPIKey(ctx context.Context, apiKey string) error {
 	if !unsupported {
 		return nil
 	}
+	unlock := a.lockRemoteAPIKeyList(cfg)
+	defer unlock()
 	keys, err := a.remoteAPIKeys(syncCtx, cfg)
 	if err != nil {
 		return err
@@ -787,19 +967,77 @@ func (a *App) addRemoteAPIKey(ctx context.Context, apiKey string) error {
 	return a.putRemoteAPIKeys(syncCtx, cfg, keys)
 }
 
-func (a *App) removeRemoteAPIKeyHash(ctx context.Context, apiKeyHash string) error {
+// addRemoteAPIKeyWithChange reports whether the key was absent before the
+// operation. Callers that need compensation can then remove only keys they
+// actually introduced, instead of deleting a pre-existing shared binding.
+func (a *App) addRemoteAPIKeyWithChange(ctx context.Context, apiKey string) (bool, error) {
 	cfg, err := a.loadConfig(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
-		return validationError(apiKeySyncMissingConfigMessage)
+		return false, validationError(apiKeySyncMissingConfigMessage)
 	}
 	syncCtx, cancel := context.WithTimeout(ctx, apiKeySyncTimeout)
 	defer cancel()
+	unlock := a.lockRemoteAPIKeyList(cfg)
+	defer unlock()
+	current, err := a.remoteAPIKeys(syncCtx, cfg)
+	if err != nil {
+		return false, err
+	}
+	for _, existing := range current {
+		if existing == apiKey {
+			return false, nil
+		}
+	}
+	unsupported, err := a.patchRemoteAPIKey(syncCtx, cfg, apiKey)
+	if err != nil {
+		return true, err
+	}
+	if !unsupported {
+		return true, nil
+	}
 	keys, err := a.remoteAPIKeys(syncCtx, cfg)
 	if err != nil {
-		return err
+		return true, err
+	}
+	for _, existing := range keys {
+		if existing == apiKey {
+			// Another synchronized operation added the key after the initial
+			// snapshot; this call did not introduce it and must not remove it
+			// during compensation.
+			return false, nil
+		}
+	}
+	keys = append(keys, apiKey)
+	return true, a.putRemoteAPIKeys(syncCtx, cfg, keys)
+}
+
+func (a *App) removeRemoteAPIKeyHash(ctx context.Context, apiKeyHash string) error {
+	_, err := a.removeRemoteAPIKeyHashWithChange(ctx, apiKeyHash)
+	return err
+}
+
+// removeRemoteAPIKeyHashWithChange reports whether the remote list contained
+// a matching key. The boolean remains true when the final PUT fails, because
+// the remote service may have applied the write before returning the error and
+// compensation must still be attempted.
+func (a *App) removeRemoteAPIKeyHashWithChange(ctx context.Context, apiKeyHash string) (bool, error) {
+	cfg, err := a.loadConfig(ctx)
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
+		return false, validationError(apiKeySyncMissingConfigMessage)
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, apiKeySyncTimeout)
+	defer cancel()
+	unlock := a.lockRemoteAPIKeyList(cfg)
+	defer unlock()
+	keys, err := a.remoteAPIKeys(syncCtx, cfg)
+	if err != nil {
+		return false, err
 	}
 	next := make([]string, 0, len(keys))
 	changed := false
@@ -811,9 +1049,9 @@ func (a *App) removeRemoteAPIKeyHash(ctx context.Context, apiKeyHash string) err
 		next = append(next, key)
 	}
 	if !changed {
-		return nil
+		return false, nil
 	}
-	return a.putRemoteAPIKeys(syncCtx, cfg, next)
+	return true, a.putRemoteAPIKeys(syncCtx, cfg, next)
 }
 
 func (a *App) remoteAPIKeys(ctx context.Context, cfg AppConfig) ([]string, error) {
@@ -824,7 +1062,36 @@ func (a *App) remoteAPIKeys(ctx context.Context, cfg AppConfig) ([]string, error
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, validationError(fmt.Sprintf("读取 CPA API KEY 失败：HTTP %d", response.StatusCode))
 	}
-	return parseStringList(payload), nil
+	// A successful HTTP status does not guarantee a usable list. Treat an
+	// invalid body as a synchronization failure instead of interpreting it as
+	// an empty list, which could otherwise let a local disable/delete operation
+	// proceed while the remote credential remains active.
+	var raw any
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return nil, validationError("读取 CPA API KEY 失败：返回格式无效")
+	}
+	switch typed := raw.(type) {
+	case nil, []any:
+		// Supported CPA response shapes include a JSON array or null.
+	case map[string]any:
+		recognized := false
+		for _, key := range []string{"api-keys", "api_keys", "items", "value", "data"} {
+			if _, ok := typed[key]; ok {
+				recognized = true
+				break
+			}
+		}
+		if !recognized {
+			return nil, validationError("读取 CPA API KEY 失败：返回格式无效")
+		}
+	default:
+		return nil, validationError("读取 CPA API KEY 失败：返回格式无效")
+	}
+	keys, err := parseStringList(payload)
+	if err != nil {
+		return nil, validationError("读取 CPA API KEY 失败：返回格式无效")
+	}
+	return keys, nil
 }
 
 func (a *App) putRemoteAPIKeys(ctx context.Context, cfg AppConfig, keys []string) error {
@@ -860,30 +1127,52 @@ func remoteAPIKeyError(action string, err error) error {
 	return validationError(fmt.Sprintf("%s 失败：%s", action, err.Error()))
 }
 
-func parseStringList(payload []byte) []string {
+func parseStringList(payload []byte) ([]string, error) {
 	var raw any
-	if json.Unmarshal(payload, &raw) != nil {
-		return nil
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return nil, err
 	}
-	var result []string
-	var walk func(any)
-	walk = func(value any) {
-		switch typed := value.(type) {
-		case []any:
-			for _, item := range typed {
-				if text, ok := item.(string); ok && strings.TrimSpace(text) != "" {
-					result = append(result, strings.TrimSpace(text))
-				}
+	if raw == nil {
+		// Some CPA versions use a top-level null to represent an empty list.
+		return []string{}, nil
+	}
+	return parseStringListValue(raw)
+}
+
+func parseStringListValue(value any) ([]string, error) {
+	if value == nil {
+		return nil, errors.New("CPA API KEY response list is null")
+	}
+	switch typed := value.(type) {
+	case []any:
+		result := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok || strings.TrimSpace(text) == "" {
+				return nil, errors.New("CPA API KEY list contains a non-string entry")
 			}
-		case map[string]any:
-			for _, key := range []string{"api-keys", "api_keys", "items", "value", "data"} {
-				if child, ok := typed[key]; ok {
-					walk(child)
-					return
-				}
-			}
+			result = append(result, strings.TrimSpace(text))
 		}
+		return result, nil
+	case map[string]any:
+		var selected any
+		found := false
+		for _, key := range []string{"api-keys", "api_keys", "items", "value", "data"} {
+			child, ok := typed[key]
+			if !ok {
+				continue
+			}
+			if found {
+				return nil, errors.New("CPA API KEY response contains multiple list fields")
+			}
+			selected = child
+			found = true
+		}
+		if !found {
+			return nil, errors.New("CPA API KEY response has no recognized list field")
+		}
+		return parseStringListValue(selected)
+	default:
+		return nil, errors.New("CPA API KEY response list has invalid type")
 	}
-	walk(raw)
-	return result
 }

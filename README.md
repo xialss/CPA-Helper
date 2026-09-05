@@ -43,8 +43,8 @@ For clarity, model requests initiated by an Agent are still sent directly from t
 
 - **Usage analytics and cost estimation**: Track requests, tokens, success rate, latency, model distribution and estimated cost from global, per-user and current-account views.
 - **Request record tracing**: Admins can filter global request events by time, user, API key description, provider, model, endpoint and failure state; regular users inspect only their own account records.
-- **User and permission management**: Provide administrator and regular-user views; admins can create or disable regular accounts and manage nicknames, login accounts, passwords and roles.
-- **User balances and automatic key pause**: Users are unlimited by default; admins can configure monthly balance and lifetime balance, usage is priced in USD with current model prices, monthly balance is consumed first, and exhausted users only have their CPA API keys paused.
+- **User and permission management**: Provide super-admin, administrator and regular-user views; admins can create or disable regular accounts and manage nicknames, login accounts, passwords and roles, while only super admins can change balances.
+- **User balances and automatic key pause**: Users are unlimited by default; super admins can configure monthly balance and lifetime balance, usage is priced in USD with current model prices, monthly balance is consumed first, and exhausted users only have their CPA API keys paused.
 - **API key lifecycle management**: Each user can independently create, edit, copy and delete their own API keys and synchronize them to CPA, with usage counted per user and per-key request guidance plus live request testing.
 - **Model pricing maintenance**: Maintain token-model input, output and cache prices in USD per million tokens; models whose name contains `image` are charged by a fixed USD price per successful request, with CPA model comparison for quickly filling LiteLLM / manual prices.
 - **Available model aggregation**: Query available models through the current account's bound CPA API keys and enrich them with local pricing data.
@@ -71,7 +71,7 @@ Admins can filter global request events, while regular users can inspect records
 
 **User management**
 
-Admins can create or disable regular accounts, manage nicknames, roles and enabled status, and review per-user daily usage, monthly balance and lifetime balance.
+Admins can create or disable regular accounts, manage nicknames, roles and enabled status, and review per-user daily usage, total cost, monthly balance and lifetime balance; only super admins can change balances.
 
 ![User management](pictures/用户管理.png)
 
@@ -330,11 +330,11 @@ Use the System Settings page to configure:
 ### User Balances
 
 - Existing users and newly created users are unlimited by default.
-- Admins can disable the unlimited toggle in User Management and then set monthly balance plus lifetime balance; both numeric fields default to `0` and cannot be left blank.
+- Super admins can disable the unlimited toggle in User Management and then set monthly balance plus lifetime balance; both numeric fields default to `0` and cannot be left blank. Ordinary admins can view balances but cannot modify them.
 - Initial balance setup does not retroactively charge historical usage; only newly collected usage after setup participates in balance deduction.
 - Balance consumption uses the USD amount estimated from current model prices. The fixed order is monthly balance first, then lifetime balance for any overflow.
 - When both balances are unavailable or exhausted, CPA-Helper removes that user's locally bound API keys from CPA, but it does not disable the login account. The user can still sign in and view the reason.
-- Monthly balance resets by the `Asia/Shanghai` calendar month. Entering a new month, adding balance or switching the user back to unlimited automatically restores keys that were paused only because of balance exhaustion.
+- Monthly balance resets by the `Asia/Shanghai` calendar month. Entering a new month, a super admin adding balance or switching the user back to unlimited automatically restores keys that were paused only because of balance exhaustion.
 - Unpriced usage does not consume balance, but CPA-Helper records it as an unpriced balance event and surfaces the warning to admins and the affected user.
 
 ### Model Pricing and Request Testing

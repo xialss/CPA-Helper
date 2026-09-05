@@ -1372,7 +1372,20 @@ func requestJSON(
 			t.Fatalf("decode %s %s response: %v", method, path, err)
 		}
 	}
-	return append(cookies, recorder.Result().Cookies()...)
+	for _, updated := range recorder.Result().Cookies() {
+		replaced := false
+		for index, existing := range cookies {
+			if existing != nil && existing.Name == updated.Name {
+				cookies[index] = updated
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			cookies = append(cookies, updated)
+		}
+	}
+	return cookies
 }
 
 func requestJSONExpectStatus(

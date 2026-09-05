@@ -356,6 +356,14 @@ func usageFactsWhere(filters UsageFilters, alias string) (string, []any, error) 
 		clauses = append(clauses, prefix+"usage_username = ?")
 		args = append(args, *filters.UsageUsername)
 	}
+	if len(filters.UsageUsernames) > 0 {
+		placeholders := make([]string, len(filters.UsageUsernames))
+		for i, username := range filters.UsageUsernames {
+			placeholders[i] = "?"
+			args = append(args, username)
+		}
+		clauses = append(clauses, prefix+"usage_username IN ("+strings.Join(placeholders, ",")+")")
+	}
 	if filters.APIKeyDescription != nil {
 		clauses = append(clauses, prefix+"api_key_description = ?")
 		args = append(args, *filters.APIKeyDescription)

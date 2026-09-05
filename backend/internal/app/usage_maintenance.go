@@ -135,6 +135,68 @@ func (runner *usageMaintenanceRunner) RunOnce(ctx context.Context) error {
 	`, dbTime(time.Now()), pruned, dbTime(time.Now())); err != nil {
 		return err
 	}
+	if err := runner.reconcileQuotaSyncErrors(ctx); err != nil {
+		return runner.recordFailure(ctx, err)
+	}
+	return nil
+}
+
+func (runner *usageMaintenanceRunner) reconcileQuotaSyncErrors(ctx context.Context) error {
+	currentMonth := quotaMonth(time.Now())
+	rows, err := runner.app.db.QueryContext(ctx, `
+		SELECT id
+		FROM users
+		WHERE disabled_at IS NULL
+		  AND (
+			quota_sync_error IS NOT NULL
+			OR (
+				quota_paused_at IS NOT NULL
+				AND quota_pause_reason = 'quota_exhausted'
+				AND (quota_month <> ? OR quota_month IS NULL)
+			)
+		  )
+	`, currentMonth)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var userIDs []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		userIDs = append(userIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range userIDs {
+		func() {
+			unlock := runner.app.lockUserMutation(id)
+			defer unlock()
+			user, err := runner.app.getUser(ctx, id)
+			if err != nil {
+				log.Printf("quota maintenance: load user %d: %v", id, err)
+				return
+			}
+			if user.DisabledAt != nil {
+				return
+			}
+			user, err = runner.app.ensureQuotaMonth(ctx, user)
+			if err != nil {
+				log.Printf("quota maintenance: ensure quota month for user %d: %v", id, err)
+				return
+			}
+			if quotaHasAvailable(user) {
+				if syncErr := runner.app.restoreQuotaPausedUserIfAvailableLocked(ctx, id); syncErr != nil {
+					log.Printf("quota maintenance: restore user %d: %v", id, syncErr)
+				}
+			} else if syncErr := runner.app.pauseUserKeysForQuotaLocked(ctx, id, quotaPauseReasonExhausted); syncErr != nil {
+				log.Printf("quota maintenance: pause user %d: %v", id, syncErr)
+			}
+		}()
+	}
 	return nil
 }
 

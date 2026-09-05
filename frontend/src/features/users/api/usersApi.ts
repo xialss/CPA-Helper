@@ -5,11 +5,16 @@ import type {
   UserPayload,
   UserQuotaPayload,
   UserQuotaStatus,
+  UserListPage,
   UserSummary,
 } from '@/shared/types/api'
 
 export function listUsers(): Promise<UserSummary[]> {
   return apiClient.get<UserSummary[]>('/users')
+}
+
+export function listUsersPage(page: number, pageSize: number): Promise<UserListPage> {
+  return apiClient.get<UserListPage>('/users', { page, page_size: pageSize })
 }
 
 export function createUser(payload: UserPayload): Promise<UserSummary> {
