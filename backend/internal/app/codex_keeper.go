@@ -1242,10 +1242,10 @@ func (a *App) computeKeeperQuotaWindowUsages(ctx context.Context, accounts []kee
 		}
 		cacheUsageRecordAuth(&record)
 		if inPrimaryWindow {
-			addRecordToKeeperQuotaWindowUsage(pair.Primary, record, pricing.Prices, pricing.MatchContext)
+			addRecordToKeeperQuotaWindowUsageVersioned(pair.Primary, record, pricing.Prices, pricing.Versions, pricing.MatchContext)
 		}
 		if inSecondaryWindow {
-			addRecordToKeeperQuotaWindowUsage(pair.Secondary, record, pricing.Prices, pricing.MatchContext)
+			addRecordToKeeperQuotaWindowUsageVersioned(pair.Secondary, record, pricing.Prices, pricing.Versions, pricing.MatchContext)
 		}
 	}
 	return usages, nil
@@ -1439,6 +1439,10 @@ func keeperRecordInQuotaWindow(record UsageRecord, usage *keeperQuotaWindowUsage
 }
 
 func addRecordToKeeperQuotaWindowUsage(usage *keeperQuotaWindowUsage, record UsageRecord, prices map[[2]string]ModelPrice, matchContexts ...modelPriceMatchContext) {
+	addRecordToKeeperQuotaWindowUsageVersioned(usage, record, prices, nil, matchContexts...)
+}
+
+func addRecordToKeeperQuotaWindowUsageVersioned(usage *keeperQuotaWindowUsage, record UsageRecord, prices map[[2]string]ModelPrice, versions modelPriceVersionIndex, matchContexts ...modelPriceMatchContext) {
 	if usage == nil {
 		return
 	}
@@ -1456,7 +1460,7 @@ func addRecordToKeeperQuotaWindowUsage(usage *keeperQuotaWindowUsage, record Usa
 	usage.CachedTokens += record.CachedTokens
 	usage.ReasoningTokens += record.ReasoningTokens
 	usage.TotalTokens += usageAggregateTotalTokens(record, matchedBrand)
-	amount, unpriced := recordCost(record, prices, matchContexts...)
+	amount, unpriced := recordCostWithVersions(record, prices, versions, matchContexts...)
 	if unpriced {
 		usage.UnpricedRecords++
 		return

@@ -123,6 +123,8 @@ export interface AIProviderItem {
   api_key_masked?: string | null
   auth_index?: string | null
   name?: string | null
+  local_alias: string
+  channel_key: string
   priority?: number | null
   weight?: number | null
   disabled?: boolean | null
@@ -142,10 +144,12 @@ export interface AIProviderItem {
   recent_success: number
   recent_failure: number
   recent_status: 'healthy' | 'failing' | 'unknown' | 'unavailable' | string
-  recent_status_available?: boolean
-  recent_requests?: AIProviderRecentRequestBucket[] | null
+  recent_status_available: boolean
+  recent_requests: AIProviderRecentRequestBucket[]
   metadata?: Record<string, unknown>
 }
+
+export type AIProviderPayload = Omit<AIProviderItem, 'channel_key' | 'local_alias'>
 
 export interface AIProviderUsage {
   provider?: string
@@ -160,8 +164,8 @@ export interface AIProviderUsage {
   last_seen?: string | null
   identity_hash?: string | null
   upstream_label?: string | null
-  recent_requests?: AIProviderRecentRequestBucket[] | null
-  recent_requests_available?: boolean
+  recent_requests: AIProviderRecentRequestBucket[]
+  recent_requests_available: boolean
 }
 
 export interface AIProviderSummary {
@@ -194,7 +198,7 @@ export interface AIProviderOrderItem {
 
 export interface AIProviderActionPayload {
   brand: AIProviderBrand
-  provider: AIProviderItem
+  provider: AIProviderPayload
   model?: string
   message?: string
 }
@@ -553,7 +557,19 @@ export interface ModelPriceLongContext {
   cache_creation_usd_per_million: number
 }
 
+export type ModelPriceLongContextRateField = Exclude<keyof ModelPriceLongContext, 'threshold_input_tokens'>
+
+export interface PriceTimeRule {
+  timezone: string
+  peak_windows: { weekdays: number[]; start: string; end: string }[]
+  offpeak_mode: 'multiplier' | 'explicit'
+  offpeak_multiplier: number
+  offpeak_rates?: Pick<ModelPriceLongContext, 'input_usd_per_million' | 'output_usd_per_million' | 'cache_read_usd_per_million' | 'cache_creation_usd_per_million'>
+  long_context_multiplier: number
+}
+
 export interface ModelPrice {
+  time_pricing: PriceTimeRule | null
   id: number
   provider: string
   model: string
@@ -578,6 +594,8 @@ export interface ModelPrice {
 }
 
 export interface ModelPricePayload {
+  time_pricing?: PriceTimeRule | null
+  time_pricing_set?: boolean
   provider: string
   model: string
   price_scope: 'library' | 'channel'
@@ -593,6 +611,7 @@ export interface ModelPricePayload {
   request_usd: number | null
   long_context: ModelPriceLongContext | null
   preserve_invalid_long_context?: boolean
+  correct_latest_version?: boolean
 }
 
 export interface ModelPriceLibraryConflict {
@@ -609,6 +628,7 @@ export interface ModelPriceLibraryConflictLongContext {
   output_usd_per_million: number | null
   cache_read_usd_per_million: number | null
   cache_creation_usd_per_million: number | null
+  non_finite_fields?: Partial<Record<ModelPriceLongContextRateField, 'NaN' | '+Inf' | '-Inf'>>
 }
 
 export interface ModelPriceLibraryConflictPromotePayload {
@@ -618,6 +638,7 @@ export interface ModelPriceLibraryConflictPromotePayload {
 
 export interface PriorityMultiplierPayload {
   priority_multiplier: number
+  correct_latest_version?: boolean
 }
 
 export interface ModelPriceSyncResponse {
@@ -629,6 +650,79 @@ export interface ModelPriceSyncResponse {
   unchanged: number
   skipped_manual: number
   skipped_invalid: number
+  payload_bytes: number
+  selected_entries: number
+  download_ms: number
+  parse_ms: number
+  transaction_ms: number
+}
+
+export interface ModelPriceChannelAlias {
+  auth_type: 'apikey'
+  channel_brand: AIProviderBrand
+  channel_key: string
+  label: string
+  channel_identity_hash?: string
+}
+
+export interface ModelPriceChannelAliasPayload {
+  auth_type: 'apikey'
+  channel_brand: AIProviderBrand
+  channel_key: string
+  label: string
+  channel_identity_hash: string
+}
+
+export interface ModelPriceVersion {
+  time_pricing: PriceTimeRule | null
+  id: number
+  effective_at: string
+  baseline: boolean
+  input_usd_per_million: number
+  output_usd_per_million: number
+  cache_read_usd_per_million: number
+  cache_creation_usd_per_million: number
+  request_usd: number | null
+  billing_unit: ModelPriceBillingUnit
+  priority_multiplier: number | null
+  long_context: ModelPriceLongContext | null
+  preserved_long_context: ModelPriceLibraryConflictLongContext | null
+}
+
+export interface LiteLLMSyncPayload {
+  models: string[]
+}
+
+export interface LiteLLMModelOption {
+  model: string
+  price_model: string
+  provider: string
+  matched_current: boolean
+}
+
+export interface LiteLLMModelOptionsResponse {
+  models: LiteLLMModelOption[]
+  payload_bytes: number
+  total_entries: number
+  channel_error: string | null
+  oauth_channel_error: string | null
+}
+
+export interface TimePricingBatchPayload {
+  price_ids: number[]
+  rule: PriceTimeRule | null
+  effective_at?: string
+}
+
+export interface TimePricingBatchItem {
+  before: ModelPrice
+  after: ModelPrice
+}
+
+export interface TimePricingBatchResult {
+  effective_at: string
+  items: TimePricingBatchItem[]
+  applied: boolean
 }
 
 export interface ModelPriceCatalogItem {
@@ -644,6 +738,7 @@ export interface ModelPriceCatalogItem {
   channel_brand: string
   channel_key: string
   channel_label: string
+  channel_alias: string
   channel_identity_hash: string
   channel_disabled: boolean
   channel_status: 'ready' | 'missing_selector' | 'conflict' | string

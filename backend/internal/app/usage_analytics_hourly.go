@@ -89,14 +89,16 @@ type usageAnalyticsHourlyContribution struct {
 
 type usageAnalyticsHourlyBuilder struct {
 	prices       modelPriceIndex
+	versions     modelPriceVersionIndex
 	matchContext modelPriceMatchContext
 	priceMatches map[usageAnalyticsPriceMatchKey]usageAnalyticsPriceMatch
 	groups       map[usageAnalyticsHourlyKey]*usageAnalyticsHourlyContribution
 }
 
-func newUsageAnalyticsHourlyBuilder(prices modelPriceIndex, matchContext modelPriceMatchContext) *usageAnalyticsHourlyBuilder {
+func newUsageAnalyticsHourlyBuilder(prices modelPriceIndex, versions modelPriceVersionIndex, matchContext modelPriceMatchContext) *usageAnalyticsHourlyBuilder {
 	return &usageAnalyticsHourlyBuilder{
 		prices:       prices,
+		versions:     versions,
 		matchContext: matchContext,
 		priceMatches: map[usageAnalyticsPriceMatchKey]usageAnalyticsPriceMatch{},
 		groups:       map[usageAnalyticsHourlyKey]*usageAnalyticsHourlyContribution{},
@@ -115,7 +117,8 @@ func (builder *usageAnalyticsHourlyBuilder) add(record UsageRecord) {
 		}
 		builder.priceMatches[matchKey] = match
 	}
-	breakdown := calculateRecordCostForMatch(record, match.price, match.status, match.brand, false)
+	versionedPrice := resolveVersionedPrice(record, match.price, builder.versions)
+	breakdown := calculateRecordCostForMatch(record, versionedPrice, match.status, match.brand, false, match.price)
 
 	channelAuthType, channelBrand, channelKey, channelLabel, channelLabelFallback := usageAnalyticsHourlyChannel(match, builder.matchContext)
 	hourStart := record.Timestamp.In(appTimeLocation).Truncate(time.Hour)
@@ -358,7 +361,7 @@ func (a *App) rebuildUsageAnalyticsHourlyLocked(ctx context.Context, pricing mod
 		return modelPriceBillingIndex{}, usageAnalyticsState{}, err
 	}
 	defer rows.Close()
-	builder := newUsageAnalyticsHourlyBuilder(pricing.Prices, pricing.MatchContext)
+	builder := newUsageAnalyticsHourlyBuilder(pricing.Prices, pricing.Versions, pricing.MatchContext)
 	for rows.Next() {
 		record, err := scanUsageAnalyticsFactRecord(rows)
 		if err != nil {
@@ -651,6 +654,7 @@ func scanUsageAnalyticsHourlyContribution(scanner usageRecordScanner) (usageAnal
 }
 
 func (a *App) collectUsageAnalytics(ctx context.Context, filters UsageFilters, pricing modelPriceBillingIndex, collector *usageAnalyticsCollector, orderBy string) error {
+	collector.setBillingPriceIndex(pricing)
 	if err := a.ensureUsageAnalyticsFacts(ctx); err != nil {
 		return err
 	}

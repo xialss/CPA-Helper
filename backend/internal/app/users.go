@@ -1954,6 +1954,7 @@ func (a *App) userUsageSummaries(ctx context.Context, users []UserRecord) (map[s
 		}
 	}
 	collector := newUsageAnalyticsCollector(filters, pricing.Prices, pricing.MatchContext, nil, usageAnalyticsCollectorOptions{})
+	collector.setBillingPriceIndex(pricing)
 	accumulator := newUserUsageSummaryAccumulator(users)
 	collector.userSummaries = accumulator
 	// Account creation is an exact record-level boundary. An hourly aggregate

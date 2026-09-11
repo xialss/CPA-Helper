@@ -6,16 +6,19 @@ import {
   NButton,
   NCheckbox,
   NDataTable,
+  NEmpty,
   NForm,
   NFormItem,
   NIcon,
   NInput,
   NInputNumber,
   NModal,
+  NPagination,
   NRadioButton,
   NRadioGroup,
   NSelect,
   NSpace,
+  NSpin,
   NSwitch,
   NTag,
   NTooltip,
@@ -24,7 +27,7 @@ import {
   type DataTableColumns,
   type DataTableRowKey,
 } from 'naive-ui'
-import { Database, Layers3, RefreshCw, Search, Server, Zap } from 'lucide-vue-next'
+import { Database, Layers3, Pencil, RefreshCw, RotateCcw, Search, Server, Zap } from 'lucide-vue-next'
 
 import {
   createModelPrice,
@@ -33,14 +36,22 @@ import {
   listModelPriceCatalog,
   listModelPriceLibraryConflicts,
   listModelPrices,
+  listModelPriceChannelAliases,
+  updateModelPriceChannelAlias,
+  listLitellmModelOptions,
   promoteModelPriceLibraryConflict,
   replaceActiveModelPriceLibraryConflict,
   syncLitellmModelPrices,
+  fetchModelPriceVersions,
+  getDeepSeekTemplate,
   updateModelPrice,
   updateModelPricePriorityMultiplier,
 } from '@/features/pricing/api/pricingApi'
 import type {
+  LiteLLMModelOption,
+  LiteLLMModelOptionsResponse,
   ModelPrice,
+  AIProviderBrand,
   ModelPriceCatalogItem,
   ModelPriceCatalogResponse,
   ModelPriceLibraryConflict,
@@ -48,8 +59,17 @@ import type {
   ModelPriceBillingUnit,
   ModelPriceLongContext,
   ModelPricePayload,
+  ModelPriceChannelAlias,
+  ModelPriceChannelAliasPayload,
+  ModelPriceVersion,
+  PriceTimeRule,
 } from '@/shared/types/api'
-import { formatDateTime, formatInteger, formatMultiplier } from '@/shared/utils/format'
+import PriceTimeRuleEditor from '../components/PriceTimeRuleEditor.vue'
+import PriceRatesMatrix from '../components/PriceRatesMatrix.vue'
+import DeepSeekTemplateModal from '../components/DeepSeekTemplateModal.vue'
+import { findModelGroupLibraryPrice, modelGroupLibraryPriceState } from '../utils/modelPriceGroupSummary'
+import { multiplyModelPrice } from '../utils/modelPriceMultiplier'
+import { formatDateTime, formatInteger, formatMultiplier, formatPreservedLongContextPrice, formatPriceValue } from '@/shared/utils/format'
 import { useI18n } from '@/shared/i18n'
 
 type PriceTableLayoutProps =
@@ -57,7 +77,7 @@ type PriceTableLayoutProps =
   | { flexHeight: false; maxHeight: string }
 
 type PriceRowStatus = 'missing' | 'litellm' | 'manual'
-type PriceStatusFilter = 'cpa' | 'missing' | 'litellm' | 'manual' | 'library' | 'migration_conflict'
+type PriceStatusFilter = 'cpa' | 'missing' | 'litellm' | 'manual' | 'library' | 'migration_conflict' | 'removed' | 'unavailable' | 'all'
 type PriceGroupingMode = 'model' | 'provider'
 type PriceScope = 'library' | 'channel'
 type ChannelAuthType = 'apikey' | 'oauth'
@@ -142,16 +162,96 @@ const dialog = useDialog()
 const { errorText, serverText, t } = useI18n()
 const isLoading = ref(false)
 const isSyncing = ref(false)
+const syncModalOpen = ref(false)
+const syncOptionsLoading = ref(false)
+const syncOptionsError = ref('')
+const syncOptionsResponse = ref<LiteLLMModelOptionsResponse | null>(null)
+const selectedSyncModels = ref<string[]>([])
+const litellmModelOptions = ref<LiteLLMModelOption[]>([])
+const syncSearch = ref('')
+const syncPage = ref(1)
+const syncPageSize = 40
+const syncSelectionFilter = ref<'all' | 'matched' | 'selected'>('all')
 const modalOpen = ref(false)
 const priorityModalOpen = ref(false)
 const conflictModalOpen = ref(false)
+const correctLatestVersion = ref(false)
+const timeTemplateOpen = ref(false)
+const timePricingEnabled = ref(false)
+const timeRule = ref<PriceTimeRule | null>(null)
+const timeRuleLoading = ref(false)
+let timeTemplateRequest = 0
+function supportsDeepSeekTimePricingForm(
+  priceScope: PriceScope,
+  billingUnit: ModelPriceBillingUnit,
+  model: string,
+): boolean {
+  return priceScope === 'channel' && billingUnit === 'token' && (model.split('/').pop()?.toLowerCase().startsWith('deepseek-') ?? false)
+}
+const deepSeekForm = computed(() => supportsDeepSeekTimePricingForm(form.price_scope, form.billing_unit, form.model))
+const priceLabels = computed(() => Object.fromEntries(priceRows.value.filter(row => row.price).map(row => [row.price!.id, row.provider])))
+const currentVersionId = computed(() => priceVersions.value.filter(version => Date.parse(version.effective_at) <= Date.now()).pop()?.id)
+const latestVersionId = computed(() => priceVersions.value[priceVersions.value.length - 1]?.id)
+// Newest first; long histories collapse to the most recent few until expanded.
+const collapsedVersionCount = 3
+const showAllVersions = ref(false)
+const visiblePriceVersions = computed(() => {
+  const newestFirst = [...priceVersions.value].reverse()
+  return showAllVersions.value ? newestFirst : newestFirst.slice(0, collapsedVersionCount)
+})
+const editingSupportsFast = computed(() => supportsPriorityMultiplier(prices.value.find(price => price.id === editingId.value) ?? null))
+function invalidateTimeTemplateRequest() {
+  timeTemplateRequest += 1
+  timeRuleLoading.value = false
+}
+
+async function toggleTimePricing(enabled: boolean) {
+  invalidateTimeTemplateRequest()
+  if (!deepSeekForm.value) {
+    timePricingEnabled.value = false
+    timeRule.value = null
+    return
+  }
+  timePricingEnabled.value = enabled
+  if (!enabled || timeRule.value) return
+  timeRuleLoading.value = true
+  const request = timeTemplateRequest
+  const id = editingId.value
+  const model = form.model
+  const isCurrentRequest = () => timeTemplateRequest === request && modalOpen.value && editingId.value === id && form.model === model
+  try {
+    const template = await getDeepSeekTemplate()
+    if (isCurrentRequest()) timeRule.value = template
+  } catch (error) {
+    if (isCurrentRequest()) {
+      timePricingEnabled.value = false
+      message.error(errorText(error, '加载峰谷模板失败', 'Failed to load time pricing template'))
+    }
+  } finally {
+    if (isCurrentRequest()) timeRuleLoading.value = false
+  }
+}
+const priceVersions = ref<ModelPriceVersion[]>([])
+const priceVersionsLoading = ref(false)
+const priceVersionsError = ref('')
+let priceVersionRequest = 0
 const isPrioritySaving = ref(false)
 const isPriceSaving = ref(false)
 const isConflictSaving = ref(false)
 const editingId = ref<number | null>(null)
 const editingChannelLabel = ref('')
+const aliasModalOpen = ref(false)
+const aliasSaving = ref(false)
+const aliasLabel = ref('')
+const aliasIdentity = reactive<ModelPriceChannelAliasPayload>({ auth_type: 'apikey', channel_brand: 'gemini', channel_key: '', channel_identity_hash: '', label: '' })
+const channelAliases = ref<ModelPriceChannelAlias[]>([])
 const priorityEditingPrice = ref<ModelPrice | null>(null)
 const priorityMultiplier = ref<number | null>(null)
+const priorityCorrectLatest = ref(false)
+const priorityLatestVersion = ref<ModelPriceVersion | null>(null)
+const priorityVersionsLoading = ref(false)
+const priorityVersionsError = ref('')
+let priorityVersionRequest = 0
 const prices = ref<ModelPrice[]>([])
 const libraryConflicts = ref<ModelPriceLibraryConflict[]>([])
 const resolvingConflict = ref<ModelPriceLibraryConflict | null>(null)
@@ -166,6 +266,8 @@ const expandedRowKeys = ref<DataTableRowKey[]>([])
 const longContextEnabled = ref(false)
 const preservedLongContext = ref<ModelPriceLibraryConflictLongContext | null>(null)
 const preserveInvalidLongContext = ref(false)
+const channelTemplatePrice = ref<ModelPrice | null>(null)
+const channelPriceMultiplier = ref<number | null>(null)
 const isDesktopPriceLayout = ref(desktopPriceLayoutQuery.matches)
 const pagination = reactive({
   page: 1,
@@ -195,18 +297,69 @@ const longContextForm = reactive<ModelPriceLongContext>({
   cache_read_usd_per_million: 0,
   cache_creation_usd_per_million: 0,
 })
+let beforeCorrection: {
+  form: ModelPricePayload
+  long: ModelPriceLongContext
+  longEnabled: boolean
+  preservedLong: ModelPriceLibraryConflictLongContext | null
+  preserveInvalidLong: boolean
+  rule: PriceTimeRule | null
+  enabled: boolean
+} | null = null
+watch(modalOpen, (open) => {
+  if (!open) invalidatePriceFormRequests()
+})
+watch(correctLatestVersion, (correct) => {
+  if (!modalOpen.value) return
+  if (correct) {
+    const latest = priceVersions.value[priceVersions.value.length - 1]
+    if (!latest) return
+    invalidateTimeTemplateRequest()
+    beforeCorrection = JSON.parse(JSON.stringify({
+      form: { ...form },
+      long: { ...longContextForm },
+      longEnabled: longContextEnabled.value,
+      preservedLong: preservedLongContext.value,
+      preserveInvalidLong: preserveInvalidLongContext.value,
+      rule: timeRule.value,
+      enabled: timePricingEnabled.value,
+    }))
+    form.billing_unit = latest.billing_unit
+    form.input_usd_per_million = latest.input_usd_per_million
+    form.output_usd_per_million = latest.output_usd_per_million
+    form.cache_read_usd_per_million = latest.cache_read_usd_per_million
+    form.cache_creation_usd_per_million = latest.cache_creation_usd_per_million
+    form.request_usd = latest.request_usd
+    preservedLongContext.value = null
+    preserveInvalidLongContext.value = false
+    longContextEnabled.value = !!latest.long_context
+    if (latest.long_context) setLongContextForm(latest.long_context)
+    else if (latest.preserved_long_context) setPreservedLongContextForm(latest.preserved_long_context)
+    timeRule.value = latest.time_pricing ? JSON.parse(JSON.stringify(latest.time_pricing)) : null
+    timePricingEnabled.value = !!timeRule.value
+  } else if (beforeCorrection) {
+    const enabled = beforeCorrection.enabled
+    Object.assign(form, beforeCorrection.form)
+    Object.assign(longContextForm, beforeCorrection.long)
+    longContextEnabled.value = beforeCorrection.longEnabled
+    preservedLongContext.value = beforeCorrection.preservedLong
+    preserveInvalidLongContext.value = beforeCorrection.preserveInvalidLong
+    timeRule.value = beforeCorrection.rule
+    beforeCorrection = null
+    void toggleTimePricing(enabled)
+  }
+})
 const preservedLongContextSummary = computed(() => {
   const value = preservedLongContext.value
   if (!value) {
     return ''
   }
-  const nullablePrice = (price: number | null) => price === null ? t('未设置', 'Not set') : formatPriceValue(price)
   return [
     `${t('阈值', 'Threshold')} ${value.threshold_input_tokens === null ? t('未设置', 'Not set') : formatInteger(value.threshold_input_tokens)}`,
-    `${t('输入', 'Input')} ${nullablePrice(value.input_usd_per_million)}`,
-    `${t('输出', 'Output')} ${nullablePrice(value.output_usd_per_million)}`,
-    `${t('缓存读', 'Cache read')} ${nullablePrice(value.cache_read_usd_per_million)}`,
-    `${t('缓存写', 'Cache write')} ${nullablePrice(value.cache_creation_usd_per_million)}`,
+    `${t('输入', 'Input')} ${formatPreservedLongContextPrice(value, 'input_usd_per_million')}`,
+    `${t('输出', 'Output')} ${formatPreservedLongContextPrice(value, 'output_usd_per_million')}`,
+    `${t('缓存读', 'Cache read')} ${formatPreservedLongContextPrice(value, 'cache_read_usd_per_million')}`,
+    `${t('缓存写', 'Cache write')} ${formatPreservedLongContextPrice(value, 'cache_creation_usd_per_million')}`,
   ].join(' · ')
 })
 
@@ -321,6 +474,10 @@ function maskedChannelReference(value: string | null): string {
 function orphanPriceChannelLabel(price: ModelPrice): string {
   if (price.price_scope === 'library') {
     return price.provider
+  }
+  const alias = channelAliasLabel(price.channel_auth_type, price.channel_brand, price.channel_key)
+  if (alias) {
+    return alias
   }
   if (price.channel_brand === 'openai_compatibility') {
     return price.channel_key || price.provider
@@ -503,6 +660,9 @@ const statusOptions = computed<Array<{ label: string; value: PriceStatusFilter }
   { label: t('手动', 'Manual'), value: 'manual' },
   { label: t('通用价格', 'Library prices'), value: 'library' },
   { label: t('迁移冲突', 'Migration conflicts'), value: 'migration_conflict' },
+  { label: t('已移除渠道或模型', 'Removed channels or models'), value: 'removed' },
+  { label: t('渠道不可用', 'Unavailable channels'), value: 'unavailable' },
+  { label: t('全部记录（含历史）', 'All records, including history'), value: 'all' },
 ])
 
 const groupingOptions = computed<Array<{ label: string; value: PriceGroupingMode }>>(() => [
@@ -517,6 +677,10 @@ const billingUnitOptions = computed<Array<{ label: string; value: ModelPriceBill
 
 const filteredPrices = computed(() => {
   return priceRows.value.filter((row) => {
+    const includesHistory = selectedStatus.value === 'removed' || selectedStatus.value === 'unavailable' || selectedStatus.value === 'all'
+    if (!includesHistory && row.priceScope === 'channel' && ['orphan', 'model_removed', 'unavailable'].includes(row.channelStatus)) {
+      return false
+    }
     if (selectedProvider.value && row.channelFilterKey !== selectedProvider.value) {
       return false
     }
@@ -568,6 +732,10 @@ watch(
 
 function renderSearchIcon() {
   return h(NIcon, { component: Search })
+}
+
+function renderStatusOptionLabel(option: { label: string }) {
+  return h('span', { class: 'status-option-label' }, option.label)
 }
 
 function updatePricePage(page: number) {
@@ -740,6 +908,12 @@ function priceStatus(price: ModelPrice, fallbackModel: string): PriceRowStatus {
 
 function rowMatchesStatus(row: PriceDisplayRow, status: PriceStatusFilter) {
   switch (status) {
+    case 'all':
+      return true
+    case 'removed':
+      return row.priceScope === 'channel' && ['orphan', 'model_removed'].includes(row.channelStatus)
+    case 'unavailable':
+      return row.priceScope === 'channel' && row.channelStatus === 'unavailable'
     case 'cpa':
       return row.in_cpa
     case 'library':
@@ -815,6 +989,12 @@ const isRequestPriceForm = computed(() => form.billing_unit === 'request')
 const isChannelPriceForm = computed(() => form.price_scope === 'channel')
 const priceSaveHint = computed(() => {
   if (isChannelPriceForm.value) {
+    if (editingId.value !== null && correctLatestVersion.value) {
+      return t(
+        '保存后将原地修正最新一条价格版本并保留其原生效时间；该时刻之后的请求在历史统计中按修正价重算，已结算的额度扣费不会改写。',
+        'Saving overwrites the latest price version in place and keeps its original effective time. Requests since that moment are recalculated with the corrected price in history; settled quota charges are not rewritten.',
+      )
+    }
     return isRequestPriceForm.value
       ? t(
           '此价格只用于当前渠道的该模型；按次计费会按每次成功调用固定金额计算。',
@@ -910,7 +1090,14 @@ function priceMatchesSearch(row: PriceDisplayRow) {
   )
 }
 
+function invalidatePriceFormRequests() {
+  invalidateTimeTemplateRequest()
+  priceVersionRequest += 1
+  priceVersionsLoading.value = false
+}
+
 function resetForm() {
+  invalidatePriceFormRequests()
   editingId.value = null
   editingChannelLabel.value = ''
   form.provider = ''
@@ -930,6 +1117,15 @@ function resetForm() {
   longContextEnabled.value = false
   preservedLongContext.value = null
   preserveInvalidLongContext.value = false
+  channelTemplatePrice.value = null
+  channelPriceMultiplier.value = null
+  timePricingEnabled.value = false
+  timeRule.value = null
+  beforeCorrection = null
+  correctLatestVersion.value = false
+  priceVersions.value = []
+  priceVersionsError.value = ''
+  showAllVersions.value = false
   longContextForm.threshold_input_tokens = 200000
   longContextForm.input_usd_per_million = 0
   longContextForm.output_usd_per_million = 0
@@ -940,14 +1136,16 @@ function resetForm() {
 async function refresh() {
   isLoading.value = true
   try {
-    const [nextPrices, nextCatalog, nextConflicts] = await Promise.all([
+    const [nextPrices, nextCatalog, nextConflicts, nextAliases] = await Promise.all([
       listModelPrices(),
       listModelPriceCatalog(),
       listModelPriceLibraryConflicts(),
+      listModelPriceChannelAliases(),
     ])
     prices.value = nextPrices
     catalog.value = nextCatalog
     libraryConflicts.value = nextConflicts
+    channelAliases.value = nextAliases
     pruneExpandedRowKeys()
   } catch (error) {
     message.error(errorText(error, '加载模型价格失败', 'Failed to load model prices'))
@@ -996,6 +1194,7 @@ function openCreateForRow(row: PriceDisplayRow) {
     request_usd: template?.request_usd ?? null,
     long_context: template?.long_context ?? null,
   }, row.provider)
+  channelTemplatePrice.value = template
 }
 
 function openEdit(row: PriceDisplayRow) {
@@ -1006,6 +1205,7 @@ function openEdit(row: PriceDisplayRow) {
   resetForm()
   editingId.value = price.id
   editingChannelLabel.value = row.provider
+  channelTemplatePrice.value = row.templatePrice
   form.provider = price.provider
   form.model = price.model
   form.price_scope = price.price_scope
@@ -1019,12 +1219,40 @@ function openEdit(row: PriceDisplayRow) {
   form.cache_read_usd_per_million = price.cache_read_usd_per_million
   form.cache_creation_usd_per_million = price.cache_creation_usd_per_million
   form.request_usd = price.request_usd
+  const supportsTimePricing = supportsDeepSeekTimePricingForm(price.price_scope, form.billing_unit, price.model)
+  timeRule.value = supportsTimePricing && price.time_pricing ? JSON.parse(JSON.stringify(price.time_pricing)) : null
+  timePricingEnabled.value = supportsTimePricing && !!price.time_pricing
   if (price.long_context) {
     setLongContextForm(price.long_context)
   } else if (price.preserved_long_context) {
     setPreservedLongContextForm(price.preserved_long_context)
   }
   modalOpen.value = true
+  if (price.price_scope === 'channel') {
+    void loadPriceVersions(price.id)
+  }
+}
+
+async function loadPriceVersions(priceId: number) {
+  const request = ++priceVersionRequest
+  const isCurrentRequest = () => priceVersionRequest === request && modalOpen.value && editingId.value === priceId
+  priceVersionsLoading.value = true
+  priceVersionsError.value = ''
+  try {
+    const versions = await fetchModelPriceVersions(priceId)
+    if (!isCurrentRequest()) {
+      return
+    }
+    priceVersions.value = versions
+  } catch (error) {
+    if (isCurrentRequest()) {
+      priceVersionsError.value = errorText(error, '加载价格版本失败', 'Failed to load price versions')
+    }
+  } finally {
+    if (isCurrentRequest()) {
+      priceVersionsLoading.value = false
+    }
+  }
 }
 
 function setLongContextForm(value: ModelPriceLongContext) {
@@ -1090,9 +1318,14 @@ async function savePrice() {
     cache_creation_usd_per_million: form.cache_creation_usd_per_million,
     request_usd: requestUSD,
     long_context: longContext,
+    time_pricing: deepSeekForm.value && timePricingEnabled.value ? timeRule.value : null,
+    time_pricing_set: true,
   }
   if (!requestPriceMode && preservedLongContext.value !== null) {
     payload.preserve_invalid_long_context = preservePartialLongContext
+  }
+  if (editingId.value !== null && payload.price_scope === 'channel' && correctLatestVersion.value) {
+    payload.correct_latest_version = true
   }
   if (!payload.provider || !payload.model) {
     message.error(t('服务商和模型不能为空', 'Provider and model are required'))
@@ -1142,12 +1375,37 @@ function supportsPriorityMultiplier(price: ModelPrice | null): boolean {
 }
 
 function openPriorityMultiplierEditor(price: ModelPrice) {
+  if (isPrioritySaving.value) return
+  priorityVersionRequest += 1
   priorityEditingPrice.value = price
   priorityMultiplier.value = price.priority_multiplier
+  priorityCorrectLatest.value = false
+  priorityLatestVersion.value = null
+  priorityVersionsError.value = ''
+  priorityVersionsLoading.value = price.price_scope === 'channel'
   priorityModalOpen.value = true
+  if (price.price_scope === 'channel') {
+    void loadPriorityPriceVersions(price.id, priorityVersionRequest)
+  }
+}
+
+async function loadPriorityPriceVersions(priceId: number, request: number) {
+  try {
+    const versions = await fetchModelPriceVersions(priceId)
+    if (priorityVersionRequest === request) {
+      priorityLatestVersion.value = versions[versions.length - 1] ?? null
+    }
+  } catch (error) {
+    if (priorityVersionRequest === request) {
+      priorityVersionsError.value = errorText(error, '加载价格版本失败', 'Failed to load price versions')
+    }
+  } finally {
+    if (priorityVersionRequest === request) priorityVersionsLoading.value = false
+  }
 }
 
 async function savePriorityMultiplier() {
+  if (isPrioritySaving.value || (priorityCorrectLatest.value && (priorityVersionsLoading.value || priorityVersionsError.value))) return
   const price = priorityEditingPrice.value
   const multiplier = priorityMultiplier.value
   if (!price || multiplier === null || !Number.isFinite(multiplier) || multiplier <= 0) {
@@ -1156,7 +1414,8 @@ async function savePriorityMultiplier() {
   }
   isPrioritySaving.value = true
   try {
-    await updateModelPricePriorityMultiplier(price.id, { priority_multiplier: multiplier })
+    const correct = price.price_scope === 'channel' && priorityCorrectLatest.value
+    await updateModelPricePriorityMultiplier(price.id, { priority_multiplier: multiplier, ...(correct ? { correct_latest_version: true } : {}) })
     priorityModalOpen.value = false
     message.success(t('Fast 倍率已更新', 'Fast multiplier updated'))
     await refresh()
@@ -1167,14 +1426,174 @@ async function savePriorityMultiplier() {
   }
 }
 
+const selectedSyncModelSet = computed(() => new Set(selectedSyncModels.value))
+const syncFilterOptions = computed(() => [
+  { label: t('全部候选', 'All candidates'), value: 'all' },
+  { label: t('CPA 匹配', 'CPA matches'), value: 'matched' },
+  { label: t('已选择', 'Selected'), value: 'selected' },
+])
+const filteredSyncModels = computed(() => {
+  const query = syncSearch.value.trim().toLowerCase()
+  return litellmModelOptions.value.filter((option) => {
+    if (syncSelectionFilter.value === 'matched' && !option.matched_current) return false
+    if (syncSelectionFilter.value === 'selected' && !selectedSyncModelSet.value.has(option.model)) return false
+    return !query || `${option.model} ${option.price_model} ${option.provider}`.toLowerCase().includes(query)
+  })
+})
+const pagedSyncModels = computed(() => filteredSyncModels.value.slice((syncPage.value - 1) * syncPageSize, syncPage.value * syncPageSize))
+watch([syncSearch, syncSelectionFilter], () => { syncPage.value = 1 })
+watch(() => filteredSyncModels.value.length, (length) => {
+  syncPage.value = Math.min(syncPage.value, Math.max(1, Math.ceil(length / syncPageSize)))
+})
+
+function setSyncModelChecked(model: string, checked: boolean) {
+  const next = new Set(selectedSyncModels.value)
+  if (checked) next.add(model)
+  else next.delete(model)
+  selectedSyncModels.value = [...next]
+}
+
+function applyChannelPriceMultiplier() {
+  const template = channelTemplatePrice.value
+  const multiplier = channelPriceMultiplier.value
+  if (!template) {
+    message.error(t('当前模型没有可用的通用价', 'No library price is available for this model'))
+    return
+  }
+  if (typeof multiplier !== 'number' || !Number.isFinite(multiplier) || multiplier < 0) {
+    message.error(t('请输入不小于 0 的有效倍率', 'Enter a valid multiplier of 0 or greater'))
+    return
+  }
+  if (template.billing_unit !== form.billing_unit) {
+    message.error(t(
+      '通用价与当前渠道价格的计费单位不一致，无法按倍率换算',
+      'The library price and current channel price use different billing units and cannot be converted by multiplier',
+    ))
+    return
+  }
+  const converted = multiplyModelPrice(template, multiplier)
+  if (!converted) {
+    message.error(t('倍率换算结果必须是有限非负数，请检查通用价和倍率', 'Converted prices must be finite non-negative numbers. Check the library price and multiplier.'))
+    return
+  }
+  if (form.billing_unit === 'request') {
+    form.request_usd = converted.request_usd
+  } else {
+    form.input_usd_per_million = converted.input_usd_per_million
+    form.output_usd_per_million = converted.output_usd_per_million
+    form.cache_read_usd_per_million = converted.cache_read_usd_per_million
+    form.cache_creation_usd_per_million = converted.cache_creation_usd_per_million
+    if (converted.long_context) setLongContextForm(converted.long_context)
+  }
+  message.success(t('已按倍率换算并填入固定价格', 'Multiplier applied as fixed prices'))
+}
+
+function selectMatchedSyncModels() {
+  selectedSyncModels.value = litellmModelOptions.value.filter((option) => option.matched_current).map((option) => option.model)
+}
+
+function selectFilteredSyncModels() {
+  selectedSyncModels.value = [...new Set([...selectedSyncModels.value, ...filteredSyncModels.value.map((option) => option.model)])]
+}
+
+async function loadSyncOptions() {
+  if (syncOptionsLoading.value || isSyncing.value) return
+  syncOptionsLoading.value = true
+  syncOptionsError.value = ''
+  litellmModelOptions.value = []
+  selectedSyncModels.value = []
+  syncOptionsResponse.value = null
+  try {
+    syncOptionsResponse.value = await listLitellmModelOptions()
+    litellmModelOptions.value = syncOptionsResponse.value.models
+    selectMatchedSyncModels()
+  } catch (error) {
+    syncOptionsError.value = errorText(error, '加载 LiteLLM 模型列表失败', 'Failed to load LiteLLM model list')
+  } finally {
+    syncOptionsLoading.value = false
+  }
+}
+
+async function openSyncModal() {
+  if (isSyncing.value || syncOptionsLoading.value) return
+  syncSearch.value = ''
+  syncSelectionFilter.value = 'all'
+  syncPage.value = 1
+  syncModalOpen.value = true
+  await loadSyncOptions()
+}
+
+const channelAliasMap = computed(() => {
+  const aliases = new Map<string, string>()
+  for (const alias of channelAliases.value) {
+    const key = channelIdentityKey(alias.auth_type, alias.channel_brand, alias.channel_key)
+    if (key !== null) {
+      aliases.set(key, alias.label)
+    }
+  }
+  return aliases
+})
+
+function channelAliasLabel(authType: ChannelAuthType | null, brand: string | null, key: string | null) {
+  const identity = channelIdentityKey(authType, brand, key)
+  return identity === null ? '' : channelAliasMap.value.get(identity) ?? ''
+}
+
+function isModelPriceChannelAliasBrand(brand: string | null): brand is AIProviderBrand {
+  switch (brand) {
+    case 'gemini':
+    case 'codex':
+    case 'claude':
+    case 'openai_compatibility':
+    case 'vertex':
+    case 'xai':
+      return true
+    default:
+      return false
+  }
+}
+
+function canEditChannelAlias(row: PriceDisplayRow) {
+  return row.priceScope === 'channel' && row.channelAuthType === 'apikey' && isModelPriceChannelAliasBrand(row.channelBrand)
+    && !!row.channelBrand && !!row.channelKey && !!row.channelIdentityHash && row.channelStatus === 'ready'
+}
+
+function openAliasEditor(row: PriceDisplayRow) {
+  const brand = row.channelBrand
+  if (!canEditChannelAlias(row) || !isModelPriceChannelAliasBrand(brand) || aliasSaving.value || isLoading.value || !row.channelKey || !row.channelIdentityHash) return
+  aliasIdentity.auth_type = 'apikey'
+  aliasIdentity.channel_brand = brand
+  aliasIdentity.channel_key = row.channelKey
+  aliasIdentity.channel_identity_hash = row.channelIdentityHash
+  aliasLabel.value = channelAliasLabel(row.channelAuthType, row.channelBrand, row.channelKey)
+  aliasModalOpen.value = true
+}
+
+async function saveAlias() {
+  if (aliasSaving.value) return
+  aliasSaving.value = true
+  try {
+    await updateModelPriceChannelAlias({ ...aliasIdentity, label: aliasLabel.value })
+    aliasModalOpen.value = false
+    await refresh()
+    message.success(t('渠道名称已保存', 'Channel name saved'))
+  } catch (error) {
+    message.error(errorText(error, '保存渠道名称失败', 'Failed to save channel name'))
+  } finally {
+    aliasSaving.value = false
+  }
+}
+
 async function syncPrices() {
+  if (isSyncing.value || syncOptionsLoading.value || selectedSyncModels.value.length === 0) return
   isSyncing.value = true
   try {
-    const result = await syncLitellmModelPrices()
+    const result = await syncLitellmModelPrices({ models: selectedSyncModels.value })
+    syncModalOpen.value = false
     message.success(
       t(
-        `同步完成：LiteLLM 价格 ${result.imported} 条，手动价格保留 ${result.skipped_manual} 条`,
-        `Sync complete: ${result.imported} LiteLLM prices imported, ${result.skipped_manual} manual prices preserved`,
+        `同步完成：新增 ${result.created} 条，更新 ${result.updated} 条，未变 ${result.unchanged} 条，保留手动 ${result.skipped_manual} 条，跳过无效 ${result.skipped_invalid} 条`,
+        `Sync complete: ${result.created} created, ${result.updated} updated, ${result.unchanged} unchanged, ${result.skipped_manual} manual prices preserved, ${result.skipped_invalid} invalid skipped`,
       ),
     )
     await refresh()
@@ -1286,20 +1705,12 @@ function priceRowClassName(row: PriceTableRow) {
   return isPriceGroupRow(row) ? 'price-group-row' : 'price-detail-row'
 }
 
-function formatPriceValue(value: number | null | undefined) {
-  return typeof value === 'number' ? String(value) : '-'
+function groupLibraryPrice(row: PriceGroupRow): ModelPrice | null {
+  return findModelGroupLibraryPrice(row.children)
 }
 
-function summarizePriceValues(values: number[]): string {
-  const finiteValues = values.filter((value) => Number.isFinite(value))
-  if (finiteValues.length === 0) {
-    return '-'
-  }
-  const minimum = Math.min(...finiteValues)
-  const maximum = Math.max(...finiteValues)
-  return minimum === maximum
-    ? formatPriceValue(minimum)
-    : `${formatPriceValue(minimum)} - ${formatPriceValue(maximum)}`
+function groupHasConfiguredChannelPrice(row: PriceGroupRow): boolean {
+  return row.children.some((child) => child.priceScope === 'channel' && child.price !== null && child.status !== 'missing')
 }
 
 function renderBillingUnitBadge(unit: ModelPriceBillingUnit | 'mixed') {
@@ -1340,11 +1751,15 @@ function renderBillingUnitCell(row: PriceTableRow) {
 
 function renderTokenPriceValue(row: PriceTableRow, field: PriceFieldName) {
   if (isPriceGroupRow(row)) {
-    const values = row.children
-      .filter((child) => child.billing_unit === 'token' && child.price !== null)
-      .map((child) => child.price?.[field])
-      .filter((value): value is number => typeof value === 'number')
-    return h('span', { class: 'price-group-range' }, summarizePriceValues(values))
+    if (row.mode === 'provider') {
+      // Prices of different models are not comparable; the by-channel group row leaves them blank.
+      return h('span', { class: 'price-muted' }, '')
+    }
+    const library = groupLibraryPrice(row)
+    if (modelGroupLibraryPriceState(library, groupHasConfiguredChannelPrice(row)) === 'empty') {
+      return h('span', { class: 'price-muted' }, '')
+    }
+    return h('span', { title: t('通用价', 'Library price') }, !library ? t('未配置', 'Not configured') : library.billing_unit === 'token' ? formatPriceValue(library[field]) : '-')
   }
   if (row.billing_unit === 'request') {
     return h('span', { class: 'price-muted' }, '-')
@@ -1354,11 +1769,14 @@ function renderTokenPriceValue(row: PriceTableRow, field: PriceFieldName) {
 
 function renderRequestPriceValue(row: PriceTableRow) {
   if (isPriceGroupRow(row)) {
-    const values = row.children
-      .filter((child) => child.billing_unit === 'request')
-      .map((child) => child.price?.request_usd)
-      .filter((value): value is number => typeof value === 'number')
-    return h('span', { class: 'price-group-range' }, summarizePriceValues(values))
+    if (row.mode === 'provider') {
+      return h('span', { class: 'price-muted' }, '')
+    }
+    const library = groupLibraryPrice(row)
+    if (modelGroupLibraryPriceState(library, groupHasConfiguredChannelPrice(row)) === 'empty') {
+      return h('span', { class: 'price-muted' }, '')
+    }
+    return h('span', { title: t('通用价', 'Library price') }, !library ? t('未配置', 'Not configured') : library.billing_unit === 'request' ? formatPriceValue(library.request_usd) : '-')
   }
   if (row.billing_unit !== 'request') {
     return h('span', { class: 'price-muted' }, '-')
@@ -1442,15 +1860,14 @@ function renderLongContextPrice(row: PriceTableRow) {
   }
   const archivedLongContext = row.migrationConflict?.archived_long_context ?? row.price?.preserved_long_context
   if (archivedLongContext) {
-    const nullablePrice = (value: number | null) => value === null ? t('未设置', 'Not set') : formatPriceValue(value)
     const threshold = archivedLongContext.threshold_input_tokens
     const label = threshold === null ? t('部分配置', 'Partial') : `>${formatThreshold(threshold)}`
     const details = [
       `${t('阈值', 'Threshold')} ${threshold === null ? t('未设置', 'Not set') : formatInteger(threshold)}`,
-      `${t('输入', 'Input')} ${nullablePrice(archivedLongContext.input_usd_per_million)}`,
-      `${t('输出', 'Output')} ${nullablePrice(archivedLongContext.output_usd_per_million)}`,
-      `${t('缓存读', 'Cache read')} ${nullablePrice(archivedLongContext.cache_read_usd_per_million)}`,
-      `${t('缓存写', 'Cache write')} ${nullablePrice(archivedLongContext.cache_creation_usd_per_million)}`,
+      `${t('输入', 'Input')} ${formatPreservedLongContextPrice(archivedLongContext, 'input_usd_per_million')}`,
+      `${t('输出', 'Output')} ${formatPreservedLongContextPrice(archivedLongContext, 'output_usd_per_million')}`,
+      `${t('缓存读', 'Cache read')} ${formatPreservedLongContextPrice(archivedLongContext, 'cache_read_usd_per_million')}`,
+      `${t('缓存写', 'Cache write')} ${formatPreservedLongContextPrice(archivedLongContext, 'cache_creation_usd_per_million')}`,
     ].join(' · ')
     return h(
       NTooltip,
@@ -1583,6 +2000,12 @@ function renderModelCell(row: PriceTableRow) {
   ])
 }
 
+function providerGroupUnpricedCount(row: PriceGroupRow): number {
+  // Keep the provider subtitle aligned with the operational status column.
+  // A saved price can still be conflicted, removed, or otherwise unavailable.
+  return row.unpricedCount
+}
+
 function renderProviderCell(row: PriceTableRow) {
   if (isPriceGroupRow(row)) {
     const isLibraryGroup = row.children.every((child) => child.priceScope === 'library')
@@ -1595,8 +2018,8 @@ function renderProviderCell(row: PriceTableRow) {
     const details =
       row.mode === 'provider'
         ? t(
-            `${formatInteger(row.modelCount)} 个模型`,
-            `${formatInteger(row.modelCount)} models`,
+            `${formatInteger(row.modelCount)} 个模型 · ${formatInteger(row.children.length)} 条明细 · ${formatInteger(providerGroupUnpricedCount(row))} 未定价`,
+            `${formatInteger(row.modelCount)} models · ${formatInteger(row.children.length)} details · ${formatInteger(providerGroupUnpricedCount(row))} unpriced`,
           )
         : null
     return h('div', { class: 'price-group-cell' }, [
@@ -1616,7 +2039,19 @@ function renderProviderCell(row: PriceTableRow) {
     detailParts.push(t('标签回退', 'Fallback label'))
   }
   return h('div', { class: 'provider-cell' }, [
-    h('div', { class: 'provider-main' }, row.provider || '-'),
+    h('div', { class: 'provider-main' }, [
+      h('span', { class: 'provider-label', title: row.provider }, row.provider || '-'),
+      canEditChannelAlias(row)
+        ? h(NTooltip, {}, {
+            trigger: () => h(NButton, {
+              size: 'tiny', quaternary: true, circle: true, disabled: aliasSaving.value || isLoading.value,
+              'aria-label': t(`设置渠道名称：${row.provider}`, `Set channel name: ${row.provider}`),
+              onClick: () => openAliasEditor(row),
+            }, { icon: () => h(NIcon, { component: Pencil }) }),
+            default: () => t('设置渠道名称', 'Set channel name'),
+          })
+        : null,
+    ]),
     h('div', { class: 'model-sub' }, detailParts.join(' · ')),
   ])
 }
@@ -1831,6 +2266,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  invalidatePriceFormRequests()
   desktopPriceLayoutQuery.removeEventListener('change', handleDesktopPriceLayoutChange)
 })
 </script>
@@ -1845,7 +2281,8 @@ onBeforeUnmount(() => {
         </p>
       </div>
       <NSpace>
-        <NButton secondary :loading="isSyncing" @click="syncPrices">
+        <NButton secondary :disabled="isLoading" @click="timeTemplateOpen = true">{{ t('DeepSeek 峰谷模板', 'DeepSeek time pricing template') }}</NButton>
+        <NButton secondary :loading="isSyncing || syncOptionsLoading" :disabled="isLoading" @click="openSyncModal">
           <template #icon>
             <NIcon :component="RefreshCw" />
           </template>
@@ -1855,6 +2292,7 @@ onBeforeUnmount(() => {
       </NSpace>
     </div>
 
+    <DeepSeekTemplateModal v-model:show="timeTemplateOpen" :prices="prices" :labels="priceLabels" @applied="refresh" />
     <div class="metric-grid price-metrics">
       <div v-for="metric in priceMetrics" :key="metric.key" class="metric-card" :class="`is-${metric.tone}`">
         <div class="metric-icon" aria-hidden="true">
@@ -1899,8 +2337,11 @@ onBeforeUnmount(() => {
                 v-model:value="selectedStatus"
                 class="status-filter"
                 :options="statusOptions"
+                :render-label="renderStatusOptionLabel"
+                :consistent-menu-width="false"
+                :menu-props="{ class: 'price-status-menu' }"
                 clearable
-                :placeholder="t('全部状态', 'All statuses')"
+                :placeholder="t('当前记录', 'Current records')"
               />
               <NInput
                 v-model:value="searchQuery"
@@ -1934,6 +2375,65 @@ onBeforeUnmount(() => {
         :scroll-x="2040"
       />
     </section>
+
+    <NModal
+      v-model:show="syncModalOpen"
+      preset="card"
+      :title="t('选择要同步的 LiteLLM 模型', 'Select LiteLLM models to sync')"
+      :style="{ width: 'min(760px, calc(100vw - 32px))' }"
+      :closable="!isSyncing"
+      :mask-closable="!isSyncing"
+      :close-on-esc="!isSyncing"
+    >
+      <NAlert v-if="syncOptionsError" type="error" class="sync-error">
+        <div class="sync-error-content">
+          <span>{{ syncOptionsError }}</span>
+          <NButton size="small" @click="loadSyncOptions">{{ t('重试', 'Retry') }}</NButton>
+        </div>
+      </NAlert>
+      <NAlert v-if="syncOptionsResponse?.channel_error || syncOptionsResponse?.oauth_channel_error" type="warning" class="sync-error">
+        {{ t('部分 CPA 渠道不可用，默认选择可能不完整。', 'Some CPA channels are unavailable; the default selection may be incomplete.') }}
+        {{ serverText(syncOptionsResponse.channel_error || syncOptionsResponse.oauth_channel_error || '') }}
+      </NAlert>
+      <NSpin :show="syncOptionsLoading">
+        <div class="sync-toolbar">
+          <NInput v-model:value="syncSearch" clearable :disabled="syncOptionsLoading || isSyncing" :placeholder="t('搜索模型或服务商', 'Search models or providers')">
+            <template #prefix><NIcon :component="Search" /></template>
+          </NInput>
+          <NSelect v-model:value="syncSelectionFilter" :options="syncFilterOptions" :disabled="syncOptionsLoading || isSyncing" />
+        </div>
+        <NSpace :size="8" class="sync-actions">
+          <NButton size="small" :disabled="syncOptionsLoading || isSyncing || !litellmModelOptions.length" @click="selectMatchedSyncModels">{{ t('选择 CPA 匹配', 'Select CPA matches') }}</NButton>
+          <NButton size="small" :disabled="syncOptionsLoading || isSyncing || !filteredSyncModels.length" @click="selectFilteredSyncModels">{{ t('选择筛选结果', 'Select filtered') }}</NButton>
+          <NButton size="small" :disabled="syncOptionsLoading || isSyncing || !selectedSyncModels.length" @click="selectedSyncModels = []">{{ t('清空选择', 'Clear selection') }}</NButton>
+        </NSpace>
+        <div class="sync-model-list">
+          <NCheckbox
+            v-for="option in pagedSyncModels"
+            :key="option.model"
+            :checked="selectedSyncModelSet.has(option.model)"
+            :disabled="isSyncing"
+            @update:checked="setSyncModelChecked(option.model, $event)"
+          >
+            <span class="sync-model-name" :title="option.model">{{ option.model }}</span>
+            <span class="sync-model-provider">{{ option.provider }}</span>
+            <NTag v-if="option.matched_current" size="small" :bordered="false" type="success">{{ t('CPA 匹配', 'CPA match') }}</NTag>
+          </NCheckbox>
+          <NEmpty v-if="!syncOptionsLoading && !syncOptionsError && !pagedSyncModels.length" :description="t('没有匹配的模型', 'No matching models')" />
+        </div>
+        <div class="sync-summary">
+          <span>{{ t(`已选 ${formatInteger(selectedSyncModels.length)} / 候选 ${formatInteger(litellmModelOptions.length)}`, `${formatInteger(selectedSyncModels.length)} selected / ${formatInteger(litellmModelOptions.length)} candidates`) }}</span>
+          <span v-if="syncOptionsResponse">{{ t('数据量', 'Payload') }} {{ (syncOptionsResponse.payload_bytes / 1024 / 1024).toFixed(2) }} MB</span>
+        </div>
+        <NPagination v-model:page="syncPage" :page-size="syncPageSize" :item-count="filteredSyncModels.length" :disabled="syncOptionsLoading || isSyncing" simple />
+      </NSpin>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton :disabled="isSyncing" @click="syncModalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
+          <NButton type="primary" :loading="isSyncing" :disabled="syncOptionsLoading || selectedSyncModels.length === 0" @click="syncPrices">{{ t('开始同步', 'Sync selected') }}</NButton>
+        </NSpace>
+      </template>
+    </NModal>
 
     <NModal
       v-model:show="conflictModalOpen"
@@ -1972,29 +2472,53 @@ onBeforeUnmount(() => {
       :style="priceModalStyle"
       class="price-modal"
     >
-      <NForm :model="form" label-placement="top">
-        <div class="form-grid">
-          <NFormItem :label="isChannelPriceForm ? t('渠道', 'Channel') : t('服务商', 'Provider')">
-            <NInput v-if="isChannelPriceForm" :value="editingChannelLabel" disabled />
-            <NInput v-else v-model:value="form.provider" />
-          </NFormItem>
-          <NFormItem :label="t('模型', 'Model')">
-            <NInput v-model:value="form.model" :disabled="isChannelPriceForm" />
-          </NFormItem>
-          <NFormItem :label="t('计费方式', 'Billing mode')" class="wide-form-item">
-            <NRadioGroup v-model:value="form.billing_unit" class="billing-unit-options" :disabled="isPriceSaving">
-              <NRadioButton
-                v-for="option in billingUnitOptions"
-                :key="option.value"
-                :value="option.value"
-              >
-                {{ option.label }}
-              </NRadioButton>
-            </NRadioGroup>
-          </NFormItem>
+      <NForm :model="form" label-placement="top" :disabled="isPriceSaving" class="price-form">
+        <!-- Section 1: identity -->
+        <section class="price-section">
+          <div class="form-grid">
+            <NFormItem :label="isChannelPriceForm ? t('渠道', 'Channel') : t('服务商', 'Provider')">
+              <NInput v-if="isChannelPriceForm" :value="editingChannelLabel" disabled />
+              <NInput v-else v-model:value="form.provider" />
+            </NFormItem>
+            <NFormItem :label="t('模型', 'Model')">
+              <NInput v-model:value="form.model" :disabled="isChannelPriceForm" />
+            </NFormItem>
+            <NFormItem :label="t('计费方式', 'Billing mode')" class="wide-form-item">
+              <NRadioGroup v-model:value="form.billing_unit" class="billing-unit-options" :disabled="isPriceSaving">
+                <NRadioButton
+                  v-for="option in billingUnitOptions"
+                  :key="option.value"
+                  :value="option.value"
+                >
+                  {{ option.label }}
+                </NRadioButton>
+              </NRadioGroup>
+            </NFormItem>
+          </div>
+        </section>
+
+        <!-- Section 2: base rates -->
+        <section class="price-section">
+          <header class="price-section-header">
+            <span class="price-section-title">{{ isRequestPriceForm ? t('价格', 'Price') : t('标准价格（USD / 1M）', 'Standard prices (USD / 1M)') }}</span>
+            <div v-if="isChannelPriceForm && channelTemplatePrice" class="multiplier-control">
+              <NInputNumber
+                v-model:value="channelPriceMultiplier"
+                size="small"
+                :min="0"
+                :precision="6"
+                :step="0.01"
+                clearable
+                :disabled="isPriceSaving"
+                :placeholder="t('通用价倍率', 'Library multiplier')"
+              />
+              <NButton size="small" secondary :disabled="isPriceSaving || channelPriceMultiplier === null" @click="applyChannelPriceMultiplier">
+                {{ t('按通用价换算', 'Apply from library') }}
+              </NButton>
+            </div>
+          </header>
           <NAlert
             v-if="preservedLongContext"
-            class="wide-form-item"
             type="warning"
             :show-icon="false"
           >
@@ -2012,60 +2536,159 @@ onBeforeUnmount(() => {
               </span>
             </NSpace>
           </NAlert>
-          <NFormItem v-if="isRequestPriceForm" :label="t('每次调用价格 USD', 'Per-call price USD')" class="wide-form-item">
+          <NFormItem v-if="isRequestPriceForm" :label="t('每次调用价格 USD', 'Per-call price USD')">
             <NInputNumber v-model:value="form.request_usd" :min="0" :placeholder="t('例如：0.04', 'Example: 0.04')" />
           </NFormItem>
-          <template v-else>
-            <NFormItem :label="t('输入价格', 'Input price')">
+          <div v-else class="rate-grid">
+            <NFormItem :label="t('输入', 'Input')">
               <NInputNumber v-model:value="form.input_usd_per_million" :min="0" />
             </NFormItem>
-            <NFormItem :label="t('输出价格', 'Output price')">
+            <NFormItem :label="t('输出', 'Output')">
               <NInputNumber v-model:value="form.output_usd_per_million" :min="0" />
             </NFormItem>
-            <NFormItem :label="t('缓存读价格', 'Cache read price')">
+            <NFormItem :label="t('缓存读', 'Cache read')">
               <NInputNumber v-model:value="form.cache_read_usd_per_million" :min="0" />
             </NFormItem>
-            <NFormItem :label="t('缓存写价格', 'Cache write price')">
+            <NFormItem :label="t('缓存写', 'Cache write')">
               <NInputNumber v-model:value="form.cache_creation_usd_per_million" :min="0" />
             </NFormItem>
-            <div class="long-context-switch-row wide-form-item">
-              <span>{{ t('长上下文阶梯', 'Long-context tier') }}</span>
-              <NSwitch
-                v-model:value="longContextEnabled"
-                :disabled="isPriceSaving"
-                :aria-label="t('启用长上下文阶梯', 'Enable long-context tier')"
+          </div>
+        </section>
+
+        <!-- Section 3: long-context tier -->
+        <section v-if="!isRequestPriceForm" class="price-section">
+          <header class="price-section-header">
+            <span class="price-section-title">{{ t('长上下文阶梯', 'Long-context tier') }}</span>
+            <NSwitch
+              v-model:value="longContextEnabled"
+              :disabled="isPriceSaving"
+              :aria-label="t('启用长上下文阶梯', 'Enable long-context tier')"
+            />
+          </header>
+          <template v-if="longContextEnabled">
+            <NFormItem :label="t('输入 Token 阈值', 'Input token threshold')">
+              <NInputNumber
+                v-model:value="longContextForm.threshold_input_tokens"
+                :min="1"
+                :precision="0"
+                :step="1000"
               />
-            </div>
-            <template v-if="longContextEnabled">
-              <NFormItem :label="t('输入 Token 阈值', 'Input token threshold')" class="wide-form-item">
-                <NInputNumber
-                  v-model:value="longContextForm.threshold_input_tokens"
-                  :min="1"
-                  :precision="0"
-                  :step="1000"
-                />
-              </NFormItem>
-              <NFormItem :label="t('长上下文输入价格', 'Long-context input price')">
+            </NFormItem>
+            <div class="rate-grid">
+              <NFormItem :label="t('输入', 'Input')">
                 <NInputNumber v-model:value="longContextForm.input_usd_per_million" :min="0" />
               </NFormItem>
-              <NFormItem :label="t('长上下文输出价格', 'Long-context output price')">
+              <NFormItem :label="t('输出', 'Output')">
                 <NInputNumber v-model:value="longContextForm.output_usd_per_million" :min="0" />
               </NFormItem>
-              <NFormItem :label="t('长上下文缓存读价格', 'Long-context cache read price')">
+              <NFormItem :label="t('缓存读', 'Cache read')">
                 <NInputNumber v-model:value="longContextForm.cache_read_usd_per_million" :min="0" />
               </NFormItem>
-              <NFormItem :label="t('长上下文缓存写价格', 'Long-context cache write price')">
+              <NFormItem :label="t('缓存写', 'Cache write')">
                 <NInputNumber v-model:value="longContextForm.cache_creation_usd_per_million" :min="0" />
               </NFormItem>
-            </template>
+            </div>
           </template>
-        </div>
+        </section>
+
+        <!-- Section 4: time pricing (DeepSeek channel token prices only) -->
+        <section v-if="deepSeekForm" class="price-section">
+          <header class="price-section-header">
+            <span class="price-section-title">{{ t('峰谷期', 'Time pricing') }}</span>
+            <NSwitch :value="timePricingEnabled" :disabled="isPriceSaving || timeRuleLoading" :loading="timeRuleLoading" @update:value="toggleTimePricing" />
+          </header>
+          <template v-if="timePricingEnabled && timeRule">
+            <details>
+              <summary>{{ t('配置峰谷规则', 'Configure time pricing') }}</summary>
+              <PriceTimeRuleEditor v-model="timeRule" :disabled="isPriceSaving" />
+            </details>
+            <PriceRatesMatrix :rule="timeRule" :rates="form" :long-context="longContextEnabled ? longContextForm : null" />
+          </template>
+        </section>
+
+        <!-- Section 5: version history (existing channel prices) -->
+        <section v-if="isChannelPriceForm && editingId !== null" class="price-section">
+          <header class="price-section-header">
+            <span class="price-section-title">
+              {{ t('价格版本', 'Price versions') }}
+              <span v-if="priceVersions.length" class="price-section-count">{{ priceVersions.length }}</span>
+            </span>
+            <label class="switch-row">
+              <span>{{ t('修正上一次价格', 'Correct last price') }}</span>
+              <NSwitch
+                v-model:value="correctLatestVersion"
+                size="small"
+                :disabled="isPriceSaving || priceVersionsLoading || !!priceVersionsError"
+                :aria-label="t('修正上一次价格而不新增版本', 'Correct the last price instead of appending a version')"
+              />
+            </label>
+          </header>
+          <NAlert v-if="correctLatestVersion && priceVersions.length" type="warning" :show-icon="false">{{ t('将覆盖最新版本（包括待生效版本），保留其生效时间：', 'Overwrites the latest version, including a scheduled version, retaining its effective time:') }} {{ formatDateTime(priceVersions[priceVersions.length - 1]!.effective_at) }}</NAlert>
+          <NAlert v-if="priceVersionsError" type="error" :show-icon="false">{{ priceVersionsError }}</NAlert>
+          <NSpin v-else :show="priceVersionsLoading" size="small">
+            <ol v-if="priceVersions.length > 0" class="price-version-list">
+              <li v-for="version in visiblePriceVersions" :key="version.id" class="price-version-item" :class="{ 'price-version-latest': version.id === latestVersionId }">
+                <div class="price-version-head">
+                  <span class="price-version-time">{{ formatDateTime(version.effective_at) }}</span>
+                  <span v-if="Date.parse(version.effective_at) > Date.now()" class="price-version-tag price-version-tag-scheduled">{{ t('待生效', 'Scheduled') }}</span>
+                  <span v-else-if="version.id === currentVersionId" class="price-version-tag price-version-tag-current">{{ t('当前生效', 'Currently effective') }}</span>
+                  <span v-if="version.id === latestVersionId" class="price-version-tag">{{ t('最新', 'Latest') }}</span>
+                  <span class="price-version-origin">{{ version.baseline ? t('迁移基线', 'Migration baseline') : t('保存', 'Saved') }}</span>
+                </div>
+                <PriceRatesMatrix
+                  :rates="version"
+                  :long-context="version.long_context"
+                  :preserved-long-context="version.preserved_long_context"
+                  :rule="version.time_pricing"
+                  :billing-unit="version.billing_unit"
+                  :request-usd="version.request_usd"
+                  :priority-multiplier="version.priority_multiplier"
+                  :show-fast="editingSupportsFast"
+                  :show-time-disabled="deepSeekForm"
+                />
+              </li>
+            </ol>
+            <div v-else-if="!priceVersionsLoading" class="price-versions-empty">
+              {{ t('暂无价格版本；保存后将创建第一条版本。', 'No price versions yet. Saving will create the first version.') }}
+            </div>
+            <NButton
+              v-if="priceVersions.length > collapsedVersionCount"
+              text
+              size="small"
+              class="price-versions-toggle"
+              @click="showAllVersions = !showAllVersions"
+            >
+              {{ showAllVersions
+                ? t('收起', 'Show fewer')
+                : t(`显示全部 ${priceVersions.length} 个版本`, `Show all ${priceVersions.length} versions`) }}
+            </NButton>
+          </NSpin>
+        </section>
       </NForm>
       <p class="price-save-hint">{{ priceSaveHint }}</p>
       <template #footer>
         <NSpace justify="end">
           <NButton :disabled="isPriceSaving" @click="modalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
-          <NButton type="primary" :loading="isPriceSaving" @click="savePrice">{{ t('保存', 'Save') }}</NButton>
+          <NButton type="primary" :loading="isPriceSaving" :disabled="timeRuleLoading" @click="savePrice">{{ t('保存', 'Save') }}</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <NModal v-model:show="aliasModalOpen" preset="card" :title="t('设置渠道名称', 'Set channel name')" :style="{ width: 'min(460px, calc(100vw - 32px))' }" :closable="!aliasSaving" :mask-closable="!aliasSaving" :close-on-esc="!aliasSaving">
+      <NForm label-placement="top">
+        <NFormItem :label="t('渠道名称', 'Channel name')">
+          <NInput v-model:value="aliasLabel" maxlength="200" show-count clearable :placeholder="t('默认名称', 'Default name')" :disabled="aliasSaving" />
+        </NFormItem>
+        <div class="model-sub">{{ channelBrandLabel(aliasIdentity.channel_brand) }} · {{ maskedChannelReference(aliasIdentity.channel_key) }}</div>
+      </NForm>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton :disabled="aliasSaving || !aliasLabel" @click="aliasLabel = ''">
+            <template #icon><NIcon :component="RotateCcw" /></template>
+            {{ t('恢复默认名称', 'Reset name') }}
+          </NButton>
+          <NButton :disabled="aliasSaving" @click="aliasModalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
+          <NButton type="primary" :loading="aliasSaving" @click="saveAlias">{{ t('保存', 'Save') }}</NButton>
         </NSpace>
       </template>
     </NModal>
@@ -2076,16 +2699,45 @@ onBeforeUnmount(() => {
       :title="t('编辑 Fast 倍率', 'Edit Fast multiplier')"
       :style="priorityModalStyle"
       class="priority-modal"
+      :closable="!isPrioritySaving"
+      :mask-closable="!isPrioritySaving"
+      :close-on-esc="!isPrioritySaving"
     >
       <NForm label-placement="top">
         <NFormItem :label="t('Fast 倍率', 'Fast multiplier')">
           <NInputNumber v-model:value="priorityMultiplier" :min="0" :disabled="isPrioritySaving" />
         </NFormItem>
+        <template v-if="priorityEditingPrice?.price_scope === 'channel'">
+          <p v-if="priorityVersionsLoading" class="price-save-hint">{{ t('加载价格版本…', 'Loading price versions…') }}</p>
+          <NAlert v-if="priorityVersionsError" type="error" :show-icon="false">{{ priorityVersionsError }}</NAlert>
+          <div class="switch-row">
+            <span>{{ t('修正上一次价格', 'Correct last price') }}</span>
+            <NSwitch
+              v-model:value="priorityCorrectLatest"
+              :disabled="isPrioritySaving || priorityVersionsLoading || !!priorityVersionsError"
+              :aria-label="t('修正上一次价格而不新增版本', 'Correct the last price instead of appending a version')"
+            />
+          </div>
+          <NAlert v-if="priorityCorrectLatest" type="warning" :show-icon="false">
+            <template v-if="priorityLatestVersion">
+              {{ t('将修正最新版本，保留生效时间：', 'Corrects the latest version, retaining its effective time:') }}
+              {{ formatDateTime(priorityLatestVersion.effective_at) }}
+              <strong v-if="Date.parse(priorityLatestVersion.effective_at) > Date.now()">{{ t('（待生效）', ' (scheduled)') }}</strong>
+              <div>{{ t('该版本当前 Fast 倍率：', 'Current Fast multiplier of this version:') }} {{ priorityLatestVersion.priority_multiplier === null ? t('默认', 'Default') : `${formatMultiplier(priorityLatestVersion.priority_multiplier)}x` }}</div>
+            </template>
+            <template v-else>{{ t('尚无历史版本，将从保存时刻新增版本。', 'No price history exists yet; a new version will start at save time.') }}</template>
+          </NAlert>
+          <p class="price-save-hint">
+            {{ priorityCorrectLatest
+              ? t('将原地修正最新一条价格版本的 Fast 倍率并保留其生效时间；该时刻之后的请求在历史统计中按修正价重算，已结算扣费不会改写。', 'Overwrites the Fast multiplier of the latest price version in place and keeps its effective time. Requests since that moment are recalculated in history; settled charges are not rewritten.')
+              : t('保存后新增一条价格版本，从现在起生效。', 'Saving appends a new price version effective from now.') }}
+          </p>
+        </template>
       </NForm>
       <template #footer>
         <NSpace justify="end">
           <NButton :disabled="isPrioritySaving" @click="priorityModalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
-          <NButton type="primary" :loading="isPrioritySaving" @click="savePriorityMultiplier">{{ t('保存', 'Save') }}</NButton>
+          <NButton type="primary" :loading="isPrioritySaving" :disabled="priorityCorrectLatest && (priorityVersionsLoading || !!priorityVersionsError)" @click="savePriorityMultiplier">{{ t('保存', 'Save') }}</NButton>
         </NSpace>
       </template>
     </NModal>
@@ -2192,7 +2844,41 @@ onBeforeUnmount(() => {
 }
 
 .status-filter {
-  width: 150px;
+  width: 180px;
+}
+
+:global(.price-status-menu .n-base-select-menu__item) {
+  min-height: 36px;
+  white-space: normal;
+}
+
+:global(.price-status-menu) {
+  min-width: 260px !important;
+  max-width: calc(100vw - 24px);
+}
+
+:global(.price-status-menu .status-option-label) {
+  display: block;
+  max-width: min(320px, calc(100vw - 48px));
+  overflow-wrap: anywhere;
+  white-space: normal;
+  line-height: 1.35;
+}
+
+.status-filter :deep(.n-base-selection-label) {
+  min-height: 34px;
+  white-space: normal;
+}
+
+.status-filter :deep(.n-base-selection) {
+  min-height: 34px;
+  height: auto;
+}
+
+.status-filter :deep(.n-base-selection-input__content) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
 }
 
 .price-filters {
@@ -2300,6 +2986,237 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
+.multiplier-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.multiplier-control :deep(.n-input-number) {
+  width: 150px;
+  max-width: 100%;
+}
+
+.price-form {
+  display: grid;
+  gap: 4px;
+}
+
+.price-section {
+  display: grid;
+  gap: 8px;
+  padding: 12px 0;
+  border-top: 1px solid var(--cpa-border);
+}
+
+.price-section:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.price-section-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.price-section-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--cpa-text);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.price-section-count {
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--cpa-surface-muted);
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.price-section :deep(.n-form-item) {
+  --n-feedback-height: 0;
+}
+
+.rate-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+
+.switch-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--cpa-text);
+  font-size: 13px;
+}
+
+.price-version-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.price-version-item {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--cpa-border);
+  border-radius: var(--cpa-radius);
+  background: var(--cpa-surface-muted);
+}
+
+.price-version-item.price-version-latest {
+  border-color: color-mix(in srgb, var(--cpa-primary) 40%, var(--cpa-border));
+  background: var(--cpa-surface);
+}
+
+.price-version-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.price-version-time {
+  color: var(--cpa-text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.price-version-origin {
+  margin-left: auto;
+  color: var(--cpa-text-muted);
+}
+
+.price-version-tag {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--cpa-primary) 14%, transparent);
+  color: var(--cpa-primary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.price-version-tag-current {
+  background: var(--cpa-success-weak);
+  color: var(--cpa-success);
+}
+
+.price-version-tag-scheduled {
+  background: var(--cpa-warning-weak);
+  color: var(--cpa-warning);
+}
+
+.price-versions-toggle {
+  justify-self: start;
+  margin-top: 6px;
+}
+
+.price-versions-empty {
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+}
+
+.price-table :deep(.provider-main) {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.price-table :deep(.provider-label) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.price-table :deep(.provider-main .n-button) {
+  flex: 0 0 auto;
+}
+
+.sync-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px;
+  gap: 8px;
+}
+
+.sync-actions,
+.sync-error {
+  margin-bottom: 12px;
+}
+
+.sync-actions {
+  margin-top: 8px;
+}
+
+.sync-model-list {
+  height: min(380px, 42dvh);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.sync-model-list > .n-checkbox {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  border-bottom: 1px solid var(--cpa-border);
+}
+
+.sync-model-list :deep(.n-checkbox__label) {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-width: 0;
+}
+
+.sync-model-name {
+  overflow-wrap: anywhere;
+}
+
+.sync-model-provider,
+.sync-summary {
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+}
+
+.sync-summary {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 12px;
+  margin: 10px 0;
+}
+
+.sync-error-content {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+@media (max-width: 480px) {
+  .sync-toolbar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .rate-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 @media (min-width: 861px) {
   .price-page {
     grid-template-rows: auto auto minmax(0, 1fr);
@@ -2336,7 +3253,7 @@ onBeforeUnmount(() => {
   }
 
   .status-filter {
-    width: min(160px, calc(100vw - 32px));
+    width: min(220px, calc(100vw - 32px));
   }
 
   .price-search {
@@ -2360,7 +3277,7 @@ onBeforeUnmount(() => {
 
   .price-filters {
     display: grid !important;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 1fr);
     gap: 8px !important;
     width: 100%;
   }
