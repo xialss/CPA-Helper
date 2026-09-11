@@ -13,6 +13,7 @@ import {
   NIcon,
   NInput,
   NInputNumber,
+  NModal,
   NSelect,
   NSpace,
   NSwitch,
@@ -33,7 +34,9 @@ import {
   Edit3,
   FlaskConical,
   Plus,
+  Pencil,
   RefreshCw,
+  RotateCcw,
   Search,
   Settings,
   Trash2,
@@ -50,6 +53,7 @@ import {
   testAIProvider,
   updateAIProvider,
 } from '@/features/ai-providers/api/aiProvidersApi'
+import { updateModelPriceChannelAlias } from '@/features/pricing/api/pricingApi'
 import { isApiRequestError } from '@/shared/api/apiClient'
 import { useI18n } from '@/shared/i18n'
 import type {
@@ -59,6 +63,7 @@ import type {
   AIProviderItem,
   AIProviderModel,
   AIProviderOrderItem,
+  AIProviderPayload,
   AIProviderRecentRequestBucket,
   AIProviderSummary,
 } from '@/shared/types/api'
@@ -66,7 +71,7 @@ import { formatInteger } from '@/shared/utils/format'
 
 type ProviderEnabledFilter = 'all' | 'enabled' | 'disabled'
 
-type ProviderMutationKind = 'save' | 'delete' | 'toggle' | 'reorder'
+type ProviderMutationKind = 'save' | 'delete' | 'toggle' | 'reorder' | 'alias'
 
 type DiscoveryModelStatus = 'existing' | 'new' | 'conflict'
 
@@ -226,6 +231,9 @@ const reorderingProviderKey = ref<string | null>(null)
 const reorderingDirection = ref<-1 | 1 | null>(null)
 const providerSnapshotGeneration = ref(0)
 const providerMutation = ref<ProviderMutationKind | null>(null)
+const aliasProvider = ref<AIProviderItem | null>(null)
+const aliasModalOpen = ref(false)
+const aliasLabel = ref('')
 const isDiscovering = ref(false)
 const isTesting = ref(false)
 const discoveredModels = ref<AIProviderModel[]>([])
@@ -264,6 +272,7 @@ const tableRows = computed(() => {
     return [
       provider.brand_label,
       provider.name ?? '',
+      provider.local_alias ?? '',
       provider.api_key_masked ?? '',
       provider.auth_index ?? '',
       provider.base_url ?? '',
@@ -635,7 +644,7 @@ function isBlankKeyEntry(entry: KeyEntryDraft) {
   return !entry.api_key.trim() && !entry.api_key_hash && !entry.api_key_masked && !entry.proxy_url.trim()
 }
 
-function draftToPayload(draft: ProviderDraft, mode: 'create' | 'edit' = editorMode.value): AIProviderItem {
+function draftToPayload(draft: ProviderDraft, mode: 'create' | 'edit' = editorMode.value): AIProviderPayload {
   const models = draft.models
     .map((model) => {
       const name = model.name.trim()
@@ -689,7 +698,7 @@ function draftToPayload(draft: ProviderDraft, mode: 'create' | 'edit' = editorMo
       return payload
     })
     .filter((model): model is AIProviderModel => model !== null)
-  const payload: AIProviderItem = {
+  const payload: AIProviderPayload = {
     brand: draft.brand,
     brand_label: draft.brand_label,
     index: draft.index,
@@ -784,7 +793,7 @@ async function saveProvider() {
   if (!canSave.value) {
     return
   }
-  let payload: AIProviderItem
+  let payload: AIProviderPayload
   try {
     payload = draftToPayload(form.value, editorMode.value)
   } catch (error) {
@@ -798,7 +807,7 @@ async function saveProvider() {
   await persistProvider(payload)
 }
 
-async function persistProvider(payload: AIProviderItem) {
+async function persistProvider(payload: AIProviderPayload) {
   const generation = beginProviderMutation('save')
   if (generation === null) {
     return
@@ -821,11 +830,43 @@ async function persistProvider(payload: AIProviderItem) {
   }
 }
 
-function providerIdentityLabel(provider: Pick<AIProviderItem, 'name' | 'api_key_masked' | 'auth_index' | 'identity_hash'>): string {
-  return provider.name || provider.api_key_masked || provider.auth_index || provider.identity_hash.slice(0, 12)
+function providerIdentityLabel(provider: Pick<AIProviderItem, 'name' | 'api_key_masked' | 'auth_index' | 'identity_hash'> & { local_alias?: string }): string {
+  return provider.local_alias || provider.name || provider.api_key_masked || provider.auth_index || provider.identity_hash.slice(0, 12)
 }
 
-function confirmDisableProvider(provider: AIProviderItem, onConfirm: () => void) {
+function openAliasEditor(provider: AIProviderItem) {
+  if (providerWriteControlsDisabled.value || !provider.channel_key || !provider.identity_hash) return
+  aliasProvider.value = provider
+  aliasLabel.value = provider.local_alias ?? ''
+  aliasModalOpen.value = true
+}
+
+async function saveAlias() {
+  const provider = aliasProvider.value
+  if (!provider?.channel_key) return
+  const generation = beginProviderMutation('alias')
+  if (generation === null) return
+  try {
+    const alias = await updateModelPriceChannelAlias({
+      auth_type: 'apikey',
+      channel_brand: provider.brand,
+      channel_key: provider.channel_key,
+      channel_identity_hash: provider.identity_hash,
+      label: aliasLabel.value,
+    })
+    if (generation === providerSnapshotGeneration.value) {
+      provider.local_alias = alias.label
+      aliasModalOpen.value = false
+      message.success(t('渠道名称已保存', 'Channel name saved'))
+    }
+  } catch (error) {
+    message.error(errorText(error, '保存渠道名称失败', 'Failed to save channel name'))
+  } finally {
+    finishProviderMutation(generation)
+  }
+}
+
+function confirmDisableProvider(provider: AIProviderPayload, onConfirm: () => void) {
   const identity = providerIdentityLabel(provider)
   dialog.warning({
     title: t('禁用 AI provider', 'Disable AI provider'),
@@ -879,7 +920,7 @@ async function toggleProviderDisabled(provider: AIProviderItem) {
   }
   const draft = providerToDraft(provider)
   draft.disabled = !draft.disabled
-  let payload: AIProviderItem
+  let payload: AIProviderPayload
   try {
     payload = draftToPayload(draft, 'edit')
   } catch (error) {
@@ -1654,12 +1695,27 @@ const columns = computed<DataTableColumns<AIProviderItem>>(() => {
   const activeReorderingDirection = reorderingDirection.value
   return [
   {
-    title: t('密钥', 'Key'),
+    title: t('渠道 / 密钥', 'Channel / Key'),
     key: 'key',
-    width: 160,
+    width: 200,
     render: (row) =>
       h('div', { class: 'provider-identity' }, [
-        h('strong', { title: providerIdentityLabel(row) }, providerIdentityLabel(row)),
+        h('div', { class: 'provider-name-row' }, [
+          h('strong', { title: providerIdentityLabel(row) }, providerIdentityLabel(row)),
+          row.channel_key && row.identity_hash
+            ? h(NTooltip, {}, {
+                trigger: () => h(NButton, {
+                  size: 'tiny', quaternary: true, circle: true, disabled: writeControlsDisabled,
+                  'aria-label': t(`设置渠道名称：${providerIdentityLabel(row)}`, `Set channel name: ${providerIdentityLabel(row)}`),
+                  onClick: () => openAliasEditor(row),
+                }, { icon: () => h(NIcon, { component: Pencil }) }),
+                default: () => t('设置渠道名称', 'Set channel name'),
+              })
+            : null,
+        ]),
+        row.local_alias && row.api_key_masked
+          ? h('span', { class: 'provider-key-secondary', title: row.api_key_masked }, row.api_key_masked)
+          : null,
       ]),
   },
   {
@@ -1793,6 +1849,31 @@ onMounted(refresh)
 
 <template>
   <section class="page">
+    <NModal
+      v-model:show="aliasModalOpen"
+      preset="card"
+      :title="t('设置渠道名称', 'Set channel name')"
+      :style="{ width: 'min(460px, calc(100vw - 32px))' }"
+      :closable="!isProviderMutationPending"
+      :mask-closable="!isProviderMutationPending"
+      :close-on-esc="!isProviderMutationPending"
+    >
+      <NForm label-placement="top">
+        <NFormItem :label="t('渠道名称', 'Channel name')">
+          <NInput v-model:value="aliasLabel" maxlength="200" show-count clearable :disabled="providerWriteControlsDisabled" :placeholder="t('默认名称', 'Default name')" />
+        </NFormItem>
+      </NForm>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton :disabled="providerWriteControlsDisabled || !aliasLabel" @click="aliasLabel = ''">
+            <template #icon><NIcon :component="RotateCcw" /></template>
+            {{ t('恢复默认名称', 'Reset name') }}
+          </NButton>
+          <NButton :disabled="isProviderMutationPending" @click="aliasModalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
+          <NButton type="primary" :loading="providerMutation === 'alias'" :disabled="providerWriteControlsDisabled" @click="saveAlias">{{ t('保存', 'Save') }}</NButton>
+        </NSpace>
+      </template>
+    </NModal>
     <div class="page-header">
       <div>
         <h1 class="page-title">{{ t('AI 提供商', 'AI Providers') }}</h1>
@@ -2170,15 +2251,35 @@ onMounted(refresh)
   min-width: 0;
 }
 
-.provider-identity {
+:global(.provider-identity) {
   display: grid;
   min-width: 0;
 }
 
-.provider-identity strong {
+:global(.provider-identity strong) {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+:global(.provider-name-row) {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+:global(.provider-name-row .n-button) {
+  flex: 0 0 auto;
+}
+
+:global(.provider-key-secondary) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--cpa-text-muted);
+  font-size: 12px;
 }
 
 .dirty-state,

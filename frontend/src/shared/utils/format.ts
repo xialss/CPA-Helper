@@ -1,4 +1,5 @@
-import { currentLanguage } from '@/shared/i18n'
+import { currentLanguage, localize } from '@/shared/i18n'
+import type { ModelPriceLibraryConflictLongContext, ModelPriceLongContextRateField } from '@/shared/types/api'
 
 export function formatInteger(value: number): string {
   return new Intl.NumberFormat(currentLanguage.value === 'zh' ? 'zh-CN' : 'en-US', {
@@ -16,6 +17,18 @@ export function formatCompact(value: number): string {
 
 export function formatMultiplier(value: number): string {
   return String(value)
+}
+
+export function formatPriceValue(value: number | null | undefined): string {
+  return typeof value === 'number' ? String(value) : '-'
+}
+
+export function formatPreservedLongContextPrice(value: ModelPriceLibraryConflictLongContext, field: ModelPriceLongContextRateField): string {
+  const nonFinite = value.non_finite_fields?.[field]
+  if (nonFinite !== undefined) {
+    return localize(`无效值 (${nonFinite})`, `Invalid value (${nonFinite})`)
+  }
+  return value[field] === null ? localize('未设置', 'Not set') : formatPriceValue(value[field])
 }
 
 export function formatUsd(value: number | null | undefined): string {

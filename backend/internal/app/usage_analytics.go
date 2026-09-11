@@ -17,6 +17,7 @@ type usageAnalyticsCollectorOptions struct {
 type usageAnalyticsCollector struct {
 	filters       UsageFilters
 	prices        modelPriceIndex
+	versions      modelPriceVersionIndex
 	matchContext  modelPriceMatchContext
 	users         map[string]userInfo
 	priceMatches  map[usageAnalyticsPriceMatchKey]usageAnalyticsPriceMatch
@@ -31,6 +32,7 @@ func newUsageAnalyticsCollector(filters UsageFilters, prices modelPriceIndex, ma
 	collector := &usageAnalyticsCollector{
 		filters:      filters,
 		prices:       prices,
+		versions:     modelPriceVersionIndex{},
 		matchContext: matchContext,
 		users:        users,
 		priceMatches: map[usageAnalyticsPriceMatchKey]usageAnalyticsPriceMatch{},
@@ -53,6 +55,7 @@ func newUsageAnalyticsCollector(filters UsageFilters, prices modelPriceIndex, ma
 
 func (c *usageAnalyticsCollector) setBillingPriceIndex(pricing modelPriceBillingIndex) {
 	c.prices = pricing.Prices
+	c.versions = pricing.Versions
 	c.matchContext = pricing.MatchContext
 	c.priceMatches = map[usageAnalyticsPriceMatchKey]usageAnalyticsPriceMatch{}
 	if c.distributions != nil {
@@ -72,7 +75,8 @@ func (c *usageAnalyticsCollector) Add(record UsageRecord) {
 		}
 		c.priceMatches[matchKey] = match
 	}
-	breakdown := calculateRecordCostForMatch(record, match.price, match.status, match.brand, false)
+	versionedPrice := resolveVersionedPrice(record, match.price, c.versions)
+	breakdown := calculateRecordCostForMatch(record, versionedPrice, match.status, match.brand, false, match.price)
 	value := usageAnalyticsRecord{
 		record:               record,
 		matchedPrice:         match.price,

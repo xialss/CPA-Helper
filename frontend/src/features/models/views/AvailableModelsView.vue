@@ -7,6 +7,7 @@ import {
   NDataTable,
   NEmpty,
   NIcon,
+  NPopover,
   NSpace,
   NSpin,
   NTag,
@@ -123,6 +124,53 @@ function renderPriceValue(row: AvailableModel, field: PriceField) {
   return formatUsdPerMtok(row.price[field])
 }
 
+const SOURCE_PREVIEW_LIMIT = 2
+
+function renderSourceTag(source: AvailableModel['sources'][number]) {
+  const label = `${source.description} · ${source.api_key_preview}`
+  return h(
+    NTag,
+    { key: source.api_key_hash, size: 'small', bordered: false, type: 'info', class: 'source-preview-tag', title: label },
+    { default: () => h('span', { class: 'source-preview-label' }, label) },
+  )
+}
+
+function renderSources(row: AvailableModel) {
+  const visibleSources = row.sources.slice(0, SOURCE_PREVIEW_LIMIT)
+  const hiddenCount = row.sources.length - visibleSources.length
+  const children = [h('div', { class: 'source-preview-tags' }, visibleSources.map(renderSourceTag))]
+  if (hiddenCount > 0) {
+    children.push(
+      h(
+        NPopover,
+        { trigger: 'click', placement: 'top-start' },
+        {
+          trigger: () =>
+            h(
+              NButton,
+              {
+                size: 'tiny',
+                secondary: true,
+                class: 'source-more-button',
+                'aria-label': t(`查看全部 ${row.sources.length} 个来源 Key`, `View all ${row.sources.length} source keys`),
+                'aria-haspopup': 'dialog',
+              },
+              { default: () => `+${hiddenCount}` },
+            ),
+          default: () =>
+            h('div', { class: 'source-full-list', role: 'dialog', 'aria-label': t('全部来源 Key', 'All source keys'), tabindex: 0 },
+              row.sources.map((source) => h('div', { key: source.api_key_hash, class: 'source-full-item' }, [
+                h('span', source.description),
+                h('code', source.api_key_preview),
+              ])),
+            ),
+        },
+      ),
+    )
+  }
+  return h('div', { class: 'source-preview' }, children)
+}
+
 function goToApiKeys() {
   void router.push('/account/keys')
 }
@@ -165,21 +213,7 @@ const columns = computed<DataTableColumns<AvailableModel>>(() => [
     title: t('来源 Key', 'Source Key'),
     key: 'sources',
     width: 220,
-    render: (row) =>
-      h(
-        NSpace,
-        { size: 4, wrap: true },
-        {
-          default: () =>
-            row.sources.map((source) =>
-              h(
-                NTag,
-                { key: source.api_key_hash, size: 'small', bordered: false, type: 'info' },
-                { default: () => `${source.description} · ${source.api_key_preview}` },
-              ),
-            ),
-        },
-      ),
+    render: renderSources,
   },
   {
     title: t('计费方式', 'Billing'),
@@ -372,6 +406,62 @@ onMounted(refresh)
 }
 
 .model-price-muted {
+  color: var(--cpa-text-muted);
+}
+
+:global(.source-preview) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  height: 52px;
+  min-width: 0;
+}
+
+:global(.source-preview-tags) {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+:global(.source-preview-tag),
+:global(.source-preview-tag .n-tag__content),
+:global(.source-preview-label) {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+:global(.source-preview-label) {
+  display: block;
+}
+
+:global(.source-more-button) {
+  min-width: 34px;
+}
+
+:global(.source-full-list) {
+  width: min(360px, calc(100vw - 64px));
+  max-height: min(320px, 50dvh);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+:global(.source-full-item) {
+  display: grid;
+  gap: 2px;
+  padding: 6px 0;
+  overflow-wrap: anywhere;
+}
+
+:global(.source-full-item + .source-full-item) {
+  border-top: 1px solid var(--cpa-border);
+}
+
+:global(.source-full-item code) {
   color: var(--cpa-text-muted);
 }
 

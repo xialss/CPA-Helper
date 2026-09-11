@@ -7,6 +7,14 @@ import type {
   ModelPricePayload,
   ModelPriceSyncResponse,
   PriorityMultiplierPayload,
+  ModelPriceChannelAlias,
+  ModelPriceChannelAliasPayload,
+  ModelPriceVersion,
+  PriceTimeRule,
+  LiteLLMSyncPayload,
+  LiteLLMModelOptionsResponse,
+  TimePricingBatchPayload,
+  TimePricingBatchResult,
 } from '@/shared/types/api'
 
 export function listModelPrices(): Promise<ModelPrice[]> {
@@ -55,6 +63,34 @@ export function deleteModelPrice(id: number): Promise<void> {
   return apiClient.delete(`/model-prices/${id}`)
 }
 
-export function syncLitellmModelPrices(): Promise<ModelPriceSyncResponse> {
-  return apiClient.post<ModelPriceSyncResponse>('/model-prices/sync/litellm')
+export function listModelPriceChannelAliases(): Promise<ModelPriceChannelAlias[]> {
+  return apiClient.get<ModelPriceChannelAlias[]>('/model-prices/channel-aliases')
+}
+
+export function updateModelPriceChannelAlias(payload: ModelPriceChannelAliasPayload): Promise<ModelPriceChannelAlias> {
+  return apiClient.put<ModelPriceChannelAlias>('/model-prices/channel-aliases', payload)
+}
+
+export function listLitellmModelOptions(): Promise<LiteLLMModelOptionsResponse> {
+  return apiClient.get<LiteLLMModelOptionsResponse>('/model-prices/sync/litellm/options')
+}
+
+export function syncLitellmModelPrices(payload: LiteLLMSyncPayload): Promise<ModelPriceSyncResponse> {
+  return apiClient.post<ModelPriceSyncResponse>('/model-prices/sync/litellm', payload)
+}
+
+export function fetchModelPriceVersions(id: number): Promise<ModelPriceVersion[]> {
+  return apiClient.get<ModelPriceVersion[]>(`/model-prices/${id}/versions`)
+}
+
+export function getDeepSeekTemplate(): Promise<PriceTimeRule> {
+  return apiClient.get<PriceTimeRule>('/model-prices/deepseek-template')
+}
+
+export function saveDeepSeekTemplate(rule: PriceTimeRule): Promise<PriceTimeRule> {
+  return apiClient.put<PriceTimeRule>('/model-prices/deepseek-template', rule)
+}
+
+export function batchDeepSeekTemplate(payload: TimePricingBatchPayload, apply = false): Promise<TimePricingBatchResult> {
+  return apiClient.post<TimePricingBatchResult>(`/model-prices/deepseek-template/${apply ? 'apply' : 'preview'}`, payload)
 }

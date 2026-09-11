@@ -4686,6 +4686,18 @@ func TestChannelCostItemsGroupConcreteChannelsAcrossModels(t *testing.T) {
 	if allUnpricedSummary["estimated_cost_usd"].(float64) != 0 || allUnpricedSummary["unpriced_records"].(int) != 1 {
 		t.Fatalf("all-unpriced summary = %#v, want zero cost and one unpriced record", allUnpricedSummary)
 	}
+
+	// Without a match context the stored native-key prices must still be
+	// counted. Folding the variadic into an explicit empty context would make
+	// findMatchingChannelPrice report "selectors unavailable" and drop them.
+	noContextItems := channelCostItems(records[:2], prices)
+	if len(noContextItems) != 1 || noContextItems[0].ChannelAuthType != modelPriceChannelAuthTypeAPIKey || noContextItems[0].EstimatedCostUSD != 3 {
+		t.Fatalf("channel cost items without match context = %#v, want one API Key group with cost 3", noContextItems)
+	}
+	noContextSummary := usageSummaryFromRecords(UsageFilters{}, records[:2], prices)
+	if noContextItems[0].EstimatedCostUSD != noContextSummary["estimated_cost_usd"].(float64) {
+		t.Fatalf("channel cost total without context = %v, summary = %v", noContextItems[0].EstimatedCostUSD, noContextSummary["estimated_cost_usd"])
+	}
 }
 
 func TestModelPriceChannelSelectorUsesNameOnlyForOpenAICompatibility(t *testing.T) {

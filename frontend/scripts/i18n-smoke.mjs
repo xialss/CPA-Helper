@@ -133,6 +133,44 @@ try {
     Math.floor((retentionNow + 3 * 1000) / 1000) * 1000 - retentionWindowMs
   assert.ok(retentionStart >= cutoffAfterThreeSeconds)
 
+  const { modelGroupLibraryPriceState } = await server.ssrLoadModule(
+    '/src/features/pricing/utils/modelPriceGroupSummary.ts',
+  )
+  assert.equal(modelGroupLibraryPriceState(null, true), 'empty')
+  assert.equal(modelGroupLibraryPriceState(null, false), 'unconfigured')
+  assert.equal(modelGroupLibraryPriceState({ id: 1 }, true), 'library')
+
+  const modelPricesView = await readFile(
+    new URL('../src/features/pricing/views/ModelPricesView.vue', import.meta.url),
+    'utf8',
+  )
+  assert.match(
+    modelPricesView,
+    /const channelAliasMap = computed\(\(\) => \{[\s\S]*?const key = channelIdentityKey\(alias\.auth_type, alias\.channel_brand, alias\.channel_key\)[\s\S]*?if \(key !== null\) \{[\s\S]*?aliases\.set\(key, alias\.label\)/,
+  )
+  assert.match(
+    modelPricesView,
+    /const identity = channelIdentityKey\(authType, brand, key\)\s*return identity === null \? '' : channelAliasMap\.value\.get\(identity\) \?\? ''/,
+  )
+  assert.match(
+    modelPricesView,
+    /function providerGroupUnpricedCount\(row: PriceGroupRow\): number \{\s*\/\/ Keep the provider subtitle aligned with the operational status column\.[\s\S]*?return row\.unpricedCount\s*\}/,
+  )
+
+  const pricingApi = await readFile(
+    new URL('../src/features/pricing/api/pricingApi.ts', import.meta.url),
+    'utf8',
+  )
+  assert.match(pricingApi, /apiClient\.get<PriceTimeRule>\('\/model-prices\/deepseek-template'\)/)
+  assert.match(pricingApi, /apiClient\.put<PriceTimeRule>\('\/model-prices\/deepseek-template', rule\)/)
+  assert.match(pricingApi, /apiClient\.post<TimePricingBatchResult>\(`\/model-prices\/deepseek-template\/\$\{apply \? 'apply' : 'preview'\}`, payload\)/)
+
+  const deepSeekTemplateModal = await readFile(
+    new URL('../src/features/pricing/components/DeepSeekTemplateModal.vue', import.meta.url),
+    'utf8',
+  )
+  assert.match(deepSeekTemplateModal, /:disabled="busy \|\| !selected\.length \|\| \(enabled && !rule\)" @click="review"/)
+
   installBrowserStubs({ browserLanguages: ['en-US'] })
 
   let {
@@ -154,6 +192,24 @@ try {
     'Request records are retained for only the last 7 days; range=all is unavailable',
   )
   assert.equal(localizedApiErrorMessage(null, null), 'Request failed')
+  assert.equal(localizedServerMessage('渠道身份不完整'), 'Channel identity is incomplete')
+  assert.equal(localizedApiErrorMessage('not_found', '峰谷时段模板不存在'), 'Time pricing template does not exist')
+  assert.equal(
+    localizedServerMessage('渠道名称不能包含控制字符或换行'),
+    'Channel name cannot contain control characters or line breaks',
+  )
+  assert.equal(localizedServerMessage('渠道名称不能超过 200 个字符'), 'Channel name must not exceed 200 characters')
+  assert.equal(
+    localizedServerMessage('单次最多批量应用 200 个渠道模型价格'),
+    'A maximum of 200 channel model prices can be applied at once',
+  )
+  assert.equal(localizedServerMessage('渠道配置已变化，请刷新后重试'), 'Channel configuration changed. Refresh and try again.')
+  assert.equal(localizedServerMessage('请至少选择一个 LiteLLM 模型'), 'Select at least one LiteLLM model')
+  assert.equal(localizedServerMessage('所选 LiteLLM 模型包含重复定价身份，请只选择一个大小写或空格变体'), 'Selected LiteLLM models share a price identity. Select only one case or whitespace variant.')
+  assert.equal(
+    localizedServerMessage('所选 LiteLLM 模型不存在或价格无效，请刷新清单后重试'),
+    'A selected LiteLLM model is missing or has invalid pricing. Refresh the list and try again.',
+  )
   assert.equal(localizedServerMessage('巡检完成'), 'Inspection complete')
   assert.equal(
     localizedServerMessage('用户状态已变化，请刷新后重试'),
@@ -300,12 +356,35 @@ try {
     'OpenAI 兼容渠道（标签不可用）',
   )
   assert.equal(localizedUsageChannelFallbackLabel('xai', 'apikey'), 'xAI API Key（标签不可用）')
-  const { formatCompact, formatMultiplier } = await server.ssrLoadModule('/src/shared/utils/format.ts')
+  const { formatCompact, formatMultiplier, formatPreservedLongContextPrice } = await server.ssrLoadModule('/src/shared/utils/format.ts')
   assert.equal(formatCompact(12_300), '12.3K')
   assert.equal(formatCompact(52_646_000), '52.6M')
   assert.equal(formatCompact(3_560_000_000), '3.6B')
   assert.equal(formatMultiplier(1.00001), '1.00001')
   assert.equal(formatMultiplier(0.00001), '0.00001')
+
+  const historicalTier = {
+    threshold_input_tokens: 1000,
+    input_usd_per_million: null,
+    output_usd_per_million: null,
+    cache_read_usd_per_million: 0,
+    cache_creation_usd_per_million: 1.00001,
+    non_finite_fields: { input_usd_per_million: '+Inf' },
+  }
+  for (const language of ['zh', 'en']) {
+    setLanguage(language)
+    for (const nonFinite of ['NaN', '+Inf', '-Inf']) {
+      historicalTier.non_finite_fields.input_usd_per_million = nonFinite
+      assert.equal(
+        formatPreservedLongContextPrice(historicalTier, 'input_usd_per_million'),
+        `${language === 'zh' ? '无效值' : 'Invalid value'} (${nonFinite})`,
+      )
+    }
+    assert.equal(formatPreservedLongContextPrice(historicalTier, 'output_usd_per_million'), language === 'zh' ? '未设置' : 'Not set')
+    assert.equal(formatPreservedLongContextPrice(historicalTier, 'cache_read_usd_per_million'), '0')
+    assert.equal(formatPreservedLongContextPrice(historicalTier, 'cache_creation_usd_per_million'), '1.00001')
+  }
+  setLanguage('zh')
 
   let browserCase = await loadI18nWithBrowserStubs({
     browserLanguages: ['fr-FR', 'zh-CN', 'en-US'],

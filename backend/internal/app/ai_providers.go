@@ -89,6 +89,8 @@ type aiProviderItem struct {
 	APIKeyMasked            *string                   `json:"api_key_masked,omitempty"`
 	AuthIndex               *string                   `json:"auth_index,omitempty"`
 	Name                    *string                   `json:"name,omitempty"`
+	ChannelKey              string                    `json:"channel_key"`
+	ChannelAlias            string                    `json:"local_alias"`
 	Priority                *int                      `json:"priority,omitempty"`
 	Weight                  *int                      `json:"-"`
 	WeightJSON              json.RawMessage           `json:"weight,omitempty"`
@@ -499,6 +501,9 @@ func (a *App) aiProvidersSnapshot(ctx context.Context) (aiProvidersResponse, err
 func (a *App) aiProvidersSnapshotForConfig(ctx context.Context, cfg AppConfig) (aiProvidersResponse, error) {
 	providers, err := a.aiProviderConfigSnapshotForConfig(ctx, cfg)
 	if err != nil {
+		return aiProvidersResponse{}, err
+	}
+	if err := a.applyModelPriceChannelAliases(ctx, providers); err != nil {
 		return aiProvidersResponse{}, err
 	}
 	response := aiProvidersResponse{

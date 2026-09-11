@@ -235,7 +235,7 @@ func (a *App) applyQuotaCharge(ctx context.Context, record UsageRecord, pricing 
 	}
 
 	cacheUsageRecordAuth(&record)
-	amount, unpriced := recordCost(record, pricing.Prices, pricing.MatchContext)
+	amount, unpriced := recordCostWithBilling(record, pricing)
 	amount = mathRound(amount, 8)
 	monthlyDeducted, lifetimeDeducted := 0.0, 0.0
 	remaining := amount

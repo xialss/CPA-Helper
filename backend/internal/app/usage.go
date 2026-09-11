@@ -481,7 +481,7 @@ func (a *App) usageRecords(w http.ResponseWriter, r *http.Request, filters Usage
 	items := make([]map[string]any, 0, len(records))
 	redaction := usageRedactionOptions{MaskAuthIndex: !scope.IsAdmin}
 	for _, record := range records {
-		items = append(items, listItemFromRecord(record, users, pricing.Prices, redaction, pricing.MatchContext))
+		items = append(items, listItemFromRecordVersioned(record, users, pricing, redaction))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items":     items,
@@ -516,7 +516,7 @@ func (a *App) usageRecordDetail(w http.ResponseWriter, r *http.Request, recordID
 	}
 	cacheUsageRecordAuth(&record)
 	redaction := usageRedactionOptions{MaskSource: !scope.IsAdmin, MaskAuthIndex: !scope.IsAdmin}
-	item := listItemFromRecord(record, users, pricing.Prices, redaction, pricing.MatchContext)
+	item := listItemFromRecordVersioned(record, users, pricing, redaction)
 	item["raw_json"] = redactedRawJSON(record.RawJSON, usageRecordAuth(record), redaction)
 	writeJSON(w, http.StatusOK, item)
 	return nil
@@ -1090,8 +1090,12 @@ func (a *App) userLookup(ctx context.Context, scope usageAccessScope) (map[strin
 }
 
 func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices map[[2]string]ModelPrice, redaction usageRedactionOptions, matchContexts ...modelPriceMatchContext) map[string]any {
-	cacheUsageRecordAuth(&record)
 	costBreakdown := calculateRecordCostBreakdown(record, prices, matchContexts...)
+	return listItemFromRecordWithBreakdown(record, users, redaction, costBreakdown)
+}
+
+func listItemFromRecordWithBreakdown(record UsageRecord, users map[string]userInfo, redaction usageRedactionOptions, costBreakdown usageCostBreakdown) map[string]any {
+	cacheUsageRecordAuth(&record)
 	userID := (*int)(nil)
 	userLabel := "未绑定"
 	if record.UsageUsername != nil {
@@ -1136,6 +1140,11 @@ func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices ma
 		"unpriced":              costBreakdown.Unpriced,
 		"cost_breakdown":        costBreakdown,
 	}
+}
+
+func listItemFromRecordVersioned(record UsageRecord, users map[string]userInfo, pricing modelPriceBillingIndex, redaction usageRedactionOptions) map[string]any {
+	breakdown := versionedCostBreakdown(record, pricing, true)
+	return listItemFromRecordWithBreakdown(record, users, redaction, breakdown)
 }
 
 func usageSummaryFromRecords(filters UsageFilters, records []UsageRecord, prices map[[2]string]ModelPrice, matchContexts ...modelPriceMatchContext) map[string]any {
@@ -1384,17 +1393,20 @@ func distributionsFromRecords(records []UsageRecord, prices map[[2]string]ModelP
 }
 
 func channelCostItems(records []UsageRecord, prices map[[2]string]ModelPrice, matchContexts ...modelPriceMatchContext) []usageChannelCostItem {
-	matchContext := modelPriceMatchContext{}
+	// Display helpers need a concrete context; cost helpers must receive the
+	// variadic as-is, because an explicit empty context is treated as
+	// "selectors required but unavailable" and yields unpriced.
+	displayContext := modelPriceMatchContext{}
 	if len(matchContexts) > 0 {
-		matchContext = matchContexts[0]
+		displayContext = matchContexts[0]
 	}
 	itemsByIdentity := map[modelPriceChannelGroupIdentity]usageChannelCostItem{}
 	for _, record := range records {
-		matchedPrice, status := findMatchingChannelPrice(prices, record, matchContext)
+		matchedPrice, status := findMatchingChannelPrice(prices, record, matchContexts...)
 		if status != priceMatchStatusMatched || matchedPrice == nil {
 			continue
 		}
-		amount, unpriced := recordCost(record, prices, matchContext)
+		amount, unpriced := recordCost(record, prices, matchContexts...)
 		if unpriced || amount <= 0 {
 			continue
 		}
@@ -1402,7 +1414,7 @@ func channelCostItems(records []UsageRecord, prices map[[2]string]ModelPrice, ma
 		if !ok {
 			continue
 		}
-		display := modelPriceChannelDisplayForPrice(*matchedPrice, matchContext)
+		display := modelPriceChannelDisplayForPrice(*matchedPrice, displayContext)
 		item := itemsByIdentity[identity]
 		if item.Key == "" {
 			label := display.Label

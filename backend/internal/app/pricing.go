@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -58,6 +59,7 @@ var defaultPriorityMultipliers = map[string]float64{
 }
 
 type ModelPrice struct {
+	TimePricing                *PriceTimeRule                        `json:"time_pricing"`
 	ID                         int                                   `json:"id"`
 	Provider                   string                                `json:"provider"`
 	Model                      string                                `json:"model"`
@@ -80,6 +82,7 @@ type ModelPrice struct {
 	LastSyncedAt               *time.Time                            `json:"last_synced_at"`
 	UpdatedAt                  time.Time                             `json:"updated_at"`
 	longContextInvalid         bool
+	cacheCreationExplicit      bool
 }
 
 type ModelPriceLibraryConflict struct {
@@ -101,11 +104,12 @@ type ModelPriceLibraryConflict struct {
 }
 
 type ModelPriceLibraryConflictLongContext struct {
-	ThresholdInputTokens       *int64   `json:"threshold_input_tokens"`
-	InputUSDPerMillion         *float64 `json:"input_usd_per_million"`
-	OutputUSDPerMillion        *float64 `json:"output_usd_per_million"`
-	CacheReadUSDPerMillion     *float64 `json:"cache_read_usd_per_million"`
-	CacheCreationUSDPerMillion *float64 `json:"cache_creation_usd_per_million"`
+	ThresholdInputTokens       *int64            `json:"threshold_input_tokens"`
+	InputUSDPerMillion         *float64          `json:"input_usd_per_million"`
+	OutputUSDPerMillion        *float64          `json:"output_usd_per_million"`
+	CacheReadUSDPerMillion     *float64          `json:"cache_read_usd_per_million"`
+	CacheCreationUSDPerMillion *float64          `json:"cache_creation_usd_per_million"`
+	NonFiniteFields            map[string]string `json:"non_finite_fields,omitempty"`
 }
 
 type ModelPriceLongContext struct {
@@ -162,6 +166,8 @@ type usageRequestCostBreakdownItem struct {
 func (usageRequestCostBreakdownItem) isUsageCostBreakdownItem() {}
 
 type modelPricePayload struct {
+	TimePricing                *PriceTimeRule                `json:"time_pricing"`
+	TimePricingSet             bool                          `json:"time_pricing_set"`
 	Provider                   string                        `json:"provider"`
 	Model                      string                        `json:"model"`
 	PriceScope                 string                        `json:"price_scope"`
@@ -177,6 +183,9 @@ type modelPricePayload struct {
 	RequestUSD                 *float64                      `json:"request_usd"`
 	LongContext                *modelPriceLongContextPayload `json:"long_context"`
 	PreserveInvalidLongContext *bool                         `json:"preserve_invalid_long_context"`
+	// CorrectLatestVersion overwrites the newest channel price version in place
+	// instead of appending a new effective-dated version. Ignored for library prices.
+	CorrectLatestVersion bool `json:"correct_latest_version"`
 }
 
 type modelPriceLongContextPayload struct {
@@ -189,6 +198,9 @@ type modelPriceLongContextPayload struct {
 
 type priorityMultiplierPayload struct {
 	PriorityMultiplier *float64 `json:"priority_multiplier"`
+	// CorrectLatestVersion mirrors modelPricePayload: overwrite the newest
+	// channel price version in place instead of appending a new one.
+	CorrectLatestVersion bool `json:"correct_latest_version"`
 }
 
 type modelPriceLibraryConflictPromotePayload struct {
@@ -198,6 +210,8 @@ type modelPriceLibraryConflictPromotePayload struct {
 
 type modelPriceSyncRequest struct {
 	SourceURL *string `json:"source_url"`
+	// Models contains explicit raw LiteLLM source keys, not normalized price names.
+	Models []string `json:"models,omitempty"`
 }
 
 type ModelPriceCatalogItem struct {
@@ -213,6 +227,7 @@ type ModelPriceCatalogItem struct {
 	ChannelBrand         string                 `json:"channel_brand"`
 	ChannelKey           string                 `json:"channel_key"`
 	ChannelLabel         string                 `json:"channel_label"`
+	ChannelAlias         string                 `json:"channel_alias"`
 	ChannelIdentityHash  string                 `json:"channel_identity_hash"`
 	ChannelDisabled      bool                   `json:"channel_disabled"`
 	ChannelStatus        string                 `json:"channel_status"`
@@ -286,6 +301,7 @@ type modelPriceMatchContext struct {
 type modelPriceBillingIndex struct {
 	Prices       modelPriceIndex
 	MatchContext modelPriceMatchContext
+	Versions     modelPriceVersionIndex
 }
 
 type modelPriceSelectorSnapshotCache struct {
@@ -498,6 +514,9 @@ func (a *App) handleModelPrices(w http.ResponseWriter, r *http.Request) error {
 
 func (a *App) handleModelPriceByPath(w http.ResponseWriter, r *http.Request) error {
 	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/model-prices/"), "/")
+	if path == "deepseek-template" || strings.HasPrefix(path, "deepseek-template/") {
+		return a.handleDeepSeekTimeTemplate(w, r, path)
+	}
 	if path == "sync/litellm" {
 		if _, err := a.adminUser(r.Context(), r); err != nil {
 			return err
@@ -506,6 +525,15 @@ func (a *App) handleModelPriceByPath(w http.ResponseWriter, r *http.Request) err
 			return err
 		}
 		return a.handleSyncLiteLLMPrices(w, r)
+	}
+	if path == "sync/litellm/options" {
+		if _, err := a.adminUser(r.Context(), r); err != nil {
+			return err
+		}
+		if err := requireMethod(r, http.MethodGet); err != nil {
+			return err
+		}
+		return a.handleLiteLLMOptions(w, r)
 	}
 	if path == "catalog" {
 		if _, err := a.adminUser(r.Context(), r); err != nil {
@@ -520,6 +548,9 @@ func (a *App) handleModelPriceByPath(w http.ResponseWriter, r *http.Request) err
 		}
 		writeJSON(w, http.StatusOK, modelPriceCatalogForAPI(response))
 		return nil
+	}
+	if path == "channel-aliases" {
+		return a.handleModelPriceChannelAliases(w, r)
 	}
 	if path == "library-conflicts" {
 		if _, err := a.adminUser(r.Context(), r); err != nil {
@@ -608,6 +639,24 @@ func (a *App) handleModelPriceByPath(w http.ResponseWriter, r *http.Request) err
 		writeJSON(w, http.StatusOK, modelPriceForAPI(price))
 		return nil
 	}
+	if strings.HasSuffix(path, "/versions") {
+		if _, err := a.adminUser(r.Context(), r); err != nil {
+			return err
+		}
+		if err := requireMethod(r, http.MethodGet); err != nil {
+			return err
+		}
+		id, err := parseIntPath(strings.TrimSuffix(path, "/versions"))
+		if err != nil {
+			return err
+		}
+		versions, err := a.listModelPriceVersionsForPrice(r.Context(), id)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, http.StatusOK, modelPriceVersionsForAPI(versions))
+		return nil
+	}
 	if _, err := a.adminUser(r.Context(), r); err != nil {
 		return err
 	}
@@ -637,6 +686,77 @@ func (a *App) handleModelPriceByPath(w http.ResponseWriter, r *http.Request) err
 	default:
 		return methodNotAllowed()
 	}
+}
+
+// handleLiteLLMOptions fetches LiteLLM metadata and returns selectable entries
+// without mutating local prices.
+func (a *App) handleLiteLLMOptions(w http.ResponseWriter, r *http.Request) error {
+	client := publicHTTPClient(30 * time.Second)
+	response, rawPayload, err := doJSON(r.Context(), client, http.MethodGet, defaultLiteLLMPricingURL, nil, nil)
+	if err != nil {
+		return validationError("下载 LiteLLM 价格数据失败")
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return validationError(fmt.Sprintf("下载 LiteLLM 价格数据失败：HTTP %d", response.StatusCode))
+	}
+	var rawData map[string]any
+	if err := json.Unmarshal(rawPayload, &rawData); err != nil || rawData == nil {
+		return validationError("LiteLLM 价格数据不是有效 JSON")
+	}
+	catalog, err := a.modelPriceCatalog(r.Context())
+	if err != nil {
+		return err
+	}
+	options := liteLLMOptions(rawData, catalog.Models)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"models": options, "payload_bytes": len(rawPayload), "total_entries": len(rawData),
+		"channel_error": catalog.ChannelError, "oauth_channel_error": catalog.OAuthChannelError,
+	})
+	return nil
+}
+
+type liteLLMModelOption struct {
+	Model          string `json:"model"`
+	PriceModel     string `json:"price_model"`
+	Provider       string `json:"provider"`
+	MatchedCurrent bool   `json:"matched_current"`
+}
+
+func validatedLiteLLMPrice(name string, entry any) (modelPricePayload, bool) {
+	if name == "sample_spec" {
+		return modelPricePayload{}, false
+	}
+	payload, ok := litellmEntryToPrice(name, entry)
+	if !ok {
+		return modelPricePayload{}, false
+	}
+	payload, err := validatePricePayload(payload)
+	return payload, err == nil
+}
+
+func liteLLMOptions(rawData map[string]any, catalog []ModelPriceCatalogItem) []liteLLMModelOption {
+	options := make([]liteLLMModelOption, 0, len(rawData))
+	for name, entry := range rawData {
+		payload, ok := validatedLiteLLMPrice(name, entry)
+		if ok {
+			options = append(options, liteLLMModelOption{Model: name, PriceModel: payload.Model, Provider: payload.Provider})
+		}
+	}
+	sort.Slice(options, func(i, j int) bool { return options[i].Model < options[j].Model })
+	prices := make([]ModelPrice, 0, len(options))
+	for i, option := range options {
+		prices = append(prices, ModelPrice{ID: i + 1, Provider: option.Provider, Model: option.PriceModel, PriceScope: modelPriceScopeLibrary})
+	}
+	lookup := libraryPricesByKey(prices)
+	for _, model := range catalog {
+		if model.ChannelDisabled || model.ChannelStatus != modelPriceChannelStatusReady {
+			continue
+		}
+		if price := findCatalogPrice(lookup, prices, model.SuggestedProvider, model.Owner, model.Name); price != nil {
+			options[price.ID-1].MatchedCurrent = true
+		}
+	}
+	return options
 }
 
 func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) {
@@ -675,6 +795,11 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 	case modelPriceScopeLibrary:
 		if strings.TrimSpace(aiProviderOptionalString(payload.ChannelAuthType)) != "" || strings.TrimSpace(aiProviderOptionalString(payload.ChannelBrand)) != "" || strings.TrimSpace(aiProviderOptionalString(payload.ChannelKey)) != "" {
 			return payload, validationError("通用价格不能包含渠道标识")
+		}
+		// A null value remains valid for an explicit cleanup of malformed
+		// legacy data, but no library price may acquire a time-pricing rule.
+		if payload.TimePricing != nil {
+			return payload, validationError("峰谷定价仅支持 DeepSeek 渠道 Token 价格")
 		}
 		payload.ChannelAuthType = nil
 		payload.ChannelBrand = nil
@@ -733,12 +858,16 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 			return payload, err
 		}
 	}
+	if err := validateTimeRuleForPrice(modelPriceFromPayload(payload, nil)); err != nil {
+		return payload, err
+	}
 	return payload, nil
 }
 
 func modelPriceFromPayload(payload modelPricePayload, priorityMultiplier *float64) ModelPrice {
 	longContext, _ := longContextFromPayload(payload.LongContext)
 	return ModelPrice{
+		TimePricing:                payload.TimePricing,
 		Provider:                   payload.Provider,
 		Model:                      payload.Model,
 		PriceScope:                 payload.PriceScope,
@@ -995,7 +1124,41 @@ func modelPriceForAPI(price ModelPrice) ModelPrice {
 	if price.longContextInvalid || (price.LongContext != nil && !validLongContextPrice(price.LongContext)) {
 		price.LongContext = nil
 	}
+	price.PreservedLongContext = modelPriceLongContextAuditForAPI(price.PreservedLongContext)
 	return price
+}
+
+func modelPriceLongContextAuditForAPI(value *ModelPriceLibraryConflictLongContext) *ModelPriceLibraryConflictLongContext {
+	if value == nil {
+		return nil
+	}
+	// Keep raw billing/persistence snapshots unchanged, while distinguishing
+	// non-finite audit values from SQL NULL in the JSON-safe response copy.
+	result := *value
+	if value.NonFiniteFields != nil {
+		result.NonFiniteFields = make(map[string]string, len(value.NonFiniteFields))
+		for field, invalid := range value.NonFiniteFields {
+			result.NonFiniteFields[field] = invalid
+		}
+	}
+	for _, field := range []struct {
+		name  string
+		value **float64
+	}{
+		{"input_usd_per_million", &result.InputUSDPerMillion},
+		{"output_usd_per_million", &result.OutputUSDPerMillion},
+		{"cache_read_usd_per_million", &result.CacheReadUSDPerMillion},
+		{"cache_creation_usd_per_million", &result.CacheCreationUSDPerMillion},
+	} {
+		if raw := *field.value; raw != nil && (math.IsNaN(*raw) || math.IsInf(*raw, 0)) {
+			if result.NonFiniteFields == nil {
+				result.NonFiniteFields = map[string]string{}
+			}
+			result.NonFiniteFields[field.name] = strconv.FormatFloat(*raw, 'g', -1, 64)
+			*field.value = nil
+		}
+	}
+	return &result
 }
 
 func modelPricesForAPI(prices []ModelPrice) []ModelPrice {
@@ -1010,6 +1173,7 @@ func modelPriceLibraryConflictsForAPI(conflicts []ModelPriceLibraryConflict) []M
 	result := make([]ModelPriceLibraryConflict, len(conflicts))
 	for index, conflict := range conflicts {
 		conflict.Price = modelPriceForAPI(conflict.Price)
+		conflict.ArchivedLongContext = modelPriceLongContextAuditForAPI(conflict.ArchivedLongContext)
 		result[index] = conflict
 	}
 	return result
@@ -1047,7 +1211,18 @@ type modelPriceQueryer interface {
 }
 
 func (a *App) listPrices(ctx context.Context) ([]ModelPrice, error) {
-	return listPricesWithQueryer(ctx, a.db)
+	prices, err := listPricesWithQueryer(ctx, a.db)
+	if err != nil {
+		return nil, err
+	}
+	versions, err := a.loadModelPriceVersions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range prices {
+		prices[i] = effectivePriceFromVersions(prices[i], versions, time.Now())
+	}
+	return prices, nil
 }
 
 func listPricesWithQueryer(ctx context.Context, queryer modelPriceQueryer) ([]ModelPrice, error) {
@@ -1058,7 +1233,7 @@ func listPricesWithQueryer(ctx context.Context, queryer modelPriceQueryer) ([]Mo
 		       priority_multiplier, long_context_threshold_tokens,
 		       long_context_input_usd_per_million, long_context_output_usd_per_million,
 		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
-		       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
+		       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT), time_pricing
 		FROM model_prices
 		ORDER BY price_scope DESC, auto_synced ASC, lower(provider), lower(model)
 	`)
@@ -1106,7 +1281,11 @@ func (a *App) billingPriceIndexWithoutSelectors(ctx context.Context) (modelPrice
 	if err != nil {
 		return modelPriceBillingIndex{}, err
 	}
-	result := modelPriceBillingIndex{Prices: channelPricesByKey(prices)}
+	versions, err := a.loadModelPriceVersions(ctx)
+	if err != nil {
+		return modelPriceBillingIndex{}, err
+	}
+	result := modelPriceBillingIndex{Prices: channelPricesByKey(prices), Versions: versions}
 	result.MatchContext.NativePriceCandidates = nativeModelPriceCandidatesByModel(result.Prices)
 	result.MatchContext.SelectorsRequired = modelPriceIndexNeedsConfiguredSelectors(result.Prices)
 	return result, nil
@@ -1120,9 +1299,14 @@ func usageAnalyticsBillingPriceIndex(ctx context.Context, queryer modelPriceQuer
 	if err != nil {
 		return modelPriceBillingIndex{}, err
 	}
+	versions, err := loadModelPriceVersionsWithQueryer(ctx, queryer)
+	if err != nil {
+		return modelPriceBillingIndex{}, err
+	}
 	result := modelPriceBillingIndex{
 		Prices:       channelPricesByKey(prices),
 		MatchContext: matchContext,
+		Versions:     versions,
 	}
 	result.MatchContext.NativePriceCandidates = nativeModelPriceCandidatesByModel(result.Prices)
 	result.MatchContext.SelectorsRequired = modelPriceIndexNeedsConfiguredSelectors(result.Prices)
@@ -1318,6 +1502,9 @@ func (a *App) modelPriceCatalog(ctx context.Context) (ModelPriceCatalogResponse,
 		response.QueryableAPIKeyCount = len(providers)
 	}
 	selectors := modelPriceChannelSelectors(providers)
+	if err := a.applyModelPriceChannelAliases(ctx, providers); err != nil {
+		return ModelPriceCatalogResponse{}, err
+	}
 	for _, provider := range providers {
 		channelKey, channelLabel, labelFallback := modelPriceChannelSelector(provider)
 		baseChannelStatus := modelPriceChannelStatusReady
@@ -1350,6 +1537,7 @@ func (a *App) modelPriceCatalog(ctx context.Context) (ModelPriceCatalogResponse,
 				ChannelBrand:         string(provider.Brand),
 				ChannelKey:           channelKey,
 				ChannelLabel:         channelLabel,
+				ChannelAlias:         provider.ChannelAlias,
 				ChannelIdentityHash:  provider.IdentityHash,
 				ChannelDisabled:      provider.Disabled != nil && *provider.Disabled,
 				ChannelStatus:        channelStatus,
@@ -1357,6 +1545,10 @@ func (a *App) modelPriceCatalog(ctx context.Context) (ModelPriceCatalogResponse,
 				Price:                price,
 				TemplatePrice:        templatePrice,
 				Sources:              []AvailableModelSource{},
+			}
+			if provider.ChannelAlias != "" {
+				item.ChannelLabel = provider.ChannelAlias
+				item.ChannelLabelFallback = false
 			}
 			if channelStatus != modelPriceChannelStatusReady || !modelPriceReadyForBilling(item.Price, item.Name) {
 				response.UnpricedModels++
@@ -1990,10 +2182,13 @@ func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 		return nil, err
 	}
 	hasBillingUnit := false
+	hasTimePricing := false
 	for _, column := range columns {
+		if strings.EqualFold(column, "time_pricing") {
+			hasTimePricing = true
+		}
 		if strings.EqualFold(column, "billing_unit") {
 			hasBillingUnit = true
-			break
 		}
 	}
 	for rows.Next() {
@@ -2001,6 +2196,7 @@ func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 		var channelAuthType, channelBrand, channelKey, sourceModel, lastSynced, updatedAt sql.NullString
 		var requestUSD, priorityMultiplier sql.NullFloat64
 		var billingUnit sql.NullString
+		var timeRule sql.NullString
 		var longContextThreshold sql.NullInt64
 		var longContextInput, longContextOutput, longContextCacheRead, longContextCacheCreation sql.NullFloat64
 		scanTargets := []any{
@@ -2014,11 +2210,18 @@ func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 			&priorityMultiplier, &longContextThreshold, &longContextInput, &longContextOutput, &longContextCacheRead, &longContextCacheCreation,
 			&price.Source, &sourceModel, &price.AutoSynced, &lastSynced, &updatedAt,
 		)
+		if hasTimePricing {
+			scanTargets = append(scanTargets, &timeRule)
+		}
 		if err := rows.Scan(scanTargets...); err != nil {
 			return nil, err
 		}
 		if requestUSD.Valid {
 			price.RequestUSD = &requestUSD.Float64
+		}
+		price.TimePricing, err = parsePriceTimeRule(timeRule)
+		if err != nil {
+			return nil, err
 		}
 		if priorityMultiplier.Valid {
 			price.PriorityMultiplier = &priorityMultiplier.Float64
@@ -2195,7 +2398,7 @@ func getPriceWithQuerier(ctx context.Context, querier priceRowsQuerier, id int) 
 		       priority_multiplier, long_context_threshold_tokens,
 		       long_context_input_usd_per_million, long_context_output_usd_per_million,
 		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
-		       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
+		       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT), time_pricing
 		FROM model_prices WHERE id = ?
 	`, id)
 	if err != nil {
@@ -2234,7 +2437,12 @@ func (a *App) createPrice(ctx context.Context, payload modelPricePayload) (Model
 		return ModelPrice{}, err
 	}
 	longContext := priceCandidate.LongContext
-	result, err := a.db.ExecContext(ctx, `
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ModelPrice{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		INSERT INTO model_prices (
 			provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 			input_usd_per_million, output_usd_per_million,
@@ -2254,7 +2462,22 @@ func (a *App) createPrice(ctx context.Context, payload modelPricePayload) (Model
 		return ModelPrice{}, err
 	}
 	id, _ := result.LastInsertId()
-	return a.getPrice(ctx, int(id))
+	if _, err := tx.ExecContext(ctx, `UPDATE model_prices SET time_pricing=? WHERE id=?`, priceTimeRuleJSON(payload.TimePricing), id); err != nil {
+		return ModelPrice{}, err
+	}
+	price, err := getPriceWithQuerier(ctx, tx, int(id))
+	if err != nil {
+		return ModelPrice{}, err
+	}
+	if price.PriceScope == modelPriceScopeChannel {
+		if err := a.appendModelPriceVersion(ctx, tx, price, time.Now(), false); err != nil {
+			return ModelPrice{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ModelPrice{}, err
+	}
+	return price, nil
 }
 
 func modelPriceConflictMessage(payload modelPricePayload) string {
@@ -2283,6 +2506,17 @@ func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload
 	existing, err := getPriceWithQuerier(ctx, tx, id)
 	if err != nil {
 		return ModelPrice{}, err
+	}
+	readAt := time.Now()
+	if payload.CorrectLatestVersion {
+		readAt = time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+	existing, err = effectivePriceWithQueryer(ctx, tx, existing, readAt)
+	if err != nil {
+		return ModelPrice{}, err
+	}
+	if payload.TimePricing == nil && !payload.TimePricingSet {
+		payload.TimePricing = existing.TimePricing
 	}
 	existingScope := existing.PriceScope
 	if existingScope == "" {
@@ -2321,6 +2555,9 @@ func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload
 		priorityMultiplier = defaultPriorityMultiplierForPayload(payload)
 	}
 	priceCandidate := modelPriceFromPayload(payload, priorityMultiplier)
+	if err := validateTimeRuleForPrice(priceCandidate); err != nil {
+		return ModelPrice{}, err
+	}
 	if err := validatePriorityMultiplierForPrice(priceCandidate); err != nil {
 		return ModelPrice{}, err
 	}
@@ -2365,9 +2602,30 @@ func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload
 	if affected == 0 {
 		return ModelPrice{}, notFoundError("模型价格不存在")
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE model_prices SET time_pricing=? WHERE id=?`, priceTimeRuleJSON(payload.TimePricing), id); err != nil {
+		return ModelPrice{}, err
+	}
 	updated, err := getPriceWithQuerier(ctx, tx, id)
 	if err != nil {
 		return ModelPrice{}, err
+	}
+	if updated.PriceScope == modelPriceScopeChannel {
+		if payload.CorrectLatestVersion {
+			// The model_prices UPDATE above already bumps pricing_version through
+			// the analytics trigger, so historical aggregates re-resolve either way.
+			if err := a.correctLatestModelPriceVersion(ctx, tx, updated, time.Now()); err != nil {
+				return ModelPrice{}, err
+			}
+		} else if err := a.appendModelPriceVersion(ctx, tx, updated, time.Now(), false); err != nil {
+			return ModelPrice{}, err
+		}
+		updated, err = effectivePriceWithQueryer(ctx, tx, updated, time.Now())
+		if err != nil {
+			return ModelPrice{}, err
+		}
+		if err := materializePriceSnapshot(ctx, tx, updated); err != nil {
+			return ModelPrice{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return ModelPrice{}, err
@@ -2388,24 +2646,55 @@ func (a *App) updatePriorityMultiplier(ctx context.Context, id int, payload prio
 	if err != nil {
 		return ModelPrice{}, err
 	}
-	if !modelPriceSupportsPriority(price) {
-		return ModelPrice{}, validationError("Fast 倍率仅支持 OpenAI 兼容或 Codex 渠道")
-	}
-	price.PriorityMultiplier = payload.PriorityMultiplier
-	if err := validatePriorityMultiplierForPrice(price); err != nil {
+	now := time.Now()
+	versions, err := loadModelPriceVersionsWithQueryer(ctx, tx)
+	if err != nil {
 		return ModelPrice{}, err
 	}
+	correctLatest := payload.CorrectLatestVersion && price.PriceScope == modelPriceScopeChannel
+	// The correction path edits the newest version (which may be scheduled),
+	// so its other fields must come from that version, not the current one.
+	target := effectivePriceFromVersions(price, versions, now)
+	if correctLatest {
+		target = latestVersionedPrice(price, versions)
+	}
+	if !modelPriceSupportsPriority(target) {
+		return ModelPrice{}, validationError("Fast 倍率仅支持 OpenAI 兼容或 Codex 渠道")
+	}
+	target.PriorityMultiplier = payload.PriorityMultiplier
+	if err := validatePriorityMultiplierForPrice(target); err != nil {
+		return ModelPrice{}, err
+	}
+	// Always touch model_prices so the analytics trigger bumps pricing_version.
 	result, err := tx.ExecContext(ctx, `
 		UPDATE model_prices
 		SET priority_multiplier = ?, updated_at = ?
 		WHERE id = ?
-	`, *payload.PriorityMultiplier, dbTime(time.Now()), id)
+	`, *payload.PriorityMultiplier, dbTime(now), id)
 	if err != nil {
 		return ModelPrice{}, err
 	}
 	affected, _ := result.RowsAffected()
 	if affected == 0 {
 		return ModelPrice{}, notFoundError("模型价格不存在")
+	}
+	if price.PriceScope == modelPriceScopeChannel {
+		if correctLatest {
+			if err := a.correctLatestModelPriceVersion(ctx, tx, target, now); err != nil {
+				return ModelPrice{}, err
+			}
+		} else if err := a.appendModelPriceVersion(ctx, tx, target, now, false); err != nil {
+			return ModelPrice{}, err
+		}
+		// Re-resolve: correcting a scheduled version must not change the
+		// currently effective snapshot.
+		target, err = effectivePriceWithQueryer(ctx, tx, price, now)
+		if err != nil {
+			return ModelPrice{}, err
+		}
+	}
+	if err := materializePriceSnapshot(ctx, tx, target); err != nil {
+		return ModelPrice{}, err
 	}
 	updated, err := getPriceWithQuerier(ctx, tx, id)
 	if err != nil {
@@ -2595,16 +2884,20 @@ func (a *App) deleteModelPriceLibraryConflict(ctx context.Context, originalID in
 }
 
 func (a *App) getPrice(ctx context.Context, id int) (ModelPrice, error) {
-	return getPriceWithQuerier(ctx, a.db, id)
+	price, err := getPriceWithQuerier(ctx, a.db, id)
+	if err != nil {
+		return ModelPrice{}, err
+	}
+	return effectivePriceWithQueryer(ctx, a.db, price, time.Now())
 }
 
 func (a *App) handleSyncLiteLLMPrices(w http.ResponseWriter, r *http.Request) error {
-	body := readAllAndRestore(r)
 	var payload modelPriceSyncRequest
-	if len(strings.TrimSpace(string(body))) > 0 {
-		if err := decodeJSON(r, &payload); err != nil {
-			return err
-		}
+	if err := decodeJSON(r, &payload); err != nil {
+		return err
+	}
+	if len(payload.Models) == 0 {
+		return validationError("请至少选择一个 LiteLLM 模型")
 	}
 	sourceURL := defaultLiteLLMPricingURL
 	if payload.SourceURL != nil && strings.TrimSpace(*payload.SourceURL) != "" {
@@ -2614,6 +2907,7 @@ func (a *App) handleSyncLiteLLMPrices(w http.ResponseWriter, r *http.Request) er
 		return err
 	}
 	client := publicHTTPClient(30 * time.Second)
+	downloadStarted := time.Now()
 	response, rawPayload, err := doJSON(r.Context(), client, http.MethodGet, sourceURL, nil, nil)
 	if err != nil {
 		return validationError("下载 LiteLLM 价格数据失败")
@@ -2621,20 +2915,51 @@ func (a *App) handleSyncLiteLLMPrices(w http.ResponseWriter, r *http.Request) er
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return validationError(fmt.Sprintf("下载 LiteLLM 价格数据失败：HTTP %d", response.StatusCode))
 	}
+	downloadDuration := time.Since(downloadStarted)
+	parseStarted := time.Now()
 	var rawData map[string]any
-	if err := json.Unmarshal(rawPayload, &rawData); err != nil {
+	if err := json.Unmarshal(rawPayload, &rawData); err != nil || rawData == nil {
 		return validationError("LiteLLM 价格数据不是有效 JSON")
 	}
-	result, err := a.syncLiteLLMPrices(r.Context(), sourceURL, rawData)
+	parseDuration := time.Since(parseStarted)
+	result, err := a.syncLiteLLMPricesSelected(r.Context(), sourceURL, rawData, payload.Models, len(rawPayload))
 	if err != nil {
 		return err
 	}
+	result["download_ms"] = downloadDuration.Seconds() * 1000
+	result["parse_ms"] = parseDuration.Seconds() * 1000
 	writeJSON(w, http.StatusOK, result)
 	return nil
 }
 
 func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData map[string]any) (map[string]any, error) {
+	return a.syncLiteLLMPricesWithSelection(ctx, sourceURL, rawData, nil, 0, true)
+}
+
+func (a *App) syncLiteLLMPricesSelected(ctx context.Context, sourceURL string, rawData map[string]any, selected []string, payloadBytes int) (map[string]any, error) {
+	if len(selected) == 0 {
+		return nil, validationError("请至少选择一个 LiteLLM 模型")
+	}
+	return a.syncLiteLLMPricesWithSelection(ctx, sourceURL, rawData, selected, payloadBytes, false)
+}
+
+func (a *App) syncLiteLLMPricesWithSelection(ctx context.Context, sourceURL string, rawData map[string]any, selected []string, payloadBytes int, replaceAll bool) (map[string]any, error) {
 	now := dbTime(time.Now())
+	selectedSet := make(map[string]struct{}, len(selected))
+	selectedPrices := make(map[[2]string]string, len(selected))
+	for _, name := range selected {
+		entry, exists := rawData[name]
+		payload, valid := validatedLiteLLMPrice(name, entry)
+		if !exists || !valid {
+			return nil, validationError("所选 LiteLLM 模型不存在或价格无效，请刷新清单后重试")
+		}
+		identity := priceKey(payload.Provider, payload.Model)
+		if previous, exists := selectedPrices[identity]; exists && previous != name {
+			return nil, validationError("所选 LiteLLM 模型包含重复定价身份，请只选择一个大小写或空格变体")
+		}
+		selectedPrices[identity] = name
+		selectedSet[name] = struct{}{}
+	}
 	type litellmPriceRow struct {
 		modelName string
 		payload   modelPricePayload
@@ -2642,22 +2967,20 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 	rows := make([]litellmPriceRow, 0, len(rawData))
 	skippedInvalid := 0
 	for modelName, rawEntry := range rawData {
-		if modelName == "sample_spec" {
-			skippedInvalid++
-			continue
+		if !replaceAll {
+			if _, ok := selectedSet[modelName]; !ok {
+				continue
+			}
 		}
-		payload, ok := litellmEntryToPrice(modelName, rawEntry)
+		payload, ok := validatedLiteLLMPrice(modelName, rawEntry)
 		if !ok {
 			skippedInvalid++
 			continue
 		}
-		validatedPayload, err := validatePricePayload(payload)
-		if err != nil {
-			skippedInvalid++
-			continue
-		}
-		rows = append(rows, litellmPriceRow{modelName: modelName, payload: validatedPayload})
+		rows = append(rows, litellmPriceRow{modelName: modelName, payload: payload})
 	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].modelName < rows[j].modelName })
+	transactionStarted := time.Now()
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -2672,7 +2995,8 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if replaceAll {
+		if _, err := tx.ExecContext(ctx, `
 		DELETE FROM model_prices
 		WHERE source = 'litellm'
 		  AND price_scope = 'library'
@@ -2681,10 +3005,12 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 			FROM model_price_library_conflicts
 			WHERE selected_price_id = model_prices.id
 		  )
-	`); err != nil {
-		return nil, err
+		`); err != nil {
+			return nil, err
+		}
 	}
-	inserted, skippedManual := 0, 0
+	inserted, updated, skippedManual := 0, 0, 0
+	unchanged := 0
 	for _, row := range rows {
 		payload := row.payload
 		override, hasOverride := overrides[priceKey(payload.Provider, payload.Model)]
@@ -2717,8 +3043,40 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 				priorityMultiplier = nil
 			}
 		}
+		// Capture the current LiteLLM row before the upsert so the response can
+		// distinguish an idempotent refresh from a real update.
+		var existing struct {
+			input, output, cacheRead, cacheCreation                 float64
+			request, priority                                       sql.NullFloat64
+			billing                                                 sql.NullString
+			threshold                                               sql.NullInt64
+			longInput, longOutput, longCacheRead, longCacheCreation sql.NullFloat64
+			source, sourceModel                                     sql.NullString
+		}
+		existingErr := tx.QueryRowContext(ctx, `SELECT input_usd_per_million, output_usd_per_million,
+			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
+			priority_multiplier, long_context_threshold_tokens, long_context_input_usd_per_million,
+			long_context_output_usd_per_million, long_context_cache_read_usd_per_million,
+			long_context_cache_creation_usd_per_million, source, source_model
+			FROM model_prices WHERE price_scope = 'library' AND lower(provider) = lower(?) AND lower(model) = lower(?)
+			LIMIT 1`, payload.Provider, payload.Model).Scan(
+			&existing.input, &existing.output, &existing.cacheRead, &existing.cacheCreation,
+			&existing.request, &existing.billing, &existing.priority, &existing.threshold,
+			&existing.longInput, &existing.longOutput, &existing.longCacheRead, &existing.longCacheCreation,
+			&existing.source, &existing.sourceModel)
+		if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
+			return nil, existingErr
+		}
+		wasUnchanged := existingErr == nil && existing.source.String == "litellm" && existing.sourceModel.String == row.modelName &&
+			existing.input == payload.InputUSDPerMillion && existing.output == payload.OutputUSDPerMillion &&
+			existing.cacheRead == payload.CacheReadUSDPerMillion && existing.cacheCreation == payload.CacheCreationUSDPerMillion &&
+			nullFloatEqual(existing.request, nullableFloatArg(payload.RequestUSD)) && existing.billing.String == payload.BillingUnit &&
+			nullFloatEqual(existing.priority, nullableFloatArg(priorityMultiplier)) &&
+			nullIntEqual(existing.threshold, longContextThreshold) &&
+			nullFloatEqual(existing.longInput, longContextInput) && nullFloatEqual(existing.longOutput, longContextOutput) &&
+			nullFloatEqual(existing.longCacheRead, longContextCacheRead) && nullFloatEqual(existing.longCacheCreation, longContextCacheCreation)
 		result, err := tx.ExecContext(ctx, `
-			INSERT OR IGNORE INTO model_prices (
+			INSERT INTO model_prices (
 				provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 				input_usd_per_million, output_usd_per_million,
 				cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
@@ -2727,29 +3085,65 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 				long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
 				source, source_model, auto_synced, last_synced_at, updated_at
 			) VALUES (?, ?, 'library', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'litellm', ?, 1, ?, ?)
+			ON CONFLICT DO UPDATE SET
+				input_usd_per_million = excluded.input_usd_per_million,
+				output_usd_per_million = excluded.output_usd_per_million,
+				cache_read_usd_per_million = excluded.cache_read_usd_per_million,
+				cache_creation_usd_per_million = excluded.cache_creation_usd_per_million,
+				request_usd = excluded.request_usd, billing_unit = excluded.billing_unit,
+				priority_multiplier = excluded.priority_multiplier,
+				long_context_threshold_tokens = excluded.long_context_threshold_tokens,
+				long_context_input_usd_per_million = excluded.long_context_input_usd_per_million,
+				long_context_output_usd_per_million = excluded.long_context_output_usd_per_million,
+				long_context_cache_read_usd_per_million = excluded.long_context_cache_read_usd_per_million,
+				long_context_cache_creation_usd_per_million = excluded.long_context_cache_creation_usd_per_million,
+				source_model = excluded.source_model, auto_synced = 1,
+				last_synced_at = excluded.last_synced_at, updated_at = excluded.updated_at
+			WHERE model_prices.source = 'litellm' AND NOT EXISTS (
+				SELECT 1 FROM model_price_library_conflicts WHERE selected_price_id = model_prices.id
+			)
 		`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), payload.BillingUnit, nullableFloatArg(priorityMultiplier),
 			longContextThreshold, longContextInput, longContextOutput, longContextCacheRead, longContextCacheCreation, row.modelName, now, now)
 		if err != nil {
 			return nil, err
 		}
-		affected, _ := result.RowsAffected()
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
 		if affected == 0 {
 			skippedManual++
 			continue
 		}
-		inserted++
+		if wasUnchanged {
+			unchanged++
+			continue
+		}
+		if hasOverride && !replaceAll {
+			updated++
+		} else {
+			inserted++
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	committed = true
 	return map[string]any{
-		"source_url":      sourceURL,
-		"total_entries":   len(rawData),
-		"imported":        inserted,
+		"source_url":    sourceURL,
+		"payload_bytes": payloadBytes,
+		"total_entries": len(rawData),
+		"selected_entries": func() int {
+			if len(selectedSet) > 0 {
+				return len(selectedSet)
+			}
+			return len(rawData)
+		}(),
+		"transaction_ms":  time.Since(transactionStarted).Seconds() * 1000,
+		"imported":        inserted + updated,
 		"created":         inserted,
-		"updated":         0,
-		"unchanged":       0,
+		"updated":         updated,
+		"unchanged":       unchanged,
 		"skipped_manual":  skippedManual,
 		"skipped_invalid": skippedInvalid,
 	}, nil
@@ -2762,6 +3156,34 @@ type liteLLMPriceOverride struct {
 	longContextOutput        sql.NullFloat64
 	longContextCacheRead     sql.NullFloat64
 	longContextCacheCreation sql.NullFloat64
+}
+
+func nullFloatEqual(value sql.NullFloat64, expected any) bool {
+	if expected == nil {
+		return !value.Valid
+	}
+	if !value.Valid {
+		return false
+	}
+	floatValue, ok := expected.(float64)
+	return ok && value.Float64 == floatValue
+}
+
+func nullIntEqual(value sql.NullInt64, expected any) bool {
+	if expected == nil {
+		return !value.Valid
+	}
+	if !value.Valid {
+		return false
+	}
+	switch typed := expected.(type) {
+	case sql.NullInt64:
+		return typed.Valid && value.Int64 == typed.Int64
+	case int64:
+		return value.Int64 == typed
+	default:
+		return false
+	}
 }
 
 func longContextFromLiteLLMOverride(override liteLLMPriceOverride) (*ModelPriceLongContext, bool) {
@@ -2815,7 +3237,11 @@ func litellmEntryToPrice(modelName string, rawEntry any) (modelPricePayload, boo
 	if !ok {
 		return modelPricePayload{}, false
 	}
-	provider := strings.ToLower(strings.TrimSpace(fmt.Sprint(entry["litellm_provider"])))
+	providerName, ok := entry["litellm_provider"].(string)
+	if !ok {
+		return modelPricePayload{}, false
+	}
+	provider := strings.ToLower(strings.TrimSpace(providerName))
 	model := strings.TrimSpace(modelName)
 	if provider == "" || model == "" || len(provider) > 120 || len(model) > 180 {
 		return modelPricePayload{}, false
@@ -3364,17 +3790,27 @@ func calculateRecordCost(record UsageRecord, prices modelPriceIndex, collectItem
 	return calculateRecordCostForMatch(record, price, matchStatus, channelBrand, collectItems)
 }
 
-func calculateRecordCostForMatch(record UsageRecord, price *ModelPrice, matchStatus string, channelBrand *aiProviderBrand, collectItems bool) usageCostBreakdown {
+func calculateRecordCostForMatch(record UsageRecord, price *ModelPrice, matchStatus string, channelBrand *aiProviderBrand, collectItems bool, matchedPrices ...*ModelPrice) usageCostBreakdown {
+	if price == nil && matchStatus == priceMatchStatusMatched {
+		matchStatus = priceMatchStatusChannelUnpriced
+	}
+	price = priceForRequestTime(price, record.Timestamp)
 	tokens := normalizedUsageTokenBreakdown(record, channelBrand)
 	contextInputTokens := usageAggregateInputTokens(record, channelBrand)
 	billingUnit := billingUnitForModelPtr(record.Model)
 	billingUnitValid := true
-	if price != nil {
+	billingUnitPrice := price
+	if billingUnitPrice == nil && len(matchedPrices) > 0 {
+		// A known channel may have no price at the request timestamp. Its
+		// stored unit still applies, but none of its current monetary rates do.
+		billingUnitPrice = matchedPrices[0]
+	}
+	if billingUnitPrice != nil {
 		fallbackModel := ""
 		if record.Model != nil {
 			fallbackModel = *record.Model
 		}
-		billingUnit, billingUnitValid = billingUnitForPrice(price, fallbackModel)
+		billingUnit, billingUnitValid = billingUnitForPrice(billingUnitPrice, fallbackModel)
 	}
 	breakdown := usageCostBreakdown{
 		BillingUnit:         billingUnit,
@@ -3459,7 +3895,7 @@ func calculateRecordCostForMatch(record UsageRecord, price *ModelPrice, matchSta
 	if multiplier != nil {
 		breakdown.TierMultiplier = multiplier
 	}
-	cacheCreationHasSeparatePrice := modelPriceIsClaudeChannel(*price) || price.CacheCreationUSDPerMillion > 0
+	cacheCreationHasSeparatePrice := modelPriceIsClaudeChannel(*price) || price.CacheCreationUSDPerMillion > 0 || (price.cacheCreationExplicit && !longContextApplied)
 	billableInputTokens := tokens.NormalInputTokens
 	if !cacheCreationHasSeparatePrice {
 		billableInputTokens += tokens.CacheCreationTokens

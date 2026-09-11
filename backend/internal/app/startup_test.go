@@ -326,6 +326,155 @@ func TestRequireSchemaShapeRejectsMissingKeeperAuthIndex(t *testing.T) {
 	}
 }
 
+func TestRequireSchemaShapeRejectsMissingModelPriceVersionID(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := NewWithOptions(context.Background(), NewOptions{Migrate: true, StartBackground: false})
+	if err != nil {
+		t.Fatalf("create current schema: %v", err)
+	}
+	defer app.Close()
+
+	if _, err := app.db.Exec(`
+		CREATE TABLE model_price_versions_without_id AS
+		SELECT price_id, provider, model, channel_auth_type, channel_brand, channel_key,
+			input_usd_per_million, output_usd_per_million, cache_read_usd_per_million, cache_creation_usd_per_million,
+			request_usd, billing_unit, priority_multiplier,
+			long_context_threshold_tokens, long_context_input_usd_per_million, long_context_output_usd_per_million,
+			long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
+			effective_at, baseline, created_at, time_pricing
+		FROM model_price_versions;
+		DROP TABLE model_price_versions;
+		ALTER TABLE model_price_versions_without_id RENAME TO model_price_versions;
+	`); err != nil {
+		t.Fatalf("remove model_price_versions.id from test schema: %v", err)
+	}
+
+	err = requireSchemaShape(context.Background(), app.db)
+	if !errors.Is(err, ErrDatabaseNeedsMigration) || !strings.Contains(err.Error(), "model_price_versions.id") {
+		t.Fatalf("requireSchemaShape error = %v, want missing model_price_versions.id", err)
+	}
+}
+
+func TestRequireSchemaShapeRejectsMissingNewModelPricingSchema(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	sourcePath := prepareMigrationTestDatabase(t, dataDir, backendMigrations.LatestVersion)
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read current schema fixture: %v", err)
+	}
+
+	for _, test := range []struct {
+		table     string
+		column    string
+		dropTable bool
+	}{
+		{table: "model_price_channel_aliases", column: "auth_type", dropTable: true},
+		{table: "model_price_channel_aliases", column: "channel_brand"},
+		{table: "model_price_channel_aliases", column: "channel_key"},
+		{table: "model_price_channel_aliases", column: "label"},
+		{table: "model_price_channel_aliases", column: "created_at"},
+		{table: "model_price_channel_aliases", column: "updated_at"},
+		{table: "model_prices", column: "time_pricing"},
+		{table: "model_price_versions", column: "id", dropTable: true},
+		{table: "model_price_versions", column: "price_id"},
+		{table: "model_price_versions", column: "time_pricing"},
+		{table: "model_price_versions", column: "provider"},
+		{table: "model_price_versions", column: "model"},
+		{table: "model_price_versions", column: "channel_auth_type"},
+		{table: "model_price_versions", column: "channel_brand"},
+		{table: "model_price_versions", column: "channel_key"},
+		{table: "model_price_versions", column: "input_usd_per_million"},
+		{table: "model_price_versions", column: "output_usd_per_million"},
+		{table: "model_price_versions", column: "cache_read_usd_per_million"},
+		{table: "model_price_versions", column: "cache_creation_usd_per_million"},
+		{table: "model_price_versions", column: "request_usd"},
+		{table: "model_price_versions", column: "billing_unit"},
+		{table: "model_price_versions", column: "priority_multiplier"},
+		{table: "model_price_versions", column: "long_context_threshold_tokens"},
+		{table: "model_price_versions", column: "long_context_input_usd_per_million"},
+		{table: "model_price_versions", column: "long_context_output_usd_per_million"},
+		{table: "model_price_versions", column: "long_context_cache_read_usd_per_million"},
+		{table: "model_price_versions", column: "long_context_cache_creation_usd_per_million"},
+		{table: "model_price_versions", column: "effective_at"},
+		{table: "model_price_versions", column: "baseline"},
+		{table: "model_price_versions", column: "created_at"},
+		{table: "model_price_time_templates", column: "name", dropTable: true},
+		{table: "model_price_time_templates", column: "rule"},
+	} {
+		t.Run(test.table+"."+test.column, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "schema.sqlite3")
+			if err := os.WriteFile(dbPath, source, 0o600); err != nil {
+				t.Fatalf("copy current schema fixture: %v", err)
+			}
+			db, err := sql.Open("sqlite", sqliteDSN(dbPath, false))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			db.SetMaxOpenConns(1)
+
+			if test.dropTable {
+				if _, err := db.Exec(`DROP TABLE ` + quoteStartupTestIdentifier(test.table)); err != nil {
+					t.Fatalf("drop %s: %v", test.table, err)
+				}
+			} else {
+				removeStartupTestSchemaColumn(t, db, test.table, test.column)
+			}
+
+			err = requireSchemaShape(context.Background(), db)
+			if !errors.Is(err, ErrDatabaseNeedsMigration) || !strings.Contains(err.Error(), test.table+"."+test.column) {
+				t.Fatalf("requireSchemaShape error = %v, want missing %s.%s", err, test.table, test.column)
+			}
+		})
+	}
+}
+
+func removeStartupTestSchemaColumn(t *testing.T, db *sql.DB, table, column string) {
+	t.Helper()
+	rows, err := db.Query(`PRAGMA table_info(` + quoteStartupTestIdentifier(table) + `)`)
+	if err != nil {
+		t.Fatalf("inspect %s: %v", table, err)
+	}
+	columns := make([]string, 0)
+	found := false
+	for rows.Next() {
+		var id, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&id, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			t.Fatal(err)
+		}
+		if name == column {
+			found = true
+			continue
+		}
+		columns = append(columns, quoteStartupTestIdentifier(name))
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatalf("%s.%s was not present in current schema fixture", table, column)
+	}
+
+	const replacement = "__startup_schema_without_column"
+	if _, err := db.Exec(`CREATE TABLE ` + quoteStartupTestIdentifier(replacement) + ` AS SELECT ` + strings.Join(columns, ", ") + ` FROM ` + quoteStartupTestIdentifier(table)); err != nil {
+		t.Fatalf("rebuild %s without %s: %v", table, column, err)
+	}
+	if _, err := db.Exec(`DROP TABLE ` + quoteStartupTestIdentifier(table)); err != nil {
+		t.Fatalf("drop %s: %v", table, err)
+	}
+	if _, err := db.Exec(`ALTER TABLE ` + quoteStartupTestIdentifier(replacement) + ` RENAME TO ` + quoteStartupTestIdentifier(table)); err != nil {
+		t.Fatalf("rename rebuilt %s: %v", table, err)
+	}
+}
+
+func quoteStartupTestIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
 const codexKeeperAuthStateSchemaForStartupTest = `CREATE TABLE codex_keeper_auth_states (auth_index TEXT)`
 
 const modelPriceSchemaForStartupTest = `CREATE TABLE model_prices (
