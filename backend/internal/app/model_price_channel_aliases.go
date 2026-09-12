@@ -104,14 +104,22 @@ func (a *App) upsertModelPriceChannelAlias(ctx context.Context, payload modelPri
 	return payload, err
 }
 
-func (a *App) applyModelPriceChannelAliases(ctx context.Context, providers []aiProviderItem) error {
+func (a *App) modelPriceChannelAliasLabels(ctx context.Context) (map[modelPriceChannelGroupIdentity]string, error) {
 	aliases, err := a.listModelPriceChannelAliases(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	labels := make(map[modelPriceChannelGroupIdentity]string, len(aliases))
 	for _, alias := range aliases {
 		labels[modelPriceChannelAliasKey(alias.AuthType, alias.ChannelBrand, alias.ChannelKey)] = alias.Label
+	}
+	return labels, nil
+}
+
+func (a *App) applyModelPriceChannelAliases(ctx context.Context, providers []aiProviderItem) error {
+	labels, err := a.modelPriceChannelAliasLabels(ctx)
+	if err != nil {
+		return err
 	}
 	for i := range providers {
 		provider := &providers[i]
