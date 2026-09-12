@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -833,6 +835,390 @@ func TestCollectAnthropicStatusUsesSummaryAndRootPage(t *testing.T) {
 	invalidHistoryClient := anthropicTestClient(t, readModelMonitorFixture(t, "anthropic_summary.json"), []byte(`<html></html>`))
 	if _, err := collectAnthropicStatus(context.Background(), invalidHistoryClient, "https://status.claude.com"); err == nil {
 		t.Fatal("invalid Anthropic history should fail instead of returning current-only status")
+	}
+}
+
+func TestCollectAnthropicStatusUsesLazyUptimeShowcase(t *testing.T) {
+	summaryBody := readModelMonitorFixture(t, "anthropic_summary.json")
+	historyBody := readModelMonitorFixture(t, "anthropic_lazy_history.html")
+	showcaseBody := readModelMonitorFixture(t, "anthropic_uptime_showcase.json")
+	var requests []string
+	client := &http.Client{Transport: modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet || request.URL.Scheme != "https" || request.URL.Host != "status.claude.com" {
+			t.Fatalf("unexpected Anthropic request: %s %s", request.Method, request.URL)
+		}
+		requests = append(requests, request.URL.RequestURI())
+		body := summaryBody
+		contentType := "application/json"
+		switch request.URL.Path {
+		case "/api/v2/summary.json":
+		case "/":
+			body = historyBody
+			contentType = "text/html"
+		case "/uptime_showcase":
+			body = showcaseBody
+			if request.URL.RawQuery != "components=claude-ai%2Cclaude-api" {
+				t.Fatalf("Anthropic showcase query = %q", request.URL.RawQuery)
+			}
+		default:
+			t.Fatalf("unexpected Anthropic request path: %s", request.URL.Path)
+		}
+		if request.Header.Get("Accept") != contentType {
+			t.Fatalf("Anthropic Accept = %q, want %q", request.Header.Get("Accept"), contentType)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{contentType}}, Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
+	})}
+	status, err := collectAnthropicStatus(context.Background(), client, "https://status.claude.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRequests := []string{"/api/v2/summary.json", "/", "/uptime_showcase?components=claude-ai%2Cclaude-api"}
+	if !equalStrings(requests, wantRequests) {
+		t.Fatalf("Anthropic requests = %#v, want %#v", requests, wantRequests)
+	}
+	legacy, err := collectAnthropicStatus(context.Background(), anthropicTestClient(t, summaryBody, readModelMonitorFixture(t, "anthropic_history.html")), "https://status.claude.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(status, legacy) {
+		t.Fatalf("lazy Anthropic status = %#v, want legacy status %#v", status, legacy)
+	}
+}
+
+func TestParseAnthropicLazyUptimeComponentIDsIgnoresNonElementMarkup(t *testing.T) {
+	placeholder := `<div class="uptime-lazy-placeholder" data-uptime-lazy="not-a-component"></div>`
+	for _, element := range []string{"script", "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes"} {
+		t.Run(element, func(t *testing.T) {
+			body := `<` + element + ` data-example='` + placeholder + `'>` + `"</different-element>"` + placeholder + `</` + strings.ToUpper(element) + `>`
+			ids, err := parseAnthropicLazyUptimeComponentIDs([]byte(body))
+			if err != nil || len(ids) != 0 {
+				t.Fatalf("non-element markup yielded IDs %#v, error %v", ids, err)
+			}
+		})
+	}
+	for _, body := range []string{
+		`<!-- ` + placeholder + ` -->`,
+		`<!-- ` + placeholder,
+		`<p data-example='` + placeholder + `'>Example</p>`,
+		`<script>const example = '</style>` + placeholder + `';</script>`,
+		`<plaintext>` + placeholder,
+	} {
+		ids, err := parseAnthropicLazyUptimeComponentIDs([]byte(body))
+		if err != nil || len(ids) != 0 {
+			t.Fatalf("non-element markup %q yielded IDs %#v, error %v", body, ids, err)
+		}
+	}
+	body := `<DIV CLASS="extra uptime-lazy-placeholder" DATA-UPTIME-LAZY="claude&#45;ai"></DIV>
+<div
+ data-uptime-lazy=claude-api
+ class=uptime-lazy-placeholder aria-hidden=true></div>`
+	ids, err := parseAnthropicLazyUptimeComponentIDs([]byte(body))
+	if err != nil || !equalStrings(ids, []string{"claude-ai", "claude-api"}) {
+		t.Fatalf("HTML component IDs = %#v, error %v", ids, err)
+	}
+}
+
+func TestCollectAnthropicStatusIgnoresUnrelatedDuplicateClasses(t *testing.T) {
+	summaryBody := readModelMonitorFixture(t, "anthropic_summary.json")
+	legacyBody := readModelMonitorFixture(t, "anthropic_history.html")
+	showcaseBody := readModelMonitorFixture(t, "anthropic_uptime_showcase.json")
+	want, err := collectAnthropicStatus(context.Background(), anthropicTestClient(t, summaryBody, legacyBody), "https://status.claude.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range []string{"anthropic_history.html", "anthropic_lazy_history.html"} {
+		t.Run(fixture, func(t *testing.T) {
+			historyBody := []byte(`<div class="status-label" class="description">Updated status</div>` + string(readModelMonitorFixture(t, fixture)))
+			client := anthropicShowcaseTestClient(t, summaryBody, historyBody, modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(showcaseBody))), Request: request}, nil
+			}))
+			status, err := collectAnthropicStatus(context.Background(), client, "https://status.claude.com")
+			if err != nil || !reflect.DeepEqual(status, want) {
+				t.Fatalf("unrelated div changed Anthropic collection: status = %#v, error = %v; want %#v", status, err, want)
+			}
+		})
+	}
+}
+
+func TestCollectAnthropicStatusRejectsInvalidLazyLayout(t *testing.T) {
+	summaryBody := readModelMonitorFixture(t, "anthropic_summary.json")
+	validBody := string(readModelMonitorFixture(t, "anthropic_lazy_history.html"))
+	legacyBody := string(readModelMonitorFixture(t, "anthropic_history.html"))
+	apiTag := `<div class='uptime-lazy-placeholder' data-uptime-lazy='claude-api' aria-hidden='true'></div>`
+	tests := []struct {
+		name      string
+		body      string
+		wantError string
+	}{
+		{name: "unknown ID", body: strings.Replace(validBody, "data-uptime-lazy='claude-api'", "data-uptime-lazy='unknown'", 1), wantError: `包含未知组件 "unknown"`},
+		{name: "missing component", body: strings.Replace(validBody, apiTag, "", 1), wantError: "data-uptime-lazy 组件不一致"},
+		{name: "extra component", body: validBody + `<div class="uptime-lazy-placeholder" data-uptime-lazy="extra"></div>`, wantError: `包含未知组件 "extra"`},
+		{name: "duplicate ID", body: validBody + apiTag, wantError: `组件 ID "claude-api" 重复`},
+		{name: "duplicate decoded ID", body: validBody + `<div class="uptime-lazy-placeholder" data-uptime-lazy="claude&#45;api"></div>`, wantError: `组件 ID "claude-api" 重复`},
+		{name: "missing ID", body: strings.Replace(validBody, "data-uptime-lazy='claude-api'", "", 1), wantError: "data-uptime-lazy 组件字段无效"},
+		{name: "blank ID", body: strings.Replace(validBody, "data-uptime-lazy='claude-api'", "data-uptime-lazy=' '", 1), wantError: "data-uptime-lazy 组件字段无效"},
+		{name: "comma in ID", body: strings.Replace(validBody, "data-uptime-lazy='claude-api'", "data-uptime-lazy='claude-api,claude-ai'", 1), wantError: "data-uptime-lazy 组件字段无效"},
+		{name: "missing class", body: strings.Replace(validBody, "class='uptime-lazy-placeholder'", "", 1), wantError: "data-uptime-lazy 组件字段无效"},
+		{name: "wrong class token", body: strings.Replace(validBody, "class='uptime-lazy-placeholder'", "class='other-uptime-lazy-placeholder'", 1), wantError: "data-uptime-lazy 组件字段无效"},
+		{name: "duplicate ID attribute", body: strings.Replace(validBody, "data-uptime-lazy='claude-api'", "data-uptime-lazy='claude-api' DATA-UPTIME-LAZY='claude-ai'", 1), wantError: `字段 "data-uptime-lazy" 重复`},
+		{name: "duplicate class attribute", body: strings.Replace(validBody, "class='uptime-lazy-placeholder'", "class='uptime-lazy-placeholder' class='other'", 1), wantError: `字段 "class" 重复`},
+		{name: "duplicate class before lazy marker", body: legacyBody + `<div class="other" class="uptime-lazy-placeholder"></div>`, wantError: `字段 "class" 重复`},
+		{name: "duplicate class after lazy marker", body: legacyBody + `<div class="uptime-lazy-placeholder" class="other"></div>`, wantError: `字段 "class" 重复`},
+		{name: "unclosed tag", body: validBody + `<div class="uptime-lazy-placeholder`, wantError: "data-uptime-lazy 结构无效"},
+		{name: "malformed attributes", body: strings.Replace(validBody, "data-uptime-lazy='claude-api'", "data-uptime-lazy=", 1), wantError: "data-uptime-lazy 结构无效"},
+		{name: "mixed inline history", body: validBody + legacyBody, wantError: "uptimeData 结构无效"},
+		{name: "mixed duplicate inline history", body: validBody + legacyBody + legacyBody, wantError: "uptimeData 结构无效"},
+		{name: "mixed damaged inline history", body: validBody + `<script>window.uptimeData={"broken":;</script>`, wantError: "uptimeData 结构无效"},
+		{name: "mixed non-object inline history", body: validBody + `<script>window.uptimeData=[];</script>`, wantError: "uptimeData 结构无效"},
+		{name: "damaged initialization", body: strings.Replace(validBody, "window.uptimeData || {};", "window.uptimeData || {} unexpected;", 1), wantError: "uptimeData 结构无效"},
+		{name: "only comments and scripts", body: strings.Replace(strings.Replace(validBody, apiTag, "", 1), `<div data-uptime-lazy="claude-ai" class="extra uptime-lazy-placeholder" aria-hidden="true"></div>`, "", 1), wantError: "uptimeData 赋值数量为 2，期望 1"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			showcaseCalls := 0
+			client := anthropicShowcaseTestClient(t, summaryBody, []byte(test.body), modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+				showcaseCalls++
+				return nil, fmt.Errorf("invalid layout must not request showcase history")
+			}))
+			status, err := collectAnthropicStatus(context.Background(), client, "https://status.claude.com")
+			if err == nil || !strings.Contains(err.Error(), test.wantError) || showcaseCalls != 0 || len(status.Services) != 0 {
+				t.Fatalf("invalid layout status = %#v, error = %v, showcase calls = %d; want %q before HTTP", status, err, showcaseCalls, test.wantError)
+			}
+		})
+	}
+}
+
+func TestCollectAnthropicStatusRejectsInvalidShowcaseHistory(t *testing.T) {
+	summaryBody := readModelMonitorFixture(t, "anthropic_summary.json")
+	historyBody := readModelMonitorFixture(t, "anthropic_lazy_history.html")
+	validBody := string(readModelMonitorFixture(t, "anthropic_uptime_showcase.json"))
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(validBody), &payload); err != nil {
+		t.Fatal(err)
+	}
+	var components map[string]json.RawMessage
+	if err := json.Unmarshal(payload["timelines"], &components); err != nil {
+		t.Fatal(err)
+	}
+	api := string(components["claude-api"])
+	ai := string(components["claude-ai"])
+	tests := []struct {
+		name      string
+		body      string
+		wantError string
+	}{
+		{name: "damaged JSON", body: `{"timelines":`, wantError: "showcase 不是有效的非空对象"},
+		{name: "null response", body: `null`, wantError: "showcase 不是有效的非空对象"},
+		{name: "non-object response", body: `[]`, wantError: "showcase 不是有效的非空对象"},
+		{name: "empty response", body: `{}`, wantError: "showcase 不是有效的非空对象"},
+		{name: "missing timelines", body: `{"components":{}}`, wantError: "响应缺少 timelines 字段"},
+		{name: "null timelines", body: `{"timelines":null}`, wantError: "timelines 不是有效的非空对象"},
+		{name: "empty timelines", body: `{"timelines":{}}`, wantError: "timelines 不是有效的非空对象"},
+		{name: "wrong timelines type", body: `{"timelines":[]}`, wantError: "timelines 不是有效的非空对象"},
+		{name: "trailing token", body: validBody + ` true`, wantError: "showcase 不是有效的非空对象"},
+		{name: "duplicate timelines", body: `{"timelines":` + string(payload["timelines"]) + `,"timelines":` + string(payload["timelines"]) + `}`, wantError: `key "timelines" 重复`},
+		{name: "duplicate decoded timelines", body: `{"timelines":` + string(payload["timelines"]) + `,"\u0074imelines":` + string(payload["timelines"]) + `}`, wantError: `key "timelines" 重复`},
+		{name: "duplicate component key", body: `{"timelines":{"claude-api":` + api + `,"claude-api":` + api + `,"claude-ai":` + ai + `}}`, wantError: `组件 key "claude-api" 重复`},
+		{name: "duplicate decoded component key", body: `{"timelines":{"claude-api":` + api + `,"\u0063laude-api":` + api + `,"claude-ai":` + ai + `}}`, wantError: `组件 key "claude-api" 重复`},
+		{name: "missing component", body: `{"timelines":{"claude-api":` + api + `}}`, wantError: `当前组件 "claude-ai" 缺少历史`},
+		{name: "extra component", body: `{"timelines":{"claude-api":` + api + `,"claude-ai":` + ai + `,"extra":` + api + `}}`, wantError: `历史包含未知组件 "extra"`},
+		{name: "unknown component", body: `{"timelines":{"claude-api":` + api + `,"unknown":` + ai + `}}`, wantError: `历史包含未知组件 "unknown"`},
+		{name: "null component", body: `{"timelines":{"claude-api":null,"claude-ai":` + ai + `}}`, wantError: `组件 "claude-api" 的历史结构无效`},
+		{name: "component code mismatch", body: strings.Replace(validBody, `"code":"claude-api"`, `"code":"claude-ai"`, 1), wantError: "历史元数据不一致"},
+		{name: "component name mismatch", body: strings.Replace(validBody, `"name":"Claude API (api.anthropic.com)"`, `"name":"Other"`, 1), wantError: "历史元数据不一致"},
+		{name: "missing days", body: strings.Replace(validBody, `"days":`, `"other":`, 1), wantError: "days 字段无效"},
+		{name: "null days", body: strings.Replace(validBody, `"days":`, `"days":null,"other":`, 1), wantError: "days 字段无效"},
+		{name: "empty days", body: strings.Replace(validBody, `"days":`, `"days":[],"other":`, 1), wantError: "days 字段无效"},
+		{name: "wrong days shape", body: strings.Replace(validBody, `"days":`, `"days":{},"other":`, 1), wantError: "days 字段无效"},
+		{name: "invalid date", body: strings.Replace(validBody, `"2026-07-28"`, `"2026-02-30"`, 1), wantError: "包含无效日期"},
+		{name: "duplicate date", body: strings.Replace(validBody, `"2026-07-28"`, `"2026-07-30"`, 1), wantError: "日期 \"2026-07-30\" 重复"},
+		{name: "missing outages", body: strings.Replace(validBody, `"outages":{"m":120}`, `"other":{}`, 1), wantError: "outages 字段无效"},
+		{name: "null outages", body: strings.Replace(validBody, `"outages":{"m":120}`, `"outages":null`, 1), wantError: "outages 字段无效"},
+		{name: "unknown outage", body: strings.Replace(validBody, `"outages":{"m":120}`, `"outages":{"unknown":1}`, 1), wantError: "outage \"unknown\" 无效"},
+		{name: "invalid outage duration", body: strings.Replace(validBody, `"outages":{"m":120}`, `"outages":{"m":-1}`, 1), wantError: "outage \"m\" 无效"},
+		{name: "missing events", body: strings.Replace(validBody, `"related_events":`, `"other_events":`, 1), wantError: "related_events 字段无效"},
+		{name: "null events", body: strings.Replace(validBody, `"related_events":`, `"related_events":null,"other_events":`, 1), wantError: "related_events 字段无效"},
+		{name: "wrong events shape", body: strings.Replace(validBody, `"related_events":`, `"related_events":{},"other_events":`, 1), wantError: "related_events 字段无效"},
+		{name: "blank event name", body: strings.Replace(validBody, `"name":"Major API interruption"`, `"name":" "`, 1), wantError: "related event 缺少名称或 code"},
+		{name: "blank event code", body: strings.Replace(validBody, `"code":"event-major"`, `"code":" "`, 1), wantError: "related event 缺少名称或 code"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			showcaseCalls := 0
+			client := anthropicShowcaseTestClient(t, summaryBody, historyBody, modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+				showcaseCalls++
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(test.body)), Request: request}, nil
+			}))
+			status, err := collectAnthropicStatus(context.Background(), client, "https://status.claude.com")
+			if err == nil || !strings.Contains(err.Error(), test.wantError) || showcaseCalls != 1 || len(status.Services) != 0 {
+				t.Fatalf("invalid showcase status = %#v, error = %v, calls = %d; want %q", status, err, showcaseCalls, test.wantError)
+			}
+		})
+	}
+}
+
+func TestCollectAnthropicStatusBatchesLazyHistoryAndPreservesSummaryOrder(t *testing.T) {
+	components := make([]openAIStatusComponent, 61)
+	for index := range components {
+		components[index] = openAIStatusComponent{ID: fmt.Sprintf("component-%02d", index), Name: fmt.Sprintf("Component %d", index), Status: "operational"}
+	}
+	components[0].ID = "component/0?mode=bad&extra=1 +#"
+	summaryBody := mutateAnthropicSummary(t, func(payload map[string]any) { payload["components"] = components })
+	var history strings.Builder
+	pageIDs := make([]string, 0, len(components))
+	for index := len(components) - 1; index >= 0; index-- {
+		component := components[index]
+		fmt.Fprintf(&history, `<div class="uptime-lazy-placeholder" data-uptime-lazy="%s"></div>`, html.EscapeString(component.ID))
+		pageIDs = append(pageIDs, component.ID)
+	}
+	for _, mode := range []string{"success", "failure in second batch", "component from another batch"} {
+		t.Run(mode, func(t *testing.T) {
+			showcaseCalls := 0
+			client := anthropicShowcaseTestClient(t, summaryBody, []byte(history.String()), modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+				start := showcaseCalls * 60
+				showcaseCalls++
+				if showcaseCalls > 2 {
+					return nil, fmt.Errorf("unexpected extra showcase request")
+				}
+				wantIDs := pageIDs[start:min(start+60, len(pageIDs))]
+				ids := strings.Split(request.URL.Query().Get("components"), ",")
+				if len(request.URL.Query()) != 1 || !equalStrings(ids, wantIDs) {
+					return nil, fmt.Errorf("showcase batch IDs = %#v, want %#v; query = %q", ids, wantIDs, request.URL.RawQuery)
+				}
+				if showcaseCalls == 2 && mode == "failure in second batch" {
+					return &http.Response{StatusCode: http.StatusBadGateway, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("unavailable")), Request: request}, nil
+				}
+				timelines := make(map[string]any, len(ids))
+				for _, id := range ids {
+					for index, component := range components {
+						if component.ID != id {
+							continue
+						}
+						days := []map[string]any{{"date": "2026-07-30", "outages": map[string]any{}, "related_events": []any{}}}
+						if index == 0 {
+							days = make([]map[string]any, 95)
+							for day := range days {
+								days[day] = map[string]any{"date": time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, 94-day).Format("2006-01-02"), "outages": map[string]any{}, "related_events": []any{}}
+							}
+						}
+						timelines[id] = map[string]any{"component": map[string]any{"code": id, "name": component.Name}, "days": days}
+					}
+				}
+				if showcaseCalls == 2 && mode == "component from another batch" {
+					timelines[pageIDs[0]] = timelines[ids[0]]
+				}
+				body, err := json.Marshal(map[string]any{"timelines": timelines})
+				if err != nil {
+					return nil, err
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(body))), Request: request}, nil
+			}))
+			status, err := collectAnthropicStatus(context.Background(), client, "https://status.claude.com/")
+			if showcaseCalls != 2 {
+				t.Fatalf("showcase calls = %d, want 2; error = %v", showcaseCalls, err)
+			}
+			if mode != "success" {
+				wantError := "HTTP 502"
+				if mode == "component from another batch" {
+					wantError = "历史包含未知组件"
+				}
+				if err == nil || !strings.Contains(err.Error(), wantError) || len(status.Services) != 0 {
+					t.Fatalf("incomplete batch status = %#v, error = %v; want %q", status, err, wantError)
+				}
+				return
+			}
+			if err != nil || len(status.Services) != len(components) {
+				t.Fatalf("batched collection = %#v, error = %v", status, err)
+			}
+			for index, service := range status.Services {
+				if service.ID != components[index].ID || service.Name != components[index].Name || service.UptimePercent != nil || service.Samples == nil {
+					t.Fatalf("service %d = %#v, want %#v", index, service, components[index])
+				}
+			}
+			samples := status.Services[0].Samples
+			if len(samples) != 90 || samples[0].Timestamp.Format("2006-01-02") != "2026-01-06" || samples[89].Timestamp.Format("2006-01-02") != "2026-04-05" {
+				t.Fatalf("batched history must preserve the latest 90 days: %#v", samples)
+			}
+		})
+	}
+}
+
+func TestCollectAnthropicStatusRejectsShowcaseTransportFailures(t *testing.T) {
+	summaryBody := readModelMonitorFixture(t, "anthropic_summary.json")
+	historyBody := readModelMonitorFixture(t, "anthropic_lazy_history.html")
+	tests := []struct {
+		name         string
+		statusCode   int
+		contentType  string
+		body         string
+		requestError error
+		cancel       bool
+		wantError    string
+	}{
+		{name: "non-2xx", statusCode: http.StatusBadGateway, contentType: "application/json", body: `{}`, wantError: "HTTP 502"},
+		{name: "content type", statusCode: http.StatusOK, contentType: "text/html", body: `{}`, wantError: "不支持的内容类型"},
+		{name: "content type prefix", statusCode: http.StatusOK, contentType: "application/jsonp", body: `{}`, wantError: "不支持的内容类型"},
+		{name: "oversized body", statusCode: http.StatusOK, contentType: "application/json", body: strings.Repeat(" ", modelMonitorMaxBodyBytes+1), wantError: "超过 8 MiB 限制"},
+		{name: "canceled showcase", cancel: true, wantError: "context canceled"},
+		{name: "timeout", requestError: context.DeadlineExceeded, wantError: "context deadline exceeded"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			type contextKey struct{}
+			ctx, cancel := context.WithCancel(context.WithValue(context.Background(), contextKey{}, "showcase-context"))
+			defer cancel()
+			showcaseCalls := 0
+			client := anthropicShowcaseTestClient(t, summaryBody, historyBody, modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+				showcaseCalls++
+				if request.Context().Value(contextKey{}) != "showcase-context" {
+					return nil, fmt.Errorf("showcase request lost its caller context")
+				}
+				if test.cancel {
+					cancel()
+					return nil, request.Context().Err()
+				}
+				if test.requestError != nil {
+					return nil, test.requestError
+				}
+				return &http.Response{StatusCode: test.statusCode, Header: http.Header{"Content-Type": []string{test.contentType}}, Body: io.NopCloser(strings.NewReader(test.body)), Request: request}, nil
+			}))
+			status, err := collectAnthropicStatus(ctx, client, "https://status.claude.com")
+			if err == nil || !strings.Contains(err.Error(), test.wantError) || showcaseCalls != 1 || len(status.Services) != 0 {
+				t.Fatalf("failed showcase status = %#v, error = %v, calls = %d; want %q without a retry", status, err, showcaseCalls, test.wantError)
+			}
+		})
+	}
+}
+
+func TestCollectAnthropicStatusKeepsShowcaseRedirectLimits(t *testing.T) {
+	summaryBody := readModelMonitorFixture(t, "anthropic_summary.json")
+	historyBody := readModelMonitorFixture(t, "anthropic_lazy_history.html")
+	for _, test := range []struct {
+		name      string
+		location  string
+		wantError string
+		wantCalls int
+	}{
+		{name: "HTTP downgrade", location: "http://status.claude.com/uptime_showcase", wantError: "重定向必须使用 HTTPS", wantCalls: 1},
+		{name: "redirect loop", location: "https://status.claude.com/uptime_showcase", wantError: "重定向次数过多", wantCalls: modelMonitorMaxRedirects},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			showcaseCalls := 0
+			fakeClient := anthropicShowcaseTestClient(t, summaryBody, historyBody, modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+				showcaseCalls++
+				return &http.Response{StatusCode: http.StatusFound, Header: http.Header{"Location": []string{test.location}}, Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+			}))
+			client, err := newModelMonitorBuiltinHTTPClient(ModelMonitorProxyConfig{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.CloseIdleConnections()
+			client.Transport = fakeClient.Transport
+			status, err := collectAnthropicStatus(context.Background(), client, "https://status.claude.com")
+			if err == nil || !strings.Contains(err.Error(), test.wantError) || showcaseCalls != test.wantCalls || len(status.Services) != 0 {
+				t.Fatalf("redirected showcase status = %#v, error = %v, calls = %d; want %q after %d calls", status, err, showcaseCalls, test.wantError, test.wantCalls)
+			}
+		})
 	}
 }
 
@@ -1705,6 +2091,80 @@ func TestModelMonitorRoutesReturnValidationErrorForCorruptSourceSettings(t *test
 	}
 }
 
+func TestModelMonitorAggregationIsolatesAnthropicLazyHistoryFailure(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := NewWithOptions(context.Background(), NewOptions{Migrate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	openAIClient := openAITestClient(t, openAITestSummary())
+	deepseekClient := deepseekFlashcatTestClient(t, readModelMonitorFixture(t, "deepseek_flashcat.html"))
+	inputBody := string(readModelMonitorFixture(t, "input_im_status.json"))
+	summaryBody := readModelMonitorFixture(t, "anthropic_summary.json")
+	historyBody := readModelMonitorFixture(t, "anthropic_lazy_history.html")
+	showcaseBody := string(readModelMonitorFixture(t, "anthropic_uptime_showcase.json"))
+	handler := app.Routes()
+	cookies := modelMonitorRequest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{"username": "admin", "password": "test-password", "nickname": "Admin"}, nil, http.StatusOK, nil)
+	for _, test := range []struct {
+		name       string
+		statusCode int
+		body       string
+		wantState  string
+	}{
+		{name: "success", statusCode: http.StatusOK, body: showcaseBody, wantState: modelMonitorCollectionOK},
+		{name: "invalid timeline", statusCode: http.StatusOK, body: `{"timelines":null}`, wantState: modelMonitorCollectionError},
+		{name: "showcase HTTP failure", statusCode: http.StatusBadGateway, body: `{}`, wantState: modelMonitorCollectionError},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			anthropicClient := anthropicShowcaseTestClient(t, summaryBody, historyBody, modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: test.statusCode, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(test.body)), Request: request}, nil
+			}))
+			app.modelMonitorHTTPClient = func(ModelMonitorProxyConfig) (*http.Client, error) {
+				return &http.Client{Transport: modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+					switch request.URL.Host {
+					case "status.input.im":
+						return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(inputBody)), Request: request}, nil
+					case "status.openai.com":
+						return openAIClient.Transport.RoundTrip(request)
+					case "status.claude.com":
+						return anthropicClient.Transport.RoundTrip(request)
+					case "statuspage.flashcat.cloud":
+						return deepseekClient.Transport.RoundTrip(request)
+					default:
+						return nil, fmt.Errorf("unexpected model monitor host %q", request.URL.Host)
+					}
+				})}, nil
+			}
+			var response ModelMonitorResponse
+			modelMonitorRequest(t, handler, http.MethodGet, "/api/model-monitor", nil, cookies, http.StatusOK, &response)
+			if len(response.Sources) != 4 {
+				t.Fatalf("model monitor sources = %#v, want four sources", response.Sources)
+			}
+			for index, source := range response.Sources {
+				if source.Groups == nil || source.Services == nil || source.Incidents == nil {
+					t.Fatalf("source arrays must remain non-nil: %#v", source)
+				}
+				if index == 2 {
+					if source.ID != "anthropic" || source.Name != "Claude Status" || source.CollectionState != test.wantState {
+						t.Fatalf("unexpected Anthropic state: %#v", source)
+					}
+					if test.wantState == modelMonitorCollectionError {
+						if source.CollectionError == nil || source.LastSuccessAt != nil || len(source.Services) != 0 || source.OverallStatus != "unknown" {
+							t.Fatalf("failed Anthropic source must not retain partial success: %#v", source)
+						}
+					} else if source.LastSuccessAt == nil || source.OverallStatus != "degraded_performance" || len(source.Services) != 2 || len(source.Services[0].Samples) != 3 {
+						t.Fatalf("successful Anthropic source lost upstream status or history: %#v", source)
+					}
+				} else if source.CollectionState != modelMonitorCollectionOK || source.LastSuccessAt == nil {
+					t.Fatalf("Anthropic failure affected another source: %#v", source)
+				}
+			}
+		})
+	}
+}
+
 func TestModelMonitorAggregationIsolatesDeepSeekHistoryFailure(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := NewWithOptions(context.Background(), NewOptions{Migrate: true})
@@ -1832,6 +2292,25 @@ func openAITestClientWithHistory(t *testing.T, summaryBody, historyBody []byte) 
 
 func anthropicTestClient(t *testing.T, summaryBody, historyBody []byte) *http.Client {
 	return statuspageTestClient(t, "Anthropic", summaryBody, historyBody)
+}
+
+func anthropicShowcaseTestClient(t *testing.T, summaryBody, historyBody []byte, showcase modelMonitorRoundTripper) *http.Client {
+	t.Helper()
+	client := anthropicTestClient(t, summaryBody, historyBody)
+	baseTransport := client.Transport
+	client.Transport = modelMonitorRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet || request.URL.Scheme != "https" || request.URL.Host != "status.claude.com" {
+			return nil, fmt.Errorf("unexpected Anthropic request: %s %s", request.Method, request.URL)
+		}
+		if request.URL.Path == "/uptime_showcase" {
+			if request.Header.Get("Accept") != "application/json" {
+				return nil, fmt.Errorf("showcase Accept = %q, want application/json", request.Header.Get("Accept"))
+			}
+			return showcase.RoundTrip(request)
+		}
+		return baseTransport.RoundTrip(request)
+	})
+	return client
 }
 
 func deepseekFlashcatTestClient(t *testing.T, pageBody []byte) *http.Client {

@@ -1,0 +1,21 @@
+{
+  "components": {"claude-api":"<div>Claude API history</div>","claude-ai":"<div>claude.ai history</div>"},
+  "timelines": {
+    "claude-api": {
+      "component": {"code":"claude-api","name":"Claude API (api.anthropic.com)","startDate":"2024-01-01"},
+      "days": [
+        {"date":"2026-07-30","outages":{"m":120},"related_events":[{"name":"Major API interruption","code":"event-major"}]},
+        {"date":"2026-07-28","outages":{},"related_events":[]},
+        {"date":"2026-07-29","outages":{"p":60},"related_events":[{"name":"Elevated API errors","code":"event-partial"},{"name":"Duplicate title is ignored","code":"event-partial"},{"name":"Slow API responses","code":"event-slow"}]}
+      ]
+    },
+    "claude-ai": {
+      "component": {"code":"claude-ai","name":"claude.ai","startDate":"2024-01-01"},
+      "days": [
+        {"date":"2026-07-29","outages":{},"related_events":[]},
+        {"date":"2026-07-30","outages":{},"related_events":[]}
+      ]
+    }
+  },
+  "values": {"claude-api":[],"claude-ai":[]}
+}
