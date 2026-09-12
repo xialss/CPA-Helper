@@ -228,6 +228,7 @@ type ModelPriceCatalogItem struct {
 	ChannelKey           string                 `json:"channel_key"`
 	ChannelLabel         string                 `json:"channel_label"`
 	ChannelAlias         string                 `json:"channel_alias"`
+	ChannelAPIKeyMasked  *string                `json:"channel_api_key_masked"`
 	ChannelIdentityHash  string                 `json:"channel_identity_hash"`
 	ChannelDisabled      bool                   `json:"channel_disabled"`
 	ChannelStatus        string                 `json:"channel_status"`
@@ -293,6 +294,7 @@ type modelPriceChannelLabelIndex map[modelPriceChannelGroupIdentity]modelPriceCh
 type modelPriceMatchContext struct {
 	Selectors             modelPriceChannelSelectorIndex
 	ChannelLabels         modelPriceChannelLabelIndex
+	SourceChannels        usageSourceChannelIndex
 	NativePriceCandidates modelPriceNativeCandidateIndex
 	SelectorsRequired     bool
 	SelectorsAvailable    bool
@@ -309,6 +311,7 @@ type modelPriceSelectorSnapshotCache struct {
 	configKey      string
 	selectors      modelPriceChannelSelectorIndex
 	channelLabels  modelPriceChannelLabelIndex
+	sourceChannels usageSourceChannelIndex
 	available      bool
 	loadedAt       time.Time
 	expiresAt      time.Time
@@ -336,31 +339,31 @@ func cloneModelPriceChannelLabels(source modelPriceChannelLabelIndex) modelPrice
 }
 
 func (cache *modelPriceSelectorSnapshotCache) snapshot() (modelPriceChannelSelectorIndex, bool) {
-	selectors, _, available := cache.snapshotWithLabels()
+	selectors, _, _, available := cache.snapshotWithLabels()
 	return selectors, available
 }
 
-func (cache *modelPriceSelectorSnapshotCache) snapshotWithLabels() (modelPriceChannelSelectorIndex, modelPriceChannelLabelIndex, bool) {
+func (cache *modelPriceSelectorSnapshotCache) snapshotWithLabels() (modelPriceChannelSelectorIndex, modelPriceChannelLabelIndex, usageSourceChannelIndex, bool) {
 	cache.mu.RLock()
 	defer cache.mu.RUnlock()
 	if !cache.available || !time.Now().Before(cache.expiresAt) {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
-	return cloneModelPriceChannelSelectors(cache.selectors), cloneModelPriceChannelLabels(cache.channelLabels), true
+	return cloneModelPriceChannelSelectors(cache.selectors), cloneModelPriceChannelLabels(cache.channelLabels), cloneUsageSourceChannels(cache.sourceChannels), true
 }
 
 func (cache *modelPriceSelectorSnapshotCache) snapshotForConfig(configKey string) (modelPriceChannelSelectorIndex, bool) {
-	selectors, _, available := cache.snapshotForConfigWithLabels(configKey)
+	selectors, _, _, available := cache.snapshotForConfigWithLabels(configKey)
 	return selectors, available
 }
 
-func (cache *modelPriceSelectorSnapshotCache) snapshotForConfigWithLabels(configKey string) (modelPriceChannelSelectorIndex, modelPriceChannelLabelIndex, bool) {
+func (cache *modelPriceSelectorSnapshotCache) snapshotForConfigWithLabels(configKey string) (modelPriceChannelSelectorIndex, modelPriceChannelLabelIndex, usageSourceChannelIndex, bool) {
 	cache.mu.RLock()
 	defer cache.mu.RUnlock()
 	if configKey == "" || cache.configKey != configKey || !cache.available || !time.Now().Before(cache.expiresAt) {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
-	return cloneModelPriceChannelSelectors(cache.selectors), cloneModelPriceChannelLabels(cache.channelLabels), true
+	return cloneModelPriceChannelSelectors(cache.selectors), cloneModelPriceChannelLabels(cache.channelLabels), cloneUsageSourceChannels(cache.sourceChannels), true
 }
 
 func (cache *modelPriceSelectorSnapshotCache) retainConfig(configKey string) {
@@ -399,6 +402,7 @@ func (cache *modelPriceSelectorSnapshotCache) resetLocked(configKey string) {
 	cache.configKey = configKey
 	cache.selectors = nil
 	cache.channelLabels = nil
+	cache.sourceChannels = nil
 	cache.available = false
 	cache.loadedAt = time.Time{}
 	cache.expiresAt = time.Time{}
@@ -425,10 +429,10 @@ func (cache *modelPriceSelectorSnapshotCache) beginRefresh(configKey string, now
 }
 
 func (cache *modelPriceSelectorSnapshotCache) finishRefresh(configKey string, generation uint64, done chan struct{}, startedAt time.Time, selectors modelPriceChannelSelectorIndex, refreshErr error) {
-	cache.finishRefreshWithLabels(configKey, generation, done, startedAt, selectors, nil, refreshErr)
+	cache.finishRefreshWithLabels(configKey, generation, done, startedAt, selectors, nil, nil, refreshErr)
 }
 
-func (cache *modelPriceSelectorSnapshotCache) finishRefreshWithLabels(configKey string, generation uint64, done chan struct{}, startedAt time.Time, selectors modelPriceChannelSelectorIndex, channelLabels modelPriceChannelLabelIndex, refreshErr error) {
+func (cache *modelPriceSelectorSnapshotCache) finishRefreshWithLabels(configKey string, generation uint64, done chan struct{}, startedAt time.Time, selectors modelPriceChannelSelectorIndex, channelLabels modelPriceChannelLabelIndex, sourceChannels usageSourceChannelIndex, refreshErr error) {
 	finishedAt := time.Now()
 	var closeDone chan struct{}
 	cache.mu.Lock()
@@ -441,6 +445,7 @@ func (cache *modelPriceSelectorSnapshotCache) finishRefreshWithLabels(configKey 
 		if refreshErr == nil {
 			cache.selectors = cloneModelPriceChannelSelectors(selectors)
 			cache.channelLabels = cloneModelPriceChannelLabels(channelLabels)
+			cache.sourceChannels = cloneUsageSourceChannels(sourceChannels)
 			cache.available = true
 			cache.loadedAt = startedAt
 			cache.expiresAt = finishedAt.Add(modelPriceSelectorSnapshotTTL)
@@ -458,10 +463,10 @@ func (cache *modelPriceSelectorSnapshotCache) finishRefreshWithLabels(configKey 
 }
 
 func (cache *modelPriceSelectorSnapshotCache) store(configKey string, generation uint64, startedAt time.Time, selectors modelPriceChannelSelectorIndex) bool {
-	return cache.storeWithLabels(configKey, generation, startedAt, selectors, nil)
+	return cache.storeWithLabels(configKey, generation, startedAt, selectors, nil, nil)
 }
 
-func (cache *modelPriceSelectorSnapshotCache) storeWithLabels(configKey string, generation uint64, startedAt time.Time, selectors modelPriceChannelSelectorIndex, channelLabels modelPriceChannelLabelIndex) bool {
+func (cache *modelPriceSelectorSnapshotCache) storeWithLabels(configKey string, generation uint64, startedAt time.Time, selectors modelPriceChannelSelectorIndex, channelLabels modelPriceChannelLabelIndex, sourceChannels usageSourceChannelIndex) bool {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	if cache.configKey != configKey || cache.generation != generation || startedAt.Before(cache.loadedAt) {
@@ -469,6 +474,7 @@ func (cache *modelPriceSelectorSnapshotCache) storeWithLabels(configKey string, 
 	}
 	cache.selectors = cloneModelPriceChannelSelectors(selectors)
 	cache.channelLabels = cloneModelPriceChannelLabels(channelLabels)
+	cache.sourceChannels = cloneUsageSourceChannels(sourceChannels)
 	cache.available = true
 	cache.loadedAt = startedAt
 	storedAt := time.Now()
@@ -1314,24 +1320,25 @@ func usageAnalyticsBillingPriceIndex(ctx context.Context, queryer modelPriceQuer
 }
 
 func (a *App) attachCachedBillingPriceSelectors(result modelPriceBillingIndex) modelPriceBillingIndex {
-	selectors, channelLabels, available := a.priceSelectors.snapshotWithLabels()
+	selectors, channelLabels, sourceChannels, available := a.priceSelectors.snapshotWithLabels()
 	if !available {
 		return result
 	}
-	return attachBillingPriceSelectors(result, selectors, channelLabels)
+	return attachBillingPriceSelectors(result, selectors, channelLabels, sourceChannels)
 }
 
 func (a *App) attachCachedBillingPriceSelectorsForConfig(result modelPriceBillingIndex, cfg AppConfig) (modelPriceBillingIndex, bool) {
-	selectors, channelLabels, available := a.priceSelectors.snapshotForConfigWithLabels(modelPriceSelectorConfigKey(cfg))
+	selectors, channelLabels, sourceChannels, available := a.priceSelectors.snapshotForConfigWithLabels(modelPriceSelectorConfigKey(cfg))
 	if !available {
 		return result, false
 	}
-	return attachBillingPriceSelectors(result, selectors, channelLabels), true
+	return attachBillingPriceSelectors(result, selectors, channelLabels, sourceChannels), true
 }
 
-func attachBillingPriceSelectors(result modelPriceBillingIndex, selectors modelPriceChannelSelectorIndex, channelLabels modelPriceChannelLabelIndex) modelPriceBillingIndex {
+func attachBillingPriceSelectors(result modelPriceBillingIndex, selectors modelPriceChannelSelectorIndex, channelLabels modelPriceChannelLabelIndex, sourceChannels usageSourceChannelIndex) modelPriceBillingIndex {
 	result.MatchContext.Selectors = selectors
 	result.MatchContext.ChannelLabels = channelLabels
+	result.MatchContext.SourceChannels = sourceChannels
 	result.MatchContext.SelectorsAvailable = true
 	return result
 }
@@ -1375,11 +1382,13 @@ func (a *App) refreshModelPriceSelectorsIfStale(ctx context.Context, cfg AppConf
 		providers, err := a.aiProviderConfigSnapshotWithConfig(ctx, cfg)
 		selectors := modelPriceChannelSelectorIndex(nil)
 		channelLabels := modelPriceChannelLabelIndex(nil)
+		sourceChannels := usageSourceChannelIndex(nil)
 		if err == nil {
 			selectors = modelPriceChannelSelectors(providers)
 			channelLabels = modelPriceChannelLabels(providers)
+			sourceChannels = usageSourceChannels(providers)
 		}
-		a.priceSelectors.finishRefreshWithLabels(configKey, generation, done, startedAt, selectors, channelLabels, err)
+		a.priceSelectors.finishRefreshWithLabels(configKey, generation, done, startedAt, selectors, channelLabels, sourceChannels, err)
 		return err
 	}
 }
@@ -1389,7 +1398,7 @@ func (a *App) storeModelPriceSelectorSnapshot(cfg AppConfig, generation uint64, 
 	if configKey == "" {
 		return false
 	}
-	return a.priceSelectors.storeWithLabels(configKey, generation, startedAt, modelPriceChannelSelectors(providers), modelPriceChannelLabels(providers))
+	return a.priceSelectors.storeWithLabels(configKey, generation, startedAt, modelPriceChannelSelectors(providers), modelPriceChannelLabels(providers), usageSourceChannels(providers))
 }
 
 func (a *App) invalidateModelPriceSelectorSnapshot(cfg AppConfig) {
@@ -1549,6 +1558,9 @@ func (a *App) modelPriceCatalog(ctx context.Context) (ModelPriceCatalogResponse,
 			if provider.ChannelAlias != "" {
 				item.ChannelLabel = provider.ChannelAlias
 				item.ChannelLabelFallback = false
+			}
+			if provider.Brand != aiProviderBrandOpenAICompatibility {
+				item.ChannelAPIKeyMasked = provider.APIKeyMasked
 			}
 			if channelStatus != modelPriceChannelStatusReady || !modelPriceReadyForBilling(item.Price, item.Name) {
 				response.UnpricedModels++

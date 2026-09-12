@@ -45,6 +45,7 @@ import {
   jsonPretty,
 } from '@/shared/utils/format'
 import { useI18n } from '@/shared/i18n'
+import { useViewportTooltip } from '@/shared/composables/useViewportTooltip'
 
 type FailedFilter = 'all' | 'success' | 'failed'
 type QuickRangeKey = 'today' | 'last24h' | 'last3d' | 'last7d'
@@ -120,6 +121,9 @@ const selectedRecord = ref<UsageRecordDetail | null>(null)
 const records = ref<UsageRecordListItem[]>([])
 const hoveredCostRecordId = ref<number | null>(null)
 const focusedCostRecordId = ref<number | null>(null)
+const hoveredSourceTooltipKey = ref<number | 'detail' | null>(null)
+const focusedSourceTooltipKey = ref<number | 'detail' | null>(null)
+const sourceTooltips = useViewportTooltip(hoveredSourceTooltipKey, focusedSourceTooltipKey, usageTooltipThemeOverrides)
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(50)
@@ -663,6 +667,35 @@ function textOrDash(value: string | null | undefined): string {
   return normalized || '-'
 }
 
+function sourceTooltipText(row: Pick<UsageRecordListItem, 'source_label' | 'source'>): string | null {
+  const source = row.source
+  if (!source?.trim()) {
+    return row.source_label?.trim() || null
+  }
+  const label = textOrDash(row.source_label || source)
+  return label === source ? source : `${label}\n${source}`
+}
+
+function renderSource(row: UsageRecordListItem) {
+  const label = textOrDash(row.source_label || row.source)
+  const tooltipText = sourceTooltipText(row)
+  if (!tooltipText) {
+    return label
+  }
+  const tooltipId = `usage-source-${row.id}`
+  return h('span', {
+    ...sourceTooltips.triggerProps(row.id),
+    class: 'usage-source-trigger',
+    tabindex: 0,
+    'aria-describedby': tooltipId,
+  }, [
+    label,
+    h(NTooltip, sourceTooltips.tooltipProps(row.id), {
+      default: () => h('span', { id: tooltipId, role: 'tooltip', class: 'usage-source-tooltip' }, tooltipText),
+    }),
+  ])
+}
+
 function userLabel(value: string | null | undefined): string {
   const normalized = value?.trim()
   if (!normalized || normalized === '未绑定') {
@@ -1132,7 +1165,7 @@ const detailRows = computed(() => {
   if (!record) {
     return []
   }
-  const rows = [
+  const rows: { label: string; value: string; tooltip?: string | null }[] = [
     { label: t('时间', 'Time'), value: formatDateTime(record.timestamp) },
     { label: t('模型', 'Model'), value: formatModelWithReasoning(record) },
     { label: t('服务商', 'Provider'), value: textOrDash(record.provider) },
@@ -1156,7 +1189,11 @@ const detailRows = computed(() => {
     rows.splice(
       4,
       0,
-      { label: t('来源', 'Source'), value: textOrDash(record.source) },
+      {
+        label: t('来源', 'Source'),
+        value: textOrDash(record.source_label || record.source),
+        tooltip: sourceTooltipText(record),
+      },
       { label: t('用户昵称', 'User nickname'), value: userLabel(record.user_label) },
     )
   }
@@ -1202,7 +1239,8 @@ const columns = computed<DataTableColumns<UsageRecordListItem>>(() => [
           title: t('来源', 'Source'),
           key: 'source',
           width: RECORDS_TABLE_COLUMN_WIDTHS.source,
-          ellipsis: { tooltip: true },
+          ellipsis: { tooltip: false },
+          render: renderSource,
         },
       ]),
   {
@@ -1461,7 +1499,30 @@ onBeforeUnmount(() => {
         <div class="detail-grid">
           <div v-for="row in detailRows" :key="row.label" class="detail-item">
             <div class="detail-label">{{ row.label }}</div>
-            <div class="detail-value">{{ row.value }}</div>
+            <div class="detail-value">
+              <NTooltip
+                v-if="row.tooltip"
+                trigger="manual"
+                width="trigger"
+                :show="hoveredSourceTooltipKey === 'detail' || focusedSourceTooltipKey === 'detail'"
+                :theme-overrides="usageTooltipThemeOverrides"
+                style="max-width: calc(100vw - 32px); box-sizing: border-box"
+              >
+                <template #trigger>
+                  <span
+                    class="usage-source-trigger"
+                    tabindex="0"
+                    aria-describedby="usage-detail-source-tooltip"
+                    @mouseenter="hoveredSourceTooltipKey = 'detail'"
+                    @mouseleave="hoveredSourceTooltipKey = null"
+                    @focus="focusedSourceTooltipKey = 'detail'"
+                    @blur="focusedSourceTooltipKey = null"
+                  >{{ row.value }}</span>
+                </template>
+                <span id="usage-detail-source-tooltip" role="tooltip" class="usage-source-tooltip">{{ row.tooltip }}</span>
+              </NTooltip>
+              <template v-else>{{ row.value }}</template>
+            </div>
           </div>
         </div>
         <h3 class="drawer-section-title">{{ t('原始数据', 'Raw data') }}</h3>
@@ -1527,6 +1588,28 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+:global(.usage-source-trigger) {
+  cursor: help;
+}
+
+:global(.records-table .usage-source-trigger) {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:global(.usage-source-trigger:focus-visible) {
+  outline: 2px solid var(--cpa-primary);
+  outline-offset: -2px;
+}
+
+:global(.usage-source-tooltip) {
+  display: block;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 :global(.records-table .usage-fast-icon) {
@@ -1750,6 +1833,10 @@ onBeforeUnmount(() => {
   color: var(--cpa-text);
   font-weight: 600;
   overflow-wrap: anywhere;
+}
+
+.detail-value .usage-source-trigger {
+  display: block;
 }
 
 .records-table :deep(.v-vl),

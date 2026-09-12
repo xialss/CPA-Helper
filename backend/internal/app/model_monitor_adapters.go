@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"math"
 	"math/big"
@@ -707,6 +708,12 @@ type anthropicRelatedEvent struct {
 }
 
 var anthropicUptimeAssignmentPattern = regexp.MustCompile(`\bwindow\s*\.\s*uptimeData\s*=`)
+var anthropicUptimeInitializationPattern = regexp.MustCompile(`^\s*window\s*\.\s*uptimeData\s*\|\|\s*\{\s*\}\s*;`)
+var anthropicUptimeAttributePattern = regexp.MustCompile(`^\s*([^\s/="'<>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>]+)))?`)
+var anthropicUptimeRawTextEndPattern = regexp.MustCompile(`(?i)</(script|style|title|textarea|xmp|iframe|noembed|noframes)\s*>`)
+
+// The Statuspage lazy loader requests at most 60 components per showcase batch.
+const anthropicUptimeShowcaseBatchSize = 60
 
 func collectAnthropicStatus(ctx context.Context, client *http.Client, baseURL string) (ModelMonitorSourceStatus, error) {
 	return collectStatuspageStatus(ctx, client, baseURL, "Anthropic")
@@ -1580,9 +1587,18 @@ func collectStatuspageStatus(ctx context.Context, client *http.Client, baseURL, 
 	if err != nil {
 		return ModelMonitorSourceStatus{}, err
 	}
-	services, err := parseStatuspagePageHistory(historyBody, current.Services, sourceName)
+	componentIDs, err := parseAnthropicLazyUptimeComponentIDs(historyBody)
 	if err != nil {
-		return ModelMonitorSourceStatus{}, err
+		return ModelMonitorSourceStatus{}, modelMonitorStatuspageSourceError(sourceName, err)
+	}
+	var services []ModelMonitorServiceStatus
+	if len(componentIDs) > 0 {
+		services, err = collectAnthropicLazyUptimeHistory(ctx, client, baseURL, componentIDs, current.Services)
+	} else {
+		services, err = parseStatuspagePageHistory(historyBody, current.Services, sourceName)
+	}
+	if err != nil {
+		return ModelMonitorSourceStatus{}, modelMonitorStatuspageSourceError(sourceName, err)
 	}
 	current.Services = services
 	return current, nil
@@ -1681,6 +1697,176 @@ func parseAnthropicSummary(body []byte) (ModelMonitorSourceStatus, error) {
 	}, nil
 }
 
+func parseAnthropicLazyUptimeComponentIDs(body []byte) ([]string, error) {
+	componentIDs := []string{}
+	seen := make(map[string]struct{})
+	for cursor := 0; cursor < len(body); {
+		start := bytes.IndexByte(body[cursor:], '<')
+		if start < 0 {
+			break
+		}
+		cursor += start
+		if bytes.HasPrefix(body[cursor:], []byte("<!--")) {
+			end := bytes.Index(body[cursor+4:], []byte("-->"))
+			if end < 0 {
+				break
+			}
+			cursor += 4 + end + 3
+			continue
+		}
+
+		// Read a complete tag so markup inside quoted attributes is never a tag.
+		end := cursor + 1
+		var quote byte
+		for ; end < len(body); end++ {
+			char := body[end]
+			if quote != 0 {
+				if char == quote {
+					quote = 0
+				}
+			} else if char == '"' || char == '\'' {
+				quote = char
+			} else if char == '>' {
+				break
+			}
+		}
+		if end == len(body) {
+			return nil, errors.New("Anthropic 页面 data-uptime-lazy 结构无效")
+		}
+		tag := body[cursor+1 : end]
+		cursor = end + 1
+		nameEnd := bytes.IndexAny(tag, " \t\r\n\f/")
+		if nameEnd < 0 {
+			nameEnd = len(tag)
+		}
+		name := strings.ToLower(string(tag[:nameEnd]))
+		switch name {
+		case "script", "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes":
+			// These HTML elements contain raw text, including JavaScript strings.
+			for cursor < len(body) {
+				closing := anthropicUptimeRawTextEndPattern.FindSubmatchIndex(body[cursor:])
+				if closing == nil {
+					cursor = len(body)
+					break
+				}
+				matchesName := strings.EqualFold(string(body[cursor+closing[2]:cursor+closing[3]]), name)
+				cursor += closing[1]
+				if matchesName {
+					break
+				}
+			}
+			continue
+		case "plaintext":
+			cursor = len(body)
+			continue
+		case "div":
+		default:
+			continue
+		}
+
+		attributes := make(map[string]string, 2)
+		duplicateAttribute := ""
+		hasClass := false
+		for remaining := strings.TrimSpace(string(tag[nameEnd:])); remaining != "" && remaining != "/"; {
+			attribute := anthropicUptimeAttributePattern.FindStringSubmatch(remaining)
+			if attribute == nil {
+				return nil, errors.New("Anthropic 页面 data-uptime-lazy 结构无效")
+			}
+			remaining = strings.TrimSpace(remaining[len(attribute[0]):])
+			key := strings.ToLower(attribute[1])
+			if key != "class" && key != "data-uptime-lazy" {
+				continue
+			}
+			if _, exists := attributes[key]; exists && duplicateAttribute == "" {
+				duplicateAttribute = key
+			}
+			attributes[key] = html.UnescapeString(attribute[2] + attribute[3] + attribute[4])
+			if key == "class" && containsString(strings.Fields(attributes[key]), "uptime-lazy-placeholder") {
+				hasClass = true
+			}
+		}
+		componentID, hasID := attributes["data-uptime-lazy"]
+		if !hasID && !hasClass {
+			continue
+		}
+		// Duplicate attributes on unrelated page elements do not affect history.
+		if duplicateAttribute != "" {
+			return nil, fmt.Errorf("Anthropic 页面 data-uptime-lazy 字段 %q 重复", duplicateAttribute)
+		}
+		if !hasID || !hasClass || strings.TrimSpace(componentID) == "" || strings.Contains(componentID, ",") {
+			return nil, errors.New("Anthropic 页面 data-uptime-lazy 组件字段无效")
+		}
+		if _, exists := seen[componentID]; exists {
+			return nil, fmt.Errorf("Anthropic 页面 data-uptime-lazy 组件 ID %q 重复", componentID)
+		}
+		seen[componentID] = struct{}{}
+		componentIDs = append(componentIDs, componentID)
+	}
+	if len(componentIDs) > 0 {
+		// A lazy page may initialize uptimeData, but must not also supply an
+		// ambiguous or malformed legacy payload that this branch would ignore.
+		for _, assignment := range anthropicUptimeAssignmentPattern.FindAllIndex(body, -1) {
+			if !anthropicUptimeInitializationPattern.Match(body[assignment[1]:]) {
+				return nil, errors.New("Anthropic 页面 uptimeData 结构无效")
+			}
+		}
+	}
+	return componentIDs, nil
+}
+
+func collectAnthropicLazyUptimeHistory(ctx context.Context, client *http.Client, baseURL string, componentIDs []string, currentServices []ModelMonitorServiceStatus) ([]ModelMonitorServiceStatus, error) {
+	currentByID := make(map[string]ModelMonitorServiceStatus, len(currentServices))
+	for _, current := range currentServices {
+		currentByID[current.ID] = current
+	}
+	for _, componentID := range componentIDs {
+		if _, exists := currentByID[componentID]; !exists {
+			return nil, fmt.Errorf("Anthropic 页面 data-uptime-lazy 包含未知组件 %q", componentID)
+		}
+	}
+	if len(componentIDs) != len(currentServices) {
+		return nil, errors.New("Anthropic 页面 data-uptime-lazy 组件不一致")
+	}
+
+	historyByID := make(map[string]ModelMonitorServiceStatus, len(currentServices))
+	for start := 0; start < len(componentIDs); start += anthropicUptimeShowcaseBatchSize {
+		batchIDs := componentIDs[start:min(start+anthropicUptimeShowcaseBatchSize, len(componentIDs))]
+		batchServices := make([]ModelMonitorServiceStatus, 0, len(batchIDs))
+		for _, componentID := range batchIDs {
+			batchServices = append(batchServices, currentByID[componentID])
+		}
+		query := url.Values{"components": []string{strings.Join(batchIDs, ",")}}
+		body, err := modelMonitorGet(ctx, client, strings.TrimRight(baseURL, "/")+"/uptime_showcase?"+query.Encode(), "application/json")
+		if err != nil {
+			return nil, err
+		}
+		payload, err := decodeAnthropicJSONProperties(body, "uptime showcase", "key")
+		if err != nil {
+			return nil, err
+		}
+		timelines, exists := payload["timelines"]
+		if !exists {
+			return nil, errors.New("Anthropic uptime showcase 响应缺少 timelines 字段")
+		}
+		rawComponents, err := decodeAnthropicJSONProperties(timelines, "uptime showcase timelines", "组件 key")
+		if err != nil {
+			return nil, err
+		}
+		services, err := applyAnthropicUptimeHistory(rawComponents, batchServices)
+		if err != nil {
+			return nil, err
+		}
+		for _, service := range services {
+			historyByID[service.ID] = service
+		}
+	}
+	services := make([]ModelMonitorServiceStatus, 0, len(currentServices))
+	for _, current := range currentServices {
+		services = append(services, historyByID[current.ID])
+	}
+	return services, nil
+}
+
 func parseAnthropicPageHistory(body []byte, currentServices []ModelMonitorServiceStatus) ([]ModelMonitorServiceStatus, error) {
 	matches := anthropicUptimeAssignmentPattern.FindAllIndex(body, -1)
 	if len(matches) != 1 {
@@ -1705,7 +1891,10 @@ func parseAnthropicPageHistory(body []byte, currentServices []ModelMonitorServic
 	if err != nil {
 		return nil, err
 	}
+	return applyAnthropicUptimeHistory(rawComponents, currentServices)
+}
 
+func applyAnthropicUptimeHistory(rawComponents map[string]json.RawMessage, currentServices []ModelMonitorServiceStatus) ([]ModelMonitorServiceStatus, error) {
 	currentByID := make(map[string]ModelMonitorServiceStatus, len(currentServices))
 	for _, service := range currentServices {
 		if strings.TrimSpace(service.ID) == "" || strings.TrimSpace(service.Name) == "" {
@@ -1758,37 +1947,41 @@ func parseAnthropicPageHistory(body []byte, currentServices []ModelMonitorServic
 }
 
 func decodeAnthropicUptimeComponents(object []byte) (map[string]json.RawMessage, error) {
+	return decodeAnthropicJSONProperties(object, "页面 uptimeData", "组件 key")
+}
+
+func decodeAnthropicJSONProperties(object []byte, subject, keySubject string) (map[string]json.RawMessage, error) {
 	decoder := json.NewDecoder(bytes.NewReader(object))
 	opening, err := decoder.Token()
 	if err != nil || opening != json.Delim('{') {
-		return nil, errors.New("Anthropic 页面 uptimeData 不是有效的非空对象")
+		return nil, fmt.Errorf("Anthropic %s 不是有效的非空对象", subject)
 	}
 
 	components := make(map[string]json.RawMessage)
 	for decoder.More() {
 		keyToken, err := decoder.Token()
 		if err != nil {
-			return nil, errors.New("Anthropic 页面 uptimeData 不是有效的非空对象")
+			return nil, fmt.Errorf("Anthropic %s 不是有效的非空对象", subject)
 		}
 		componentID, ok := keyToken.(string)
 		if !ok {
-			return nil, errors.New("Anthropic 页面 uptimeData 不是有效的非空对象")
+			return nil, fmt.Errorf("Anthropic %s 不是有效的非空对象", subject)
 		}
 		if _, exists := components[componentID]; exists {
-			return nil, fmt.Errorf("Anthropic 页面 uptimeData 组件 key %q 重复", componentID)
+			return nil, fmt.Errorf("Anthropic %s %s %q 重复", subject, keySubject, componentID)
 		}
 		var rawComponent json.RawMessage
 		if err := decoder.Decode(&rawComponent); err != nil {
-			return nil, errors.New("Anthropic 页面 uptimeData 不是有效的非空对象")
+			return nil, fmt.Errorf("Anthropic %s 不是有效的非空对象", subject)
 		}
 		components[componentID] = rawComponent
 	}
 	closing, err := decoder.Token()
 	if err != nil || closing != json.Delim('}') || len(components) == 0 {
-		return nil, errors.New("Anthropic 页面 uptimeData 不是有效的非空对象")
+		return nil, fmt.Errorf("Anthropic %s 不是有效的非空对象", subject)
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		return nil, errors.New("Anthropic 页面 uptimeData 不是有效的非空对象")
+		return nil, fmt.Errorf("Anthropic %s 不是有效的非空对象", subject)
 	}
 	return components, nil
 }

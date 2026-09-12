@@ -480,8 +480,17 @@ func (a *App) usageRecords(w http.ResponseWriter, r *http.Request, filters Usage
 	}
 	items := make([]map[string]any, 0, len(records))
 	redaction := usageRedactionOptions{MaskAuthIndex: !scope.IsAdmin}
+	var sourceLabels *usageSourceLabelContext
+	if scope.IsAdmin {
+		sourceLabels, err = a.usageSourceLabels(r.Context(), pricing.MatchContext)
+		if err != nil {
+			return err
+		}
+	}
 	for _, record := range records {
-		items = append(items, listItemFromRecordVersioned(record, users, pricing, redaction))
+		item := listItemFromRecordVersioned(record, users, pricing, redaction)
+		item["source_label"] = sourceLabels.labelFor(record)
+		items = append(items, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items":     items,
@@ -517,6 +526,13 @@ func (a *App) usageRecordDetail(w http.ResponseWriter, r *http.Request, recordID
 	cacheUsageRecordAuth(&record)
 	redaction := usageRedactionOptions{MaskSource: !scope.IsAdmin, MaskAuthIndex: !scope.IsAdmin}
 	item := listItemFromRecordVersioned(record, users, pricing, redaction)
+	if scope.IsAdmin {
+		sourceLabels, err := a.usageSourceLabels(r.Context(), pricing.MatchContext)
+		if err != nil {
+			return err
+		}
+		item["source_label"] = sourceLabels.labelFor(record)
+	}
 	item["raw_json"] = redactedRawJSON(record.RawJSON, usageRecordAuth(record), redaction)
 	writeJSON(w, http.StatusOK, item)
 	return nil
@@ -1123,6 +1139,7 @@ func listItemFromRecordWithBreakdown(record UsageRecord, users map[string]userIn
 		"reasoning_effort":      record.ReasoningEffort,
 		"endpoint":              record.Endpoint,
 		"source":                redactedUsageSource(source, auth, redaction),
+		"source_label":          (*string)(nil),
 		"request_id":            record.RequestID,
 		"auth_index":            authIndex,
 		"auth":                  auth,

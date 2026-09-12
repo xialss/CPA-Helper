@@ -71,6 +71,7 @@ import { findModelGroupLibraryPrice, modelGroupLibraryPriceState } from '../util
 import { multiplyModelPrice } from '../utils/modelPriceMultiplier'
 import { formatDateTime, formatInteger, formatMultiplier, formatPreservedLongContextPrice, formatPriceValue } from '@/shared/utils/format'
 import { useI18n } from '@/shared/i18n'
+import { useViewportTooltip } from '@/shared/composables/useViewportTooltip'
 
 type PriceTableLayoutProps =
   | { flexHeight: true }
@@ -115,6 +116,7 @@ interface PriceDisplayRow {
   channelAuthType: ChannelAuthType | null
   channelBrand: string | null
   channelKey: string | null
+  channelAPIKeyMasked: string | null
   channelIdentityHash: string | null
   channelStatus: string
   channelDisabled: boolean
@@ -161,6 +163,9 @@ const message = useMessage()
 const dialog = useDialog()
 const { errorText, serverText, t } = useI18n()
 const isLoading = ref(false)
+const hoveredChannelLabelKey = ref<string | null>(null)
+const focusedChannelLabelKey = ref<string | null>(null)
+const channelLabelTooltips = useViewportTooltip(hoveredChannelLabelKey, focusedChannelLabelKey)
 const isSyncing = ref(false)
 const syncModalOpen = ref(false)
 const syncOptionsLoading = ref(false)
@@ -243,7 +248,11 @@ const editingChannelLabel = ref('')
 const aliasModalOpen = ref(false)
 const aliasSaving = ref(false)
 const aliasLabel = ref('')
+const aliasAPIKeyMasked = ref<string | null>(null)
 const aliasIdentity = reactive<ModelPriceChannelAliasPayload>({ auth_type: 'apikey', channel_brand: 'gemini', channel_key: '', channel_identity_hash: '', label: '' })
+watch(aliasModalOpen, (open) => {
+  if (!open) aliasAPIKeyMasked.value = null
+})
 const channelAliases = ref<ModelPriceChannelAlias[]>([])
 const priorityEditingPrice = ref<ModelPrice | null>(null)
 const priorityMultiplier = ref<number | null>(null)
@@ -519,6 +528,7 @@ function pricedDisplayRow(
     channelAuthType: price.channel_auth_type,
     channelBrand: price.channel_brand,
     channelKey: price.channel_key,
+    channelAPIKeyMasked: catalogModel?.channel_api_key_masked ?? null,
     channelIdentityHash: catalogModel?.channel_identity_hash ?? null,
     channelStatus: catalogModel?.channel_status ?? (scope === 'channel' ? unmatchedChannelStatus : 'ready'),
     channelDisabled: catalogModel?.channel_disabled ?? false,
@@ -569,6 +579,7 @@ function unpricedCatalogDisplayRow(model: ModelPriceCatalogItem): PriceDisplayRo
     channelAuthType: model.channel_auth_type,
     channelBrand: model.channel_brand,
     channelKey: model.channel_key,
+    channelAPIKeyMasked: model.channel_api_key_masked ?? null,
     channelIdentityHash: model.channel_identity_hash,
     channelStatus: model.channel_status,
     channelDisabled: model.channel_disabled,
@@ -1565,6 +1576,7 @@ function openAliasEditor(row: PriceDisplayRow) {
   aliasIdentity.channel_brand = brand
   aliasIdentity.channel_key = row.channelKey
   aliasIdentity.channel_identity_hash = row.channelIdentityHash
+  aliasAPIKeyMasked.value = row.channelAPIKeyMasked
   aliasLabel.value = channelAliasLabel(row.channelAuthType, row.channelBrand, row.channelKey)
   aliasModalOpen.value = true
 }
@@ -2006,6 +2018,41 @@ function providerGroupUnpricedCount(row: PriceGroupRow): number {
   return row.unpricedCount
 }
 
+function channelLabelKeyMask(row: PriceTableRow): string | null {
+  if (isPriceGroupRow(row)) {
+    if (row.mode !== 'provider') return null
+    const firstChild = row.children[0]
+    const identityHash = firstChild?.channelIdentityHash
+    const mask = firstChild ? channelLabelKeyMask(firstChild) : null
+    return mask && identityHash && row.children.every((child) => child.channelIdentityHash === identityHash && channelLabelKeyMask(child) === mask)
+      ? mask
+      : null
+  }
+  return row.priceScope === 'channel' && row.channelAuthType === 'apikey' && row.channelBrand !== 'openai_compatibility'
+    ? row.channelAPIKeyMasked
+    : null
+}
+
+function renderChannelLabel(row: PriceTableRow, label: string) {
+  const mask = channelLabelKeyMask(row)
+  if (!mask?.trim()) {
+    return h('span', { class: 'provider-label', title: label }, label)
+  }
+  const tooltipId = `price-channel-key-${encodeURIComponent(row.key)}`
+  const tooltipText = label === mask ? mask : `${label}\n${mask}`
+  return h('span', {
+    ...channelLabelTooltips.triggerProps(row.key),
+    class: ['provider-label', 'channel-key-trigger'],
+    tabindex: 0,
+    'aria-describedby': tooltipId,
+  }, [
+    label,
+    h(NTooltip, channelLabelTooltips.tooltipProps(row.key), {
+      default: () => h('span', { id: tooltipId, role: 'tooltip', class: 'price-channel-key-tooltip' }, tooltipText),
+    }),
+  ])
+}
+
 function renderProviderCell(row: PriceTableRow) {
   if (isPriceGroupRow(row)) {
     const isLibraryGroup = row.children.every((child) => child.priceScope === 'library')
@@ -2023,7 +2070,7 @@ function renderProviderCell(row: PriceTableRow) {
           )
         : null
     return h('div', { class: 'price-group-cell' }, [
-      h('div', { class: 'price-group-title' }, title),
+      h('div', { class: 'price-group-title' }, [renderChannelLabel(row, title)]),
       details ? h('div', { class: 'price-group-sub' }, details) : null,
     ])
   }
@@ -2040,7 +2087,7 @@ function renderProviderCell(row: PriceTableRow) {
   }
   return h('div', { class: 'provider-cell' }, [
     h('div', { class: 'provider-main' }, [
-      h('span', { class: 'provider-label', title: row.provider }, row.provider || '-'),
+      renderChannelLabel(row, row.provider || '-'),
       canEditChannelAlias(row)
         ? h(NTooltip, {}, {
             trigger: () => h(NButton, {
@@ -2188,7 +2235,7 @@ const columns = computed<DataTableColumns<PriceTableRow>>(() => [
     title: t('渠道', 'Channel'),
     key: 'provider',
     width: 160,
-    ellipsis: { tooltip: true },
+    ellipsis: { tooltip: false },
     render: renderProviderCell,
   },
   {
@@ -2679,7 +2726,12 @@ onBeforeUnmount(() => {
         <NFormItem :label="t('渠道名称', 'Channel name')">
           <NInput v-model:value="aliasLabel" maxlength="200" show-count clearable :placeholder="t('默认名称', 'Default name')" :disabled="aliasSaving" />
         </NFormItem>
-        <div class="model-sub">{{ channelBrandLabel(aliasIdentity.channel_brand) }} · {{ maskedChannelReference(aliasIdentity.channel_key) }}</div>
+        <div class="model-sub">
+          {{ channelBrandLabel(aliasIdentity.channel_brand) }} ·
+          {{ aliasIdentity.channel_brand === 'openai_compatibility'
+            ? `${t('上游名称', 'Upstream name')}: ${aliasIdentity.channel_key}`
+            : aliasAPIKeyMasked || t('Key 不可用', 'Key unavailable') }}
+        </div>
       </NForm>
       <template #footer>
         <NSpace justify="end">
@@ -3137,9 +3189,25 @@ onBeforeUnmount(() => {
 }
 
 .price-table :deep(.provider-label) {
+  display: block;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.price-table :deep(.channel-key-trigger) {
+  cursor: help;
+}
+
+.price-table :deep(.channel-key-trigger:focus-visible) {
+  outline: 2px solid var(--cpa-primary);
+  outline-offset: -2px;
+}
+
+:global(.price-channel-key-tooltip) {
+  display: block;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .price-table :deep(.provider-main .n-button) {

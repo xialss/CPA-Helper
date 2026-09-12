@@ -518,6 +518,7 @@ export interface UsageRecordListItem {
   reasoning_effort: string | null
   endpoint: string | null
   source: string | null
+  source_label: string | null
   request_id: string | null
   auth_index: string | null
   auth: string | null
@@ -739,6 +740,7 @@ export interface ModelPriceCatalogItem {
   channel_key: string
   channel_label: string
   channel_alias: string
+  channel_api_key_masked: string | null
   channel_identity_hash: string
   channel_disabled: boolean
   channel_status: 'ready' | 'missing_selector' | 'conflict' | string

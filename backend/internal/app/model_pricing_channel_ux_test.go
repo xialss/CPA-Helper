@@ -167,7 +167,7 @@ func TestModelPriceChannelAliasLifecycleAndValidation(t *testing.T) {
 		ChannelIdentityHash: compatibility.IdentityHash,
 		Label:               "Friendly compatibility channel",
 	}
-	beforeSelectors, beforeLabels, available := a.priceSelectors.snapshotWithLabels()
+	beforeSelectors, beforeLabels, beforeSourceChannels, available := a.priceSelectors.snapshotWithLabels()
 	if !available {
 		t.Fatal("expected selector snapshot")
 	}
@@ -177,8 +177,8 @@ func TestModelPriceChannelAliasLifecycleAndValidation(t *testing.T) {
 	if _, err := a.upsertModelPriceChannelAlias(ctx, compatibilityPayload); err != nil {
 		t.Fatalf("OpenAI-compatible channel alias was rejected: %v", err)
 	}
-	afterSelectors, afterLabels, available := a.priceSelectors.snapshotWithLabels()
-	if !available || !reflect.DeepEqual(beforeSelectors, afterSelectors) || !reflect.DeepEqual(beforeLabels, afterLabels) {
+	afterSelectors, afterLabels, afterSourceChannels, available := a.priceSelectors.snapshotWithLabels()
+	if !available || !reflect.DeepEqual(beforeSelectors, afterSelectors) || !reflect.DeepEqual(beforeLabels, afterLabels) || !reflect.DeepEqual(beforeSourceChannels, afterSourceChannels) {
 		t.Fatal("display-only alias changed/invalidated billing selectors or cached labels")
 	}
 	var snapshot aiProvidersResponse
