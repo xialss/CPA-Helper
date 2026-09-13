@@ -360,14 +360,16 @@ func resolveVersionedPrice(record UsageRecord, price *ModelPrice, versions model
 	if len(history) == 0 {
 		return price
 	}
-	if record.Timestamp.Before(history[0].EffectiveAt) && !history[0].Baseline {
+	// Only the channel's first lifecycle may price requests before its first
+	// save; a recreated price must not reach back into an earlier lifecycle.
+	if record.Timestamp.Before(history[0].EffectiveAt) && !history[0].Baseline && history[0] != chain.all[0] {
 		return nil
 	}
 	latest := sort.Search(len(history), func(i int) bool {
 		return record.Timestamp.Before(history[i].EffectiveAt)
 	}) - 1
 	if latest < 0 {
-		latest = 0 // The baseline estimates requests before recorded history.
+		latest = 0 // The first price or a baseline estimates earlier requests.
 	}
 	selected := history[latest].Price
 	return &selected

@@ -240,7 +240,7 @@ func TestRunMigrationsUpgradesFromPreviousProductionHead(t *testing.T) {
 	if current != backendMigrations.LatestVersion {
 		t.Fatalf("migrated version = %d, want %d", current, backendMigrations.LatestVersion)
 	}
-	for _, version := range []int64{202609050001, 202609060001, 202609070001, 202609070002, 202609080001} {
+	for _, version := range []int64{202609050001, 202609060001, 202609070001, 202609070002, 202609080001, 202609130001} {
 		var applied int
 		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM goose_db_version WHERE is_applied = 1 AND version_id = ?`, version).Scan(&applied); err != nil {
 			t.Fatalf("check migration %d: %v", version, err)
@@ -248,6 +248,103 @@ func TestRunMigrationsUpgradesFromPreviousProductionHead(t *testing.T) {
 		if applied != 1 {
 			t.Fatalf("migration %d applied rows = %d, want 1", version, applied)
 		}
+	}
+}
+
+func TestRunMigrationsBackfillsFirstChannelPriceHourlyCosts(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	prepareMigrationTestDatabase(t, dataDir, 202609080001)
+	ctx := context.Background()
+	a, err := NewWithOptions(ctx, NewOptions{Migrate: false, StartBackground: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	start := time.Now().In(appTimeLocation).Truncate(time.Hour).Add(-4 * time.Hour)
+	end := start.Add(time.Hour)
+	model := "first-price-upgrade"
+	if _, err := a.db.ExecContext(ctx, `
+		INSERT INTO usage_records (
+			created_at, timestamp, provider, model, auth, failed,
+			input_tokens, output_tokens, cached_tokens, cache_read_tokens,
+			cache_creation_tokens, reasoning_tokens, total_tokens, dedupe_key, raw_json
+		) VALUES (?, ?, 'codex', ?, 'oauth', 0, 1000000, 0, 0, 0, 0, 0, 1000000, 'first-price-upgrade', '{}')
+	`, dbTime(start), dbTime(start.Add(5*time.Minute)), model); err != nil {
+		t.Fatal(err)
+	}
+	id := seedCorrectionTestChannelPrice(t, a, model, 3)
+	price, err := getPriceWithQuerier(ctx, a.db, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	firstPrice := price
+	firstPrice.InputUSDPerMillion = 1
+	if err := a.appendModelPriceVersion(ctx, tx, firstPrice, start.Add(2*time.Hour), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.appendModelPriceVersion(ctx, tx, price, start.Add(3*time.Hour), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ensureUsageAnalyticsFacts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pricing, err := a.billingPriceIndexWithoutSelectors(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ensureUsageAnalyticsHourlyForMaintenance(ctx, pricing); err != nil {
+		t.Fatal(err)
+	}
+	// Represent a complete, current cache produced by the previous billing rule.
+	if _, err := a.db.ExecContext(ctx, `UPDATE usage_analytics_hourly SET estimated_cost_usd = 0, unpriced_records = record_count`); err != nil {
+		t.Fatal(err)
+	}
+	assertSummary := func(wantCost float64, wantUnpriced int) {
+		t.Helper()
+		filters := UsageFilters{Start: &start, End: &end}
+		collector := newUsageAnalyticsCollector(filters, pricing.Prices, pricing.MatchContext, nil, usageAnalyticsCollectorOptions{Summary: true})
+		if err := a.collectUsageAnalytics(ctx, filters, pricing, collector, ""); err != nil {
+			t.Fatal(err)
+		}
+		if collector.summary.records != 1 || collector.summary.estimated != wantCost || collector.summary.unpriced != wantUnpriced {
+			t.Fatalf("hourly summary = %#v, want records/cost/unpriced 1/%v/%d", collector.summary, wantCost, wantUnpriced)
+		}
+	}
+	assertSummary(0, 1)
+	before, err := loadUsageAnalyticsState(ctx, a.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpToContext(ctx, a.db, ".", backendMigrations.LatestVersion); err != nil {
+		t.Fatalf("upgrade first-price billing: %v", err)
+	}
+	after, err := loadUsageAnalyticsState(ctx, a.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.pricingVersion != before.pricingVersion+1 || !after.hourlyNeedsRebuild {
+		t.Fatalf("upgrade did not invalidate the old pricing cache: before=%#v after=%#v", before, after)
+	}
+	assertSummary(1, 0)
+	if err := goose.UpToContext(ctx, a.db, ".", backendMigrations.LatestVersion); err != nil {
+		t.Fatal(err)
+	}
+	repeated, err := loadUsageAnalyticsState(ctx, a.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated.pricingVersion != after.pricingVersion || repeated.hourlyNeedsRebuild {
+		t.Fatalf("repeat migration invalidated the rebuilt cache: %#v", repeated)
 	}
 }
 
