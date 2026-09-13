@@ -53,6 +53,18 @@ type usageSourceLabelContext struct {
 	selectors      modelPriceChannelSelectorIndex
 }
 
+type usageSourceLabelEvidence struct {
+	Provider  string
+	Model     string
+	Source    *string
+	AuthIndex *string
+}
+
+type usageSourceLabelMatch struct {
+	Identity modelPriceChannelGroupIdentity
+	Label    string
+}
+
 func (a *App) usageSourceLabels(ctx context.Context, matchContext modelPriceMatchContext) (*usageSourceLabelContext, error) {
 	aliases, err := a.modelPriceChannelAliasLabels(ctx)
 	if err != nil {
@@ -99,15 +111,32 @@ func (labels *usageSourceLabelContext) labelFor(record UsageRecord) *string {
 	if conflict || !isAPIKeyAuth(auth) {
 		return nil
 	}
-	provider := strings.TrimSpace(aiProviderOptionalString(record.Provider))
-	if provider == "" {
-		return nil
-	}
 	authIndex := usageAnalyticsRecordAuthIndex(record)
 	if rawIndex, storedIndex := usageAnalyticsRawAuthIndex(record.RawJSON), usageNonBlankText(record.AuthIndex); rawIndex != nil && storedIndex != nil && *rawIndex != *storedIndex {
 		return nil
 	}
-	if model := normalizeModelPriceChannelModel(aiProviderOptionalString(record.Model)); model != "" {
+	matched := labels.resolve(usageSourceLabelEvidence{
+		Provider: aiProviderOptionalString(record.Provider), Model: aiProviderOptionalString(record.Model),
+		Source: usageAnalyticsRecordSource(record), AuthIndex: authIndex,
+	})
+	if matched == nil {
+		return nil
+	}
+	return &matched.Label
+}
+
+// Callers validate authentication before entering this shared resolver: records
+// require raw evidence, while historical options use the persisted catalog/facts.
+func (labels *usageSourceLabelContext) resolve(evidence usageSourceLabelEvidence) *usageSourceLabelMatch {
+	if labels == nil {
+		return nil
+	}
+	provider := strings.TrimSpace(evidence.Provider)
+	if provider == "" {
+		return nil
+	}
+	authIndex := evidence.AuthIndex
+	if model := normalizeModelPriceChannelModel(evidence.Model); model != "" {
 		if strings.TrimSpace(aiProviderOptionalString(authIndex)) == "" {
 			compatibleCount, nativeCount := configuredMissingAuthModelPriceCandidateCounts(labels.modelSelectors, provider, model)
 			if compatibleCount > 0 && nativeCount > 0 {
@@ -119,10 +148,10 @@ func (labels *usageSourceLabelContext) labelFor(record UsageRecord) *string {
 			if count != 1 {
 				return nil
 			}
-			if matched.Brand == aiProviderBrandOpenAICompatibility && labels.hasNativeCredentialConflict(record, provider, authIndex) {
+			if matched.Brand == aiProviderBrandOpenAICompatibility && labels.hasNativeCredentialConflict(evidence.Source, provider, authIndex) {
 				return nil
 			}
-			return labels.channelLabel(record, matched)
+			return labels.channelLabel(evidence.Source, matched)
 		}
 	}
 	if strings.TrimSpace(aiProviderOptionalString(authIndex)) == "" {
@@ -131,22 +160,22 @@ func (labels *usageSourceLabelContext) labelFor(record UsageRecord) *string {
 			if compatibleCount > 0 {
 				return nil
 			}
-			return labels.keyHashLabel(record, provider)
+			return labels.keyHashLabel(evidence.Source, provider)
 		}
 	}
 	matched, count := configuredModelPriceCandidates(labels.selectors, provider, "", authIndex)
 	if count != 1 {
 		return nil
 	}
-	return labels.channelLabel(record, matched)
+	return labels.channelLabel(evidence.Source, matched)
 }
 
-func (labels *usageSourceLabelContext) hasNativeCredentialConflict(record UsageRecord, provider string, authIndexValue *string) bool {
+func (labels *usageSourceLabelContext) hasNativeCredentialConflict(source *string, provider string, authIndexValue *string) bool {
 	brands := matchingNativePriceBrands(provider)
 	if len(brands) == 0 {
 		return false
 	}
-	sourceHash := usageSourceAPIKeyHash(record)
+	sourceHash := usageSourceAPIKeyHash(source)
 	if sourceHash == "" {
 		return false
 	}
@@ -169,7 +198,7 @@ func (labels *usageSourceLabelContext) hasNativeCredentialConflict(record UsageR
 	return false
 }
 
-func (labels *usageSourceLabelContext) channelLabel(record UsageRecord, matched modelPriceChannelIdentity) *string {
+func (labels *usageSourceLabelContext) channelLabel(source *string, matched modelPriceChannelIdentity) *usageSourceLabelMatch {
 	identity := modelPriceChannelAliasKey(modelPriceChannelAuthTypeAPIKey, string(matched.Brand), matched.ChannelKey)
 	channel := labels.channels[identity]
 	// Model evidence cannot make a duplicate alias identity unique or choose
@@ -178,23 +207,23 @@ func (labels *usageSourceLabelContext) channelLabel(record UsageRecord, matched 
 		return nil
 	}
 	if matched.Brand != aiProviderBrandOpenAICompatibility {
-		if sourceHash := usageSourceAPIKeyHash(record); sourceHash != "" && channel.APIKeyHash != "" && sourceHash != channel.APIKeyHash {
+		if sourceHash := usageSourceAPIKeyHash(source); sourceHash != "" && channel.APIKeyHash != "" && sourceHash != channel.APIKeyHash {
 			return nil
 		}
 	}
 	if label := labels.aliases[identity]; label != "" {
-		return &label
+		return &usageSourceLabelMatch{Identity: identity, Label: label}
 	}
 	if matched.Brand == aiProviderBrandOpenAICompatibility {
 		if display, ok := labels.labels[identity]; ok && !display.LabelFallback && display.Label != "" {
-			return &display.Label
+			return &usageSourceLabelMatch{Identity: identity, Label: display.Label}
 		}
 	}
 	return nil
 }
 
-func (labels *usageSourceLabelContext) keyHashLabel(record UsageRecord, provider string) *string {
-	sourceHash := usageSourceAPIKeyHash(record)
+func (labels *usageSourceLabelContext) keyHashLabel(source *string, provider string) *usageSourceLabelMatch {
+	sourceHash := usageSourceAPIKeyHash(source)
 	if sourceHash == "" {
 		return nil
 	}
@@ -213,13 +242,12 @@ func (labels *usageSourceLabelContext) keyHashLabel(record UsageRecord, provider
 		return nil
 	}
 	if label := labels.aliases[matched]; label != "" {
-		return &label
+		return &usageSourceLabelMatch{Identity: matched, Label: label}
 	}
 	return nil
 }
 
-func usageSourceAPIKeyHash(record UsageRecord) string {
-	source := usageAnalyticsRecordSource(record)
+func usageSourceAPIKeyHash(source *string) string {
 	if source == nil {
 		return ""
 	}

@@ -592,9 +592,16 @@ func (a *App) usageOptionsResponse(ctx context.Context, user *AuthUser, filters 
 		type sourceOption struct {
 			Key   string
 			Label string
+			Match *usageSourceLabelMatch
+		}
+		// Load local names before opening rows: the SQLite pool has one connection.
+		labels, err := a.usageSourceLabels(ctx, a.attachCachedBillingPriceSelectors(modelPriceBillingIndex{}).MatchContext)
+		if err != nil {
+			return nil, err
 		}
 		rows, err := a.db.QueryContext(ctx, `
-			SELECT DISTINCT catalog.source_key, catalog.source, catalog.auth, catalog.auth_conflict
+			SELECT DISTINCT catalog.source_key, catalog.source, catalog.auth, catalog.auth_conflict,
+				facts.provider, facts.model, facts.auth, facts.auth_index
 			FROM usage_analytics_facts AS facts
 			JOIN usage_source_catalog AS catalog ON catalog.source_key = facts.source_key
 			`+where+` AND catalog.source IS NOT NULL AND trim(catalog.source) <> ''
@@ -603,12 +610,12 @@ func (a *App) usageOptionsResponse(ctx context.Context, user *AuthUser, filters 
 			return nil, err
 		}
 		defer rows.Close()
-		options := []sourceOption{}
+		byKey := map[string]sourceOption{}
 		for rows.Next() {
 			var key, source string
-			var auth sql.NullString
+			var auth, provider, model, factAuth, authIndex sql.NullString
 			var conflict bool
-			if err := rows.Scan(&key, &source, &auth, &conflict); err != nil {
+			if err := rows.Scan(&key, &source, &auth, &conflict, &provider, &model, &factAuth, &authIndex); err != nil {
 				return nil, err
 			}
 			sourceValue := strings.TrimSpace(source)
@@ -623,10 +630,31 @@ func (a *App) usageOptionsResponse(ctx context.Context, user *AuthUser, filters 
 			if displaySource == nil {
 				continue
 			}
-			options = append(options, sourceOption{Key: key, Label: *displaySource})
+			var matched *usageSourceLabelMatch
+			if !conflict && isAPIKeyAuth(authValue) && usageAuthTypeKey(authValue) == usageAuthTypeKey(nullableString(factAuth)) {
+				matched = labels.resolve(usageSourceLabelEvidence{
+					Provider: provider.String, Model: model.String, Source: &sourceValue, AuthIndex: nullableString(authIndex),
+				})
+			}
+			option, exists := byKey[key]
+			if !exists {
+				option = sourceOption{Key: key, Label: *displaySource, Match: matched}
+			} else if matched == nil || option.Match == nil || option.Match.Identity != matched.Identity {
+				// All evidence must agree on identity, even when aliases are equal.
+				// An unresolved or conflicting row cannot be healed by a later match.
+				option.Match = nil
+			}
+			byKey[key] = option
 		}
 		if err := rows.Err(); err != nil {
 			return nil, err
+		}
+		options := make([]sourceOption, 0, len(byKey))
+		for _, option := range byKey {
+			if option.Match != nil && option.Match.Label != option.Label {
+				option.Label = option.Match.Label + " · " + option.Label
+			}
+			options = append(options, option)
 		}
 		sort.Slice(options, func(i, j int) bool {
 			if options[i].Label == options[j].Label {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, type Component } from 'vue'
+import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -392,6 +392,7 @@ const filterForm = reactive({
     typeof route.query.api_key_description === 'string' ? route.query.api_key_description : null,
   provider: typeof route.query.provider === 'string' ? route.query.provider : null,
   model: typeof route.query.model === 'string' ? route.query.model : null,
+  source_key: typeof route.query.source_key === 'string' ? route.query.source_key : null,
   endpoint: typeof route.query.endpoint === 'string' ? route.query.endpoint : null,
   failed: failedFromQuery(),
 })
@@ -406,6 +407,14 @@ function apiKeyFilterLabel(item: UsageOptionsResponse['api_key_descriptions'][nu
   return item.label?.trim() || item.key
 }
 
+function renderSourceOptionLabel(option: { label: string }) {
+  return h('span', { title: option.label }, option.label)
+}
+
+function sourceFallbackOption(value: string | number) {
+  return { label: t('已选来源', 'Selected source'), value }
+}
+
 const selectOptions = computed(() => ({
   users: options.value.users
     .filter((item) => item.user_id !== null)
@@ -416,6 +425,7 @@ const selectOptions = computed(() => ({
   })),
   providers: options.value.providers.map((item) => ({ label: item, value: item })),
   models: options.value.models.map((item) => ({ label: item, value: item })),
+  sources: options.value.sources.map((item) => ({ label: item.label, value: item.key })),
   endpoints: options.value.endpoints.map((item) => ({ label: item, value: item })),
 }))
 
@@ -509,6 +519,7 @@ function buildFilters(): UsageFilters {
     api_key_description: filterForm.api_key_description ?? undefined,
     provider: filterForm.provider ?? undefined,
     model: filterForm.model ?? undefined,
+    source_key: isAccountScope.value ? undefined : (filterForm.source_key ?? undefined),
     endpoint: filterForm.endpoint ?? undefined,
     failed,
   }
@@ -576,6 +587,11 @@ function handleProviderChange(value: unknown) {
 
 function handleModelChange(value: unknown) {
   filterForm.model = normalizeSelectValue(value)
+  refreshAfterFilterChange()
+}
+
+function handleSourceChange(value: unknown) {
+  filterForm.source_key = normalizeSelectValue(value)
   refreshAfterFilterChange()
 }
 
@@ -1676,6 +1692,17 @@ onBeforeUnmount(() => {
             @update:value="handleModelChange"
           />
           <NSelect
+            v-if="!isAccountScope"
+            :value="filterForm.source_key"
+            :options="selectOptions.sources"
+            :render-label="renderSourceOptionLabel"
+            :fallback-option="sourceFallbackOption"
+            clearable
+            filterable
+            :placeholder="t('来源', 'Source')"
+            @update:value="handleSourceChange"
+          />
+          <NSelect
             :value="filterForm.endpoint"
             :options="selectOptions.endpoints"
             clearable
@@ -2143,7 +2170,7 @@ onBeforeUnmount(() => {
 
 .field-row {
   display: grid;
-  grid-template-columns: repeat(5, minmax(118px, 1fr)) auto;
+  grid-template-columns: repeat(6, minmax(118px, 1fr)) auto;
   gap: 8px;
   align-items: end;
   min-width: 0;

@@ -268,6 +268,14 @@ function apiKeyFilterLabel(item: UsageOptionsResponse['api_key_descriptions'][nu
   return item.label?.trim() || item.key
 }
 
+function renderSourceOptionLabel(option: { label: string }) {
+  return h('span', { title: option.label }, option.label)
+}
+
+function sourceFallbackOption(value: string | number) {
+  return { label: t('已选来源', 'Selected source'), value }
+}
+
 function emptyRankingItem(
   key: string,
   label: string,
@@ -1436,6 +1444,8 @@ onBeforeUnmount(() => {
             v-if="!isAccountScope"
             :value="filterForm.source_key"
             :options="selectOptions.sources"
+            :render-label="renderSourceOptionLabel"
+            :fallback-option="sourceFallbackOption"
             clearable
             filterable
             :placeholder="t('来源', 'Source')"
