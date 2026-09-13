@@ -62,6 +62,7 @@ const exactServerMessages: MessagePair[] = [
   ['渠道身份不完整', 'Channel identity is incomplete'],
   ['渠道名称不能包含控制字符或换行', 'Channel name cannot contain control characters or line breaks'],
   ['渠道名称不能超过 200 个字符', 'Channel name must not exceed 200 characters'],
+  ['OpenAI-compatible 渠道名称请在渠道编辑页修改 Provider 名称', 'Change the Provider name in the channel editor to rename an OpenAI-compatible channel.'],
   ['渠道配置已变化，请刷新后重试', 'Channel configuration changed. Refresh and try again.'],
   ['渠道配置已变化，请刷新页面后重试', 'Channel configuration changed. Refresh and try again.'],
   ['请至少选择一个 LiteLLM 模型', 'Select at least one LiteLLM model'],

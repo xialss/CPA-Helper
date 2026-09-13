@@ -57,6 +57,9 @@ func TestModelPriceCatalogPreservesProviderKeyMask(t *testing.T) {
 		if provider.ChannelKey == "Not-The-API-Key.json" {
 			native = provider
 		}
+		if provider.Brand == aiProviderBrandOpenAICompatibility {
+			continue
+		}
 		requestJSONForPricingTest(t, handler, http.MethodPut, "/api/model-prices/channel-aliases", modelPriceChannelAlias{
 			AuthType: "apikey", ChannelBrand: string(provider.Brand), ChannelKey: provider.ChannelKey,
 			ChannelIdentityHash: provider.IdentityHash, Label: "Display name " + provider.ChannelKey,

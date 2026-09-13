@@ -835,7 +835,7 @@ function providerIdentityLabel(provider: Pick<AIProviderItem, 'name' | 'api_key_
 }
 
 function openAliasEditor(provider: AIProviderItem) {
-  if (providerWriteControlsDisabled.value || !provider.channel_key || !provider.identity_hash) return
+  if (provider.brand === 'openai_compatibility' || providerWriteControlsDisabled.value || !provider.channel_key || !provider.identity_hash) return
   aliasProvider.value = provider
   aliasLabel.value = provider.local_alias ?? ''
   aliasModalOpen.value = true
@@ -1702,7 +1702,7 @@ const columns = computed<DataTableColumns<AIProviderItem>>(() => {
       h('div', { class: 'provider-identity' }, [
         h('div', { class: 'provider-name-row' }, [
           h('strong', { title: providerIdentityLabel(row) }, providerIdentityLabel(row)),
-          row.channel_key && row.identity_hash
+          row.brand !== 'openai_compatibility' && row.channel_key && row.identity_hash
             ? h(NTooltip, {}, {
                 trigger: () => h(NButton, {
                   size: 'tiny', quaternary: true, circle: true, disabled: writeControlsDisabled,

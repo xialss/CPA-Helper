@@ -7,21 +7,32 @@ import (
 	"time"
 )
 
-func TestVersionedCostPreservesBillingUnitWithoutHistoricalPrice(t *testing.T) {
+func TestVersionedCostPreservesBillingUnitAcrossPriceHistory(t *testing.T) {
 	for _, tc := range []struct {
 		name, model, unit, historicalUnit string
 		tokens                            int
 		failed, baseline, atVersion       bool
+		recreated, updated, zeroPrice     bool
 		wantUnit                          string
 		wantCost                          float64
 		wantUnpriced                      bool
 	}{
-		{name: "successful request without tokens", model: "text-job", unit: modelBillingUnitRequest, wantUnit: modelBillingUnitRequest, wantUnpriced: true},
+		{name: "successful request before first price without tokens", model: "text-job", unit: modelBillingUnitRequest, wantUnit: modelBillingUnitRequest, wantCost: 0.04},
 		{name: "failed request without tokens", model: "text-job", unit: modelBillingUnitRequest, failed: true, wantUnit: modelBillingUnitRequest},
 		{name: "failed request with tokens", model: "text-job", unit: modelBillingUnitRequest, tokens: 1000, failed: true, wantUnit: modelBillingUnitRequest},
 		{name: "token model without tokens", model: "text-job", unit: modelBillingUnitToken, wantUnit: modelBillingUnitToken},
 		{name: "image explicitly billed by tokens", model: "image-job", unit: modelBillingUnitToken, wantUnit: modelBillingUnitToken},
-		{name: "token usage without history", model: "image-job", unit: modelBillingUnitToken, tokens: 1000, wantUnit: modelBillingUnitToken, wantUnpriced: true},
+		{name: "token usage before first price", model: "image-job", unit: modelBillingUnitToken, tokens: 1000, wantUnit: modelBillingUnitToken, wantCost: 0.003},
+		{name: "first request price survives an update", model: "text-job", unit: modelBillingUnitRequest, updated: true, wantUnit: modelBillingUnitRequest, wantCost: 0.04},
+		{name: "first token price survives an update", model: "text-job", unit: modelBillingUnitToken, tokens: 1000, updated: true, wantUnit: modelBillingUnitToken, wantCost: 0.003},
+		{name: "zero first request price survives an update", model: "text-job", unit: modelBillingUnitRequest, updated: true, zeroPrice: true, wantUnit: modelBillingUnitRequest},
+		{name: "zero first token price survives an update", model: "text-job", unit: modelBillingUnitToken, tokens: 1000, updated: true, zeroPrice: true, wantUnit: modelBillingUnitToken},
+		{name: "recreated request price without tokens", model: "text-job", unit: modelBillingUnitRequest, recreated: true, wantUnit: modelBillingUnitRequest, wantUnpriced: true},
+		{name: "recreated failed request without tokens", model: "text-job", unit: modelBillingUnitRequest, failed: true, recreated: true, wantUnit: modelBillingUnitRequest},
+		{name: "recreated failed request with tokens", model: "text-job", unit: modelBillingUnitRequest, tokens: 1000, failed: true, recreated: true, wantUnit: modelBillingUnitRequest},
+		{name: "recreated token model without tokens", model: "text-job", unit: modelBillingUnitToken, recreated: true, wantUnit: modelBillingUnitToken},
+		{name: "recreated image explicitly billed by tokens", model: "image-job", unit: modelBillingUnitToken, recreated: true, wantUnit: modelBillingUnitToken},
+		{name: "recreated token usage without history", model: "image-job", unit: modelBillingUnitToken, tokens: 1000, recreated: true, wantUnit: modelBillingUnitToken, wantUnpriced: true},
 		{name: "request at effective boundary", model: "text-job", unit: modelBillingUnitRequest, atVersion: true, wantUnit: modelBillingUnitRequest, wantCost: 0.04},
 		{name: "request before baseline", model: "text-job", unit: modelBillingUnitRequest, baseline: true, wantUnit: modelBillingUnitRequest, wantCost: 0.04},
 		{name: "historical request unit overrides current token unit", model: "text-job", unit: modelBillingUnitToken, historicalUnit: modelBillingUnitRequest, atVersion: true, wantUnit: modelBillingUnitRequest, wantCost: 0.04},
@@ -31,6 +42,9 @@ func TestVersionedCostPreservesBillingUnitWithoutHistoricalPrice(t *testing.T) {
 			brand, provider, requestUSD := string(aiProviderBrandOpenAICompatibility), "jobs", 0.04
 			price := ModelPrice{ID: 22, PriceScope: modelPriceScopeChannel, Provider: provider, Model: tc.model,
 				ChannelBrand: &brand, ChannelKey: &provider, BillingUnit: tc.unit, RequestUSD: &requestUSD, InputUSDPerMillion: 3}
+			if tc.zeroPrice {
+				requestUSD, price.InputUSDPerMillion = 0, 0
+			}
 			at := time.Date(2026, 9, 11, 0, 0, 0, 123456000, time.UTC)
 			key := channelModelPriceKey(modelPriceChannelAuthTypeAPIKey, brand, provider, tc.model)
 			version := price
@@ -38,7 +52,17 @@ func TestVersionedCostPreservesBillingUnitWithoutHistoricalPrice(t *testing.T) {
 				version.BillingUnit = tc.historicalUnit
 			}
 			versions := modelPriceVersionIndex{}
+			if tc.recreated {
+				previous := version
+				previous.ID = 11
+				versions.add(key, modelPriceVersionFromPrice(previous, at.Add(-time.Hour), false))
+			}
 			versions.add(key, modelPriceVersionFromPrice(version, at, tc.baseline))
+			if tc.updated {
+				latestRequestUSD := 0.07
+				price.InputUSDPerMillion, price.RequestUSD = 9, &latestRequestUSD
+				versions.add(key, modelPriceVersionFromPrice(price, at.Add(time.Hour), false))
+			}
 			pricing := modelPriceBillingIndex{
 				Prices: modelPriceIndex{key: price}, Versions: versions,
 				MatchContext: modelPriceMatchContext{Selectors: modelPriceChannelSelectorIndex{}, SelectorsRequired: true, SelectorsAvailable: true},
@@ -102,8 +126,12 @@ func TestVersionedCostPreservesBillingUnitWithoutHistoricalPrice(t *testing.T) {
 }
 
 func TestVersionedCostPreservesRemovedCompatibleChannelTokenSemantics(t *testing.T) {
-	for _, provider := range []string{"claude", "anthropic"} {
-		t.Run(provider, func(t *testing.T) {
+	for _, tc := range []struct {
+		provider  string
+		recreated bool
+	}{{"claude", false}, {"anthropic", false}, {"claude", true}, {"anthropic", true}} {
+		t.Run(tc.provider+"/recreated="+strconv.FormatBool(tc.recreated), func(t *testing.T) {
+			provider := tc.provider
 			brand, model := string(aiProviderBrandOpenAICompatibility), "historical-compatible"
 			price := ModelPrice{ID: 22, PriceScope: modelPriceScopeChannel, Provider: provider, Model: model,
 				ChannelBrand: &brand, ChannelKey: &provider, BillingUnit: modelBillingUnitToken,
@@ -111,6 +139,11 @@ func TestVersionedCostPreservesRemovedCompatibleChannelTokenSemantics(t *testing
 			at := time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC)
 			key := channelModelPriceKey(modelPriceChannelAuthTypeAPIKey, brand, provider, model)
 			versions := modelPriceVersionIndex{}
+			if tc.recreated {
+				previous := price
+				previous.ID = 11
+				versions.add(key, modelPriceVersionFromPrice(previous, at.Add(-time.Hour), false))
+			}
 			versions.add(key, modelPriceVersionFromPrice(price, at, false))
 			pricing := modelPriceBillingIndex{
 				Prices:   modelPriceIndex{key: price},
@@ -121,28 +154,40 @@ func TestVersionedCostPreservesRemovedCompatibleChannelTokenSemantics(t *testing
 			}
 			record := UsageRecord{Provider: &provider, Model: &model, Timestamp: at.Add(-time.Microsecond),
 				InputTokens: 1000, CacheReadTokens: 200, CacheCreationTokens: 100, TotalTokens: 1000}
+			wantCost, wantUnpricedCount := 0.0032, 0
+			if tc.recreated {
+				wantCost, wantUnpricedCount = 0, 1
+			}
 			breakdown := versionedCostBreakdown(record, pricing, true)
 			if breakdown.NormalInputTokens != 700 || breakdown.ContextInputTokens != 1000 || breakdown.CacheReadTokens != 200 || breakdown.CacheCreationTokens != 100 {
 				t.Errorf("pre-version token semantics = normal/context/read/write %d/%d/%d/%d, want 700/1000/200/100",
 					breakdown.NormalInputTokens, breakdown.ContextInputTokens, breakdown.CacheReadTokens, breakdown.CacheCreationTokens)
 			}
-			if !breakdown.Unpriced || breakdown.TotalUSD != 0 || len(breakdown.Items) != 0 ||
-				breakdown.UnpricedReason == nil || *breakdown.UnpricedReason != priceMatchStatusChannelUnpriced {
-				t.Errorf("request before first non-baseline version must stay unpriced: %#v", breakdown)
+			if breakdown.Unpriced != tc.recreated || breakdown.TotalUSD != wantCost {
+				t.Errorf("historical breakdown = %#v, want cost/unpriced %v/%v", breakdown, wantCost, tc.recreated)
 			}
-			if cost, unpriced := recordCostWithBilling(record, pricing); cost != 0 || !unpriced {
-				t.Errorf("pre-version billing cost = %v/%v, want 0/true", cost, unpriced)
+			if tc.recreated {
+				if len(breakdown.Items) != 0 || breakdown.UnpricedReason == nil || *breakdown.UnpricedReason != priceMatchStatusChannelUnpriced {
+					t.Errorf("missing lifecycle history must stay unpriced: %#v", breakdown)
+				}
+			} else if len(breakdown.Items) == 0 || breakdown.UnpricedReason != nil {
+				t.Errorf("first price must provide historical charge items: %#v", breakdown)
+			}
+			if cost, unpriced := recordCostWithBilling(record, pricing); cost != wantCost || unpriced != tc.recreated {
+				t.Errorf("pre-version billing cost = %v/%v, want %v/%v", cost, unpriced, wantCost, tc.recreated)
 			}
 			collector := newUsageAnalyticsCollector(UsageFilters{}, pricing.Prices, pricing.MatchContext, nil, usageAnalyticsCollectorOptions{Summary: true})
 			collector.setBillingPriceIndex(pricing)
 			collector.Add(record)
-			if collector.summary.normalInput != breakdown.NormalInputTokens || collector.summary.input != breakdown.ContextInputTokens || collector.summary.unpriced != 1 {
+			if collector.summary.normalInput != breakdown.NormalInputTokens || collector.summary.input != breakdown.ContextInputTokens ||
+				collector.summary.unpriced != wantUnpricedCount || collector.summary.estimated != wantCost {
 				t.Errorf("detail and aggregate token semantics disagree: detail=%#v summary=%#v", breakdown, collector.summary)
 			}
 			builder := newUsageAnalyticsHourlyBuilder(pricing.Prices, pricing.Versions, pricing.MatchContext)
 			builder.add(record)
 			for _, group := range builder.groups {
-				if group.normalInputTokens != int64(breakdown.NormalInputTokens) || group.aggregateInputTokens != int64(breakdown.ContextInputTokens) || group.unpricedRecords != 1 {
+				if group.normalInputTokens != int64(breakdown.NormalInputTokens) || group.aggregateInputTokens != int64(breakdown.ContextInputTokens) ||
+					group.unpricedRecords != int64(wantUnpricedCount) || group.estimatedCostUSD != wantCost {
 					t.Errorf("detail and hourly token semantics disagree: detail=%#v hourly=%#v", breakdown, group)
 				}
 			}
@@ -177,6 +222,8 @@ func TestLoadModelPriceVersionsPreservesLifecycleLookupSemantics(t *testing.T) {
 		baseline bool
 	}{
 		{"legacy", nil, 0, 1, true},
+		{"first", 22, time.Hour, 5, false},
+		{"first", 22, 0, 3, false},
 		{"mixed", 11, -2 * time.Hour, 2, true},
 		{"mixed", 22, time.Hour, 5, false}, // Insert out of time order.
 		{"mixed", nil, -3 * time.Hour, 1, true},
@@ -205,6 +252,9 @@ func TestLoadModelPriceVersionsPreservesLifecycleLookupSemantics(t *testing.T) {
 	}{
 		{"legacy baseline before start", "legacy", 22, -time.Microsecond, 1, false},
 		{"legacy chain without lifecycle IDs", "legacy", 22, time.Hour, 1, false},
+		{"first price before start", "first", 22, -time.Hour, 3, false},
+		{"first price at boundary", "first", 22, 0, 3, false},
+		{"later price at boundary", "first", 22, time.Hour, 5, false},
 		{"prior lifecycle baseline", "mixed", 11, -4 * time.Hour, 2, false},
 		{"prior lifecycle after recreation", "mixed", 11, 2 * time.Hour, 2, false},
 		{"recreated lifecycle cannot inherit baseline", "mixed", 22, -time.Microsecond, 0, true},

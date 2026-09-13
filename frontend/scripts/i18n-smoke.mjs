@@ -10,7 +10,9 @@ const languageStorageKey = 'cpa-helper-language'
 const server = await createServer({
   root,
   logLevel: 'error',
-  server: { middlewareMode: true },
+  // SSR-only assertions do not need client dependency scanning or listeners.
+  optimizeDeps: { noDiscovery: true, include: [] },
+  server: { middlewareMode: true, hmr: false, ws: false, watch: null },
 })
 
 let moduleCase = 0

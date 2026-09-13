@@ -174,8 +174,18 @@ func TestModelPriceChannelAliasLifecycleAndValidation(t *testing.T) {
 	if _, err := a.upsertModelPriceChannelAlias(ctx, payload); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.upsertModelPriceChannelAlias(ctx, compatibilityPayload); err != nil {
-		t.Fatalf("OpenAI-compatible channel alias was rejected: %v", err)
+	_, err = a.upsertModelPriceChannelAlias(ctx, compatibilityPayload)
+	var aliasError *AppError
+	if !errors.As(err, &aliasError) || aliasError.Code != "validation_error" || aliasError.Status != http.StatusUnprocessableEntity || !strings.Contains(aliasError.Message, "Provider 名称") {
+		t.Fatalf("OpenAI-compatible alias must direct users to edit the Provider name: %v", err)
+	}
+	var compatibilityAliasCount int
+	if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_price_channel_aliases WHERE channel_brand = ?`, compatibilityPayload.ChannelBrand).Scan(&compatibilityAliasCount); err != nil || compatibilityAliasCount != 0 {
+		t.Fatalf("rejected compatible alias was persisted: count=%d error=%v", compatibilityAliasCount, err)
+	}
+	// Legacy aliases stay stored, but cannot override the Provider name.
+	if _, err := a.db.ExecContext(ctx, `INSERT INTO model_price_channel_aliases (auth_type, channel_brand, channel_key, label) VALUES (?, ?, ?, ?)`, compatibilityPayload.AuthType, compatibilityPayload.ChannelBrand, compatibilityPayload.ChannelKey, compatibilityPayload.Label); err != nil {
+		t.Fatal(err)
 	}
 	afterSelectors, afterLabels, afterSourceChannels, available := a.priceSelectors.snapshotWithLabels()
 	if !available || !reflect.DeepEqual(beforeSelectors, afterSelectors) || !reflect.DeepEqual(beforeLabels, afterLabels) || !reflect.DeepEqual(beforeSourceChannels, afterSourceChannels) {
@@ -196,8 +206,8 @@ func TestModelPriceChannelAliasLifecycleAndValidation(t *testing.T) {
 			break
 		}
 	}
-	if compatibilitySnapshot == nil || compatibilitySnapshot.ChannelAlias != compatibilityPayload.Label || compatibilitySnapshot.ChannelKey != compatibilityPayload.ChannelKey || compatibilitySnapshot.IdentityHash != compatibility.IdentityHash || aiProviderOptionalString(compatibilitySnapshot.Name) != "Compat Vendor" {
-		t.Fatalf("OpenAI-compatible alias changed its upstream identity: %#v", compatibilitySnapshot)
+	if compatibilitySnapshot == nil || compatibilitySnapshot.ChannelAlias != "" || compatibilitySnapshot.ChannelKey != compatibilityPayload.ChannelKey || compatibilitySnapshot.IdentityHash != compatibility.IdentityHash || aiProviderOptionalString(compatibilitySnapshot.Name) != "Compat Vendor" {
+		t.Fatalf("legacy OpenAI-compatible alias displaced its Provider name or identity: %#v", compatibilitySnapshot)
 	}
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {
@@ -210,13 +220,20 @@ func TestModelPriceChannelAliasLifecycleAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	compatibleCatalogRows := 0
 	for _, row := range catalog.Models {
 		if row.ChannelKey == "Auth.json" && (row.ChannelLabel != payload.Label || row.ChannelLabelFallback || row.ChannelAlias != payload.Label) {
 			t.Fatalf("catalog omitted alias: %#v", row)
 		}
-		if row.ChannelBrand == string(aiProviderBrandOpenAICompatibility) && row.ChannelKey == compatibilityPayload.ChannelKey && (row.ChannelLabel != compatibilityPayload.Label || row.ChannelLabelFallback || row.ChannelAlias != compatibilityPayload.Label) {
-			t.Fatalf("catalog omitted OpenAI-compatible alias: %#v", row)
+		if row.ChannelBrand == string(aiProviderBrandOpenAICompatibility) && row.ChannelKey == compatibilityPayload.ChannelKey {
+			compatibleCatalogRows++
+			if row.ChannelLabel != "Compat Vendor" || row.ChannelLabelFallback || row.ChannelAlias != "" {
+				t.Fatalf("catalog legacy alias displaced the OpenAI-compatible Provider name: %#v", row)
+			}
 		}
+	}
+	if compatibleCatalogRows != 1 {
+		t.Fatalf("compatible catalog rows = %d, want 1", compatibleCatalogRows)
 	}
 	masked := providers[0]
 	newMask := "changed...mask"
@@ -268,9 +285,9 @@ func TestModelPriceChannelAliasLifecycleAndValidation(t *testing.T) {
 			t.Fatalf("accepted invalid alias %#v", invalid)
 		}
 	}
-	// Local aliases remain available to label historical prices after removal.
+	// Only native aliases remain available for historical display.
 	aliases, err := a.listModelPriceChannelAliases(ctx)
-	if err != nil || len(aliases) != 2 || !modelPriceAliasExists(aliases, payload) || !modelPriceAliasExists(aliases, compatibilityPayload) {
+	if err != nil || len(aliases) != 1 || !modelPriceAliasExists(aliases, payload) {
 		t.Fatalf("persisted aliases = %#v %v", aliases, err)
 	}
 	handler := a.Routes()
@@ -278,11 +295,22 @@ func TestModelPriceChannelAliasLifecycleAndValidation(t *testing.T) {
 	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{"username": "admin", "password": "test-password", "nickname": "Admin"}, nil, nil)
 	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices/sync/litellm", map[string]any{"models": []string{}}, cookies, http.StatusUnprocessableEntity)
 	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPost, "/api/model-prices/sync/litellm", map[string]any{}, cookies, http.StatusUnprocessableEntity)
+	legacyLabel := compatibilityPayload.Label
 	compatibilityPayload.Label = "Friendly compatibility channel via API"
-	var savedCompatibilityAlias modelPriceChannelAlias
-	requestJSONForPricingTest(t, handler, http.MethodPut, "/api/model-prices/channel-aliases", compatibilityPayload, cookies, &savedCompatibilityAlias)
-	if savedCompatibilityAlias.Label != compatibilityPayload.Label || savedCompatibilityAlias.ChannelKey != compatibilityPayload.ChannelKey {
-		t.Fatalf("OpenAI-compatible alias API result = %#v", savedCompatibilityAlias)
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPut, "/api/model-prices/channel-aliases", compatibilityPayload, cookies, http.StatusUnprocessableEntity)
+	var storedCompatibilityLabel string
+	if err := a.db.QueryRowContext(ctx, `SELECT label FROM model_price_channel_aliases WHERE channel_brand = ? AND channel_key = ?`, compatibilityPayload.ChannelBrand, compatibilityPayload.ChannelKey).Scan(&storedCompatibilityLabel); err != nil || storedCompatibilityLabel != legacyLabel {
+		t.Fatalf("legacy compatible alias was changed or removed: label=%q error=%v", storedCompatibilityLabel, err)
+	}
+	payload.Label = "Primary upstream via API"
+	var savedAlias modelPriceChannelAlias
+	requestJSONForPricingTest(t, handler, http.MethodPut, "/api/model-prices/channel-aliases", payload, cookies, &savedAlias)
+	if savedAlias.Label != payload.Label || savedAlias.ChannelKey != payload.ChannelKey || savedAlias.ChannelIdentityHash != payload.ChannelIdentityHash {
+		t.Fatalf("native alias API result = %#v", savedAlias)
+	}
+	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/model-prices/channel-aliases", nil, cookies, &aliases)
+	if len(aliases) != 1 || !modelPriceAliasExists(aliases, payload) {
+		t.Fatalf("alias API exposed legacy compatible names: %#v", aliases)
 	}
 	payload.Label = ""
 	requestJSONForPricingTest(t, handler, http.MethodPut, "/api/model-prices/channel-aliases", payload, cookies, nil)
@@ -291,6 +319,9 @@ func TestModelPriceChannelAliasLifecycleAndValidation(t *testing.T) {
 	aliases, err = a.listModelPriceChannelAliases(ctx)
 	if err != nil || len(aliases) != 0 {
 		t.Fatalf("reset did not delete alias: %#v %v", aliases, err)
+	}
+	if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_price_channel_aliases`).Scan(&compatibilityAliasCount); err != nil || compatibilityAliasCount != 0 {
+		t.Fatalf("explicit reset did not delete legacy compatible alias: count=%d error=%v", compatibilityAliasCount, err)
 	}
 	if _, err := a.db.Exec(`DROP TABLE model_price_channel_aliases`); err != nil {
 		t.Fatal(err)
@@ -312,29 +343,32 @@ func TestModelPriceChannelAliasCanClearAfterProviderRemoval(t *testing.T) {
 	defer a.Close()
 
 	ctx := context.Background()
-	const (
-		brand = "gemini"
-		key   = "removed-auth.json"
-	)
-	if _, err := a.db.ExecContext(ctx, `INSERT INTO model_price_channel_aliases (auth_type, channel_brand, channel_key, label) VALUES ('apikey', ?, ?, ?)`, brand, key, "Former upstream"); err != nil {
-		t.Fatal(err)
-	}
-	// The upstream provider no longer exists in the current snapshot. Clearing
-	// display metadata remains a local, idempotent delete keyed by identity.
-	if _, err := a.upsertModelPriceChannelAlias(ctx, modelPriceChannelAlias{
-		AuthType:     "apikey",
-		ChannelBrand: brand,
-		ChannelKey:   key,
-		Label:        "",
-	}); err != nil {
-		t.Fatalf("clear alias after provider removal: %v", err)
-	}
-	var count int
-	if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_price_channel_aliases WHERE channel_brand=? AND channel_key=?`, brand, key).Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 0 {
-		t.Fatalf("removed-provider alias rows = %d, want 0", count)
+	for _, test := range []struct{ brand, key string }{
+		{"gemini", "removed-auth.json"},
+		{"openai_compatibility", "Removed Vendor"},
+	} {
+		t.Run(test.brand, func(t *testing.T) {
+			key := canonicalModelPriceChannelKey(test.brand, test.key)
+			if _, err := a.db.ExecContext(ctx, `INSERT INTO model_price_channel_aliases (auth_type, channel_brand, channel_key, label) VALUES ('apikey', ?, ?, ?)`, test.brand, key, "Former upstream"); err != nil {
+				t.Fatal(err)
+			}
+			// Clearing remains local even without upstream settings or an identity hash.
+			if _, err := a.upsertModelPriceChannelAlias(ctx, modelPriceChannelAlias{
+				AuthType:     "apikey",
+				ChannelBrand: test.brand,
+				ChannelKey:   test.key,
+				Label:        "",
+			}); err != nil {
+				t.Fatalf("clear alias after provider removal: %v", err)
+			}
+			var count int
+			if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_price_channel_aliases WHERE channel_brand=? AND channel_key=?`, test.brand, key).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 0 {
+				t.Fatalf("removed-provider alias rows = %d, want 0", count)
+			}
+		})
 	}
 }
 

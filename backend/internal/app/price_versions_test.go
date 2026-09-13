@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func TestHistoricalRequestWithoutPriceVersionRemainsUnpricedInQuota(t *testing.T) {
+func TestHistoricalRequestBeforeFirstPriceIsChargedWhenCollectedLater(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	ctx := context.Background()
 	a, err := NewWithOptions(ctx, NewOptions{Migrate: true, StartBackground: false})
@@ -51,23 +51,133 @@ func TestHistoricalRequestWithoutPriceVersionRemainsUnpricedInQuota(t *testing.T
 	if err != nil || !created {
 		t.Fatalf("save delayed usage created=%v err=%v", created, err)
 	}
-	if cost, unpriced := recordCostWithBilling(record, pricing); cost != 0 || !unpriced {
-		t.Errorf("delayed request cost/unpriced = %v/%v, want 0/true", cost, unpriced)
+	if cost, unpriced := recordCostWithBilling(record, pricing); cost != requestUSD || unpriced {
+		t.Errorf("delayed request cost/unpriced = %v/%v, want %v/false", cost, unpriced, requestUSD)
 	}
 	user, err := a.getUser(ctx, userID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != lifetime || user.QuotaUnpricedRecords != 1 {
-		t.Errorf("quota = %#v, want unchanged balance and one unpriced record", user)
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != lifetime-requestUSD || user.QuotaUnpricedRecords != 0 {
+		t.Errorf("quota = %#v, want request charge and no unpriced records", user)
 	}
 	var amount float64
 	var unpriced bool
 	if err := a.db.QueryRow(`SELECT amount_usd, unpriced FROM user_quota_charges WHERE usage_record_id = ?`, record.ID).Scan(&amount, &unpriced); err != nil {
 		t.Fatal(err)
 	}
-	if amount != 0 || !unpriced {
-		t.Errorf("persisted charge = %v/%v, want 0/true", amount, unpriced)
+	if amount != requestUSD || unpriced {
+		t.Errorf("persisted charge = %v/%v, want %v/false", amount, unpriced, requestUSD)
+	}
+}
+
+func TestFirstChannelPriceRepricesHistoryWithoutRewritingQuotaCharges(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	ctx := context.Background()
+	a, err := NewWithOptions(ctx, NewOptions{Migrate: true, StartBackground: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	userID := seedQuotaTestUser(t, a, "member")
+	apiKey, lifetime := "sk-first-channel-price", 5.0
+	seedQuotaTestAPIKey(t, a, userID, apiKey)
+	if _, err := a.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
+		t.Fatal(err)
+	}
+	pricing, err := a.billingPriceIndexWithoutSelectors(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := "first-channel-price"
+	message := map[string]any{
+		"api_key": apiKey, "provider": "codex", "model": model, "auth_type": "oauth",
+		"timestamp": dbTime(time.Now().Add(-time.Hour)), "input_tokens": 1000000, "request_id": "before-first-price",
+	}
+	raw, err := json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, created, err := a.saveUsageMessage(ctx, raw, pricing)
+	if err != nil || !created {
+		t.Fatalf("save initial usage created=%v err=%v", created, err)
+	}
+	if cost, unpriced := recordCostWithBilling(record, pricing); cost != 0 || !unpriced {
+		t.Fatalf("usage before pricing = %v/%v, want 0/true", cost, unpriced)
+	}
+
+	id := seedCorrectionTestChannelPrice(t, a, model, 2)
+	for _, input := range []float64{2, 3} {
+		if _, err := a.updatePrice(ctx, id, correctionTestPayload(model, input, false)); err != nil {
+			t.Fatal(err)
+		}
+		pricing, err = a.billingPriceIndexWithoutSelectors(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cost, unpriced := recordCostWithBilling(record, pricing); cost != 2 || unpriced {
+			t.Errorf("historical cost after saving %v = %v/%v, want first price 2/false", input, cost, unpriced)
+		}
+		if err := a.applyQuotaCharge(ctx, record, pricing); err != nil {
+			t.Fatal(err)
+		}
+		var amount float64
+		var unpriced bool
+		if err := a.db.QueryRow(`SELECT amount_usd, unpriced FROM user_quota_charges WHERE usage_record_id = ?`, record.ID).Scan(&amount, &unpriced); err != nil {
+			t.Fatal(err)
+		}
+		if amount != 0 || !unpriced {
+			t.Errorf("settled unpriced charge changed after saving %v: %v/%v", input, amount, unpriced)
+		}
+	}
+	user, err := a.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != lifetime || user.QuotaUnpricedRecords != 1 {
+		t.Errorf("settled quota changed after repricing: %#v", user)
+	}
+
+	// A delayed request has no settled charge yet and uses the first price,
+	// even when collection happens after the second price was saved.
+	message["request_id"] = "delayed-before-first-price"
+	raw, err = json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delayed, created, err := a.saveUsageMessage(ctx, raw, pricing)
+	if err != nil || !created {
+		t.Fatalf("save delayed usage created=%v err=%v", created, err)
+	}
+	var amount float64
+	var unpriced bool
+	if err := a.db.QueryRow(`SELECT amount_usd, unpriced FROM user_quota_charges WHERE usage_record_id = ?`, delayed.ID).Scan(&amount, &unpriced); err != nil {
+		t.Fatal(err)
+	}
+	if amount != 2 || unpriced {
+		t.Errorf("delayed charge = %v/%v, want first price 2/false", amount, unpriced)
+	}
+	user, err = a.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != lifetime-2 || user.QuotaUnpricedRecords != 1 {
+		t.Errorf("quota after delayed collection = %#v, want only the new charge deducted", user)
+	}
+
+	if err := a.deletePrice(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	recreatedID := seedCorrectionTestChannelPrice(t, a, model, 4)
+	if _, err := a.updatePrice(ctx, recreatedID, correctionTestPayload(model, 4, false)); err != nil {
+		t.Fatal(err)
+	}
+	pricing, err = a.billingPriceIndexWithoutSelectors(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cost, unpriced := recordCostWithBilling(record, pricing); cost != 0 || !unpriced {
+		t.Errorf("recreated price crossed the lifecycle boundary: %v/%v, want 0/true", cost, unpriced)
 	}
 }
 
