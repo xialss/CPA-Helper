@@ -205,24 +205,32 @@ func TestUsageSourceLabelsUnpricedAliasLifecycleRoutes(t *testing.T) {
 		}
 		assertSourceOption(nativeSource, label)
 	}
-	writeAlias(aiProviderBrandGemini, "Shared display name")
-	for _, label := range []string{"Shared display name", "Renamed compatibility", ""} {
-		writeAlias(aiProviderBrandOpenAICompatibility, label)
-		want := label
-		if want == "" {
-			want = "Fixture Vendor"
-		}
-		item := readDetail(compatibleID, "admin", adminCookies)
-		if aiProviderOptionalString(item.SourceLabel) != want || item.Source == compatibilityKey {
-			t.Fatalf("compatible alias/fallback response = %#v, want %q", item, want)
-		}
-		all := readRecords("/api/usage/records?scope=admin", adminCookies)
-		if all.Total != 2 || len(all.Items) != 2 {
-			t.Fatal("duplicate display names merged channels")
-		}
-		assertSourceOption(compatibilityKey, want)
+	writeAlias(aiProviderBrandGemini, "Fixture Vendor")
+	compatibilityProvider := providerByBrand[aiProviderBrandOpenAICompatibility]
+	legacyAlias := modelPriceChannelAlias{
+		AuthType: "apikey", ChannelBrand: string(aiProviderBrandOpenAICompatibility), ChannelKey: compatibilityProvider.ChannelKey,
+		ChannelIdentityHash: compatibilityProvider.IdentityHash, Label: "Private administrator alias",
 	}
-	writeAlias(aiProviderBrandOpenAICompatibility, "Private administrator alias")
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPut, "/api/model-prices/channel-aliases", legacyAlias, memberCookies, http.StatusForbidden)
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodGet, "/api/model-prices/channel-aliases", nil, memberCookies, http.StatusForbidden)
+	requestJSONForPricingTestExpectStatus(t, handler, http.MethodPut, "/api/model-prices/channel-aliases", legacyAlias, adminCookies, http.StatusUnprocessableEntity)
+	if _, err := a.db.Exec(`INSERT INTO model_price_channel_aliases (auth_type, channel_brand, channel_key, label) VALUES (?, ?, ?, ?)`, legacyAlias.AuthType, legacyAlias.ChannelBrand, legacyAlias.ChannelKey, legacyAlias.Label); err != nil {
+		t.Fatal(err)
+	}
+	item := readDetail(compatibleID, "admin", adminCookies)
+	if aiProviderOptionalString(item.SourceLabel) != "Fixture Vendor" || item.Source == compatibilityKey {
+		t.Fatalf("legacy compatible alias displaced the Provider name: %#v", item)
+	}
+	all := readRecords("/api/usage/records?scope=admin", adminCookies)
+	if all.Total != 2 || len(all.Items) != 2 {
+		t.Fatal("duplicate display names merged channels")
+	}
+	for _, item := range all.Items {
+		if aiProviderOptionalString(item.SourceLabel) != "Fixture Vendor" {
+			t.Fatalf("source list disagrees with configured channel names: %#v", item)
+		}
+	}
+	assertSourceOption(compatibilityKey, "Fixture Vendor")
 	for _, path := range []string{"/api/usage/records?scope=account", "/api/usage/records?scope=admin"} {
 		member := readRecords(path, memberCookies)
 		if member.Total != 1 || len(member.Items) != 1 || member.Items[0].ID != compatibleID || member.Items[0].SourceLabel != nil {
@@ -237,7 +245,7 @@ func TestUsageSourceLabelsUnpricedAliasLifecycleRoutes(t *testing.T) {
 	}
 	requestJSONForPricingTestExpectStatus(t, handler, http.MethodGet, fmt.Sprintf("/api/usage/records/%d?scope=admin", nativeID), nil, memberCookies, http.StatusNotFound)
 	requestJSONForPricingTestExpectStatus(t, handler, http.MethodGet, "/api/usage/records?scope=admin", nil, nil, http.StatusUnauthorized)
-	assertSourceOption(nativeSource, "Shared display name")
+	assertSourceOption(nativeSource, "Fixture Vendor")
 	var storedSource, storedRaw string
 	if err := a.db.QueryRow(`SELECT source, raw_json FROM usage_records WHERE id = ?`, nativeID).Scan(&storedSource, &storedRaw); err != nil {
 		t.Fatal(err)
@@ -343,14 +351,14 @@ func TestUsageSourceLabelIdentityEvidence(t *testing.T) {
 		{"google has one exact native selector", google, []aiProviderItem{native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), native(aiProviderBrandVertex, "Vertex.json", "fixture-key-two")}, []modelPriceChannelAlias{nativeAlias}, "Primary"},
 		{"model uniquely selects Gemini over Vertex", google, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), *baseRecord.Model), withModels(native(aiProviderBrandVertex, "Auth.json", "fixture-key-two"), "other-model")}, []modelPriceChannelAlias{nativeAlias}, "Primary"},
 		{"model uniquely selects native over compatible", baseRecord, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), *baseRecord.Model), withModels(compatible("gemini"), "other-model")}, []modelPriceChannelAlias{nativeAlias}, "Primary"},
-		{"model uniquely selects compatible over native", nativeNamedCompat, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), "other-model"), withModels(compatible("gemini"), *baseRecord.Model)}, []modelPriceChannelAlias{alias("openai_compatibility", "gemini", "Compatibility")}, "Compatibility"},
+		{"model uniquely selects compatible over native", nativeNamedCompat, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), "other-model"), withModels(compatible("gemini"), *baseRecord.Model)}, []modelPriceChannelAlias{alias("openai_compatibility", "gemini", "Compatibility")}, "gemini"},
 		{"model change rejects native credentials before compatible alias", baseRecord, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), "other-model"), sameNameCompatible}, []modelPriceChannelAlias{nativeAlias, alias("openai_compatibility", "gemini", "Compatibility")}, ""},
 		{"model change rejects native credentials before compatible upstream name", baseRecord, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), "other-model"), sameNameCompatible}, []modelPriceChannelAlias{nativeAlias}, ""},
 		{"model change rejects keyhash credentials before compatible alias", noIndex, []aiProviderItem{withModels(native(aiProviderBrandGemini, "", "fixture-key-one"), "other-model"), sameNameCompatible}, []modelPriceChannelAlias{hashAlias, alias("openai_compatibility", "gemini", "Compatibility")}, ""},
 		{"model change rejects duplicate native credentials before compatible alias", baseRecord, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), "other-model"), withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-two"), "other-model"), sameNameCompatible}, []modelPriceChannelAlias{nativeAlias, alias("openai_compatibility", "gemini", "Compatibility")}, ""},
 		{"model change rejects reversed duplicate native credentials before compatible alias", baseRecord, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-two"), "other-model"), withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), "other-model"), sameNameCompatible}, []modelPriceChannelAlias{nativeAlias, alias("openai_compatibility", "gemini", "Compatibility")}, ""},
-		{"model match keeps compatible alias for a different complete key", wrongSource, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), "other-model"), sameNameCompatible}, []modelPriceChannelAlias{nativeAlias, alias("openai_compatibility", "gemini", "Compatibility")}, "Compatibility"},
-		{"model match keeps compatible alias without masked key evidence", masked, []aiProviderItem{withModels(native(aiProviderBrandGemini, "", "fixture-key-one"), "other-model"), sameNameCompatible}, []modelPriceChannelAlias{hashAlias, alias("openai_compatibility", "gemini", "Compatibility")}, "Compatibility"},
+		{"model match keeps compatible Provider name for a different complete key", wrongSource, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), "other-model"), sameNameCompatible}, []modelPriceChannelAlias{nativeAlias, alias("openai_compatibility", "gemini", "Compatibility")}, "gemini"},
+		{"model match keeps compatible Provider name without masked key evidence", masked, []aiProviderItem{withModels(native(aiProviderBrandGemini, "", "fixture-key-one"), "other-model"), sameNameCompatible}, []modelPriceChannelAlias{hashAlias, alias("openai_compatibility", "gemini", "Compatibility")}, "gemini"},
 		{"same model native and compatible conflict", baseRecord, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), *baseRecord.Model), withModels(compatible("gemini"), *baseRecord.Model)}, []modelPriceChannelAlias{nativeAlias}, ""},
 		{"same model conflict without auth index", nativeNamedCompat, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), *baseRecord.Model), withModels(compatible("gemini"), *baseRecord.Model)}, []modelPriceChannelAlias{alias("openai_compatibility", "gemini", "Compatibility")}, ""},
 		{"model match rejects mismatched source hash", wrongSource, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), *baseRecord.Model)}, []modelPriceChannelAlias{nativeAlias}, ""},
@@ -360,7 +368,7 @@ func TestUsageSourceLabelIdentityEvidence(t *testing.T) {
 		{"duplicate native identity with different models rejects reversed hashes", baseRecord, []aiProviderItem{withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-two"), "other-model"), withModels(native(aiProviderBrandGemini, "Auth.json", "fixture-key-one"), *baseRecord.Model)}, []modelPriceChannelAlias{nativeAlias}, ""},
 		{"duplicate compatible identity with different models", compat, []aiProviderItem{withModels(compatible("Fixture Vendor"), *baseRecord.Model), withModels(compatible("fixture vendor"), "other-model")}, []modelPriceChannelAlias{alias("openai_compatibility", "fixture vendor", "Compatibility")}, ""},
 		{"compatible upstream name", compat, []aiProviderItem{compatible("Fixture Vendor")}, nil, "Fixture Vendor"},
-		{"compatible prefix and canonical alias", compat, []aiProviderItem{compatible("Fixture Vendor")}, []modelPriceChannelAlias{alias("openai_compatibility", "FIXTURE VENDOR", "Compatibility")}, "Compatibility"},
+		{"compatible prefix ignores legacy canonical alias", compat, []aiProviderItem{compatible("Fixture Vendor")}, []modelPriceChannelAlias{alias("openai_compatibility", "FIXTURE VENDOR", "Compatibility")}, "Fixture Vendor"},
 		{"compatible exact and prefix candidates conflict", compat, []aiProviderItem{compatible("Fixture Vendor"), compatible("openai-compatible-fixture vendor")}, nil, ""},
 		{"duplicate compatible names conflict", compat, []aiProviderItem{compatible("Fixture Vendor"), compatible("fixture vendor")}, nil, ""},
 		{"missing record auth index is not inferred", noIndex, []aiProviderItem{native(aiProviderBrandGemini, "Auth.json", "fixture-key-one")}, []modelPriceChannelAlias{nativeAlias}, ""},
@@ -368,7 +376,7 @@ func TestUsageSourceLabelIdentityEvidence(t *testing.T) {
 		{"keyhash rejects masked source", masked, []aiProviderItem{native(aiProviderBrandGemini, "", "fixture-key-one")}, []modelPriceChannelAlias{hashAlias}, ""},
 		{"keyhash rejects duplicate credential", noIndex, []aiProviderItem{native(aiProviderBrandGemini, "", "fixture-key-one"), native(aiProviderBrandGemini, "Auth.json", "fixture-key-one")}, []modelPriceChannelAlias{hashAlias}, ""},
 		{"retained exact historical identity", baseRecord, nil, []modelPriceChannelAlias{nativeAlias}, "Primary"},
-		{"retained compatible name", compat, nil, []modelPriceChannelAlias{alias("openai_compatibility", "fixture vendor", "Historical vendor")}, "Historical vendor"},
+		{"removed compatible provider ignores retained alias", compat, nil, []modelPriceChannelAlias{alias("openai_compatibility", "fixture vendor", "Historical vendor")}, ""},
 		{"historical keyhash still requires current evidence", noIndex, nil, []modelPriceChannelAlias{hashAlias}, ""},
 		{"missing provider", missingProvider, []aiProviderItem{native(aiProviderBrandGemini, "Auth.json", "fixture-key-one")}, []modelPriceChannelAlias{nativeAlias}, ""},
 	}

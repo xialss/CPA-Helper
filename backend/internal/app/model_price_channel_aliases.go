@@ -17,7 +17,9 @@ type modelPriceChannelAlias struct {
 }
 
 func (a *App) listModelPriceChannelAliases(ctx context.Context) ([]modelPriceChannelAlias, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT auth_type, channel_brand, channel_key, label FROM model_price_channel_aliases ORDER BY channel_brand, channel_key`)
+	// Compatible channels use the configured Provider name. Keep legacy aliases
+	// stored for explicit clearing, but never use them for display.
+	rows, err := a.db.QueryContext(ctx, `SELECT auth_type, channel_brand, channel_key, label FROM model_price_channel_aliases WHERE channel_brand <> ? ORDER BY channel_brand, channel_key`, string(aiProviderBrandOpenAICompatibility))
 	if err != nil {
 		return nil, err
 	}
@@ -39,8 +41,8 @@ func modelPriceChannelAliasKey(authType, brand, channelKey string) modelPriceCha
 
 func modelPriceChannelAliasSelector(provider aiProviderItem) string {
 	key, _, _ := modelPriceChannelSelector(provider)
-	// OpenAI-compatible providers use their canonical upstream name as the
-	// stable selector. A local alias is display-only and must not replace it.
+	// OpenAI-compatible providers keep their canonical upstream name as the
+	// stable selector, including when clearing a legacy local alias.
 	if key == "" && provider.Brand != aiProviderBrandOpenAICompatibility {
 		if hash := strings.TrimSpace(aiProviderOptionalString(provider.APIKeyHash)); hash != "" {
 			return "keyhash:" + hash
@@ -74,6 +76,9 @@ func (a *App) upsertModelPriceChannelAlias(ctx context.Context, payload modelPri
 			return payload, err
 		}
 		return payload, nil
+	}
+	if payload.ChannelBrand == string(aiProviderBrandOpenAICompatibility) {
+		return payload, validationError("OpenAI-compatible 渠道名称请在渠道编辑页修改 Provider 名称")
 	}
 	// Names are display metadata; resolve the current credential without changing
 	// its upstream config or invalidating the billing selector snapshot.

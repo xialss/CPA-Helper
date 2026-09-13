@@ -1555,7 +1555,6 @@ function isModelPriceChannelAliasBrand(brand: string | null): brand is AIProvide
     case 'gemini':
     case 'codex':
     case 'claude':
-    case 'openai_compatibility':
     case 'vertex':
     case 'xai':
       return true
@@ -2728,9 +2727,7 @@ onBeforeUnmount(() => {
         </NFormItem>
         <div class="model-sub">
           {{ channelBrandLabel(aliasIdentity.channel_brand) }} ·
-          {{ aliasIdentity.channel_brand === 'openai_compatibility'
-            ? `${t('上游名称', 'Upstream name')}: ${aliasIdentity.channel_key}`
-            : aliasAPIKeyMasked || t('Key 不可用', 'Key unavailable') }}
+          {{ aliasAPIKeyMasked || t('Key 不可用', 'Key unavailable') }}
         </div>
       </NForm>
       <template #footer>

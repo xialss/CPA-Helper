@@ -196,12 +196,12 @@ func TestUsageSourceOptionsRequireConsistentIdentity(t *testing.T) {
 		{
 			name:      "different full credential allows compatible model selection",
 			providers: []aiProviderItem{native(aiProviderBrandGemini, "Auth.json", "other-key", "other"), compatible("gemini", "one")},
-			aliases:   []modelPriceChannelAlias{nativeAlias, compatibleAlias}, rows: []evidence{base}, wantName: "Compatible name",
+			aliases:   []modelPriceChannelAlias{nativeAlias, compatibleAlias}, rows: []evidence{base}, wantName: "gemini",
 		},
 		{
 			name:      "masked source is not surviving native credential evidence",
 			providers: []aiProviderItem{native(aiProviderBrandGemini, "", originalSource, "other"), compatible("gemini", "one")},
-			aliases:   []modelPriceChannelAlias{compatibleAlias}, rows: []evidence{noIndex}, source: "sk-opt...3456", wantName: "Compatible name",
+			aliases:   []modelPriceChannelAlias{compatibleAlias}, rows: []evidence{noIndex}, source: "sk-opt...3456", wantName: "gemini",
 		},
 		{
 			name:      "missing auth index is not inferred",
@@ -227,10 +227,10 @@ func TestUsageSourceOptionsRequireConsistentIdentity(t *testing.T) {
 			aliases: []modelPriceChannelAlias{alias("gemini", keyhash, "No index")}, rows: []evidence{noIndex},
 		},
 		{
-			name:      "compatible runtime prefix and canonical alias",
+			name:      "compatible runtime prefix ignores legacy canonical alias",
 			providers: []aiProviderItem{compatible("Fixture Vendor", "one", "two")},
 			aliases:   []modelPriceChannelAlias{alias("openai_compatibility", "FIXTURE VENDOR", "Shared name")},
-			rows:      []evidence{{"openai-compatible-fixture vendor", "one", "first-key"}, {"FIXTURE VENDOR", "two", "second-key"}}, wantName: "Shared name",
+			rows:      []evidence{{"openai-compatible-fixture vendor", "one", "first-key"}, {"FIXTURE VENDOR", "two", "second-key"}}, wantName: "Fixture Vendor",
 		},
 		{
 			name:      "duplicate compatible identity despite different models",
