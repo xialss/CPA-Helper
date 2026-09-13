@@ -129,6 +129,49 @@ func TestUsageSourceLabelsUnpricedAliasLifecycleRoutes(t *testing.T) {
 		}
 		return response
 	}
+	type optionsResponse struct {
+		Sources []struct{ Key, Label string } `json:"sources"`
+	}
+	assertSourceOption := func(source, label string) {
+		t.Helper()
+		var standalone optionsResponse
+		var overview struct {
+			Options optionsResponse `json:"options"`
+		}
+		beforeCalls := managementCalls.Load()
+		// Data filters must not cascade into the date/scope option catalog.
+		query := "?scope=admin&provider=not-configured&model=not-configured&source_key=not-present" + rangeQuery
+		requestJSONForPricingTest(t, handler, http.MethodGet, "/api/usage/options"+query, nil, adminCookies, &standalone)
+		requestJSONForPricingTest(t, handler, http.MethodGet, "/api/usage/overview"+query, nil, adminCookies, &overview)
+		if managementCalls.Load() != beforeCalls {
+			t.Fatal("source options performed a synchronous management request")
+		}
+		if !reflect.DeepEqual(standalone, overview.Options) {
+			t.Fatal("standalone and embedded source options disagree")
+		}
+		if len(standalone.Sources) != 2 {
+			t.Fatalf("source options merged distinct source keys: %#v", standalone)
+		}
+		want := maskSecret(&source)
+		if label != "" && label != want {
+			want = label + " · " + want
+		}
+		found := false
+		for _, option := range standalone.Sources {
+			if strings.Contains(option.Label, nativeKey) || strings.Contains(option.Label, compatibilityKey) {
+				t.Fatal("source option exposed an original credential")
+			}
+			if option.Key == *usageSourceKey(&source) {
+				if option.Label != want {
+					t.Fatalf("source option label = %q, want %q", option.Label, want)
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatal("rename changed source option identity")
+		}
+	}
 	nativeSource := nativeKey
 	filteredPath := "/api/usage/records?scope=admin&source_key=" + *usageSourceKey(&nativeSource) + "&request_id=native-label-request"
 	before := readRecords(filteredPath, adminCookies)
@@ -160,6 +203,7 @@ func TestUsageSourceLabelsUnpricedAliasLifecycleRoutes(t *testing.T) {
 				t.Fatal("source alias changed raw-detail redaction")
 			}
 		}
+		assertSourceOption(nativeSource, label)
 	}
 	writeAlias(aiProviderBrandGemini, "Shared display name")
 	for _, label := range []string{"Shared display name", "Renamed compatibility", ""} {
@@ -176,6 +220,7 @@ func TestUsageSourceLabelsUnpricedAliasLifecycleRoutes(t *testing.T) {
 		if all.Total != 2 || len(all.Items) != 2 {
 			t.Fatal("duplicate display names merged channels")
 		}
+		assertSourceOption(compatibilityKey, want)
 	}
 	writeAlias(aiProviderBrandOpenAICompatibility, "Private administrator alias")
 	for _, path := range []string{"/api/usage/records?scope=account", "/api/usage/records?scope=admin"} {
@@ -192,19 +237,7 @@ func TestUsageSourceLabelsUnpricedAliasLifecycleRoutes(t *testing.T) {
 	}
 	requestJSONForPricingTestExpectStatus(t, handler, http.MethodGet, fmt.Sprintf("/api/usage/records/%d?scope=admin", nativeID), nil, memberCookies, http.StatusNotFound)
 	requestJSONForPricingTestExpectStatus(t, handler, http.MethodGet, "/api/usage/records?scope=admin", nil, nil, http.StatusUnauthorized)
-	var options struct {
-		Sources []struct{ Key, Label string } `json:"sources"`
-	}
-	requestJSONForPricingTest(t, handler, http.MethodGet, "/api/usage/options?scope=admin"+rangeQuery, nil, adminCookies, &options)
-	foundSource := false
-	for _, source := range options.Sources {
-		if source.Key == *usageSourceKey(&nativeSource) {
-			foundSource = source.Label == maskSecret(&nativeSource)
-		}
-	}
-	if !foundSource {
-		t.Fatal("rename changed source option identity or masking")
-	}
+	assertSourceOption(nativeSource, "Shared display name")
 	var storedSource, storedRaw string
 	if err := a.db.QueryRow(`SELECT source, raw_json FROM usage_records WHERE id = ?`, nativeID).Scan(&storedSource, &storedRaw); err != nil {
 		t.Fatal(err)
@@ -217,6 +250,22 @@ func TestUsageSourceLabelsUnpricedAliasLifecycleRoutes(t *testing.T) {
 	}
 	requestJSONForPricingTestExpectStatus(t, handler, http.MethodGet, "/api/usage/records?scope=admin"+rangeQuery, nil, adminCookies, http.StatusInternalServerError)
 	requestJSONForPricingTestExpectStatus(t, handler, http.MethodGet, fmt.Sprintf("/api/usage/records/%d?scope=admin", nativeID), nil, adminCookies, http.StatusInternalServerError)
+	for _, path := range []string{"/api/usage/options", "/api/usage/overview"} {
+		requestJSONForPricingTestExpectStatus(t, handler, http.MethodGet, path+"?scope=admin"+rangeQuery, nil, adminCookies, http.StatusInternalServerError)
+		for _, test := range []struct {
+			scope   string
+			cookies []*http.Cookie
+		}{{"account", adminCookies}, {"account", memberCookies}, {"admin", memberCookies}} {
+			var response struct {
+				Sources []map[string]string `json:"sources"`
+				Options optionsResponse     `json:"options"`
+			}
+			requestJSONForPricingTest(t, handler, http.MethodGet, path+"?scope="+test.scope+rangeQuery, nil, test.cookies, &response)
+			if len(response.Sources) != 0 || len(response.Options.Sources) != 0 {
+				t.Fatal("account source options exposed administrator metadata")
+			}
+		}
+	}
 	readRecords("/api/usage/records?scope=account", memberCookies)
 }
 
