@@ -23,6 +23,8 @@ export function useViewportTooltip<Key extends string | number>(
   const triggerRefs = new Map<Key, TooltipTriggerRef>()
   const tooltipRefs = new Map<Key, Ref<TooltipInst | null>>()
   const positions = shallowRef(new Map<Key, TooltipPosition>())
+  // Naive UI keeps the follower mounted through leave, so retain geometry until row removal.
+  const lastPositions = new Map<Key, TooltipPosition>()
   let listening = false
 
   function setListening(active: boolean) {
@@ -55,6 +57,7 @@ export function useViewportTooltip<Key extends string | number>(
         maxWidth,
       })
     }
+    for (const [key, position] of next) lastPositions.set(key, position)
     positions.value = next
     setListening(next.size > 0)
   }
@@ -71,6 +74,7 @@ export function useViewportTooltip<Key extends string | number>(
           targets.delete(key)
           triggerRefs.delete(key)
           tooltipRefs.delete(key)
+          lastPositions.delete(key)
           if (hoveredKey.value === key) hoveredKey.value = null
           if (focusedKey.value === key) focusedKey.value = null
         }
@@ -92,11 +96,12 @@ export function useViewportTooltip<Key extends string | number>(
       tooltipRef = shallowRef<TooltipInst | null>(null)
       tooltipRefs.set(key, tooltipRef)
     }
-    const position = positions.value.get(key)
+    const activePosition = positions.value.get(key)
+    const position = activePosition ?? lastPositions.get(key)
     return {
       ref: tooltipRef,
       trigger: 'manual',
-      show: position !== undefined && (hoveredKey.value === key || focusedKey.value === key),
+      show: activePosition !== undefined && (hoveredKey.value === key || focusedKey.value === key),
       x: position?.x ?? 0,
       y: position?.y ?? 0,
       placement: 'top',
@@ -132,6 +137,10 @@ export function useViewportTooltip<Key extends string | number>(
     targets.clear()
     triggerRefs.clear()
     tooltipRefs.clear()
+    lastPositions.clear()
+    positions.value = new Map()
+    hoveredKey.value = null
+    focusedKey.value = null
   })
 
   return { triggerProps, tooltipProps }

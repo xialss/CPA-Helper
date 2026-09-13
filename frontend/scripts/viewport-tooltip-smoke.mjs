@@ -10,7 +10,7 @@ import { getPointRect, getRect } from 'vueuc/lib/binder/src/utils.js'
 const server = await createServer({
   root: fileURLToPath(new URL('..', import.meta.url)),
   logLevel: 'error',
-  server: { middlewareMode: true, hmr: false, watch: null },
+  server: { middlewareMode: true, hmr: false, ws: false, watch: null },
 })
 
 let viewportWidth = 390
@@ -80,6 +80,27 @@ function positionedBox(targetRect, width, height, props) {
   }
 }
 
+function geometrySnapshot(props) {
+  const width = Number.parseFloat(props.style.maxWidth)
+  const height = 80
+  const gap = Number.parseFloat(props.themeOverrides.peers.Popover.space)
+  const box = positionedBox(getPointRect(props.x, props.y), width, height + gap, props)
+  const top = box.top + (box.placement.startsWith('bottom') ? gap : 0)
+  return {
+    inputs: {
+      x: props.x,
+      y: props.y,
+      placement: props.placement,
+      flip: props.flip,
+      showArrow: props.showArrow,
+      maxWidth: props.style.maxWidth,
+      boxSizing: props.style.boxSizing,
+      space: props.themeOverrides.peers.Popover.space,
+    },
+    box: { left: box.left, right: box.left + width, top, bottom: top + height, width, height, placement: box.placement },
+  }
+}
+
 let app
 try {
   const { useViewportTooltip } = await server.ssrLoadModule('/src/shared/composables/useViewportTooltip.ts')
@@ -97,8 +118,8 @@ try {
   const first = new TriggerElement()
   const second = new TriggerElement()
   second.rect = domRect(220, 600, 116, 42)
-  const firstTrigger = tooltips.triggerProps(1)
-  const secondTrigger = tooltips.triggerProps('channel:Auth File.json')
+  let firstTrigger = tooltips.triggerProps(1)
+  let secondTrigger = tooltips.triggerProps('channel:Auth File.json')
   firstTrigger.ref(first)
   secondTrigger.ref(second)
   let positionSyncs = 0
@@ -160,20 +181,64 @@ try {
   assert.equal(fixedBox.left, 16)
   assert.equal(fixedBox.left + 358, 374)
 
+  const beforeMouseleave = geometrySnapshot(tooltips.tooltipProps(1))
+  firstTrigger.onMouseleave()
+  await nextTick()
+  await nextTick()
+  assert.equal(tooltips.tooltipProps(1).show, false)
+  assert.deepEqual(geometrySnapshot(tooltips.tooltipProps(1)), beforeMouseleave, 'Mouseleave preserves positioning inputs and the closing tooltip box')
+  assert.equal(listenerCount(), 0, 'A closing tooltip must not keep scroll or resize listeners')
+
+  viewportWidth = 768
+  first.rect = domRect(460, 120, 174, 32)
+  dispatch('resize')
+  dispatch('scroll')
+  assert.deepEqual(geometrySnapshot(tooltips.tooltipProps(1)), beforeMouseleave, 'Inactive exit geometry is not changed by resize or scrolling')
+  firstTrigger.onMouseenter()
+  await nextTick()
+  await nextTick()
+  const reopenedProps = tooltips.tooltipProps(1)
+  assert.equal(reopenedProps.show, true)
+  assert.equal(reopenedProps.x, 547)
+  assert.equal(reopenedProps.y, 136)
+  assert.equal(reopenedProps.style.maxWidth, '360px')
+  assert.equal(reopenedProps.themeOverrides.peers.Popover.space, '22px', 'Reopening measures the current trigger height')
+  assert.notDeepEqual(geometrySnapshot(reopenedProps), beforeMouseleave, 'Quick re-entry uses the current viewport and trigger geometry')
+  firstTrigger.onMouseleave()
+  firstTrigger.onMouseenter()
+  await nextTick()
+  assert.equal(tooltips.tooltipProps(1).show, true, 'An immediate leave/re-entry keeps the current row open')
+  assert.deepEqual(geometrySnapshot(tooltips.tooltipProps(1)), geometrySnapshot(reopenedProps))
+
+  viewportWidth = 390
+  first.rect = domRect(68, 400, 174, 20)
+  dispatch('resize')
+  firstTrigger.onMouseenter()
   firstTrigger.onFocus()
   firstTrigger.onMouseleave()
   await nextTick()
   assert.equal(tooltips.tooltipProps(1).show, true, 'Focus keeps the tooltip open after mouseleave')
+  const beforeBlur = geometrySnapshot(tooltips.tooltipProps(1))
+  firstTrigger.onBlur()
+  await nextTick()
+  await nextTick()
+  assert.equal(tooltips.tooltipProps(1).show, false)
+  assert.deepEqual(geometrySnapshot(tooltips.tooltipProps(1)), beforeBlur, 'Final blur preserves positioning inputs and the closing tooltip box')
+  assert.equal(listenerCount(), 0, 'Ending keyboard focus stops listeners during the exit transition')
+
+  firstTrigger.onFocus()
   secondTrigger.onMouseenter()
   await nextTick()
   assert.equal(tooltips.tooltipProps(1).show, true)
   assert.equal(tooltips.tooltipProps('channel:Auth File.json').show, true, 'Hover and focus can show different rows')
   assert.notEqual(tooltips.tooltipProps(1).y, tooltips.tooltipProps('channel:Auth File.json').y)
+  const beforeSwitch = geometrySnapshot(tooltips.tooltipProps(1))
   firstTrigger.onMouseleave()
   assert.equal(hovered.value, 'channel:Auth File.json', 'A late mouseleave must not clear another row')
   firstTrigger.onBlur()
   await nextTick()
   assert.equal(tooltips.tooltipProps(1).show, false)
+  assert.deepEqual(geometrySnapshot(tooltips.tooltipProps(1)), beforeSwitch, 'Closing one row preserves its geometry while another stays open')
   assert.equal(tooltips.tooltipProps('channel:Auth File.json').show, true)
 
   secondTrigger.onFocus()
@@ -182,13 +247,63 @@ try {
   second.rect = domRect(-80, 200, 116, 42)
   dispatch('scroll')
   assert.equal(tooltips.tooltipProps('channel:Auth File.json').y, 221)
+  assert.deepEqual(geometrySnapshot(tooltips.tooltipProps(1)), beforeSwitch, 'Active-row scrolling does not overwrite a different closing row')
+
+  const secondBeforeBlur = geometrySnapshot(tooltips.tooltipProps('channel:Auth File.json'))
+  secondTrigger.onBlur()
+  await nextTick()
+  await nextTick()
+  assert.equal(tooltips.tooltipProps('channel:Auth File.json').show, false)
+  assert.deepEqual(geometrySnapshot(tooltips.tooltipProps('channel:Auth File.json')), secondBeforeBlur, 'Channel-key tooltips retain their own exit geometry')
+  assert.equal(listenerCount(), 0)
+  const removedTriggerRef = secondTrigger.ref
+  const removedTooltipRef = tooltips.tooltipProps('channel:Auth File.json').ref
+  secondTrigger.ref(null)
+  await nextTick()
+  const removedProps = tooltips.tooltipProps('channel:Auth File.json')
+  assert.equal(removedProps.x, 0)
+  assert.equal(removedProps.y, 0, 'Removing an inactive row releases its retained exit geometry')
+  assert.notEqual(removedProps.ref, removedTooltipRef, 'Removed rows release their tooltip instance refs')
+  secondTrigger = tooltips.triggerProps('channel:Auth File.json')
+  assert.notEqual(secondTrigger.ref, removedTriggerRef, 'Removed rows release their trigger callbacks')
+  second.rect = domRect(80, 80, 116, 18)
+  secondTrigger.ref(second)
+  assert.equal(tooltips.tooltipProps('channel:Auth File.json').show, false, 'Reusing a row key does not restore old focus')
+  secondTrigger.onFocus()
+  await nextTick()
+  assert.equal(tooltips.tooltipProps('channel:Auth File.json').y, 89, 'A reused row measures its replacement trigger')
   secondTrigger.ref(null)
   await nextTick()
   assert.equal(focused.value, null)
   assert.equal(tooltips.tooltipProps('channel:Auth File.json').show, false)
   assert.equal(listenerCount(), 0, 'Removing the focused row clears its tooltip and listeners')
+  secondTrigger = tooltips.triggerProps('channel:Auth File.json')
   secondTrigger.ref(second)
-  assert.equal(tooltips.tooltipProps('channel:Auth File.json').show, false, 'Reusing a row key does not restore old focus')
+
+  firstTrigger.onMouseenter()
+  await nextTick()
+  const beforeDetail = geometrySnapshot(tooltips.tooltipProps(1))
+  hovered.value = 'detail'
+  await nextTick()
+  await nextTick()
+  assert.equal(tooltips.tooltipProps(1).show, false)
+  assert.equal(tooltips.tooltipProps('detail').show, false, 'An unregistered drawer key cannot activate a table tooltip')
+  assert.deepEqual(geometrySnapshot(tooltips.tooltipProps(1)), beforeDetail)
+  assert.equal(listenerCount(), 0, 'Retained positions do not make an unregistered key listen for scrolling')
+
+  firstTrigger.onMouseenter()
+  await nextTick()
+  first.isConnected = false
+  dispatch('scroll')
+  assert.equal(tooltips.tooltipProps(1).show, false, 'A disconnected active trigger cannot keep its tooltip shown')
+  assert.equal(listenerCount(), 0, 'Only connected active targets need listeners')
+  firstTrigger.ref(null)
+  await nextTick()
+  assert.equal(hovered.value, null)
+  first.isConnected = true
+  firstTrigger = tooltips.triggerProps(1)
+  firstTrigger.ref(first)
+  tooltips.tooltipProps(1).ref.value = { syncPosition: () => { positionSyncs += 1 } }
 
   firstTrigger.onMouseenter()
   await nextTick()
@@ -196,9 +311,14 @@ try {
   secondTrigger.onFocus()
   app.unmount()
   app = undefined
+  const syncsAtUnmount = positionSyncs
   await nextTick()
   assert.equal(listenerCount(), 0, 'Unmount cancels pending watchers and all listeners')
-  globalThis.console.log(`Viewport tooltip smoke passed: ${geometryCases} installed-library geometry cases; hover, focus, scroll, resize and cleanup passed`)
+  assert.equal(positionSyncs, syncsAtUnmount, 'A queued position sync cannot call an unmounted tooltip')
+  assert.equal(tooltips.tooltipProps(1).show, false)
+  assert.equal(tooltips.tooltipProps(1).x, 0, 'Unmount releases retained geometry')
+  assert.equal(tooltips.tooltipProps('channel:Auth File.json').y, 0)
+  globalThis.console.log(`Viewport tooltip smoke passed: ${geometryCases} installed-library geometry cases; exit geometry, re-entry, row switching, hover, focus, scroll, resize and cleanup passed`)
 } finally {
   app?.unmount()
   await server.close()
