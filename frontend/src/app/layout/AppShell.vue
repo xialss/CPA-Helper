@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { Component } from 'vue'
-import { computed, h, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, h, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { isNavigationFailure, NavigationFailureType, useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -23,6 +23,7 @@ import {
   DollarSign,
   Github,
   Gauge,
+  Images,
   KeyRound,
   Languages,
   List,
@@ -54,6 +55,7 @@ const isMobile = ref(mobileQuery.matches)
 const drawerOpen = ref(false)
 const navigationTarget = ref<string | null>(null)
 const isRouteTransitioning = ref(false)
+const studioScrollModeHeld = ref(false)
 const { currentUser, setCurrentUser } = useCurrentUser()
 const hasLoadedUser = ref(currentUser.value !== null)
 const { isDark, preference, setThemePreference, toggleTheme } = useThemePreference()
@@ -143,6 +145,10 @@ const accountInspectionMenuItems = computed<MenuOption[]>(() => [
   { label: t('模型监控', 'Model Monitoring'), key: '/admin/model-monitor', icon: renderIcon(Gauge) },
 ])
 
+const featureMenuItems = computed<MenuOption[]>(() => [
+  { label: t('生图广场', 'Image Studio'), key: '/account/image-studio', icon: renderIcon(Images) },
+])
+
 const accountMenuItems = computed<MenuOption[]>(() => [
   { label: t('我的用量', 'My Usage'), key: '/account/usage', icon: renderIcon(BarChart3) },
   { label: t('我的明细', 'My Records'), key: '/account/records', icon: renderIcon(List) },
@@ -201,6 +207,13 @@ const menuOptions = computed<MenuOption[]>(() => {
   }
   groups.push({
     type: 'group',
+    label: t('功能中心', 'Feature Center'),
+    key: 'feature-group',
+    icon: renderIcon(Images),
+    children: featureMenuItems.value,
+  })
+  groups.push({
+    type: 'group',
     label: t('我的账户', 'My Account'),
     key: 'account-group',
     icon: renderIcon(UserRound),
@@ -211,22 +224,32 @@ const menuOptions = computed<MenuOption[]>(() => {
 
 const leafMenuOptions = computed(() =>
   isAdmin.value
-    ? [...adminMenuItems.value, ...accountInspectionMenuItems.value, ...accountMenuItems.value]
-    : accountMenuItems.value,
+    ? [...adminMenuItems.value, ...accountInspectionMenuItems.value, ...featureMenuItems.value, ...accountMenuItems.value]
+    : [...featureMenuItems.value, ...accountMenuItems.value],
 )
 
 const selectedKey = computed(() => {
-  const matched = leafMenuOptions.value.find((item) => route.path.startsWith(String(item.key)))
+  const matched = leafMenuOptions.value.find((item) => router.resolve(String(item.key)).name === route.name)
   return matched ? String(matched.key) : isAdmin.value ? '/admin/usage' : '/account/usage'
 })
 const isMenuNavigationPending = computed(() => navigationTarget.value !== null)
 const recordsRoutePaths = ['/admin/records', '/account/records'] as const
+const studioRoutePath = '/account/image-studio'
+const studioRouteName = 'account-image-studio'
 const isRecordsScrollMode = computed(
   () =>
     recordsRoutePaths.some((path) => route.path === path) ||
     (navigationTarget.value !== null &&
       recordsRoutePaths.some((path) => navigationTarget.value === path)),
 )
+const isStudioScrollMode = computed(
+  () => route.name === studioRouteName || navigationTarget.value === studioRoutePath || studioScrollModeHeld.value,
+)
+
+watch(() => route.name, (name, previousName) => {
+  if (previousName === studioRouteName && name !== studioRouteName) studioScrollModeHeld.value = true
+  else if (name === studioRouteName) studioScrollModeHeld.value = false
+}, { flush: 'sync' })
 
 function finishNavigationFeedback(target: string) {
   if (navigationFeedbackTimer !== undefined) {
@@ -255,6 +278,11 @@ function finishRouteTransition() {
     isRouteTransitioning.value = false
     routeTransitionReleaseTimer = undefined
   }, 60)
+}
+
+function finishRouteLeave() {
+  if (route.name !== studioRouteName) studioScrollModeHeld.value = false
+  finishRouteTransition()
 }
 
 async function handleMenuUpdate(key: string) {
@@ -420,6 +448,7 @@ const logoutAriaLabel = computed(() => t('退出登录', 'Sign out'))
           'is-route-pending': isMenuNavigationPending,
           'is-route-transitioning': isRouteTransitioning,
           'is-records-scroll-mode': isRecordsScrollMode,
+          'is-studio-scroll-mode': isStudioScrollMode,
         }"
       >
         <div v-if="isMenuNavigationPending" class="route-progress" aria-hidden="true" />
@@ -432,8 +461,8 @@ const logoutAriaLabel = computed(() => t('退出登录', 'Sign out'))
             @after-enter="finishRouteTransition"
             @enter-cancelled="finishRouteTransition"
             @before-leave="beginRouteTransition"
-            @after-leave="finishRouteTransition"
-            @leave-cancelled="finishRouteTransition"
+            @after-leave="finishRouteLeave"
+            @leave-cancelled="finishRouteLeave"
           >
             <component :is="RouteComponent" :key="activeRoute.name ?? activeRoute.path" />
           </Transition>
@@ -846,16 +875,28 @@ const logoutAriaLabel = computed(() => t('退出登录', 'Sign out'))
 }
 
 .content.is-records-scroll-mode,
-.content.is-records-scroll-mode > :deep(.n-layout-scroll-container) {
+.content.is-records-scroll-mode > :deep(.n-layout-scroll-container),
+.content.is-studio-scroll-mode,
+.content.is-studio-scroll-mode > :deep(.n-layout-scroll-container) {
   scrollbar-gutter: auto;
   scrollbar-width: none;
 }
 
 .content.is-records-scroll-mode::-webkit-scrollbar,
-.content.is-records-scroll-mode > :deep(.n-layout-scroll-container::-webkit-scrollbar) {
+.content.is-records-scroll-mode > :deep(.n-layout-scroll-container::-webkit-scrollbar),
+.content.is-studio-scroll-mode::-webkit-scrollbar,
+.content.is-studio-scroll-mode > :deep(.n-layout-scroll-container::-webkit-scrollbar) {
   display: none;
   width: 0;
   height: 0;
+}
+
+.content.is-studio-scroll-mode > :deep(.n-layout-scroll-container) {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .route-progress {

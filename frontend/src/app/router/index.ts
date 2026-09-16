@@ -114,6 +114,11 @@ export const router = createRouter({
           component: () => import('@/features/models/views/AvailableModelsView.vue'),
         },
         {
+          path: 'account/image-studio',
+          name: 'account-image-studio',
+          component: () => import('@/features/image-studio/views/ImageStudioView.vue'),
+        },
+        {
           path: 'account/settings',
           name: 'account-settings',
           component: () => import('@/features/settings/views/AccountSettingsView.vue'),

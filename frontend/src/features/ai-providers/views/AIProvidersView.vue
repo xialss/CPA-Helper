@@ -546,21 +546,6 @@ function removeModel(index: number) {
   form.value.models.splice(index, 1)
 }
 
-function updateModelIsCompat(model: ModelDraft, value: boolean) {
-  model.is_compat = value
-  model.is_compat_state = 'value'
-}
-
-function updateModelDisplayName(model: ModelDraft, value: string) {
-  model.display_name = value
-  model.display_name_state = 'value'
-}
-
-function updateModelMaxContextLength(model: ModelDraft, value: number | null) {
-  model.max_context_length = value
-  model.max_context_length_state = value === null ? 'null' : 'value'
-}
-
 function updateModelThinking(model: ModelDraft, value: string) {
   model.thinking_text = value
   model.thinking_state = value.trim() === '' ? 'null' : 'value'
@@ -577,11 +562,6 @@ function updateModelThinkingText(model: ModelDraft, value: string) {
 function updateWebsockets(value: boolean) {
   form.value.websockets = value
   form.value.websockets_state = 'value'
-}
-
-function updateWeight(value: number | null) {
-  form.value.weight = value
-  form.value.weight_state = value === null ? 'null' : 'value'
 }
 
 function addHeader() {
@@ -1971,9 +1951,6 @@ onMounted(refresh)
               <NFormItem :label="t('优先级', 'Priority')">
                 <NInputNumber v-model:value="form.priority" clearable />
               </NFormItem>
-              <NFormItem v-if="form.brand === 'xai'" :label="t('权重', 'Weight')">
-                <NInputNumber :value="form.weight" clearable :max="1000000" :precision="0" @update:value="(value) => updateWeight(value as number | null)" />
-              </NFormItem>
               <NFormItem :label="t('前缀 Prefix', 'Prefix')">
                 <NInput v-model:value="form.prefix" clearable />
               </NFormItem>
@@ -2040,27 +2017,7 @@ onMounted(refresh)
             <div v-for="(model, index) in form.models" :key="index" class="model-row" :class="{ 'is-xai': form.brand === 'xai' }">
               <NInput v-model:value="model.name" :placeholder="t('模型名称', 'Model name')" />
               <NInput v-model:value="model.alias" clearable :placeholder="t('Alias', 'Alias')" />
-              <NInput
-                v-if="form.brand === 'xai'"
-                :value="model.display_name"
-                clearable
-                :placeholder="t('显示名称', 'Display name')"
-                @update:value="(value) => updateModelDisplayName(model, value)"
-              />
-              <NInputNumber
-                v-if="form.brand === 'xai'"
-                :value="model.max_context_length"
-                clearable
-                :min="0"
-                :precision="0"
-                :placeholder="t('最大上下文长度', 'Max context length')"
-                @update:value="(value) => updateModelMaxContextLength(model, value as number | null)"
-              />
               <label class="inline-switch"><span>force-mapping</span><NSwitch v-model:value="model.force_mapping" /></label>
-              <label v-if="form.brand === 'xai'" class="inline-switch">
-                <span>is-compat</span>
-                <NSwitch :value="model.is_compat" @update:value="(value) => updateModelIsCompat(model, value as boolean)" />
-              </label>
               <label v-if="form.brand === 'openai_compatibility'" class="inline-switch"><span>image</span><NSwitch v-model:value="model.image" /></label>
               <NInput
                 v-if="form.brand === 'openai_compatibility' || form.brand === 'xai'"
@@ -2596,16 +2553,18 @@ onMounted(refresh)
 }
 
 .model-row.is-xai {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(160px, 1.2fr) minmax(120px, 0.9fr) minmax(116px, auto) auto;
   align-items: start;
 }
 
-.model-row.is-xai .xai-model-thinking,
-.model-row.is-xai .xai-model-delete {
+.model-row.is-xai .xai-model-thinking {
   grid-column: 1 / -1;
+  grid-row: 2;
 }
 
 .model-row.is-xai .xai-model-delete {
+  grid-column: 4;
+  grid-row: 1;
   justify-self: end;
 }
 
@@ -2711,6 +2670,13 @@ onMounted(refresh)
 
   .model-row.is-xai {
     grid-template-columns: 1fr;
+  }
+
+  .model-row.is-xai .xai-model-thinking,
+  .model-row.is-xai .xai-model-delete {
+    grid-column: auto;
+    grid-row: auto;
+    justify-self: stretch;
   }
 
   .settings-alert-content,
