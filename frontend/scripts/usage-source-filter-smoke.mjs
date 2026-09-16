@@ -35,7 +35,7 @@ globalThis.window = {
 }
 globalThis.fetch = (url) => bridge.current.fetch(url)
 
-const passiveUI = ['NButton', 'NDataTable', 'NDatePicker', 'NDrawer', 'NDrawerContent', 'NIcon', 'NPagination', 'NRadioButton', 'NRadioGroup', 'NSpin', 'NTag', 'NTooltip']
+const passiveUI = ['NButton', 'NDataTable', 'NDatePicker', 'NDrawerContent', 'NIcon', 'NPagination', 'NRadioButton', 'NRadioGroup', 'NSpin', 'NTag', 'NTooltip']
 const iconNames = ['CircleDollarSign', 'ClipboardList', 'Gauge', 'Info', 'Layers3', 'ShieldCheck', 'Timer', 'Zap']
 const stubComponent = "{ inheritAttrs: false, render: () => null }"
 
@@ -79,6 +79,17 @@ const server = await createServer({
         return `import { onBeforeUnmount } from 'vue';
           ${passiveUI.map(name => `export const ${name} = ${stubComponent};`).join('\n')}
           export const useMessage = () => globalThis.__usageSourceFilterSmoke.current.message;
+          export const NDrawer = {
+            inheritAttrs: false,
+            props: { show: Boolean, autoFocus: { type: Boolean, default: true } },
+            emits: ['update:show'],
+            setup(props) {
+              const drawers = globalThis.__usageSourceFilterSmoke.current.drawers;
+              drawers.add(props);
+              onBeforeUnmount(() => drawers.delete(props));
+              return () => null;
+            }
+          };
           export const NSelect = {
             inheritAttrs: false,
             props: { value: [String, Number], options: Array, placeholder: String, clearable: Boolean, filterable: Boolean, renderLabel: Function, fallbackOption: Function },
@@ -131,7 +142,7 @@ function summaryFor(params) {
 function makeEnvironment(query = {}) {
   const env = {
     route: { query }, requests: [], replacements: [], pushes: [], errors: [],
-    selects: new Set(), timers: new Map(), nextTimer: 1, gates: [],
+    selects: new Set(), drawers: new Set(), timers: new Map(), nextTimer: 1, gates: [],
     sourceOptions: [{ key: sourceA, label: safeLabel }, { key: sourceB, label: safeLabel }],
   }
   env.message = { error: (error) => env.errors.push(error) }
@@ -159,6 +170,9 @@ function makeEnvironment(query = {}) {
     else if (entry.path === '/api/usage/records') payload = {
       start: summary.start, end: summary.end, total: summary.total_records,
       items: summary.total_records ? [{ id: summary.total_records, user_id: null, api_key_description: null, provider: 'provider-a', model: 'model-a', endpoint: '/v1/messages' }] : [],
+    }
+    else if (/^\/api\/usage\/records\/\d+$/.test(entry.path)) payload = {
+      id: Number(entry.path.split('/').at(-1)), source: 'x'.repeat(64), source_label: '测试渠道 · sk-abcd…wxyz', raw_json: {},
     }
     else if (entry.path === '/api/account/quota') payload = null
     else assert.fail(`Unexpected API call ${entry.path}`)
@@ -212,6 +226,7 @@ async function mountView(name, scope, env) {
     app.unmount()
     assert.equal(env.timers.size, 0)
     assert.equal(env.selects.size, 0)
+    assert.equal(env.drawers.size, 0)
   }
   await settle()
   return env
@@ -322,6 +337,7 @@ try {
   })
 
   await withView('UsageRecordsView', 'admin', makeEnvironment({ source_key: sourceA, quick_range: 'today', provider: 'provider-a', model: 'model-a' }), async (env) => {
+    assert.equal([...env.drawers][0].autoFocus, false, 'The request-detail drawer does not autofocus the Source tooltip trigger')
     const select = assertSourceControl(env)
     assertSourceRequests(env, sourceA)
     assert.equal(env.replacements.at(-1).query.source_key, sourceA)
@@ -341,6 +357,12 @@ try {
     assertSourceRequests(env, undefined, start)
     assert.equal('source_key' in env.replacements.at(-1).query, false)
     assert.equal(env.replacements.at(-1).query.provider, 'provider-a')
+    env.state.hoveredSourceTooltipKey.value = 'detail'
+    env.state.focusedSourceTooltipKey.value = 'detail'
+    await env.state.openRecord({ id: 22 })
+    assert.equal(env.state.drawerOpen.value, true)
+    assert.equal(env.state.hoveredSourceTooltipKey.value, null)
+    assert.equal(env.state.focusedSourceTooltipKey.value, null, 'Opening details clears any stale Source tooltip state')
     assert.deepEqual(env.errors, [])
   })
 

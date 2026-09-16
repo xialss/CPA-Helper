@@ -664,6 +664,8 @@ async function refresh({
 async function openRecord(record: UsageRecordListItem) {
   try {
     selectedRecord.value = await getUsageRecord(record.id, props.scope)
+    hoveredSourceTooltipKey.value = null
+    focusedSourceTooltipKey.value = null
     drawerOpen.value = true
   } catch (error) {
     message.error(errorText(error, '加载原始数据失败', 'Failed to load raw data'))
@@ -1503,7 +1505,7 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <NDrawer v-model:show="drawerOpen" placement="right" width="min(760px, 100vw)">
+    <NDrawer v-model:show="drawerOpen" placement="right" width="min(760px, 100vw)" :auto-focus="false">
       <NDrawerContent :title="t('请求事件详情', 'Request event details')">
         <h3 class="drawer-section-title">{{ t('结构化信息', 'Structured information') }}</h3>
         <div class="detail-grid">
