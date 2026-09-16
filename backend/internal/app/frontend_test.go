@@ -348,7 +348,6 @@ func TestAIProviderViewPreservesXAIIsCompatPresence(t *testing.T) {
 		"is_compat_state: OptionalFieldState",
 		"Object.prototype.hasOwnProperty.call(model, 'is_compat')",
 		"is_compat_state: !hasIsCompat ? 'omitted' : model.is_compat === null ? 'null' : 'value'",
-		"model.is_compat_state = 'value'",
 		"if (model.is_compat_state === 'null')",
 		"payload.is_compat = null",
 		"else if (model.is_compat_state === 'value')",
@@ -388,6 +387,37 @@ func TestAIProviderViewPreservesXAIOptionalFieldPresence(t *testing.T) {
 	} {
 		if !strings.Contains(source, expected) {
 			t.Fatalf("AIProvidersView.vue missing xAI optional-field presence contract %q", expected)
+		}
+	}
+}
+
+func TestAIProviderViewHidesLegacyXAIOnlyControls(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "frontend", "src", "features", "ai-providers", "views", "AIProvidersView.vue")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(body)
+	for _, forbidden := range []string{
+		`:label="t('权重'`,
+		`:placeholder="t('显示名称'`,
+		`:placeholder="t('最大上下文长度'`,
+		`<span>is-compat</span>`,
+	} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("AIProvidersView.vue unexpectedly renders legacy xAI-only control %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		`:label="t('优先级', 'Priority')"`,
+		`:label="t('Base URL', 'Base URL')"`,
+		`:label="t('WebSockets', 'WebSockets')"`,
+		`<NInput v-model:value="model.name"`,
+		`<NInput v-model:value="model.alias"`,
+		`<span>force-mapping</span>`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("AIProvidersView.vue lost shared provider/model control %q", required)
 		}
 	}
 }
