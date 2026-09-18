@@ -33,6 +33,7 @@ import {
   Monitor,
   Moon,
   Network,
+  Radar,
   Settings,
   Shield,
   Sun,
@@ -147,6 +148,7 @@ const accountInspectionMenuItems = computed<MenuOption[]>(() => [
 
 const featureMenuItems = computed<MenuOption[]>(() => [
   { label: t('生图广场', 'Image Studio'), key: '/account/image-studio', icon: renderIcon(Images) },
+  { label: t('AI 雷达', 'AI Radar'), key: '/account/ai-radar', icon: renderIcon(Radar) },
 ])
 
 const accountMenuItems = computed<MenuOption[]>(() => [

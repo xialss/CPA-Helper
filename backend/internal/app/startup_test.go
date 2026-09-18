@@ -108,8 +108,17 @@ func TestUsageMaintenanceStartupProfiles(t *testing.T) {
 		serveApp.Close()
 		t.Fatal("serve profile did not start the collector and Keeper background runners")
 	}
+	if serveApp.aiRadarSampling == nil || serveApp.aiRadarSampling.done == nil {
+		serveApp.Close()
+		t.Fatal("serve profile did not start the AI radar sampling runner")
+	}
 	assertRawJSON("serve profile", serveApp, rawJSON)
 	serveApp.Close()
+	select {
+	case <-serveApp.aiRadarSampling.done:
+	default:
+		t.Fatal("serve profile did not stop the AI radar sampling runner")
+	}
 
 	defaultApp, err := New()
 	if err != nil {
@@ -119,7 +128,22 @@ func TestUsageMaintenanceStartupProfiles(t *testing.T) {
 	if defaultApp.usageMaintenance == nil || defaultApp.usageMaintenance.done == nil {
 		t.Fatal("New() did not start immediate and periodic usage maintenance")
 	}
+	if defaultApp.aiRadarSampling == nil || defaultApp.aiRadarSampling.done == nil {
+		t.Fatal("New() did not start periodic AI radar sampling")
+	}
 	assertRawJSON("default app", defaultApp, "")
+}
+
+func TestNewWithOptionsDoesNotStartAIRadarSamplingWithoutBackgroundServices(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := NewWithOptions(context.Background(), NewOptions{Migrate: true, StartBackground: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	if app.aiRadarSampling != nil {
+		t.Fatal("AI radar sampling started while background services were disabled")
+	}
 }
 
 func TestCheckStartupDoesNotCreateVersionTableForUnmigratedDatabase(t *testing.T) {
@@ -401,6 +425,15 @@ func TestRequireSchemaShapeRejectsMissingNewModelPricingSchema(t *testing.T) {
 		{table: "model_price_versions", column: "created_at"},
 		{table: "model_price_time_templates", column: "name", dropTable: true},
 		{table: "model_price_time_templates", column: "rule"},
+		// The drop-table row must name the table's first required column, because
+		// requireSchemaShape reports that first missing entry.
+		{table: "ai_radar_points", column: "model", dropTable: true},
+		{table: "ai_radar_points", column: "effort"},
+		{table: "ai_radar_points", column: "observed_at"},
+		{table: "ai_radar_points", column: "origin"},
+		{table: "ai_radar_points", column: "created_at"},
+		{table: "ai_radar_state", column: "backfill_completed_at", dropTable: true},
+		{table: "ai_radar_state", column: "updated_at"},
 	} {
 		t.Run(test.table+"."+test.column, func(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "schema.sqlite3")

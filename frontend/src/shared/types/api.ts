@@ -1029,3 +1029,67 @@ export interface ModelMonitorProxySettingsPayload {
   enabled?: boolean
   proxy_url?: string
 }
+
+// AI radar. Every nullable field is null when the upstream omits it; a missing
+// measurement is never reported as zero.
+export type AIRadarEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'
+
+export interface AIRadarPoint {
+  model: string
+  effort: AIRadarEffort
+  iq: number | null
+  passed: number | null
+  total: number | null
+  average_price_usd: number | null
+  average_minutes: number | null
+  combined_cost_index: number | null
+  average_agent_steps: number | null
+  average_total_tokens: number | null
+  cache_hit_rate: number | null
+  runs_24h: number | null
+  runs_48h: number | null
+  runs_total: number | null
+  low_confidence: boolean
+}
+
+export interface AIRadarResponse {
+  available: boolean
+  stale: boolean
+  source_label: string
+  source_url: string
+  benchmark_id: string
+  scoring_mode: string
+  score_label: string
+  source_updated_at: string | null
+  fetched_at: string | null
+  runs_24h_total: number | null
+  low_sample_runs: number
+  points: AIRadarPoint[]
+  message: string | null
+}
+
+export interface AIRadarHistoryPoint {
+  observed_at: string
+  iq: number | null
+  average_price_usd: number | null
+  average_minutes: number | null
+  combined_cost_index: number | null
+  average_agent_steps: number | null
+}
+
+export interface AIRadarHistorySeries {
+  model: string
+  effort: AIRadarEffort
+  points: AIRadarHistoryPoint[]
+}
+
+export interface AIRadarHistoryResponse {
+  available: boolean
+  source_label: string
+  source_url: string
+  interval_hours: number
+  series: AIRadarHistorySeries[]
+  message: string | null
+}
+
+export type AIRadarHistoryWindow = '24h' | '7d' | '30d' | 'all'

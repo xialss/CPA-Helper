@@ -25,7 +25,7 @@ import {
 import { getUsageOptions, getUsageOverview, getUsageSummary } from '@/features/usage/api/usageApi'
 import { usageRecordsLatestRange } from '@/features/usage/recordsRetention'
 import { getCurrentUserQuota } from '@/features/users/api/usersApi'
-import ChartPanel, { type ChartOption } from '@/features/usage/components/ChartPanel.vue'
+import ChartPanel, { type ChartOption } from '@/shared/components/ChartPanel.vue'
 import type {
   DistributionItem,
   RankingItem,

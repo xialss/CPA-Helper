@@ -278,6 +278,24 @@ const modelMonitorTransportMessagePatterns: ServerMessagePattern[] = [
   [/^模型监控上游响应超过 (.+) 限制$/, ([, limit]) => `Model monitoring upstream response exceeds the ${limit} limit`],
 ]
 
+// The AI radar proxies a third-party feed, so its failures never reach the
+// client as HTTP errors; these patterns localize the reason it reports.
+const aiRadarTransportMessagePatterns: ServerMessagePattern[] = [
+  [/^AI 雷达请求失败:\s*(.+)$/, ([, detail]) => `AI radar request failed: ${translateAIRadarRequestDetail(detail ?? '')}`],
+  [/^AI 雷达上游返回 HTTP (\d+)$/, ([, status]) => `AI radar upstream returned HTTP ${status}`],
+  [/^AI 雷达上游返回了不支持的内容类型 (.+)$/, ([, contentType]) => `AI radar upstream returned unsupported content type ${contentType}`],
+  [/^读取 AI 雷达上游响应失败:\s*(.+)$/, ([, detail]) => `Failed to read the AI radar upstream response: ${detail}`],
+  [/^AI 雷达上游响应超过 (.+) 限制$/, ([, limit]) => `AI radar upstream response exceeds the ${limit} limit`],
+  [/^AI 雷达上游返回了无效 JSON:\s*(.+)$/, ([, detail]) => `AI radar upstream returned invalid JSON: ${detail}`],
+  [/^AI 雷达上游 schema 不受支持:\s*(-?\d+)$/, ([, version]) => `AI radar upstream schema ${version} is not supported`],
+  [/^AI 雷达上游缺少 points 数组$/, () => 'AI radar upstream is missing the points array'],
+  [/^AI 雷达上游 points 不是数组:\s*(.+)$/, ([, detail]) => `AI radar upstream points is not an array: ${detail}`],
+  [/^AI 雷达上游缺少有效 source_updated_at$/, () => 'AI radar upstream is missing a valid source_updated_at'],
+  [/^AI 雷达时间范围无效:\s*(.*)$/, ([, value]) => `AI radar time range is invalid: ${value}`],
+  [/^AI 雷达历史快照不是有效 JSON:\s*(.+)$/, ([, detail]) => `AI radar history snapshot is not valid JSON: ${detail}`],
+  [/^AI 雷达历史快照没有可导入的 GPT 观测点$/, () => 'AI radar history snapshot has no importable GPT observations'],
+]
+
 const serverMessagePatterns: ServerMessagePattern[] = [
   [/^峰谷规则缺少字段: (.+)$/, (match) => `Time pricing rule is missing field: ${match[1]}`],
   [/^空闲价格缺少字段: (.+)$/, (match) => `Off-peak rates are missing field: ${match[1]}`],
@@ -489,6 +507,29 @@ function translateModelMonitorTransportMessage(message: string): string | null {
   return null
 }
 
+function translateAIRadarRequestDetail(value: string): string {
+  const fixedDetails: MessagePair[] = [
+    ['AI 雷达重定向必须使用 HTTPS', 'AI radar redirects must use HTTPS'],
+    ['AI 雷达重定向次数过多', 'Too many AI radar redirects'],
+  ]
+  for (const [zh, en] of fixedDetails) {
+    if (value === zh) return en
+    const wrappedSuffix = `: ${zh}`
+    if (value.endsWith(wrappedSuffix)) {
+      return `${value.slice(0, -zh.length)}${en}`
+    }
+  }
+  return value
+}
+
+function translateAIRadarTransportMessage(message: string): string | null {
+  for (const [pattern, translate] of aiRadarTransportMessagePatterns) {
+    const match = message.match(pattern)
+    if (match) return translate(match)
+  }
+  return null
+}
+
 function translateNested(value: string): string {
   return translateKnownServerMessage(value) ?? translateTerms(value)
 }
@@ -530,6 +571,11 @@ export function localizedServerMessage(
   const modelMonitorTransportMessage = translateModelMonitorTransportMessage(message)
   if (modelMonitorTransportMessage) {
     return modelMonitorTransportMessage
+  }
+
+  const aiRadarTransportMessage = translateAIRadarTransportMessage(message)
+  if (aiRadarTransportMessage) {
+    return aiRadarTransportMessage
   }
 
   if (!containsHan(message)) {

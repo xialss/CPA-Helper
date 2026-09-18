@@ -148,6 +148,21 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 			t.Fatalf("usage_analytics_state.%s was not created", column)
 		}
 	}
+	for _, table := range []string{"ai_radar_points", "ai_radar_state"} {
+		if !testTableExists(t, app.db, table) {
+			t.Fatalf("%s was not created", table)
+		}
+	}
+	for _, column := range []string{"model", "effort", "observed_at", "combined_cost_index", "origin", "created_at"} {
+		if !testColumnExists(t, app.db, "ai_radar_points", column) {
+			t.Fatalf("ai_radar_points.%s was not created", column)
+		}
+	}
+	for _, column := range []string{"backfill_completed_at", "updated_at"} {
+		if !testColumnExists(t, app.db, "ai_radar_state", column) {
+			t.Fatalf("ai_radar_state.%s was not created", column)
+		}
+	}
 	if testTableExists(t, app.db, "user_card_shop_favorites") {
 		t.Fatal("user_card_shop_favorites should not exist")
 	}
@@ -247,6 +262,45 @@ func TestRunMigrationsUpgradesFromPreviousProductionHead(t *testing.T) {
 		}
 		if applied != 1 {
 			t.Fatalf("migration %d applied rows = %d, want 1", version, applied)
+		}
+	}
+}
+
+func TestRunMigrationsUpgradesFromImmediatePreviousHead(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	dbPath := prepareMigrationTestDatabase(t, dataDir, 202609130001)
+
+	db, err := sql.Open("sqlite", sqliteDSN(dbPath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	goose.SetBaseFS(backendMigrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpToContext(ctx, db, ".", backendMigrations.LatestVersion); err != nil {
+		t.Fatalf("upgrade from immediate previous head %d to %d: %v", 202609130001, backendMigrations.LatestVersion, err)
+	}
+
+	var current int64
+	if err := db.QueryRowContext(ctx, `SELECT MAX(version_id) FROM goose_db_version WHERE is_applied = 1`).Scan(&current); err != nil {
+		t.Fatal(err)
+	}
+	if current != backendMigrations.LatestVersion {
+		t.Fatalf("migrated version = %d, want %d", current, backendMigrations.LatestVersion)
+	}
+	for _, table := range []string{"ai_radar_points", "ai_radar_state"} {
+		if !testTableExists(t, db, table) {
+			t.Fatalf("%s was not created by the immediate-head upgrade", table)
+		}
+	}
+	for _, index := range []string{"idx_ai_radar_points_identity", "idx_ai_radar_points_series"} {
+		if !testIndexExists(t, db, index) {
+			t.Fatalf("%s was not created by the immediate-head upgrade", index)
 		}
 	}
 }
