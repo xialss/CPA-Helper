@@ -119,6 +119,11 @@ export const router = createRouter({
           component: () => import('@/features/image-studio/views/ImageStudioView.vue'),
         },
         {
+          path: 'account/ai-radar',
+          name: 'account-ai-radar',
+          component: () => import('@/features/ai-radar/views/AiRadarView.vue'),
+        },
+        {
           path: 'account/settings',
           name: 'account-settings',
           component: () => import('@/features/settings/views/AccountSettingsView.vue'),

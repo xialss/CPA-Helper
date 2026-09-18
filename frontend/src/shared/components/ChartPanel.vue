@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { NEmpty, NSpin } from 'naive-ui'
 import * as echarts from 'echarts/core'
 import { BarChart, LineChart, PieChart } from 'echarts/charts'
@@ -49,14 +49,50 @@ const props = defineProps<{
   empty: boolean
   loading?: boolean
   compactFooter?: boolean
+  /**
+   * Plot height in px. Omit to keep the shared default; taller feature charts
+   * (a log axis plus a legend and two axis names) pass an explicit value
+   * instead of copying the panel to escape the fixed height.
+   */
+  height?: number
 }>()
 
 const chartEl = ref<HTMLDivElement | null>(null)
-const chart = ref<ECharts | null>(null)
+// ECharts keeps identity-sensitive internal models; never deep-proxy its instance.
+const chart = shallowRef<ECharts | null>(null)
 const { isDark } = useThemePreference()
 const { t } = useI18n()
 
+// An inline height wins over the class rules below, so the shared defaults stay
+// intact for every existing caller.
+const bodyStyle = computed(() =>
+  props.height === undefined ? undefined : { height: `${props.height}px` },
+)
+
 let chartThemeFrame: number | undefined
+let applyFrame: number | undefined
+
+/**
+ * Apply a new option to the live chart.
+ *
+ * `notMerge` stays: every caller passes a complete option, and charts whose
+ * series list shrinks (the radar history chart) rely on the old series being
+ * dropped. `scheduleApply` coalesces reactive updates into one apply per frame.
+ */
+function applyOption() {
+  chart.value?.setOption(buildCurrentOption(), true)
+}
+
+/** Coalesce a burst of reactive updates into a single apply per frame. */
+function scheduleApply() {
+  if (applyFrame !== undefined) {
+    window.cancelAnimationFrame(applyFrame)
+  }
+  applyFrame = window.requestAnimationFrame(() => {
+    applyFrame = undefined
+    applyOption()
+  })
+}
 
 function getChartTextColor(): string {
   return (
@@ -100,19 +136,26 @@ function resize() {
   chart.value?.resize()
 }
 
+function highlightSeries(name: string | null) {
+  chart.value?.dispatchAction({ type: 'downplay' })
+  if (name !== null) chart.value?.dispatchAction({ type: 'highlight', seriesName: name })
+}
+
+defineExpose({ highlightSeries })
+
 onMounted(() => {
   if (!chartEl.value) {
     return
   }
   chart.value = echarts.init(chartEl.value, isDark.value ? 'dark' : undefined)
-  chart.value.setOption(buildCurrentOption())
+  applyOption()
   window.addEventListener('resize', resize)
 })
 
 watch(
   () => props.option,
   () => {
-    chart.value?.setOption(buildCurrentOption(), true)
+    scheduleApply()
   },
   { deep: true },
 )
@@ -128,7 +171,7 @@ watch(isDark, () => {
     }
     chart.value?.dispose()
     chart.value = echarts.init(chartEl.value, isDark.value ? 'dark' : undefined)
-    chart.value.setOption(buildCurrentOption())
+    applyOption()
     chartThemeFrame = undefined
   })
 })
@@ -137,6 +180,9 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', resize)
   if (chartThemeFrame !== undefined) {
     window.cancelAnimationFrame(chartThemeFrame)
+  }
+  if (applyFrame !== undefined) {
+    window.cancelAnimationFrame(applyFrame)
   }
   chart.value?.dispose()
 })
@@ -159,8 +205,11 @@ onBeforeUnmount(() => {
         </slot>
       </div>
     </div>
+    <div v-if="$slots.controls" class="chart-controls">
+      <slot name="controls" />
+    </div>
     <NSpin :show="loading ?? false">
-      <div class="chart-body">
+      <div class="chart-body" :style="bodyStyle">
         <div ref="chartEl" class="chart-surface" :class="{ 'is-empty': empty }" />
         <div v-if="empty" class="chart-empty">
           <NEmpty :description="t('暂无数据', 'No data')" />
@@ -210,6 +259,13 @@ h2 {
   font-weight: 750;
 }
 
+/* Filters that change what the chart draws belong inside the same panel, above
+   the plot, so they cannot read as a separate section. */
+.chart-controls {
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--cpa-border);
+}
+
 .chart-heading-extra {
   display: flex;
   min-width: 0;
@@ -229,17 +285,16 @@ h2 {
 .chart-surface,
 .chart-empty {
   width: 100%;
-  height: 222px;
+  height: 100%;
 }
 
-.chart-panel.has-chart-footer .chart-body,
-.chart-panel.has-chart-footer .chart-surface,
-.chart-panel.has-chart-footer .chart-empty {
+.chart-panel.has-chart-footer .chart-body {
   height: 160px;
 }
 
 .chart-body {
   position: relative;
+  height: 222px;
   background: transparent;
 }
 

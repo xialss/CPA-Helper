@@ -314,6 +314,13 @@ func requireSchemaShape(ctx context.Context, db *sql.DB) error {
 		{"model_price_versions", "effective_at"},
 		{"model_price_versions", "baseline"},
 		{"model_price_versions", "created_at"},
+		{"ai_radar_points", "model"},
+		{"ai_radar_points", "effort"},
+		{"ai_radar_points", "observed_at"},
+		{"ai_radar_points", "origin"},
+		{"ai_radar_points", "created_at"},
+		{"ai_radar_state", "backfill_completed_at"},
+		{"ai_radar_state", "updated_at"},
 	}
 	for _, item := range required {
 		ok, err := columnExists(ctx, db, item.table, item.column)

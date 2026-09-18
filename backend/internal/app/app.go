@@ -65,6 +65,12 @@ type App struct {
 	priceSelectors         modelPriceSelectorSnapshotCache
 	aiProviderWriteMu      sync.Mutex // serialize provider read/validate/write mutations
 	modelMonitorHTTPClient func(ModelMonitorProxyConfig) (*http.Client, error)
+	aiRadarMu              sync.Mutex // guards aiRadarSnapshot
+	aiRadarSnapshot        aiRadarSnapshot
+	aiRadarGeneration      uint64     // monotonically orders live fetch attempts
+	aiRadarBackfillMu      sync.Mutex // single-flight guard for the one-time history backfill
+	aiRadarHTTPClient      func(time.Duration) (*http.Client, error)
+	aiRadarSampling        *aiRadarSamplingRunner
 	loginAttemptsMu        sync.Mutex
 	loginFailures          map[string]loginFailureRecord
 }
@@ -168,6 +174,7 @@ func NewWithOptions(ctx context.Context, options NewOptions) (*App, error) {
 		frontendFS:             frontendFS,
 		frontendEnv:            frontendEnv,
 		modelMonitorHTTPClient: newModelMonitorBuiltinHTTPClient,
+		aiRadarHTTPClient:      newAIRadarHTTPClient,
 		loginFailures:          map[string]loginFailureRecord{},
 	}
 	if options.Migrate {
@@ -203,6 +210,8 @@ func (a *App) startBackground(ctx context.Context) {
 	a.collector.Start()
 	a.keeper.LoadPersistedState(ctx)
 	a.keeper.StartAutoIfConfigured()
+	a.aiRadarSampling = newAIRadarSamplingRunner(a)
+	a.aiRadarSampling.Start(ctx)
 }
 
 func (a *App) startUsageMaintenance(ctx context.Context) {
@@ -216,6 +225,9 @@ func (a *App) startUsageMaintenance(ctx context.Context) {
 func (a *App) Close() {
 	if a.usageMaintenance != nil {
 		a.usageMaintenance.Stop()
+	}
+	if a.aiRadarSampling != nil {
+		a.aiRadarSampling.Stop()
 	}
 	if a.collector != nil {
 		a.collector.Stop()
@@ -335,6 +347,9 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("/api/model-monitor/settings", a.wrap(a.handleModelMonitorSettings))
 	mux.HandleFunc("/api/model-monitor/sources/{id}", a.wrap(a.handleModelMonitorSource))
 	mux.HandleFunc("/api/model-monitor/proxy", a.wrap(a.handleModelMonitorProxy))
+	mux.HandleFunc("/api/ai-radar", a.wrap(a.handleAIRadar))
+	mux.HandleFunc("/api/ai-radar/history", a.wrap(a.handleAIRadarHistory))
+	mux.HandleFunc("/api/ai-radar/refresh", a.wrap(a.handleAIRadarRefresh))
 	mux.HandleFunc("/", a.wrap(a.handleSPA))
 	return withCORS(mux)
 }

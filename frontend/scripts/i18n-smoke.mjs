@@ -274,6 +274,42 @@ try {
     localizedServerMessage('模型监控请求失败: dial tcp: 上游自定义详情'),
     'Model monitoring request failed: dial tcp: 上游自定义详情',
   )
+  const aiRadarErrors = [
+    ['AI 雷达上游返回 HTTP 503', 'AI radar upstream returned HTTP 503'],
+    ['AI 雷达上游返回了不支持的内容类型 "text/html"', 'AI radar upstream returned unsupported content type "text/html"'],
+    ['读取 AI 雷达上游响应失败: unexpected EOF', 'Failed to read the AI radar upstream response: unexpected EOF'],
+    ['AI 雷达上游响应超过 8 MiB 限制', 'AI radar upstream response exceeds the 8 MiB limit'],
+    ['AI 雷达上游返回了无效 JSON: invalid character', 'AI radar upstream returned invalid JSON: invalid character'],
+    ['AI 雷达上游 schema 不受支持: 4', 'AI radar upstream schema 4 is not supported'],
+    ['AI 雷达上游 schema 不受支持: -1', 'AI radar upstream schema -1 is not supported'],
+    ['AI 雷达上游缺少 points 数组', 'AI radar upstream is missing the points array'],
+    ['AI 雷达上游 points 不是数组: json: cannot unmarshal object', 'AI radar upstream points is not an array: json: cannot unmarshal object'],
+    ['AI 雷达上游缺少有效 source_updated_at', 'AI radar upstream is missing a valid source_updated_at'],
+    ['AI 雷达时间范围无效: 3d', 'AI radar time range is invalid: 3d'],
+    ['AI 雷达历史快照不是有效 JSON: unexpected EOF', 'AI radar history snapshot is not valid JSON: unexpected EOF'],
+    ['AI 雷达历史快照没有可导入的 GPT 观测点', 'AI radar history snapshot has no importable GPT observations'],
+  ]
+  for (const [input, expected] of aiRadarErrors) {
+    const translated = localizedServerMessage(input)
+    assert.equal(translated, expected)
+    assert.doesNotMatch(translated, /\p{Script=Han}/u)
+  }
+  assert.equal(
+    localizedServerMessage('AI 雷达请求失败: AI 雷达重定向必须使用 HTTPS'),
+    'AI radar request failed: AI radar redirects must use HTTPS',
+  )
+  assert.equal(
+    localizedServerMessage('AI 雷达请求失败: AI 雷达重定向次数过多'),
+    'AI radar request failed: Too many AI radar redirects',
+  )
+  assert.equal(
+    localizedServerMessage('AI 雷达请求失败: Get "https://api.codexradar.com/": AI 雷达重定向次数过多'),
+    'AI radar request failed: Get "https://api.codexradar.com/": Too many AI radar redirects',
+  )
+  assert.equal(
+    localizedServerMessage('AI 雷达请求失败: dial tcp: 上游自定义详情'),
+    'AI radar request failed: dial tcp: 上游自定义详情',
+  )
   assert.equal(
     localizedServerMessage('模型监控来源设置缺少 enabled_source_ids 字段'),
     'Model monitoring source settings are missing enabled_source_ids',

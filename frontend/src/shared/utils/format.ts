@@ -44,7 +44,7 @@ export const BEIJING_TIME_ZONE = 'Asia/Shanghai'
 const BEIJING_OFFSET = '+08:00'
 const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000
 
-function parseDisplayDate(value: string): Date | null {
+export function parseDisplayDate(value: string): Date | null {
   const localMatch = value.match(
     /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3})\d*)?)?)?$/,
   )
@@ -55,7 +55,11 @@ function parseDisplayDate(value: string): Date | null {
       `${year}-${month}-${day}T${hour.padStart(2, '0')}:${minute.padStart(2, '0')}:${second.padStart(2, '0')}.${millisecond.padEnd(3, '0')}${BEIJING_OFFSET}`,
     )
   }
-  const parsed = new Date(value)
+  // SQLite timestamps may carry microseconds while browser parsers reliably
+  // accept milliseconds. Preserve the explicit offset and trim only excess
+  // fractional precision before handing the value to Date.
+  const normalized = value.replace(/(\.\d{3})\d+(?=(?:Z|[+-]\d{2}:\d{2})$)/, '$1')
+  const parsed = new Date(normalized)
   return Number.isNaN(parsed.getTime()) ? null : parsed
 }
 

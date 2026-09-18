@@ -2187,7 +2187,7 @@ try {
       assert.deepEqual(desktopMenu.props.options.map((group) => group.key), ['admin-group', 'account-inspection-group', 'feature-group', 'account-group'])
       assert.deepEqual(desktopMenu.props.options.map((group) => group.label), ['管理中心', '渠道巡检', '功能中心', '我的账户'])
       const featureGroup = desktopMenu.props.options.find((group) => group.key === 'feature-group')
-      assert.deepEqual(featureGroup.children.map((item) => item.key), ['/account/image-studio'])
+      assert.deepEqual(featureGroup.children.map((item) => item.key), ['/account/image-studio', '/account/ai-radar'])
       assert.ok(!desktopMenu.props.options.find((group) => group.key === 'account-group').children.some((item) => item.key === '/account/image-studio'))
       assert.equal(desktopMenu.props.value, '/account/image-studio')
       assert.equal(state.leafMenuOptions.value.filter((item) => item.key === '/account/image-studio').length, 1)
