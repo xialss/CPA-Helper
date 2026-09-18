@@ -53,7 +53,7 @@ const server = await createServer({
     resolveId(id) {
       if (id.startsWith('/__usage-source-smoke__/')) return `\0${id}`
       if (id === 'naive-ui' || id === 'vue-router' || id === 'lucide-vue-next') return `\0smoke:${id}`
-      if (id.replaceAll('\\', '/').endsWith('/usage/components/ChartPanel.vue')) return '\0smoke:chart'
+      if (id.replaceAll('\\', '/').endsWith('/shared/components/ChartPanel.vue')) return '\0smoke:chart'
     },
     async load(id) {
       if (id.startsWith('\0/__usage-source-smoke__/')) {

@@ -8,6 +8,7 @@
     "build": "vue-tsc -b && vite build",
     "lint": "eslint . --max-warnings=0",
     "test:i18n": "node scripts/i18n-smoke.mjs",
+    "test:ai-radar": "node scripts/ai-radar-metrics-smoke.mjs",
     "test:image-studio": "node scripts/image-studio-smoke.mjs"
   },
   "dependencies": {
