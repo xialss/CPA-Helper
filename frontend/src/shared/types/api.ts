@@ -514,6 +514,8 @@ export interface UsageRecordListItem {
   user_label: string
   provider: string | null
   model: string | null
+  response_model: string | null
+  request_alias: string | null
   service_tier: string | null
   reasoning_effort: string | null
   endpoint: string | null
@@ -548,6 +550,44 @@ export interface UsageRecordsResponse {
 
 export interface UsageRecordDetail extends UsageRecordListItem {
   raw_json: Record<string, unknown> | unknown[] | string
+}
+
+export interface UsageModelAuditAttempt {
+  index: number
+  request_model: string | null
+  response_model: string | null
+  signature_model: string | null
+  models: string[]
+  signature_status: 'found' | 'missing' | 'malformed' | 'unsupported'
+  status: 'complete' | 'incomplete'
+  conflict: boolean
+}
+
+export interface UsageModelAudit {
+  record_id: number
+  checked_at: string
+  checked_by: number
+  parser_version: number
+  source_status: 'matched' | 'unknown'
+  queue_response_model: string | null
+  log_response_model: string | null
+  signature_model: string | null
+  status: 'complete' | 'incomplete' | 'unsupported'
+  association: 'single' | 'matched' | 'ambiguous' | 'none'
+  attempts: UsageModelAuditAttempt[]
+  log_sha256: string
+}
+
+export interface UsageModelAuditResponse {
+  audit: UsageModelAudit | null
+  source_status: 'matched' | 'unknown'
+  acknowledgement_token: string | null
+}
+
+export interface UsageLogPreview {
+  text: string
+  truncated: boolean
+  total_bytes: number
 }
 
 export interface ModelPriceLongContext {

@@ -268,6 +268,13 @@ func (a *App) pruneExpiredUsageRawJSON(ctx context.Context, now time.Time) (int6
 		ctx = context.Background()
 	}
 	cutoff := usageRawRetentionCutoff(now)
+	if _, err := a.db.ExecContext(ctx, `DELETE FROM usage_model_audits AS audits WHERE EXISTS (
+		SELECT 1 FROM usage_records AS records
+		WHERE records.id = audits.usage_record_id
+		  AND (records.timestamp < ? OR trim(records.raw_json) = '')
+	)`, dbTime(cutoff)); err != nil {
+		return 0, err
+	}
 	var pruned int64
 	for {
 		// Pending rows can have source/auth metadata only in raw_json. Keep the

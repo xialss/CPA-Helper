@@ -307,6 +307,8 @@ func (a *App) usageAnalyticsFactsPending(ctx context.Context) (bool, error) {
 }
 
 func pendingUsageAnalyticsFactRecords(ctx context.Context, tx *sql.Tx) ([]UsageRecord, error) {
+	// Analytics does not consume response-model presentation fields. NULL slots
+	// also allow historical migration repair to run before those columns exist.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT records.id, CAST(records.timestamp AS TEXT), records.usage_username,
 		       records.api_key_description, records.provider, records.model, records.service_tier,
@@ -314,7 +316,7 @@ func pendingUsageAnalyticsFactRecords(ctx context.Context, tx *sql.Tx) ([]UsageR
 		       records.request_id, records.auth, records.auth_index, records.latency_ms, records.ttft_ms,
 		       records.failed, records.input_tokens, records.output_tokens, records.cached_tokens,
 		       records.cache_read_tokens, records.cache_creation_tokens, records.reasoning_tokens,
-		       records.total_tokens, records.dedupe_key, records.raw_json
+		       records.total_tokens, records.dedupe_key, records.raw_json, NULL, NULL
 		FROM usage_analytics_pending_facts AS pending
 		JOIN usage_records AS records ON records.id = pending.usage_record_id
 		ORDER BY records.id
