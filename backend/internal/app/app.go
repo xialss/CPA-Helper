@@ -73,6 +73,9 @@ type App struct {
 	aiRadarSampling        *aiRadarSamplingRunner
 	loginAttemptsMu        sync.Mutex
 	loginFailures          map[string]loginFailureRecord
+	usageAuditMu           sync.Mutex
+	usageAuditFlights      map[int]*usageAuditFlight
+	usageAuditActive       int
 }
 
 type loginFailureRecord struct {

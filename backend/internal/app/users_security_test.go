@@ -581,13 +581,20 @@ func TestMustChangePasswordLifecycle(t *testing.T) {
 	}
 
 	requestJSONExpectStatus(t, handler, http.MethodGet, "/api/account/models", nil, newbieCookies, http.StatusForbidden)
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/auth/change-credentials", map[string]any{
+		"password": "root-new-password",
+	}, rootCookies, http.StatusForbidden)
+
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/auth/change-credentials", map[string]any{
+		"password": "newbie-password",
+	}, newbieCookies, http.StatusUnprocessableEntity)
 
 	changeResp := struct {
 		MustChangePassword bool `json:"must_change_password"`
 	}{}
-	requestJSON(t, handler, http.MethodPost, "/api/auth/change-credentials", map[string]any{
-		"current_password": "newbie-password",
-		"password":         "newbie-new-password",
+	oldCookies := append([]*http.Cookie(nil), newbieCookies...)
+	newbieCookies = requestJSON(t, handler, http.MethodPost, "/api/auth/change-credentials", map[string]any{
+		"password": "newbie-new-password",
 	}, newbieCookies, &changeResp)
 
 	if changeResp.MustChangePassword {
@@ -595,4 +602,21 @@ func TestMustChangePasswordLifecycle(t *testing.T) {
 	}
 
 	requestJSONExpectStatus(t, handler, http.MethodGet, "/api/account/models", nil, newbieCookies, http.StatusOK)
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/auth/change-credentials", map[string]any{
+		"password": "another-new-password",
+	}, oldCookies, http.StatusUnauthorized)
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/auth/change-credentials", map[string]any{
+		"password": "another-new-password",
+	}, newbieCookies, http.StatusForbidden)
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/auth/login", map[string]any{
+		"username": "newbie",
+		"password": "newbie-password",
+	}, nil, http.StatusUnauthorized)
+	requestJSON(t, handler, http.MethodPost, "/api/auth/login", map[string]any{
+		"username": "newbie",
+		"password": "newbie-new-password",
+	}, nil, &loginResp)
+	if loginResp.MustChangePassword {
+		t.Fatal("signing in with the new password must not require another password change")
+	}
 }

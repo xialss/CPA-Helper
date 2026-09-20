@@ -10,7 +10,27 @@ import type {
   UsageRecordDetail,
   UsageRecordsResponse,
   UsageSummary,
+  UsageModelAuditResponse,
+  UsageLogPreview,
 } from '@/shared/types/api'
+
+export function getUsageModelAudit(id: number, signal?: AbortSignal): Promise<UsageModelAuditResponse> {
+  return apiClient.get<UsageModelAuditResponse>(`/usage/records/${id}/model-audit`, {}, signal)
+}
+
+export function auditUsageModel(id: number, refresh: boolean, acknowledgement?: string, signal?: AbortSignal): Promise<UsageModelAuditResponse> {
+  return apiClient.post<UsageModelAuditResponse>(`/usage/records/${id}/model-audit`, {
+    refresh, acknowledge_source: acknowledgement,
+  }, signal)
+}
+
+export function getUsageLogPreview(id: number, acknowledgement?: string, signal?: AbortSignal): Promise<UsageLogPreview> {
+  return apiClient.get<UsageLogPreview>(`/usage/records/${id}/cpa-log`, { acknowledge_source: acknowledgement }, signal)
+}
+
+export function downloadUsageLog(id: number, acknowledgement?: string, signal?: AbortSignal): Promise<Blob> {
+  return apiClient.getBlob(`/usage/records/${id}/cpa-log`, { download: 1, acknowledge_source: acknowledgement }, signal)
+}
 
 interface UsageOverviewRequestOptions {
   primary?: UsageRankingSort

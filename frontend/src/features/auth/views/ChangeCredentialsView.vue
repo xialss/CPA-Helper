@@ -16,7 +16,7 @@ const errorMessage = ref<string | null>(null)
 const form = reactive({
   username: '',
   password: '',
-  current_password: '',
+  confirm_password: '',
 })
 
 onMounted(async () => {
@@ -29,12 +29,20 @@ onMounted(async () => {
 })
 
 async function handleSubmit() {
-  isLoading.value = true
+  if (isLoading.value) return
   errorMessage.value = null
+  if (!form.password) {
+    errorMessage.value = t('请输入新密码', 'Enter a new password')
+    return
+  }
+  if (form.password !== form.confirm_password) {
+    errorMessage.value = t('两次输入的新密码不一致', 'The new passwords do not match')
+    return
+  }
+  isLoading.value = true
   try {
     const user = await changeCredentials({
       password: form.password,
-      current_password: form.current_password || undefined,
     })
     setCurrentUser(user)
     message.success(t('密码已更新', 'Password updated'))
@@ -64,7 +72,7 @@ async function handleSubmit() {
       <NCard class="auth-card" :bordered="true">
         <div class="auth-heading">
           <h1>{{ t('修改密码', 'Change password') }}</h1>
-          <p>{{ t('首次登录后需要完成密码更新', 'Update your password after first sign-in') }}</p>
+          <p>{{ t('首次登录后需要完成密码更新。请设置并确认不同于初始密码的新密码。', 'Update your password after first sign-in. Choose and confirm a new password that differs from your initial password.') }}</p>
         </div>
 
         <NAlert v-if="errorMessage" type="error" :bordered="false" class="auth-alert">
@@ -83,13 +91,12 @@ async function handleSubmit() {
               autocomplete="new-password"
             />
           </NFormItem>
-          <NFormItem :label="t('当前密码', 'Current password')" path="current_password">
+          <NFormItem :label="t('确认新密码', 'Confirm new password')" path="confirm_password">
             <NInput
-              v-model:value="form.current_password"
+              v-model:value="form.confirm_password"
               type="password"
               show-password-on="mousedown"
-              autocomplete="current-password"
-              @keyup.enter="handleSubmit"
+              autocomplete="new-password"
             />
           </NFormItem>
           <NButton type="primary" block attr-type="submit" :loading="isLoading">

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -16,6 +16,8 @@ import {
   type DataTableColumns,
 } from 'naive-ui'
 import { Zap } from 'lucide-vue-next'
+import { useCurrentUser } from '@/features/auth/state/currentUser'
+import UsageModelAuditPanel from '@/features/usage/components/UsageModelAuditPanel.vue'
 
 import {
   getUsageOptions,
@@ -118,6 +120,10 @@ const autoRefreshError = ref<string | null>(null)
 const lastRefreshedAt = ref<Date | null>(null)
 const drawerOpen = ref(false)
 const selectedRecord = ref<UsageRecordDetail | null>(null)
+const { currentUser } = useCurrentUser()
+const isSuperAdmin = computed(() => currentUser.value?.is_super_admin === true)
+let detailGeneration = 0
+watch(drawerOpen, (open) => { if (!open) detailGeneration++ }, { flush: 'sync' })
 const records = ref<UsageRecordListItem[]>([])
 const hoveredCostRecordId = ref<number | null>(null)
 const focusedCostRecordId = ref<number | null>(null)
@@ -662,12 +668,17 @@ async function refresh({
 }
 
 async function openRecord(record: UsageRecordListItem) {
+  const generation = ++detailGeneration
+  selectedRecord.value = null
   try {
-    selectedRecord.value = await getUsageRecord(record.id, props.scope)
+    const detail = await getUsageRecord(record.id, props.scope)
+    if (generation !== detailGeneration) return
+    selectedRecord.value = detail
     hoveredSourceTooltipKey.value = null
     focusedSourceTooltipKey.value = null
     drawerOpen.value = true
   } catch (error) {
+    if (generation !== detailGeneration) return
     message.error(errorText(error, '加载原始数据失败', 'Failed to load raw data'))
   }
 }
@@ -818,7 +829,8 @@ function renderModelWithPricingMarkers(row: UsageRecordListItem) {
   const model = formatModelWithReasoning(row)
   const fast = isFastRecord(row)
   const longContext = row.cost_breakdown.long_context_applied
-  if (!fast && !longContext) {
+  const responseDiffers = !!row.response_model && row.response_model !== row.model
+  if (!fast && !longContext && !responseDiffers) {
     return model
   }
 
@@ -871,9 +883,12 @@ function renderModelWithPricingMarkers(row: UsageRecordListItem) {
     )
   }
 
-  return h('div', { class: 'usage-model-cell', title: model }, [
-    h('span', { class: 'usage-model-name' }, model),
-    ...markers,
+  return h('div', {}, [
+    h('div', { class: 'usage-model-cell', title: model }, [
+      h('span', { class: 'usage-model-name' }, model),
+      ...markers,
+    ]),
+    responseDiffers ? h('div', { class: 'usage-response-model', title: t('与 CPA 记录模型名称不一致；不代表模型身份已验证', 'Name differs from the CPA record model; model identity is not verified') }, `${t('响应：', 'Response: ')}${row.response_model}`) : null,
   ])
 }
 
@@ -1177,7 +1192,9 @@ const detailRows = computed(() => {
   }
   const rows: { label: string; value: string; tooltip?: string | null }[] = [
     { label: t('时间', 'Time'), value: formatDateTime(record.timestamp) },
-    { label: t('模型', 'Model'), value: formatModelWithReasoning(record) },
+    { label: t('记录模型', 'Record model'), value: formatModelWithReasoning(record) },
+    { label: t('请求别名', 'Request alias'), value: record.request_alias || t('未采集', 'Not collected') },
+    { label: t('上游响应模型', 'Upstream response model'), value: record.response_model || t('未采集', 'Not collected') },
     { label: t('服务商', 'Provider'), value: textOrDash(record.provider) },
     { label: t('服务层级', 'Service tier'), value: serviceTierLabel(record) },
     { label: t('接口', 'Endpoint'), value: textOrDash(record.endpoint) },
@@ -1361,6 +1378,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  detailGeneration++
   desktopRecordsLayoutQuery.removeEventListener('change', handleRecordsLayoutChange)
   if (autoRefreshTimer !== undefined) {
     window.clearInterval(autoRefreshTimer)
@@ -1539,12 +1557,23 @@ onBeforeUnmount(() => {
         </div>
         <h3 class="drawer-section-title">{{ t('原始数据', 'Raw data') }}</h3>
         <pre class="mono-json">{{ jsonPretty(selectedRecord?.raw_json ?? {}) }}</pre>
+        <UsageModelAuditPanel
+          v-if="drawerOpen && selectedRecord && isSuperAdmin"
+          :key="selectedRecord.id"
+          :record-id="selectedRecord.id"
+          :queue-model="selectedRecord.response_model"
+        />
       </NDrawerContent>
     </NDrawer>
   </section>
 </template>
 
 <style scoped>
+:global(.records-table .usage-response-model) {
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
 .records-table-panel,
 .records-table {
   min-width: 0;
