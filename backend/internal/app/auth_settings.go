@@ -329,7 +329,8 @@ func (a *App) handleChangeCredentials(w http.ResponseWriter, r *http.Request) er
 	}
 	unlock := a.lockUserMutation(current.ID)
 	defer unlock()
-	_, err = a.getUser(r.Context(), current.ID)
+	// Recheck session and forced-change state after acquiring the mutation lock.
+	current, err = a.currentUser(r.Context(), r)
 	if err != nil {
 		return err
 	}
@@ -340,7 +341,7 @@ func (a *App) handleChangeCredentials(w http.ResponseWriter, r *http.Request) er
 	if err := validatePasswordBaseline(payload.Password); err != nil {
 		return err
 	}
-	if payload.CurrentPassword == nil {
+	if payload.CurrentPassword == nil && !current.MustChangePassword {
 		return forbiddenError("需要提供当前密码")
 	}
 	rateKey := fmt.Sprintf("change:%d", current.ID)
@@ -358,11 +359,11 @@ func (a *App) handleChangeCredentials(w http.ResponseWriter, r *http.Request) er
 		}
 		return err
 	}
-	if !passwordHash.Valid || !passwordSalt.Valid || !verifyPassword(*payload.CurrentPassword, passwordSalt.String, passwordHash.String) {
+	if !passwordHash.Valid || !passwordSalt.Valid || (!current.MustChangePassword && (payload.CurrentPassword == nil || !verifyPassword(*payload.CurrentPassword, passwordSalt.String, passwordHash.String))) {
 		a.recordLoginFailure(rateKey)
 		return authenticationError("当前密码不正确")
 	}
-	if *payload.CurrentPassword == payload.Password {
+	if verifyPassword(payload.Password, passwordSalt.String, passwordHash.String) {
 		return validationError("新密码不能与当前密码相同")
 	}
 	a.loginAttemptsMu.Lock()

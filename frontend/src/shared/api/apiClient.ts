@@ -86,11 +86,22 @@ function toQuery(params: Record<string, string | number | boolean | undefined>):
 }
 
 export const apiClient = {
-  get<T>(path: string, params: Record<string, string | number | boolean | undefined> = {}) {
-    return request<T>(`${path}${toQuery(params)}`)
+  async getBlob(path: string, params: Record<string, string | number | boolean | undefined> = {}, signal?: AbortSignal): Promise<Blob> {
+    const response = await fetch(`/api${path}${toQuery(params)}`, {
+      credentials: 'include', cache: 'no-store', signal: signal ?? null,
+    })
+    if (!response.ok) {
+      const error = await parseError(response)
+      throw new ApiRequestError(error.localizedMessage, response.status, error.code)
+    }
+    return response.blob()
   },
-  post<T>(path: string, body?: unknown) {
+  get<T>(path: string, params: Record<string, string | number | boolean | undefined> = {}, signal?: AbortSignal) {
+    return request<T>(`${path}${toQuery(params)}`, { signal: signal ?? null })
+  },
+  post<T>(path: string, body?: unknown, signal?: AbortSignal) {
     const init: RequestInit = { method: 'POST' }
+    if (signal) init.signal = signal
     if (body !== undefined) {
       init.body = JSON.stringify(body)
     }

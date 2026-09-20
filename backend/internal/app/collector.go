@@ -139,7 +139,7 @@ func (r *CollectorRunner) loop(ctx context.Context) {
 		}
 		inserted := 0
 		for _, message := range messages {
-			_, created, err := r.app.saveUsageMessage(ctx, []byte(message), pricing)
+			_, created, err := r.app.saveUsageMessage(ctx, []byte(message), pricing, usageCollectorOrigin(collector))
 			if err != nil {
 				r.setCollectorError(err, durationSeconds(collector.RetryIntervalSeconds))
 				continue
