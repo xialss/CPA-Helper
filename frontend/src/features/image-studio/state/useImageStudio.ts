@@ -6,7 +6,7 @@ import { loadUpstreamModels, validateConnection } from '../api/imageStudioApi'
 import { GenerationRunner } from '../services/generationRunner'
 import { ImageStudioStorage } from '../storage/imageStudioStorage'
 import type { GenerationTask, HistoryCursor, PresetKind, SaveState, StudioConnection, StudioFavoriteTag, StudioProblem, TextPreset } from '../types'
-import { createDefaultDraft, createStudioId, draftFromTask } from '../utils/generationParameters'
+import { copyDraft, createDefaultDraft, createStudioId, draftFromTask } from '../utils/generationParameters'
 import { cancelledError, ImageStudioError, toStudioProblem } from '../utils/studioErrors'
 
 const storage = new ImageStudioStorage()
@@ -121,7 +121,7 @@ async function refreshLocalData(): Promise<void> {
     } else loadProblems.value.push(readProblem(savedConnection.reason, '读取本地连接设置失败', 'Failed to read the local connection settings'))
     if (savedDraft.status === 'fulfilled') {
       if (savedDraft.value && draftRevision === draftRead) {
-        draft.value = { ...createDefaultDraft(), ...savedDraft.value }
+        draft.value = copyDraft(savedDraft.value)
         draftSave.value = { status: 'saved', problem: null }
       }
     } else loadProblems.value.push(readProblem(savedDraft.reason, '读取本地生成设置失败', 'Failed to read the local generation settings'))
@@ -241,7 +241,7 @@ async function saveDraft(): Promise<boolean> {
   if (draftSave.value.status === 'saving') return false
   const captured = context()
   const revision = draftRevision
-  const value = { ...draft.value }
+  const value = copyDraft(draft.value)
   draftSave.value = { status: 'saving', problem: null }
   try {
     await storage.saveDraft(captured.owner, value)

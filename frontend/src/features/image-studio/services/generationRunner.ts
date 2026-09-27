@@ -8,7 +8,7 @@ import type {
   StoredGenerationTask,
   StudioConnection,
 } from '../types'
-import { createGenerationRequest, createStudioId, validateDraft } from '../utils/generationParameters'
+import { copyDraft, createGenerationRequest, createStudioId, validateDraft } from '../utils/generationParameters'
 import { cancelledError, ImageStudioError, storageProblem, toStudioProblem } from '../utils/studioErrors'
 
 type Generate = (request: GenerationRequest, apiKey: string, signal: AbortSignal) => Promise<GeneratedImage>
@@ -206,7 +206,7 @@ export class GenerationRunner {
     if (!task || this.deleting.has(id) || isTaskActive(task) || task.status === 'succeeded') {
       throw new ImageStudioError('validation', '该记录当前无法重试生成', 'This record cannot be retried now')
     }
-    return this.submit({ ...task.input, count: 1, seed: task.request?.submittedSeed ?? task.input.seed }, connection, id)
+    return this.submit({ ...copyDraft(task.input), count: 1, seed: task.request?.submittedSeed ?? task.input.seed }, connection, id)
   }
 
   retrySave(id: string): Promise<boolean> {
@@ -223,9 +223,16 @@ export class GenerationRunner {
     for (const stored of tasks) {
       if (stored.ownerId !== ownerId || this.records.has(stored.id)) continue
       const interrupted = isTaskActive(stored)
+      const draft = copyDraft(stored.input)
+      const characters = draft.characters.length > 0 ? draft.characters : [{ prompt: '', positionHint: '' }]
+      const input = {
+        ...stored.input,
+        characterPromptsEnabled: draft.characterPromptsEnabled,
+        characters: Object.freeze(characters.map((character) => Object.freeze({ ...character }))),
+      }
       this.records.set(stored.id, {
         ...stored,
-        input: Object.freeze({ ...stored.input }),
+        input: Object.freeze(input),
         request: stored.request ? Object.freeze({ ...stored.request }) : null,
         status: interrupted ? 'interrupted' : stored.status,
         problem: interrupted ? {

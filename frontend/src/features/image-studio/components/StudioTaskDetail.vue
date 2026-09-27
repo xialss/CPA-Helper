@@ -8,7 +8,7 @@ import { useI18n } from '@/shared/i18n'
 import { isTaskActive } from '../services/generationRunner'
 import { useStudioImage } from '../state/useStudioImage'
 import type { GenerationTask } from '../types'
-import { seedComparison } from '../utils/generationParameters'
+import { normalizePositionHint, seedComparison } from '../utils/generationParameters'
 import { problemMessage } from '../utils/studioErrors'
 import { saveStatusText, seedEvidenceText, studioTime, taskStatusText, taskStatusType } from '../utils/studioPresentation'
 
@@ -63,6 +63,12 @@ const parameters = computed(() => JSON.stringify(props.task?.image?.parameters ?
       <p class="detail-note">{{ t('复用设置优先回填 PNG 返回种子；未回传时使用具体请求种子。旧记录的参数保持不变。', 'Reuse fills the returned PNG seed when available, otherwise the submitted seed. The original record stays unchanged.') }}</p>
       <section class="prompt-snapshot">
         <h3>{{ t('正向提示词', 'Positive prompt') }}</h3><pre>{{ task.input.positivePrompt }}</pre>
+        <template v-if="task.input.characterPromptsEnabled">
+          <template v-for="(character, index) in task.input.characters" :key="index">
+            <h3>{{ t(`角色 ${index + 1}`, `Character ${index + 1}`) }}</h3><pre>{{ character.prompt }}</pre>
+            <h3>{{ t('位置提示', 'Position hint') }}</h3><pre>{{ normalizePositionHint(character.positionHint) || '—' }}</pre>
+          </template>
+        </template>
         <h3>{{ t('画师串', 'Artist prompt') }}</h3><pre>{{ task.input.artistPrompt || '—' }}</pre>
         <h3>{{ t('负面提示词', 'Negative prompt') }}</h3><pre>{{ task.input.negativePrompt || '—' }}</pre>
       </section>
