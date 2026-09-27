@@ -1,18 +1,18 @@
 <script setup lang="ts">
-import { computed, h, ref, watch, type FunctionDirective } from 'vue'
+import { computed, h, nextTick, ref, watch, type FunctionDirective } from 'vue'
 import {
   NAlert, NButton, NCollapse, NCollapseItem, NForm, NFormItem, NIcon, NInput, NInputNumber,
-  NSelect, NSlider, NTag, type SelectGroupOption, type SelectOption,
+  NSelect, NSlider, NSwitch, NTag, NTooltip, type SelectGroupOption, type SelectOption,
 } from 'naive-ui'
-import { ChevronDown, ChevronUp, RefreshCw, Save, Sparkles } from 'lucide-vue-next'
+import { ArrowDown, ArrowUp, ChevronDown, ChevronUp, Plus, RefreshCw, Save, Sparkles, Trash2 } from 'lucide-vue-next'
 
 import { useI18n } from '@/shared/i18n'
 
 import { upstreamApiUrl } from '../api/imageStudioApi'
 import { useImageStudio } from '../state/useImageStudio'
 import { useStudioFeedback } from '../state/useStudioFeedback'
-import type { StudioProblem } from '../types'
-import { assemblePrompt, imageResolutions, novelAISamplers, validateDraft } from '../utils/generationParameters'
+import type { CharacterPrompt, StudioProblem } from '../types'
+import { assemblePrompt, createStudioId, imageResolutions, normalizePositionHint, novelAISamplers, validateDraft } from '../utils/generationParameters'
 import { problemMessage, toStudioProblem } from '../utils/studioErrors'
 import { saveStatusText } from '../utils/studioPresentation'
 import StudioPromptField from './StudioPromptField.vue'
@@ -32,6 +32,85 @@ const tagMarketVisible = ref(false)
 const pickerVersion = ref(0)
 const modelOptions = computed(() => visibleModels.value.map((model) => ({ label: model, value: model })))
 const samplerOptions = novelAISamplers.map((sampler) => ({ label: sampler, value: sampler }))
+const selectedCharacterId = ref<string | null>(null)
+const positionRows = computed(() => [
+  { label: t('上', 'Top'), hint: 'at the top' },
+  { label: t('偏上', 'Upper'), hint: 'slightly above center' },
+  { label: t('居中', 'Center'), hint: '' },
+  { label: t('偏下', 'Lower'), hint: 'slightly below center' },
+  { label: t('下', 'Bottom'), hint: 'at the bottom' },
+])
+const positionColumns = computed(() => [
+  { label: t('左', 'Left'), hint: 'on the left' },
+  { label: t('偏左', 'Left of center'), hint: 'slightly left of center' },
+  { label: t('居中', 'Center'), hint: '' },
+  { label: t('偏右', 'Right of center'), hint: 'slightly right of center' },
+  { label: t('右', 'Right'), hint: 'on the right' },
+])
+function gridPosition(row: number, column: number): string {
+  return [positionRows.value[row]?.hint, positionColumns.value[column]?.hint].filter(Boolean).join(', ') || 'in the center'
+}
+function positionCoordinates(hint: string): { row: number; column: number } | null {
+  if (!hint) return null
+  for (let row = 0; row < 5; row++) {
+    for (let column = 0; column < 5; column++) {
+      if (gridPosition(row, column) === hint) return { row, column }
+    }
+  }
+  return null
+}
+const characterIds = new WeakMap<CharacterPrompt, string>()
+function characterId(character: CharacterPrompt): string {
+  let id = characterIds.get(character)
+  if (!id) { id = `studio-character-${createStudioId()}`; characterIds.set(character, id) }
+  return id
+}
+const activeCharacter = computed(() => draft.value.characters.find((character) => characterId(character) === selectedCharacterId.value) ?? draft.value.characters[0])
+const activeCharacterNumber = computed(() => draft.value.characters.findIndex((character) => character === activeCharacter.value) + 1)
+function selectCharacter(character: CharacterPrompt): void {
+  selectedCharacterId.value = characterId(character)
+}
+function charactersAt(row: number, column: number): { character: CharacterPrompt; index: number }[] {
+  return draft.value.characters.flatMap((character, index) => {
+    const position = positionCoordinates(normalizePositionHint(character.positionHint)) ?? { row: 2, column: 2 }
+    return position.row === row && position.column === column ? [{ character, index }] : []
+  })
+}
+function assignPosition(character: CharacterPrompt | undefined, row: number, column: number): void {
+  if (!character) return
+  selectCharacter(character)
+  character.positionHint = gridPosition(row, column)
+}
+function setPositionAxis(character: CharacterPrompt, axis: 'row' | 'column', value: number | null): void {
+  if (value === null) { character.positionHint = ''; return }
+  const position = positionCoordinates(character.positionHint) ?? { row: 2, column: 2 }
+  assignPosition(character, axis === 'row' ? value : position.row, axis === 'column' ? value : position.column)
+}
+function startCharacterDrag(event: DragEvent, character: CharacterPrompt): void {
+  selectCharacter(character)
+  event.dataTransfer?.setData('text/plain', characterId(character))
+  if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
+}
+function dropCharacter(event: DragEvent, row: number, column: number): void {
+  const id = event.dataTransfer?.getData('text/plain')
+  const character = draft.value.characters.find((item) => characterId(item) === id)
+  assignPosition(character, row, column)
+}
+async function moveCharacter(index: number, offset: number, event: MouseEvent): Promise<void> {
+  const characters = draft.value.characters
+  const next = index + offset
+  if (next < 0 || next >= characters.length) return
+  const button = event.currentTarget as HTMLElement | null
+  const row = button?.closest<HTMLElement>('.character-row')
+  const scroller = button?.closest<HTMLElement>('.parameter-scroll')
+  const scrollTop = scroller?.scrollTop
+  button?.blur()
+  const [character] = characters.splice(index, 1)
+  if (character) characters.splice(next, 0, character)
+  await nextTick()
+  row?.focus({ preventScroll: true })
+  if (scroller && scrollTop !== undefined) scroller.scrollTop = scrollTop
+}
 const resolutionOptions = computed(() => imageResolutions.map(({ width, height }) => ({
   width,
   height,
@@ -87,6 +166,7 @@ watch(connection, () => {
 watch(ownerId, () => {
   submitProblem.value = null
   tagMarketVisible.value = false
+  selectedCharacterId.value = null
 }, { flush: 'sync' })
 
 function renderModelLabel(option: SelectOption | SelectGroupOption) {
@@ -152,6 +232,51 @@ async function saveSettings(): Promise<void> {
           </div>
           <NInput v-model:value="draft.positivePrompt" type="textarea" :autosize="{ minRows: 4, maxRows: 12 }" :placeholder="t('描述画面主体、构图、光线与细节…', 'Describe the subject, composition, lighting and details…')" :input-props="{ id: 'studio-positive-prompt' }" />
         </div>
+        <div class="character-mode">
+          <label for="studio-character-mode" class="field-heading">{{ t('独立角色提示', 'Independent character prompts') }}</label>
+          <NSwitch id="studio-character-mode" v-model:value="draft.characterPromptsEnabled" :disabled="localLoading" :aria-label="t('独立角色提示', 'Independent character prompts')" />
+        </div>
+        <section v-if="draft.characterPromptsEnabled" class="character-editor" :aria-label="t('角色提示', 'Character prompts')">
+          <div class="shared-position">
+            <div class="position-board-heading">
+              <span class="field-heading">{{ t('角色位置', 'Character positions') }}</span>
+              <span class="field-note">{{ t(`已选角色 ${activeCharacterNumber}`, `Selected character ${activeCharacterNumber}`) }}</span>
+            </div>
+            <div class="position-grid" role="group" :aria-label="t('共享角色位置棋盘', 'Shared character position board')">
+              <span aria-hidden="true" />
+              <span v-for="(column, columnIndex) in positionColumns" :key="columnIndex" class="position-axis">{{ column.label }}</span>
+              <template v-for="(row, rowIndex) in positionRows" :key="rowIndex">
+                <span class="position-axis">{{ row.label }}</span>
+                <div v-for="(column, columnIndex) in positionColumns" :key="columnIndex" class="position-cell" :class="{ 'position-cell-crowded': charactersAt(rowIndex, columnIndex).length > 2 }" @dragover.prevent @drop.prevent="dropCharacter($event, rowIndex, columnIndex)">
+                  <button type="button" class="position-cell-target" :aria-label="t(`${row.label}、${column.label}，放置已选角色`, `${row.label}, ${column.label}, place selected character`)" @click="assignPosition(activeCharacter, rowIndex, columnIndex)" />
+                  <button v-for="item in charactersAt(rowIndex, columnIndex)" :key="characterId(item.character)" type="button" class="position-marker" :class="{ selected: activeCharacter === item.character, unassigned: !normalizePositionHint(item.character.positionHint) }" :aria-label="t(`选择角色 ${item.index + 1}`, `Select character ${item.index + 1}`)" :aria-pressed="activeCharacter === item.character" draggable="true" @click.stop="selectCharacter(item.character)" @dragstart.stop="startCharacterDrag($event, item.character)">{{ item.index + 1 }}</button>
+                </div>
+              </template>
+            </div>
+          </div>
+          <div v-for="(character, index) in draft.characters" :key="characterId(character)" class="character-row" :class="{ 'character-row-selected': activeCharacter === character }" tabindex="-1" @click="selectCharacter(character)" @focusin="selectCharacter(character)">
+            <div class="character-toolbar">
+              <span class="field-heading">{{ t(`角色 ${index + 1}`, `Character ${index + 1}`) }}</span>
+              <div class="character-actions">
+                <NTooltip><template #trigger><NButton size="small" quaternary :disabled="index === 0" :aria-label="t('上移角色', 'Move character up')" @click="moveCharacter(index, -1, $event)"><template #icon><NIcon :component="ArrowUp" /></template></NButton></template>{{ t('上移角色', 'Move character up') }}</NTooltip>
+                <NTooltip><template #trigger><NButton size="small" quaternary :disabled="index === draft.characters.length - 1" :aria-label="t('下移角色', 'Move character down')" @click="moveCharacter(index, 1, $event)"><template #icon><NIcon :component="ArrowDown" /></template></NButton></template>{{ t('下移角色', 'Move character down') }}</NTooltip>
+                <NTooltip><template #trigger><NButton size="small" quaternary :disabled="draft.characters.length === 1" :aria-label="t('删除角色', 'Delete character')" @click="draft.characters.splice(index, 1)"><template #icon><NIcon :component="Trash2" /></template></NButton></template>{{ t('删除角色', 'Delete character') }}</NTooltip>
+              </div>
+            </div>
+            <NFormItem :label="t('角色提示词', 'Character prompt')" :label-props="{ for: characterId(character) }" :show-feedback="false">
+              <NInput v-model:value="character.prompt" type="textarea" :autosize="{ minRows: 2, maxRows: 8 }" :input-props="{ id: characterId(character) }" />
+            </NFormItem>
+            <div class="position-selectors">
+              <NFormItem :label="t('水平位置', 'Horizontal position')" :label-props="{ for: `${characterId(character)}-horizontal` }" :show-feedback="false">
+                <NSelect :value="positionCoordinates(character.positionHint)?.column ?? null" :options="positionColumns.map((column, value) => ({ label: column.label, value }))" :placeholder="t('未指定', 'Unspecified')" :input-props="{ id: `${characterId(character)}-horizontal`, 'aria-label': t(`角色 ${index + 1} 水平位置`, `Character ${index + 1} horizontal position`) }" @update:value="setPositionAxis(character, 'column', $event)" />
+              </NFormItem>
+              <NFormItem :label="t('垂直位置', 'Vertical position')" :label-props="{ for: `${characterId(character)}-vertical` }" :show-feedback="false">
+                <NSelect :value="positionCoordinates(character.positionHint)?.row ?? null" :options="positionRows.map((row, value) => ({ label: row.label, value }))" :placeholder="t('未指定', 'Unspecified')" :input-props="{ id: `${characterId(character)}-vertical`, 'aria-label': t(`角色 ${index + 1} 垂直位置`, `Character ${index + 1} vertical position`) }" @update:value="setPositionAxis(character, 'row', $event)" />
+              </NFormItem>
+            </div>
+          </div>
+          <NButton size="small" secondary class="add-character" @click="draft.characters.push({ prompt: '', positionHint: '' })"><template #icon><NIcon :component="Plus" /></template>{{ t('添加角色', 'Add character') }}</NButton>
+        </section>
         <StudioPromptField v-model:value="draft.artistPrompt" kind="artist" :label="t('画师串', 'Artist prompt')" :placeholder="t('例如：1.15::art nouveau::，保留你的权重语法', 'For example: 1.15::art nouveau:: — weights are preserved')" />
         <p class="field-note">{{ t('画师串自动拼接到正向正文前；负面词单独发送。', 'The artist prompt is prepended to the positive prompt; negative terms stay separate.') }}</p>
         <StudioPromptField v-model:value="draft.negativePrompt" kind="negative" :label="t('负面提示词', 'Negative prompt')" placeholder="lowres, blurry, text, watermark" />
@@ -230,6 +355,28 @@ async function saveSettings(): Promise<void> {
 .parameter-heading h2 { margin: 0; font-size: 16px; color: var(--cpa-text-strong); }
 .positive-prompt-field { display: grid; gap: 8px; min-width: 0; }
 .prompt-label { font-weight: 600; color: var(--cpa-text-strong); }
+.character-mode, .character-toolbar, .character-actions { display: flex; align-items: center; gap: 8px; }
+.character-mode, .character-toolbar { justify-content: space-between; }
+.character-editor, .character-row { display: grid; gap: 10px; min-width: 0; }
+.character-row { border-top: 1px solid var(--cpa-border); padding-top: 10px; }
+.character-row:focus { outline: none; }
+.character-row-selected { border-top-color: var(--cpa-primary); }
+.character-actions { flex-shrink: 0; gap: 2px; }
+.add-character { justify-self: start; }
+.shared-position { display: grid; gap: 8px; min-width: 0; }
+.position-board-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.position-grid { display: grid; grid-template-columns: 38px repeat(5, minmax(0, 1fr)); gap: 3px; align-items: stretch; width: min(100%, 280px); }
+.position-axis { display: grid; place-items: center; text-align: center; font-size: 10px; line-height: 1.2; color: var(--cpa-text-muted); overflow-wrap: anywhere; }
+.position-cell { position: relative; display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 2px; width: 100%; min-height: 44px; padding: 2px; border: 1px solid var(--cpa-border); background: var(--cpa-surface-muted); }
+.position-cell-crowded { min-height: 64px; }
+.position-cell:hover, .position-cell:focus-within { border-color: var(--cpa-primary); }
+.position-cell-target { position: absolute; inset: 0; width: 100%; border: 0; background: transparent; cursor: pointer; }
+.position-cell-target:focus-visible { outline: 2px solid var(--cpa-primary); outline-offset: -2px; }
+.position-marker { position: relative; z-index: 1; display: grid; place-items: center; width: 18px; height: 18px; flex: 0 0 18px; padding: 0; border: 1px solid var(--cpa-primary); border-radius: 50%; color: var(--cpa-primary); background: var(--cpa-surface); font: inherit; font-size: 10px; font-weight: 700; cursor: grab; }
+.position-marker.selected { color: var(--cpa-surface); background: var(--cpa-primary); }
+.position-marker.unassigned { border-style: dashed; }
+.position-marker:focus-visible { outline: 2px solid var(--cpa-primary); outline-offset: 2px; }
+.position-selectors { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; min-width: 0; }
 .field-heading { font-size: 13px; font-weight: 650; color: var(--cpa-text-strong); }
 .field-note { margin: 0; color: var(--cpa-text-muted); font-size: 12px; line-height: 1.6; }
 .model-section { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--cpa-border); border-radius: var(--cpa-radius-sm); background: var(--cpa-surface-muted); }

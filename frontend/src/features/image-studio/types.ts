@@ -1,4 +1,12 @@
+export interface CharacterPrompt {
+  prompt: string
+  /** Serialized label from the fixed 5×5 position vocabulary; empty means unspecified. */
+  positionHint: string
+}
+
 export interface GenerationDraft {
+  characterPromptsEnabled: boolean
+  characters: CharacterPrompt[]
   positivePrompt: string
   artistPrompt: string
   negativePrompt: string
@@ -13,7 +21,8 @@ export interface GenerationDraft {
   count: number | null
 }
 
-export interface GenerationInput extends GenerationDraft {
+export interface GenerationInput extends Omit<GenerationDraft, 'characters'> {
+  characters: readonly Readonly<CharacterPrompt>[]
   cfg: number
   steps: number
   count: number

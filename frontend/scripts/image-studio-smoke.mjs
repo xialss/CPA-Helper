@@ -23,7 +23,7 @@ const bridge = { controls: new Set(), messages: [], dialogs: [], slider: naiveUI
 globalThis.__imageStudioSmoke = bridge
 const virtualPrefix = '\0image-studio-smoke:'
 const uiNames = ['NAlert', 'NButton', 'NCollapse', 'NCollapseItem', 'NForm', 'NFormItem', 'NIcon', 'NInput', 'NInputNumber', 'NSelect', 'NSlider', 'NSwitch', 'NTag', 'NDrawer', 'NDrawerContent', 'NModal', 'NSpin', 'NEmpty', 'NLayout', 'NLayoutContent', 'NLayoutHeader', 'NLayoutSider', 'NMenu', 'NTooltip']
-const iconNames = ['ChevronDown', 'ChevronUp', 'RefreshCw', 'Save', 'Sparkles', 'Copy', 'Download', 'Image', 'RotateCcw', 'Trash2', 'Images', 'Settings2', 'SlidersHorizontal', 'Activity', 'BarChart3', 'Cpu', 'DollarSign', 'Github', 'Gauge', 'KeyRound', 'Languages', 'List', 'ListChecks', 'LogOut', 'Menu', 'Monitor', 'Moon', 'Network', 'Settings', 'Shield', 'Sun', 'UserRound', 'Users']
+const iconNames = ['ArrowDown', 'ArrowUp', 'Plus', 'ChevronDown', 'ChevronUp', 'RefreshCw', 'Save', 'Sparkles', 'Copy', 'Download', 'Image', 'RotateCcw', 'Trash2', 'Images', 'Settings2', 'SlidersHorizontal', 'Activity', 'BarChart3', 'Cpu', 'DollarSign', 'Github', 'Gauge', 'KeyRound', 'Languages', 'List', 'ListChecks', 'LogOut', 'Menu', 'Monitor', 'Moon', 'Network', 'Settings', 'Shield', 'Sun', 'UserRound', 'Users']
 
 const server = await createServer({
   root,
@@ -93,7 +93,7 @@ const server = await createServer({
                   disabled: props.disabled, tooltip: false,
                   'onUpdate:value': (value) => emit('update:value', value)
                 });
-                const children = slots.default?.() ?? [];
+                const children = name === 'NTooltip' ? slots.trigger?.() ?? [] : slots.default?.() ?? [];
                 entry.text = text(children).trim();
                 const tag = name === 'NButton' ? 'button' : name === 'NForm' ? 'form' : 'div';
                 return h(tag, { ...attrs, 'data-control': name, disabled: props.disabled }, children);
@@ -354,6 +354,52 @@ try {
     assert.ok(requestFor({ ...input, artistPrompt: '水彩画师，' }).content.startsWith('水彩画师， apple'), 'A trailing full-width comma is not duplicated')
     assert.ok(content.endsWith(`negative_prompt:${multiline.negativePrompt}}`))
     assert.doesNotMatch(requestFor({ ...input, artistPrompt: '', negativePrompt: '' }).content, /[\r\n]/)
+  })
+
+  await test('character segments preserve order, position and seed while legacy mode stays identical', async () => {
+    const base = { ...draft(), artistPrompt: '', positivePrompt: 'two characters', seed: '12345' }
+    const legacy = requestFor(base)
+    assert.equal(parameters.createDefaultDraft().characterPromptsEnabled, false)
+    assert.deepEqual(parameters.copyDraft({ ...base, characterPromptsEnabled: undefined, characters: undefined }).characters, [{ prompt: '', positionHint: '' }])
+    assert.deepEqual(parameters.copyDraft({ ...base, characters: [] }).characters, [{ prompt: '', positionHint: '' }])
+    assert.equal(requestFor({ ...base, characters: [{ prompt: 'unused Parameter{seed:7}', positionHint: '' }] }).content, legacy.content)
+    const characters = [{ prompt: 'red hair', positionHint: 'on the left' }, { prompt: 'blue hair', positionHint: 'on the right' }]
+    const enabled = { ...base, characterPromptsEnabled: true, characters }
+    const input = parameters.validateDraft(enabled)
+    const request = requestFor(enabled)
+    assert.equal(request.content, parameters.assemblePrompt(input, '12345'))
+    assert.ok(request.content.startsWith('two characters | red hair, on the left | blue hair, on the right Parameter{'))
+    assert.equal(request.submittedSeed, '12345')
+    const swapped = requestFor({ ...enabled, characters: [characters[1], characters[0]] })
+    assert.ok(swapped.content.startsWith('two characters | blue hair, on the right | red hair, on the left Parameter{'))
+    assert.equal(swapped.submittedSeed, request.submittedSeed)
+    const moved = requestFor({ ...enabled, characters: [{ ...characters[0], positionHint: 'at the top, on the left' }, characters[1]] })
+    assert.notEqual(moved.content, request.content)
+    assert.equal(moved.submittedSeed, request.submittedSeed)
+    const legacyFreeform = { ...enabled, characters: [{ ...characters[0], positionHint: 'in the foreground' }, characters[1]] }
+    assert.equal(parameters.copyDraft(legacyFreeform).characters[0].positionHint, '')
+    const sanitized = requestFor(legacyFreeform)
+    assert.ok(sanitized.content.startsWith('two characters | red hair | blue hair, on the right Parameter{'))
+    assert.doesNotMatch(sanitized.content, /in the foreground/)
+    assert.ok(requestFor({ ...enabled, characters: [characters[0]] }).content.startsWith('two characters | red hair, on the left Parameter{'))
+    for (const invalid of [[], [{ prompt: ' ', positionHint: '' }], [{ prompt: 'red hair', positionHint: '' }, { prompt: '', positionHint: '' }]]) {
+      assert.throws(() => requestFor({ ...enabled, characters: invalid }), hasKind('validation'))
+    }
+    for (const value of ['bad | segment', 'bad Parameter{seed:7}']) {
+      assert.throws(() => requestFor({ ...enabled, characters: [{ ...characters[0], prompt: value }] }), hasKind('validation'))
+      const position = requestFor({ ...enabled, characters: [{ ...characters[0], positionHint: value }, characters[1]] })
+      assert.doesNotMatch(position.content, /bad (\||Parameter)/)
+    }
+    assert.throws(() => requestFor({ ...enabled, positivePrompt: 'bad | global' }), hasKind('validation'))
+    assert.throws(() => requestFor({ ...enabled, artistPrompt: 'bad | artist' }), hasKind('validation'))
+    characters[0].prompt = 'mutated'
+    assert.equal(input.characters[0].prompt, 'red hair')
+    assert.ok(Object.isFrozen(input.characters[0]))
+    const restored = parameters.draftFromTask({ input, request, image: null })
+    assert.deepEqual(restored.characters, [{ prompt: 'red hair', positionHint: 'on the left' }, { prompt: 'blue hair', positionHint: 'on the right' }])
+    restored.characters[0].prompt = 'new'
+    assert.equal(input.characters[0].prompt, 'red hair')
+    assert.equal(parameters.draftFromTask({ input: base, request: legacy, image: null }).characterPromptsEnabled, false)
   })
 
   await test('tag catalog identities and append preserve existing text, weights and simple tag boundaries', async () => {
@@ -724,6 +770,38 @@ try {
     assert.equal(runner.activeCount, 0)
   })
 
+  await test('history compatibility restores a default character row and clones existing rows', async () => {
+    const runner = new GenerationRunner(storage)
+    runner.setOwner(107)
+    const legacyInput = { ...draft(), characterPromptsEnabled: true }
+    delete legacyInput.characters
+    const existingInput = { ...draft(), characterPromptsEnabled: true, characters: [{ prompt: 'red hair', positionHint: 'on the left' }] }
+    runner.mergeHistory(107, [
+      {
+        id: 'legacy-missing-characters', ownerId: 107, batchId: 'legacy-batch', batchSize: 1, position: 1,
+        retryOf: null, createdAt: 1, finishedAt: 1, input: legacyInput, endpoint: 'https://example.invalid/v1/chat/completions',
+        request: null, status: 'failed', problem: null, image: null,
+      },
+      {
+        id: 'legacy-existing-characters', ownerId: 107, batchId: 'legacy-batch-2', batchSize: 1, position: 1,
+        retryOf: null, createdAt: 2, finishedAt: 2, input: existingInput, endpoint: 'https://example.invalid/v1/chat/completions',
+        request: null, status: 'succeeded', problem: null, image: null,
+      },
+    ])
+    const legacy = runner.tasks.find(({ id }) => id === 'legacy-missing-characters')
+    const existing = runner.tasks.find(({ id }) => id === 'legacy-existing-characters')
+    assert.ok(legacy && existing)
+    assert.deepEqual(legacy.input.characters, [{ prompt: '', positionHint: '' }])
+    assert.ok(Object.isFrozen(legacy.input) && Object.isFrozen(legacy.input.characters) && Object.isFrozen(legacy.input.characters[0]))
+    assert.deepEqual(existing.input.characters, [{ prompt: 'red hair', positionHint: 'on the left' }])
+    assert.notEqual(existing.input.characters, existingInput.characters)
+    assert.notEqual(existing.input.characters[0], existingInput.characters[0])
+    const reused = parameters.draftFromTask(legacy)
+    assert.deepEqual(reused.characters, [{ prompt: '', positionHint: '' }])
+    reused.characters[0].prompt = 'new prompt'
+    assert.equal(legacy.input.characters[0].prompt, '')
+  })
+
   await test('save failures retain original bytes; retry saving never generates again', async () => {
     let fail = true
     let requests = 0
@@ -906,6 +984,102 @@ try {
     await nextTick()
     return { app, element }
   }
+
+  await test('real parameter panel edits, previews and persists independent characters', async () => {
+    await switchOwner(319)
+    await storage.saveDraft(319, { ...parameters.createDefaultDraft(), positivePrompt: 'scene', seed: '77' })
+    // The singleton store does not reread when the account id is unchanged.
+    // Cross an account boundary so the fixture exercises draft restoration.
+    await switchOwner(320)
+    await switchOwner(319)
+    studio.connection.value = { ...connection }
+    studio.draft.value.positivePrompt = 'scene'
+    const { app, element } = await mountStudio()
+    try {
+      const mode = uiControl('NSwitch', (item) => item.attrs['aria-label'] === '独立角色提示')
+      mode.emit('update:value', true)
+      await nextTick()
+      assert.equal(studio.draft.value.characterPromptsEnabled, true)
+      assert.ok(nodeText(element).includes('角色 1'))
+      const promptInputs = [...bridge.controls].filter((item) => item.name === 'NInput' && item.props.inputProps?.id?.startsWith('studio-character-') && !item.props.inputProps.id.endsWith('-position'))
+      assert.equal(promptInputs.length, 1)
+      assert.equal([...bridge.controls].filter((item) => item.name === 'NInput' && item.props.inputProps?.id?.endsWith('-position')).length, 0)
+      const horizontal = [...bridge.controls].find((item) => item.name === 'NSelect' && item.props.inputProps?.id?.endsWith('-horizontal'))
+      const vertical = [...bridge.controls].find((item) => item.name === 'NSelect' && item.props.inputProps?.id?.endsWith('-vertical'))
+      assert.ok(horizontal)
+      assert.ok(vertical)
+      assert.equal(horizontal.props.options?.length, 5)
+      assert.equal(vertical.props.options?.length, 5)
+      const positionCells = () => findNodes(element, (node) => node.class === 'position-cell')
+      const positionTargets = () => findNodes(element, (node) => node.class === 'position-cell-target')
+      assert.equal(positionCells().length, 25)
+      assert.equal(positionTargets().length, 25)
+      promptInputs[0].emit('update:value', 'red hair')
+      horizontal.emit('update:value', 0)
+      uiControl('NButton', (item) => item.text === '添加角色').emit('click')
+      await nextTick()
+      const rows = [...bridge.controls].filter((item) => item.name === 'NInput' && item.props.inputProps?.id?.startsWith('studio-character-') && !item.props.inputProps.id.endsWith('-position'))
+      const secondPrompt = rows.find((item) => item.props.value === '')
+      secondPrompt?.emit('update:value', 'blue hair')
+      await nextTick()
+      // The renderer stub does not mirror Naive UI's internal input value; verify the
+      // component's emitted controls above and use the reactive draft for serialization.
+      studio.draft.value.characters[0].prompt = 'red hair'
+      studio.draft.value.characters[0].positionHint = 'on the left'
+      studio.draft.value.characters[1].prompt = 'blue hair'
+      const positionMarkers = () => findNodes(element, (node) => typeof node.class === 'string' && node.class.includes('position-marker'))
+      assert.equal(positionMarkers().length, 2)
+      positionMarkers()[1].onClick({ stopPropagation() {} })
+      positionTargets()[24].onClick()
+      await nextTick()
+      assert.equal(studio.draft.value.characters[1].positionHint, 'at the bottom, on the right')
+      const preview = parameters.createGenerationRequest(parameters.validateDraft(studio.draft.value), api.upstreamApiUrl(connection.baseUrl, 'chat/completions'))
+      assert.ok(preview.content.includes('scene | red hair, on the left | blue hair, at the bottom, on the right Parameter{'))
+      await studio.saveDraft()
+      await switchOwner(320)
+      await switchOwner(319)
+      assert.deepEqual(studio.draft.value.characters.map(({ prompt, positionHint }) => ({ prompt, positionHint })), [{ prompt: 'red hair', positionHint: 'on the left' }, { prompt: 'blue hair', positionHint: 'at the bottom, on the right' }])
+    } finally {
+      app.unmount()
+      assert.equal(bridge.controls.size, 0)
+    }
+  })
+
+  await test('shared position board keeps every marker when four characters share one cell', async () => {
+    await switchOwner(321)
+    studio.connection.value = { ...connection }
+    studio.draft.value = {
+      ...parameters.createDefaultDraft(),
+      positivePrompt: 'four characters',
+      characterPromptsEnabled: true,
+      characters: [
+        { prompt: 'red hair', positionHint: 'in the center' },
+        { prompt: 'blue hair', positionHint: 'in the center' },
+        { prompt: 'green hair', positionHint: 'in the center' },
+        { prompt: 'yellow hair', positionHint: 'in the center' },
+      ],
+    }
+    const { app, element } = await mountStudio()
+    try {
+      await nextTick()
+      const positionCells = () => findNodes(element, (node) => typeof node.class === 'string' && node.class.split(' ').includes('position-cell'))
+      const crowdedCells = () => positionCells().filter((node) => typeof node.class === 'string' && node.class.split(' ').includes('position-cell-crowded'))
+      const positionMarkers = () => findNodes(element, (node) => typeof node.class === 'string' && node.class.split(' ').includes('position-marker'))
+      assert.equal(positionCells().length, 25)
+      assert.equal(crowdedCells().length, 1)
+      assert.deepEqual(positionMarkers().map(nodeText).sort(), ['1', '2', '3', '4'])
+      assert.deepEqual(findNodes(crowdedCells()[0], (node) => typeof node.class === 'string' && node.class.split(' ').includes('position-marker')).map(nodeText).sort(), ['1', '2', '3', '4'])
+      const fourthMarker = positionMarkers().find((node) => nodeText(node) === '4')
+      assert.ok(fourthMarker)
+      fourthMarker.onClick({ stopPropagation() {} })
+      findNodes(element, (node) => node.class === 'position-cell-target')[0].onClick()
+      await nextTick()
+      assert.equal(studio.draft.value.characters[3].positionHint, 'at the top, on the left')
+    } finally {
+      app.unmount()
+      assert.equal(bridge.controls.size, 0)
+    }
+  })
 
   await test('new connections start empty while explicitly saved URLs survive account reloads', async () => {
     await switchOwner(317)
