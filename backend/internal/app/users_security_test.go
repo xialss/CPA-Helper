@@ -378,6 +378,11 @@ func TestConcurrentSuperAdminDemotionsKeepOneActive(t *testing.T) {
 		},
 	)
 	assertConcurrentUserMutationStatuses(t, statuses, http.StatusOK, http.StatusConflict)
+	// A successful root demotion revokes its earlier session.
+	rootCookies = requestJSON(t, handler, http.MethodPost, "/api/auth/login", map[string]any{
+		"username": "root",
+		"password": "root-password",
+	}, nil, nil)
 	assertOneActiveSuperAdmin(t, handler, rootCookies)
 }
 
