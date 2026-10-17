@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import {
   NAlert,
   NButton,
@@ -9,9 +9,11 @@ import {
   NFormItem,
   NInput,
   NInputNumber,
+  NSelect,
   NSpace,
   NSwitch,
   NTag,
+  useDialog,
   useMessage,
 } from 'naive-ui'
 import { Activity, Database, Power, Server } from 'lucide-vue-next'
@@ -21,12 +23,21 @@ import {
   getSettings,
   updateSettings,
 } from '@/features/settings/api/settingsApi'
+import {
+  getCPAHelperResponseModelConfig,
+  updateCPAHelperResponseModelConfig,
+} from '@/features/plugin/api/cpaHelperPluginApi'
+import { useCurrentUser } from '@/features/auth/state/currentUser'
+import { ApiRequestError } from '@/shared/api/apiClient'
 import { useI18n } from '@/shared/i18n'
-import type { CollectorStatus, SettingsUpdatePayload } from '@/shared/types/api'
+import type { CPAHelperResponseModelConfig, CollectorStatus, SettingsUpdatePayload } from '@/shared/types/api'
 import { formatDateTime, formatInteger } from '@/shared/utils/format'
 
 const message = useMessage()
+const dialog = useDialog()
 const { errorText, serverText, t } = useI18n()
+const { currentUser } = useCurrentUser()
+const canManageResponseVerification = computed(() => currentUser.value?.is_super_admin === true)
 const isLoading = ref(false)
 const isSaving = ref(false)
 const collectorStatus = ref<CollectorStatus | null>(null)
@@ -64,14 +75,81 @@ const remoteStatusText = computed(() => {
 const collectorEnabledText = computed(() => (collectorStatus.value?.enabled ? t('开启', 'On') : t('关闭', 'Off')))
 const collectorRunningText = computed(() => (collectorStatus.value?.running ? t('运行中', 'Running') : t('空闲', 'Idle')))
 const isManagementKeySet = ref(false)
+const responseModelConfigLoading = ref(false)
+const responseModelConfigSaving = ref(false)
+const responseModelConfigError = ref<unknown>(null)
+const responseModelLoaded = ref(false)
+const savedResponseModelSnapshot = ref('')
+let settingsLoadGeneration = 0
+let responseModelConfigGeneration = 0
+const responseConfig = reactive<CPAHelperResponseModelConfig>({
+  enabled: false, stream_enabled: true,
+  max_buffer_bytes: 2097152, max_total_buffer_bytes: 8388608,
+  action: 'reject', unknown_action: 'pass', case_sensitive: false,
+  ignore_thinking_suffix: true, ignored_models: [], accepted_models: {},
+})
+const ignoredModelsText = ref('')
+const acceptedModelRows = ref<Array<{ request: string; responses: string }>>([])
+const responseModelSnapshot = () => JSON.stringify({
+  config: responseConfig,
+  ignoredModelsText: ignoredModelsText.value,
+  acceptedModelRows: acceptedModelRows.value,
+})
+const responseModelDirty = computed(() => responseModelLoaded.value && responseModelSnapshot() !== savedResponseModelSnapshot.value)
+const responseModelFormDisabled = computed(() => responseModelConfigLoading.value || responseModelConfigSaving.value || !responseModelLoaded.value || !!responseModelConfigError.value)
+const responseModelConfigErrorText = computed(() => {
+  if (!responseModelConfigError.value) return ''
+  if (responseModelConfigError.value instanceof ApiRequestError && responseModelConfigError.value.code === 'plugin_not_loaded') return t('CPA Helper Plugin 未加载或契约不兼容；系统其他设置仍可使用。', 'CPA Helper Plugin is not loaded or its contract is incompatible; other system settings remain available.')
+  if (responseModelConfigError.value instanceof ApiRequestError && responseModelConfigError.value.code === 'plugin_unavailable') return t('CPA Helper Plugin 不可达；系统其他设置仍可使用。', 'CPA Helper Plugin is unreachable; other system settings remain available.')
+  return errorText(responseModelConfigError.value, '插件响应核验配置不可用；系统其他设置仍可使用。', 'Plugin response verification is unavailable; other system settings remain usable.')
+})
 
-async function refresh() {
+function refresh() {
+  if (isLoading.value || isSaving.value || responseModelConfigSaving.value) return
+  if (responseModelDirty.value) {
+    dialog.warning({ title: t('放弃修改', 'Discard changes'), content: t('尚未保存的响应核验修改将被丢弃。', 'Unsaved response verification changes will be discarded.'), positiveText: t('放弃并刷新', 'Discard and refresh'), negativeText: t('继续编辑', 'Keep editing'), onPositiveClick: () => {
+      if (isLoading.value || isSaving.value || responseModelConfigSaving.value) return false
+      return loadSettings()
+    } })
+    return
+  }
+  return loadSettings()
+}
+
+function applyResponseModelConfig(config: CPAHelperResponseModelConfig) {
+  Object.assign(responseConfig, config)
+  ignoredModelsText.value = config.ignored_models.join('\n')
+  acceptedModelRows.value = Object.entries(config.accepted_models).map(([request, responses]) => ({ request, responses: responses.join(', ') }))
+  responseModelConfigError.value = null
+  responseModelLoaded.value = true
+  savedResponseModelSnapshot.value = responseModelSnapshot()
+}
+
+async function loadResponseModelConfig() {
+  if (!canManageResponseVerification.value || responseModelConfigSaving.value) return
+  const generation = ++responseModelConfigGeneration
+  responseModelConfigLoading.value = true
+  try {
+    const loaded = await getCPAHelperResponseModelConfig()
+    if (generation !== responseModelConfigGeneration) return
+    applyResponseModelConfig(loaded)
+  } catch (error) {
+    if (generation === responseModelConfigGeneration) responseModelConfigError.value = error
+  } finally {
+    if (generation === responseModelConfigGeneration) responseModelConfigLoading.value = false
+  }
+}
+
+async function loadSettings(includeResponseConfig = true) {
+  const generation = ++settingsLoadGeneration
   isLoading.value = true
   try {
     const [settings, status] = await Promise.all([
       getSettings(),
       getCollectorStatus(),
+      includeResponseConfig ? loadResponseModelConfig() : Promise.resolve(),
     ])
+    if (generation !== settingsLoadGeneration) return
     settingsForm.cliaproxy_url = settings.cliaproxy_url
     settingsForm.model_request_url = settings.model_request_url
     settingsForm.management_key = ''
@@ -82,13 +160,55 @@ async function refresh() {
     settingsForm.retry_interval_seconds = settings.retry_interval_seconds
     collectorStatus.value = status
   } catch (error) {
-    message.error(errorText(error, '加载设置失败', 'Failed to load settings'))
+    if (generation === settingsLoadGeneration) message.error(errorText(error, '加载设置失败', 'Failed to load settings'))
   } finally {
-    isLoading.value = false
+    if (generation === settingsLoadGeneration) isLoading.value = false
+  }
+}
+
+async function saveResponseModelConfig() {
+  if (!canManageResponseVerification.value || !responseModelLoaded.value || responseModelConfigSaving.value) return
+  const acceptedModels: Record<string, string[]> = Object.create(null)
+  for (const row of acceptedModelRows.value) {
+    const request = row.request.trim()
+    const responses = row.responses.split(',').map((value) => value.trim()).filter(Boolean)
+    if (!request || responses.length === 0) {
+      message.error(t('允许响应模型映射不能为空', 'Accepted model mappings cannot be empty'))
+      return
+    }
+    if (Object.prototype.hasOwnProperty.call(acceptedModels, request)) {
+      message.error(t('请求模型映射不能重复', 'Requested model mappings must be unique'))
+      return
+    }
+    acceptedModels[request] = [...new Set(responses)]
+  }
+  const config: CPAHelperResponseModelConfig = {
+    ...responseConfig,
+    ignored_models: ignoredModelsText.value.split('\n').map((value) => value.trim()).filter(Boolean),
+    accepted_models: acceptedModels,
+  }
+  if (config.max_buffer_bytes < 1048576 || config.max_buffer_bytes > 268435456 || config.max_total_buffer_bytes < config.max_buffer_bytes || config.max_total_buffer_bytes > 1073741824) {
+    message.error(t('暂存大小范围无效：单请求 1–256 MiB，总量不能小于单请求且不超过 1 GiB。', 'Invalid buffer sizes: request 1–256 MiB; total must be at least request and at most 1 GiB.'))
+    return
+  }
+  responseModelConfigSaving.value = true
+  const generation = ++responseModelConfigGeneration
+  responseModelConfigLoading.value = false
+  try {
+    const saved = await updateCPAHelperResponseModelConfig(config)
+    if (generation !== responseModelConfigGeneration) return
+    applyResponseModelConfig(saved)
+    message.success(t('响应核验配置已保存并生效', 'Response verification config saved and active'))
+  } catch (error) {
+    if (generation === responseModelConfigGeneration) message.error(errorText(error, '保存响应核验配置失败', 'Failed to save response verification config'))
+  } finally {
+    if (generation === responseModelConfigGeneration) responseModelConfigSaving.value = false
   }
 }
 
 async function saveSettings() {
+  if (isLoading.value || isSaving.value) return
+  settingsLoadGeneration++
   isSaving.value = true
   try {
     const payload: SettingsUpdatePayload = {
@@ -107,7 +227,7 @@ async function saveSettings() {
     settingsForm.management_key = ''
     isManagementKeySet.value = saved.management_key_set
     message.success(t('设置已保存', 'Settings saved'))
-    await refresh()
+    await loadSettings(false)
   } catch (error) {
     message.error(errorText(error, '保存设置失败', 'Failed to save settings'))
   } finally {
@@ -116,6 +236,10 @@ async function saveSettings() {
 }
 
 onMounted(refresh)
+onBeforeUnmount(() => {
+  settingsLoadGeneration++
+  responseModelConfigGeneration++
+})
 </script>
 
 <template>
@@ -126,8 +250,8 @@ onMounted(refresh)
         <p class="page-subtitle">{{ t('集中管理采集配置', 'Manage collection settings in one place') }}</p>
       </div>
       <NSpace>
-        <NButton secondary :loading="isLoading" @click="refresh">{{ t('刷新', 'Refresh') }}</NButton>
-        <NButton type="primary" :loading="isSaving" @click="saveSettings">{{ t('保存设置', 'Save settings') }}</NButton>
+        <NButton secondary :loading="isLoading" :disabled="isSaving || responseModelConfigSaving" @click="refresh">{{ t('刷新', 'Refresh') }}</NButton>
+        <NButton type="primary" :loading="isSaving" :disabled="isLoading" @click="saveSettings">{{ t('保存设置', 'Save settings') }}</NButton>
       </NSpace>
     </div>
 
@@ -170,7 +294,7 @@ onMounted(refresh)
       <section class="panel">
         <div class="panel-inner">
           <h2 class="section-title">{{ t('采集配置', 'Collection Settings') }}</h2>
-          <NForm :model="settingsForm" label-placement="top">
+          <NForm :model="settingsForm" label-placement="top" :disabled="isLoading || isSaving">
             <div class="form-grid">
               <div class="field-stack">
                 <div class="field-label">{{ t('CLIProxyAPI 地址', 'CLIProxyAPI URL') }}</div>
@@ -249,13 +373,53 @@ onMounted(refresh)
           </NAlert>
         </div>
       </section>
+
+      <section v-if="canManageResponseVerification" class="panel response-verification-panel">
+        <div class="panel-inner">
+          <div class="section-heading-row">
+            <div>
+              <h2 class="section-title">{{ t('响应核验', 'Response verification') }}</h2>
+              <p class="form-help">{{ t('仅超级管理员可修改，保存前会由插件校验并确认热更新。', 'Super admins only. The plugin validates and confirms hot reload before success.') }}</p>
+            </div>
+            <NButton type="primary" :loading="responseModelConfigSaving" :disabled="responseModelConfigLoading || !responseModelLoaded || !!responseModelConfigError" @click="saveResponseModelConfig">
+              {{ t('保存核验配置', 'Save verification config') }}
+            </NButton>
+          </div>
+          <NAlert v-if="responseModelConfigError" type="warning" :bordered="false" class="status-alert">
+            {{ responseModelConfigErrorText }}
+          </NAlert>
+          <NForm class="response-verification-form" :model="responseConfig" label-placement="top" :show-feedback="false" :disabled="responseModelFormDisabled">
+            <div class="response-verification-grid">
+              <NFormItem :show-feedback="false" :label="t('启用核验', 'Enable verification')"><NSwitch v-model:value="responseConfig.enabled" /></NFormItem>
+              <NFormItem :show-feedback="false" :label="t('核验流式响应', 'Verify streaming responses')"><NSwitch v-model:value="responseConfig.stream_enabled" /></NFormItem>
+              <NFormItem :show-feedback="false" :label="t('拦截动作', 'Mismatch action')"><NSelect v-model:value="responseConfig.action" :options="[{ label: t('拒绝', 'Reject'), value: 'reject' }, { label: t('仅审计', 'Audit only'), value: 'audit' }]" /></NFormItem>
+              <NFormItem :show-feedback="false" :label="t('无法核验时', 'Unknown response action')"><NSelect v-model:value="responseConfig.unknown_action" :options="[{ label: t('放行', 'Pass'), value: 'pass' }, { label: t('拒绝', 'Reject'), value: 'reject' }]" /></NFormItem>
+              <NFormItem :show-feedback="false" :label="t('单请求暂存上限（字节）', 'Per-request buffer limit (bytes)')"><NInputNumber v-model:value="responseConfig.max_buffer_bytes" :min="1048576" :max="268435456" :precision="0" /></NFormItem>
+              <NFormItem :show-feedback="false" :label="t('并发暂存总上限（字节）', 'Total buffer limit (bytes)')"><NInputNumber v-model:value="responseConfig.max_total_buffer_bytes" :min="1048576" :max="1073741824" :precision="0" /></NFormItem>
+              <NFormItem :show-feedback="false" :label="t('区分大小写', 'Case sensitive')"><NSwitch v-model:value="responseConfig.case_sensitive" /></NFormItem>
+              <NFormItem :show-feedback="false" :label="t('忽略思考后缀', 'Ignore thinking suffix')"><NSwitch v-model:value="responseConfig.ignore_thinking_suffix" /></NFormItem>
+            </div>
+            <NFormItem :show-feedback="false" :label="t('跳过核验的模型（每行一个）', 'Ignored models (one per line)')"><NInput v-model:value="ignoredModelsText" type="textarea" :rows="4" /></NFormItem>
+            <NFormItem :show-feedback="false" :label="t('允许响应模型映射', 'Accepted response model mappings')">
+              <div class="mapping-list">
+                <div v-for="(row, index) in acceptedModelRows" :key="index" class="mapping-row">
+                  <NInput v-model:value="row.request" :placeholder="t('请求模型', 'Requested model')" />
+                  <NInput v-model:value="row.responses" :placeholder="t('允许响应模型，逗号分隔', 'Allowed response models, comma separated')" />
+                  <NButton quaternary type="error" :disabled="responseModelFormDisabled" @click="acceptedModelRows.splice(index, 1)">{{ t('删除', 'Remove') }}</NButton>
+                </div>
+                <NButton dashed :disabled="responseModelFormDisabled" @click="acceptedModelRows.push({ request: '', responses: '' })">{{ t('添加映射', 'Add mapping') }}</NButton>
+              </div>
+            </NFormItem>
+          </NForm>
+        </div>
+      </section>
     </div>
   </section>
 </template>
 
 <style scoped>
 .section-title {
-  margin: 0 0 12px;
+  margin: 0 0 8px;
 }
 
 .settings-metrics {
@@ -265,7 +429,40 @@ onMounted(refresh)
 .form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 18px 12px;
+  gap: 8px 12px;
+}
+
+.response-verification-panel .section-heading-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.response-verification-panel .section-heading-row > .n-button {
+  flex-shrink: 0;
+}
+
+.response-verification-form {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.response-verification-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 12px 16px;
+}
+
+.response-verification-form :deep(.n-form-item-label) {
+  padding-bottom: 6px;
+}
+
+.response-verification-form :deep(.n-form-item-blank) {
+  min-height: 34px;
 }
 
 .field-stack {
@@ -290,6 +487,25 @@ onMounted(refresh)
   font-size: 13px;
   font-weight: 600;
   line-height: 1.45;
+}
+
+.mapping-list {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+}
+
+.mapping-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+@media (max-width: 720px) {
+  .mapping-row { grid-template-columns: 1fr; }
+  .response-verification-grid { grid-template-columns: 1fr; }
+  .response-verification-panel .section-heading-row { flex-wrap: wrap; }
 }
 
 .status-alert {

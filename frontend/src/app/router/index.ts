@@ -62,6 +62,12 @@ export const router = createRouter({
           meta: { requiresAdmin: true },
         },
         {
+          path: 'admin/plugin-rules',
+          name: 'admin-plugin-rules',
+          component: () => import('@/features/plugin/views/PluginRouteRulesView.vue'),
+          meta: { requiresAdmin: true, requiresSuperAdmin: true },
+        },
+        {
           path: 'admin/account-status',
           name: 'admin-account-status',
           component: () => import('@/features/codex-keeper/views/CodexKeeperStatusView.vue'),

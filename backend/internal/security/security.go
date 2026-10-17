@@ -70,7 +70,7 @@ func MaskSecret(value *string) string {
 	if len(normalized) <= 4 {
 		return "****"
 	}
-	if len(normalized) <= 8 {
+	if len(normalized) <= 10 {
 		return normalized[:1] + "..." + normalized[len(normalized)-1:]
 	}
 	return normalized[:6] + "..." + normalized[len(normalized)-4:]

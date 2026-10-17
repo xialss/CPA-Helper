@@ -4,6 +4,61 @@ type MessagePair = readonly [zh: string, en: string]
 type ServerMessagePattern = readonly [RegExp, (match: RegExpMatchArray) => string]
 
 const exactServerMessages: MessagePair[] = [
+  ['插件策略保存后未生效', 'Plugin policy was saved but did not take effect'],
+  ['响应核验配置已提交，但插件未确认生效', 'Response verification config was submitted, but the plugin did not confirm activation'],
+  ['插件策略已提交，但未确认目标修订号', 'Plugin policy was submitted, but the target revision was not confirmed'],
+  ['CPA Helper Plugin 不可达', 'CPA Helper Plugin is unreachable'],
+  ['CPA Helper Plugin 管理端认证失败，请检查管理密钥', 'CPA Helper Plugin management authentication failed. Check the management key.'],
+  ['CPA Helper Plugin 未加载或不支持当前管理契约', 'CPA Helper Plugin is not loaded or does not support the current management contract'],
+  ['CPA Helper Plugin 策略快照格式无效（groups/keys 必须为对象数组）', 'CPA Helper Plugin policy snapshot is invalid (groups/keys must be arrays of objects)'],
+  ['CPA Helper Plugin 配置校验失败', 'CPA Helper Plugin configuration validation failed'],
+  ['CPA Helper Plugin 写入缺少版本前置条件', 'CPA Helper Plugin write is missing the version precondition'],
+  ['CPA Helper Plugin 配置已被其他管理端修改，请刷新后重试', 'CPA Helper Plugin configuration was changed by another administrator. Refresh and try again.'],
+  ['插件配置已被其他管理端修改，请刷新后重试', 'Plugin configuration was changed by another administrator. Refresh and try again.'],
+  ['CPA Helper Plugin 模型列表策略不可用', 'CPA Helper Plugin model list policy is unavailable'],
+  ['CPA Helper Plugin 模型目录无效', 'CPA Helper Plugin model catalog is invalid'],
+  ['CPA Helper Plugin 模型列表查询失败', 'CPA Helper Plugin model list query failed'],
+  ['CPA Helper Plugin 无法识别当前 API 密钥，模型列表未按路由规则过滤', 'CPA Helper Plugin cannot identify this API key; the model list was not filtered by routing rules'],
+  ['CPA 模型列表包含无效模型标识', 'CPA model list contains an invalid model identifier'],
+  ['CPA Helper Plugin 管理密钥无效', 'CPA Helper Plugin management key is invalid'],
+  ['CPA Helper Plugin 管理契约不兼容', 'CPA Helper Plugin management contract is incompatible'],
+  ['CPA Helper Plugin 版本不兼容', 'CPA Helper Plugin version is incompatible'],
+  ['CPA Helper Plugin API 密钥启用状态无效', 'CPA Helper Plugin API key enabled state is invalid'],
+  ['CPA Helper Plugin 返回的 JSON 不是对象', 'CPA Helper Plugin returned JSON that is not an object'],
+  ['CPA Helper Plugin 策略字段格式无效', 'CPA Helper Plugin policy field format is invalid'],
+  ['CPA Helper Plugin API 密钥 group_ids 字段格式无效', 'CPA Helper Plugin API key group_ids field format is invalid'],
+  ['CPA Helper Plugin 规则字段格式无效', 'CPA Helper Plugin rule field format is invalid'],
+  ['CPA Helper Plugin 当前并发数据缺失或无效', 'CPA Helper Plugin current concurrency data is missing or invalid'],
+  ['CPA Helper Plugin 当前并发数据超出可表示范围', 'CPA Helper Plugin current concurrency data exceeds the supported numeric range'],
+  ['CPA Helper Plugin 路由规则关联无效', 'CPA Helper Plugin route rule association is invalid'],
+  ['CPA Helper Plugin 并发上限数据无效', 'CPA Helper Plugin concurrency limit data is invalid'],
+  ['CPA Helper Plugin capabilities 缺少响应核验配置', 'CPA Helper Plugin capabilities are missing the response verification config'],
+  ['scope 参数无效', 'Invalid scope parameter'],
+  ['API KEY 不存在', 'API key does not exist'],
+  ['CLIProxyAPI 地址不能为空', 'CLIProxyAPI URL is required'],
+  ['CLIProxyAPI 地址无效', 'CLIProxyAPI URL is invalid'],
+  ['CLIProxyAPI 地址缺少主机名', 'CLIProxyAPI URL is missing a hostname'],
+  ['CLIProxyAPI 地址必须使用 http、https、tcp、redis 或 resp 协议', 'CLIProxyAPI URL must use http, https, tcp, redis, or resp'],
+  ['CPA 模型列表响应不是有效 JSON', 'CPA model list response is not valid JSON'],
+  ['CPA 模型列表响应格式不支持', 'CPA model list response format is unsupported'],
+  ['CPA 模型列表响应缺少模型列表', 'CPA model list response is missing the model list'],
+  ['当前 API 密钥缺少完整密钥，无法映射插件策略', 'The full API key is missing; its plugin policy cannot be mapped'],
+  ['插件 API 密钥策略缺少 id', 'Plugin API key policy is missing id'],
+  ['插件 API 密钥策略必须包含 policy_revision 和 key', 'Plugin API key policy must include policy_revision and key'],
+  ['插件 API 密钥身份映射不匹配', 'Plugin API key identity mapping does not match'],
+  ['插件目录响应格式无效', 'Plugin directory response format is invalid'],
+  ['插件目录响应缺少 credentials', 'Plugin directory response is missing credentials'],
+  ['CLIProxyAPI 配置响应不是有效 JSON object', 'CLIProxyAPI configuration response is not a valid JSON object'],
+  ['CLIProxyAPI v8 配置缺少 access', 'CLIProxyAPI v8 configuration is missing access'],
+  ['CLIProxyAPI v8 配置缺少 api-keys', 'CLIProxyAPI v8 configuration is missing api-keys'],
+  ['读取 CPA API KEY 失败：v8 配置格式无效', 'Failed to read CPA API keys: invalid v8 configuration format'],
+  ['CPA 认证文件目录格式无效', 'CPA auth file directory format is invalid'],
+  ['CPA 凭据缺少宿主 ID', 'CPA credential is missing its host ID'],
+  ['CPA 凭据目录存在重复标识', 'CPA credential directory contains duplicate identifiers'],
+  ['CPA 配置与运行时凭据索引不一致', 'CPA configuration does not match the runtime credential index'],
+  ['CPA 凭据索引格式错误', 'CPA credential index format is invalid'],
+  ['CPA 上游 Key 格式错误', 'CPA upstream key format is invalid'],
+  ['CPA 上游配置格式错误', 'CPA upstream configuration format is invalid'],
   ['峰谷时段模板不存在', 'Time pricing template does not exist'],
   ['峰谷时段时间必须为 HH:mm', 'Time pricing windows must use HH:mm'],
   ['请选择明确的 IANA 时区', 'Choose an explicit IANA time zone'],
@@ -296,7 +351,22 @@ const aiRadarTransportMessagePatterns: ServerMessagePattern[] = [
   [/^AI 雷达历史快照没有可导入的 GPT 观测点$/, () => 'AI radar history snapshot has no importable GPT observations'],
 ]
 
+// Preserve opaque upstream identifiers, including when UI errorText localizes an API error again.
+const pluginDiagnosticMessagePatterns: ServerMessagePattern[] = [
+  [/^(?:CPA 上游配置格式错误|Invalid CPA upstream configuration format): (.+)$/, ([, field]) => `Invalid CPA upstream configuration format: ${field}`],
+  [/^(?:CPA 上游配置条目格式错误|Invalid CPA upstream configuration entry format): (.+)$/, ([, field]) => `Invalid CPA upstream configuration entry format: ${field}`],
+  [/^(?:CPA 上游分组格式错误|Invalid CPA upstream group format): (.+)$/, ([, provider]) => `Invalid CPA upstream group format: ${provider}`],
+  [/^(?:CPA 上游凭据格式错误|Invalid CPA upstream credential format): (.+)$/, ([, provider]) => `Invalid CPA upstream credential format: ${provider}`],
+  [/^(?:CPA 上游类型不受支持|Unsupported CPA upstream provider type): (.+)$/, ([, provider]) => `Unsupported CPA upstream provider type: ${provider}`],
+]
+
 const serverMessagePatterns: ServerMessagePattern[] = [
+  [/^CLIProxyAPI 管理地址无效：(.+)$/, ([, detail]) => `Invalid CLIProxyAPI management URL: ${translateNested(detail ?? '')}`],
+  [/^查询 CPA 模型目录失败：(.+)$/, ([, detail]) => `Failed to query CPA model catalog: ${translateNested(detail ?? '')}`],
+  [/^CPA 模型列表请求失败：(.+)$/, ([, detail]) => `CPA model list request failed: ${translateNested(detail ?? '')}`],
+  [/^CPA 模型列表响应字段 (.+) 不是列表$/, ([, field]) => `CPA model list response field ${field} is not a list`],
+  [/^CPA Helper Plugin 请求失败（上游 HTTP (\d+)）$/, ([, status]) => `CPA Helper Plugin request failed (upstream HTTP ${status})`],
+  [/^CPA Helper Plugin 暂不可用（上游 HTTP (\d+)）$/, ([, status]) => `CPA Helper Plugin is temporarily unavailable (upstream HTTP ${status})`],
   [/^峰谷规则缺少字段: (.+)$/, (match) => `Time pricing rule is missing field: ${match[1]}`],
   [/^空闲价格缺少字段: (.+)$/, (match) => `Off-peak rates are missing field: ${match[1]}`],
   [/^单次最多批量应用 (\d+) 个渠道模型价格$/, ([, count]) => `A maximum of ${count} channel model prices can be applied at once`],
@@ -381,8 +451,6 @@ const serverMessagePatterns: ServerMessagePattern[] = [
   [/^模型响应不是有效 JSON$/, () => 'Model response is not valid JSON'],
   [/^请求格式不支持$/, () => 'Request format is unsupported'],
   [/^查询 CPA 可用模型失败：(.+)$/, ([, detail]) => `Failed to query CPA available models: ${translateNested(detail ?? '')}`],
-  [/^CPA 模型列表响应字段 (.+) 不是列表$/, ([, field]) => `CPA model list response field ${field} is not a list`],
-  [/^CPA 模型列表响应缺少模型列表$/, () => 'CPA model list response is missing the model list'],
   [/^下载 LiteLLM 价格数据失败：HTTP (\d+)$/, ([, status]) => `Failed to download LiteLLM price data: HTTP ${status}`],
   [/^下载 LiteLLM 价格数据失败$/, () => 'Failed to download LiteLLM price data'],
   [/^LiteLLM 价格数据不是有效 JSON$/, () => 'LiteLLM price data is not valid JSON'],
@@ -566,6 +634,11 @@ export function localizedServerMessage(
 
   if (!message) {
     return fallbackEn
+  }
+
+  for (const [pattern, translate] of pluginDiagnosticMessagePatterns) {
+    const match = message.match(pattern)
+    if (match) return translate(match)
   }
 
   const modelMonitorTransportMessage = translateModelMonitorTransportMessage(message)

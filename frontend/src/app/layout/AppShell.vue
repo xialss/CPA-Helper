@@ -144,6 +144,9 @@ const accountInspectionMenuItems = computed<MenuOption[]>(() => [
   },
   { label: t('账号状态', 'Account Status'), key: '/admin/account-status', icon: renderIcon(ListChecks) },
   { label: t('模型监控', 'Model Monitoring'), key: '/admin/model-monitor', icon: renderIcon(Gauge) },
+  ...(currentUser.value?.is_super_admin
+    ? [{ label: t('路由规则', 'Route rules'), key: '/admin/plugin-rules', icon: renderIcon(Network) }]
+    : []),
 ])
 
 const featureMenuItems = computed<MenuOption[]>(() => [
