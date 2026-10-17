@@ -23,6 +23,7 @@ import {
 } from 'lucide-vue-next'
 
 import { getUsageOptions, getUsageOverview, getUsageSummary } from '@/features/usage/api/usageApi'
+import { getCPAHelperPluginConcurrencySummary } from '@/features/plugin/api/cpaHelperPluginApi'
 import { usageRecordsLatestRange } from '@/features/usage/recordsRetention'
 import { getCurrentUserQuota } from '@/features/users/api/usersApi'
 import ChartPanel, { type ChartOption } from '@/shared/components/ChartPanel.vue'
@@ -48,6 +49,7 @@ import {
   formatUsd,
 } from '@/shared/utils/format'
 import { localizedUsageChannelFallbackLabel, useI18n } from '@/shared/i18n'
+import { isApiRequestError } from '@/shared/api/apiClient'
 
 type FailedFilter = 'all' | 'success' | 'failed'
 type QuickRangeKey = 'today' | 'last24h' | 'last3d' | 'last7d' | 'last30d' | 'all'
@@ -146,6 +148,10 @@ const lastRefreshedAt = ref<Date | null>(null)
 const filtersExpanded = ref(false)
 const summary = ref<UsageSummary | null>(null)
 const quotaStatus = ref<UserQuotaStatus | null>(null)
+type PluginConcurrencyStatus = 'loading' | 'enabled' | 'not_loaded' | 'unavailable'
+const pluginConcurrencyStatus = ref<PluginConcurrencyStatus>('loading')
+const pluginConcurrency = ref<number | null>(null)
+let concurrencyRefreshVersion = 0
 const realtimeSummary = ref<UsageSummary | null>(null)
 const previousRealtimeSummary = ref<UsageSummary | null>(null)
 const realtimeSummaryFailed = ref(false)
@@ -671,7 +677,7 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       end: formatLocalDateTimeParam(todayEnd),
     }
     const failedFilters: UsageFilters = { ...filters, failed: true }
-    const includeRealtime = activeQuickRange.value === 'today'
+    const includeRealtime = true
     const overview = await getUsageOverview(filters, {
       primary: primaryRankingSort.value,
       model: modelRankingSort.value,
@@ -709,7 +715,7 @@ async function refresh({ silent = false }: RefreshOptions = {}) {
       isLoading.value = false
     }
 
-    let auxiliaryFailed = false
+    let auxiliaryFailed = !(await refreshPluginConcurrency())
     try {
       const todayOverview = await getUsageOverview(todayFilters, { includeOptions: false })
       if (refreshId !== refreshVersion) {
@@ -829,7 +835,7 @@ async function refreshSummary() {
   try {
     const filters = buildFilters()
     const usedServerDefaultRange = filters.start === undefined && filters.end === undefined
-    const includeRealtime = activeQuickRange.value === 'today'
+    const includeRealtime = true
     const nextSummary = await getUsageSummary(filters)
     if (refreshId !== refreshVersion) {
       return
@@ -860,7 +866,13 @@ async function refreshSummary() {
       clearRealtimeMinuteSummaries()
     }
 
-    autoRefreshError.value = realtimeError
+    const pluginConcurrencyLoaded = await refreshPluginConcurrency()
+    if (refreshId !== refreshVersion) {
+      return
+    }
+    autoRefreshError.value = pluginConcurrencyLoaded
+      ? realtimeError
+      : errorText(null, '刷新插件并发失败', 'Failed to refresh plugin concurrency')
     lastRefreshedAt.value = new Date()
   } catch (error) {
     if (refreshId !== refreshVersion) {
@@ -1037,6 +1049,14 @@ const requestsPerMinuteText = computed(() => {
   return realtimeSummaryFailed.value ? t('不可用', 'Unavailable') : t('加载中', 'Loading')
 })
 
+const currentRequestsPerMinuteText = computed(() => {
+  const current = realtimeSummary.value?.total_records
+  if (current !== undefined) {
+    return formatRate(current)
+  }
+  return realtimeSummaryFailed.value ? t('不可用', 'Unavailable') : t('加载中', 'Loading')
+})
+
 const requestsPerMinuteFootnote = computed(() => {
   if (activeQuickRange.value !== 'today') {
     return dashboardRangeLabel.value
@@ -1052,6 +1072,65 @@ const requestsPerMinuteFootnote = computed(() => {
     `Previous minute ${formatRate(previousRequestsPerMinute)} RPM`,
   )
 })
+
+const pluginConcurrencyValueText = computed(() => {
+  switch (pluginConcurrencyStatus.value) {
+    case 'enabled':
+      return formatInteger(pluginConcurrency.value ?? 0)
+    case 'unavailable':
+      return t('不可用', 'Unavailable')
+    case 'not_loaded':
+      return requestsPerMinuteText.value
+    default:
+      return t('加载中', 'Loading')
+  }
+})
+
+const pluginConcurrencyFootnote = computed(() => {
+  if (pluginConcurrencyStatus.value === 'unavailable') {
+    return t(
+      `当前 RPM ${currentRequestsPerMinuteText.value} · 并发读取失败`,
+      `Current RPM ${currentRequestsPerMinuteText.value} · concurrency unavailable`,
+    )
+  }
+  if (pluginConcurrencyStatus.value === 'loading') {
+    return t('插件并发加载中 · RPM 同步中', 'Loading plugin concurrency · syncing RPM')
+  }
+  if (pluginConcurrencyStatus.value === 'enabled') {
+    return t(`当前 RPM ${currentRequestsPerMinuteText.value}`, `Current RPM ${currentRequestsPerMinuteText.value}`)
+  }
+  return requestsPerMinuteFootnote.value
+})
+
+const showPluginConcurrencyCard = computed(() => pluginConcurrencyStatus.value !== 'not_loaded')
+
+async function refreshPluginConcurrency(): Promise<boolean> {
+  const requestVersion = ++concurrencyRefreshVersion
+  const ownerVersion = refreshVersion
+  const hadValue = pluginConcurrencyStatus.value === 'enabled' && pluginConcurrency.value !== null
+  if (!hadValue) {
+    pluginConcurrencyStatus.value = 'loading'
+    pluginConcurrency.value = null
+  }
+  try {
+    const result = await getCPAHelperPluginConcurrencySummary(isAccountScope.value ? 'account' : 'admin')
+    if (requestVersion !== concurrencyRefreshVersion || ownerVersion !== refreshVersion) {
+      return false
+    }
+    pluginConcurrency.value = result.current_concurrency
+    pluginConcurrencyStatus.value = 'enabled'
+    return true
+  } catch (error) {
+    if (requestVersion !== concurrencyRefreshVersion || ownerVersion !== refreshVersion) {
+      return false
+    }
+    pluginConcurrency.value = null
+    pluginConcurrencyStatus.value = isApiRequestError(error) && error.code === 'plugin_not_loaded'
+      ? 'not_loaded'
+      : 'unavailable'
+    return pluginConcurrencyStatus.value !== 'unavailable'
+  }
+}
 
 function quotaValueText(quota: UserQuotaStatus | null): string {
   if (!quota) {
@@ -1131,14 +1210,23 @@ const metricCards = computed<MetricCardConfig[]>(() => {
         )}`,
       ),
     },
-    {
-      key: 'rpm',
-      label: 'RPM',
-      value: requestsPerMinuteText.value,
-      icon: Gauge,
-      tone: 'orange',
-      footnote: requestsPerMinuteFootnote.value,
-    },
+    showPluginConcurrencyCard.value
+      ? {
+          key: 'concurrency',
+          label: t('当前并发', 'Current concurrency'),
+          value: pluginConcurrencyValueText.value,
+          icon: Gauge,
+          tone: pluginConcurrencyStatus.value === 'unavailable' ? 'danger' : 'orange',
+          footnote: pluginConcurrencyFootnote.value,
+        }
+      : {
+          key: 'rpm',
+          label: 'RPM',
+          value: requestsPerMinuteText.value,
+          icon: Gauge,
+          tone: 'orange',
+          footnote: requestsPerMinuteFootnote.value,
+        },
     {
       key: 'average_ttft',
       label: t('平均首字耗时', 'Avg TTFT'),

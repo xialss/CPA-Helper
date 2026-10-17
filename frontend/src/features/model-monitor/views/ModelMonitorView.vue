@@ -68,11 +68,7 @@ const sourceSettingsModalStyle: CSSProperties = { width: 'min(620px, calc(100vw 
 const sourceSettingsModalContentStyle: CSSProperties = { padding: '16px 22px 4px' }
 const sourceSettingsModalFooterStyle: CSSProperties = { padding: '12px 22px 18px' }
 const modelMonitorTooltipThemeOverrides = {
-  color: 'var(--cpa-surface-raised)',
-  textColor: 'var(--cpa-text)',
-  boxShadow: 'var(--cpa-shadow), 0 0 0 1px var(--cpa-border)',
   padding: '10px 12px',
-  borderRadius: '8px',
 }
 const message = useMessage()
 const { errorText, language, serverText, t } = useI18n()

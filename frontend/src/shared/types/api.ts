@@ -51,6 +51,112 @@ export interface SettingsUpdatePayload {
   retry_interval_seconds?: number
 }
 
+export interface CPAHelperPluginRule {
+  models?: string[]
+  denied_models?: string[]
+  credential_ids?: string[]
+  denied_credential_ids?: string[]
+  credential_providers?: Array<{ source: 'auth-files' | 'ai-providers'; provider: string }>
+  denied_credential_providers?: Array<{ source: 'auth-files' | 'ai-providers'; provider: string }>
+  [key: string]: unknown
+}
+
+export interface CPAHelperPluginCredential {
+  ref: string
+  label: string
+  source: 'auth-files' | 'ai-providers' | string
+  provider: string
+  status: string
+  auth_index?: string
+}
+
+export interface CPAHelperPluginDirectory {
+  models: string[]
+  credentials: CPAHelperPluginCredential[]
+  credential_providers: Array<{ source: 'auth-files' | 'ai-providers' | string; provider: string; label?: string }>
+}
+
+export interface CPAHelperPluginGroup {
+  id: string
+  name: string
+  note?: string
+  rule: CPAHelperPluginRule
+  [key: string]: unknown
+}
+
+export interface CPAHelperPluginKey {
+  id: string
+  label?: string
+  enabled: boolean
+  group_ids: string[]
+  max_concurrency: number
+  rule: CPAHelperPluginRule
+  [key: string]: unknown
+}
+
+export interface CPAHelperPluginKeySummary {
+  api_key_hash: string
+  enabled: boolean
+  group_names: string[]
+  current_concurrency: number
+  max_concurrency: number
+}
+
+export interface CPAHelperPluginKeysSummaryResponse {
+  keys: CPAHelperPluginKeySummary[]
+}
+
+export interface CPAHelperPluginKeyPolicy {
+  policy_revision: number
+  groups: CPAHelperPluginGroup[]
+  key: CPAHelperPluginKey
+}
+
+export interface CPAHelperPluginConcurrencySummary {
+  scope: 'admin' | 'account'
+  current_concurrency: number
+}
+
+export interface CPAHelperPluginPolicy {
+  contract_version: string
+  plugin_version: string
+  policy_revision: number
+  generated_at: string
+  groups: CPAHelperPluginGroup[]
+  keys: CPAHelperPluginKey[]
+  helper_key_metadata?: Record<string, CPAHelperPluginKeyMetadata>
+  [key: string]: unknown
+}
+
+export interface CPAHelperPluginKeyMetadata {
+  username: string
+  nickname: string
+  description: string
+  key_preview: string
+}
+
+export interface CPAHelperPluginStatus {
+  loaded: boolean
+  capabilities: Record<string, unknown>
+  health: Record<string, unknown>
+}
+
+export interface CPAHelperResponseModelConfig {
+  enabled: boolean
+  stream_enabled: boolean
+  /** Present in CPA-Helper-Plugin 0.1.4; removed in 0.1.5. */
+  responses_only_stream?: boolean
+  max_buffer_bytes: number
+  max_total_buffer_bytes: number
+  action: 'reject' | 'audit'
+  unknown_action: 'pass' | 'reject'
+  case_sensitive: boolean
+  ignore_thinking_suffix: boolean
+  ignored_models: string[]
+  accepted_models: Record<string, string[]>
+  [key: string]: unknown
+}
+
 export interface ModelRequestGuide {
   model_request_url: string
   openai_base_url: string
@@ -894,6 +1000,7 @@ export interface AvailableModelsResponse {
   has_api_keys: boolean
   api_key_count: number
   queryable_api_key_count: number
+  model_list_filter_status: 'not_checked' | 'not_configured' | 'not_loaded' | 'enabled' | 'disabled' | 'unsupported'
   models: AvailableModel[]
   errors: AvailableModelKeyError[]
 }

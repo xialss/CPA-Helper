@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { Component } from 'vue'
-import { computed, h, onMounted, ref, watch } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   NAlert,
   NButton,
@@ -9,11 +9,14 @@ import {
   NFormItem,
   NIcon,
   NInput,
+  NInputNumber,
   NModal,
   NRadioButton,
   NRadioGroup,
   NSelect,
   NSpace,
+  NSwitch,
+  NTag,
   useDialog,
   useMessage,
   type DataTableColumns,
@@ -26,7 +29,10 @@ import {
   EyeOff,
   KeyRound,
   Layers3,
+  Pencil,
+  Power,
   Send,
+  Trash2,
 } from 'lucide-vue-next'
 
 import {
@@ -37,7 +43,18 @@ import {
   testModelRequest,
   updateApiKey,
 } from '@/features/api-keys/api/apiKeysApi'
+import {
+  getCPAHelperPluginKeyPolicy,
+  getCPAHelperPluginDirectory,
+  getCPAHelperPluginStatus,
+  getCPAHelperPluginKeysSummary,
+  normalizeCPAHelperPluginKey,
+  updateCPAHelperPluginKeyPolicy,
+} from '@/features/plugin/api/cpaHelperPluginApi'
+import PluginRuleFields from '@/features/plugin/components/PluginRuleFields.vue'
+import { ApiRequestError } from '@/shared/api/apiClient'
 import { listAvailableModels } from '@/features/models/api/availableModelsApi'
+import ModelListNotice from '@/features/models/components/ModelListNotice.vue'
 import { getCurrentUserQuota } from '@/features/users/api/usersApi'
 import { getUsageOverview } from '@/features/usage/api/usageApi'
 import type {
@@ -49,6 +66,11 @@ import type {
   UsageSummary,
   UserApiKeySummary,
   UserQuotaStatus,
+  CPAHelperPluginDirectory,
+  CPAHelperPluginGroup,
+  CPAHelperPluginKey,
+  CPAHelperPluginKeySummary,
+  CPAHelperPluginStatus,
 } from '@/shared/types/api'
 import { useI18n } from '@/shared/i18n'
 import { copyToClipboard } from '@/shared/utils/clipboard'
@@ -56,8 +78,9 @@ import { formatCompact, formatDateTime, formatInteger, formatUsd } from '@/share
 
 const message = useMessage()
 const dialog = useDialog()
-const { copiedText, currentLanguage, errorText, t } = useI18n()
+const { copiedText, currentLanguage, errorText, serverText, t } = useI18n()
 const isLoading = ref(false)
+let refreshGeneration = 0
 const isSaving = ref(false)
 const apiKeys = ref<UserApiKeySummary[]>([])
 const usageSummary = ref<UsageSummary | null>(null)
@@ -65,6 +88,49 @@ const quotaStatus = ref<UserQuotaStatus | null>(null)
 const modelRequestGuide = ref<ModelRequestGuide | null>(null)
 const availableModels = ref<AvailableModelsResponse | null>(null)
 const editorVisible = ref(false)
+const pluginKeyPolicyVisible = ref(false)
+const pluginKeyPolicyHash = ref<string | null>(null)
+const pluginKeyPolicyRevision = ref(0)
+const pluginKeyPolicyGroups = ref<CPAHelperPluginKey['group_ids']>([])
+const pluginKeyPolicyGroupOptions = ref<CPAHelperPluginGroup[]>([])
+const pluginKeyPolicyDraft = ref<CPAHelperPluginKey | null>(null)
+const pluginKeyPolicyError = ref<unknown>(null)
+const editedApiKeyDescription = ref('')
+const savedApiKeyDescription = ref('')
+const apiKeyEditSaveError = ref<string | null>(null)
+const pluginKeyToggleHash = ref<string | null>(null)
+let pluginKeyPolicyLoadGeneration = 0
+const pluginDirectory = ref<CPAHelperPluginDirectory | null>(null)
+const pluginStatus = ref<CPAHelperPluginStatus | null>(null)
+const pluginStatusError = ref<unknown>(null)
+const pluginKeySummaries = ref<CPAHelperPluginKeySummary[] | null>(null)
+const pluginKeySummaryError = ref<unknown>(null)
+const pluginKeySummaryByHash = computed(() => new Map(
+  (pluginKeySummaries.value ?? []).map((summary) => [summary.api_key_hash, summary]),
+))
+const pluginKeySummaryPlaceholder = computed(() =>
+  pluginKeySummaries.value === null && !pluginKeySummaryError.value
+    ? t('加载中', 'Loading')
+    : t('不可用', 'Unavailable'),
+)
+let pluginKeySummaryRequest: Promise<void> | null = null
+let pluginKeySummaryController: AbortController | null = null
+let pluginKeySummaryTimer: ReturnType<typeof setTimeout> | null = null
+let pluginKeySummaryRefreshQueued = false
+let pluginKeySummaryStopped = false
+const pluginKeyPolicySnapshot = ref('')
+const pluginKeyPolicyDirty = computed(() => pluginKeyPolicyDraft.value !== null && JSON.stringify({
+  ...pluginKeyPolicyDraft.value, group_ids: pluginKeyPolicyGroups.value,
+}) !== pluginKeyPolicySnapshot.value)
+const apiKeyEditDirty = computed(() => editedApiKeyDescription.value.trim() !== savedApiKeyDescription.value || pluginKeyPolicyDirty.value)
+const pluginStatusText = computed(() => {
+  if (!pluginStatusError.value) return ''
+  if (pluginStatusError.value instanceof ApiRequestError && pluginStatusError.value.code === 'plugin_not_loaded') return t('CPA Helper Plugin 未加载或契约不兼容，原有 API Key 管理仍可使用。', 'CPA Helper Plugin is not loaded or its contract is incompatible; regular API key management remains available.')
+  if (pluginStatusError.value instanceof ApiRequestError && pluginStatusError.value.code === 'plugin_unavailable') return t('CPA Helper Plugin 不可达，原有 API Key 管理仍可使用。', 'CPA Helper Plugin is unreachable; regular API key management remains available.')
+  return errorText(pluginStatusError.value, 'CPA Helper Plugin 状态读取失败，原有 API Key 管理仍可使用。', 'CPA Helper Plugin status could not be read; regular API key management remains available.')
+})
+const isPluginPolicyLoading = ref(false)
+const isPluginPolicySaving = ref(false)
 const requestTestVisible = ref(false)
 const requestTestApiKey = ref<UserApiKeySummary | null>(null)
 const requestEndpoint = ref<ModelRequestEndpoint>('chat_completions')
@@ -77,8 +143,9 @@ const requestTestMessage = ref(requestTestMessageDefaults[currentLanguage.value]
 const requestTestResult = ref<ModelRequestTestResponse | null>(null)
 const requestTestError = ref<string | null>(null)
 const isAvailableModelsLoading = ref(false)
+let availableModelsRequestGeneration = 0
+let availableModelsController: AbortController | null = null
 const isRequestTesting = ref(false)
-const editingApiKeyHash = ref<string | null>(null)
 const apiKeyDescription = ref('Default')
 const generatedApiKey = ref<string | null>(null)
 const generatedApiKeyHash = ref<string | null>(null)
@@ -226,6 +293,9 @@ const requestTestModelOptions = computed(() => {
     value: model.id,
   }))
 })
+const requestTestModelError = computed(() => availableModels.value?.errors.find(
+  (error) => error.api_key_hash === requestTestApiKey.value?.api_key_hash,
+))
 const requestTestReplyText = computed(() => {
   const reply = requestTestResult.value?.reply?.trim()
   return reply || t('模型返回成功，但没有可展示文本。', 'The model returned successfully, but there is no displayable text.')
@@ -254,6 +324,10 @@ const requestTestUsageText = computed(() => {
 watch(requestEndpoint, () => {
   requestTestResult.value = null
   requestTestError.value = null
+})
+
+watch(requestTestVisible, (visible) => {
+  if (!visible) invalidateAvailableModelsForTest()
 })
 
 watch(currentLanguage, (language, previousLanguage) => {
@@ -364,20 +438,12 @@ function maskDisplayedApiKey(apiKey: string | null | undefined): string {
   if (!apiKey) {
     return t('未知', 'Unknown')
   }
-  if (apiKey.length <= 12) {
-    return `${apiKey.slice(0, 3)}${'*'.repeat(Math.max(apiKey.length - 3, 0))}`
-  }
-  const visiblePrefix = apiKey.startsWith('sk-') ? 4 : 6
-  const visibleSuffix = 4
-  const maskedLength = Math.max(apiKey.length - visiblePrefix - visibleSuffix, 8)
-  return `${apiKey.slice(0, visiblePrefix)}${'*'.repeat(maskedLength)}${apiKey.slice(-visibleSuffix)}`
+  if (apiKey.length <= 10) return '••••'
+  return `${apiKey.slice(0, 6)}...${apiKey.slice(-4)}`
 }
 
 function renderMaskedKeyTitle() {
-  return h('span', { class: 'api-key-title' }, [
-    h(NIcon, { class: 'api-key-mask-icon', component: EyeOff }),
-    h('span', t('密钥（点击复制）', 'Key (click to copy)')),
-  ])
+  return t('密钥', 'Key')
 }
 
 function isApiKeyVisible(row: UserApiKeySummary): boolean {
@@ -431,15 +497,36 @@ async function loadModelRequestGuide() {
   }
 }
 
+function invalidateAvailableModelsForTest() {
+  availableModelsRequestGeneration++
+  availableModelsController?.abort()
+  availableModelsController = null
+  isAvailableModelsLoading.value = false
+  availableModels.value = null
+  requestTestModel.value = null
+}
+
 async function loadAvailableModelsForTest() {
+  const generation = ++availableModelsRequestGeneration
+  availableModelsController?.abort()
+  const controller = new AbortController()
+  availableModelsController = controller
   isAvailableModelsLoading.value = true
+  availableModels.value = null
+  requestTestModel.value = null
   try {
-    availableModels.value = await listAvailableModels()
+    const models = await listAvailableModels(controller.signal)
+    if (generation !== availableModelsRequestGeneration) return
+    availableModels.value = models
     ensureRequestTestModel()
   } catch (error) {
+    if (generation !== availableModelsRequestGeneration) return
     message.error(errorText(error, '加载可用模型失败', 'Failed to load available models'))
   } finally {
-    isAvailableModelsLoading.value = false
+    if (generation === availableModelsRequestGeneration) {
+      isAvailableModelsLoading.value = false
+      availableModelsController = null
+    }
   }
 }
 
@@ -453,11 +540,7 @@ function openRequestTest(row: UserApiKeySummary) {
   if (!modelRequestGuide.value) {
     void loadModelRequestGuide()
   }
-  if (!availableModels.value) {
-    void loadAvailableModelsForTest()
-  } else {
-    ensureRequestTestModel()
-  }
+  void loadAvailableModelsForTest()
 }
 
 async function copyRequestValue(label: string, value: string) {
@@ -509,7 +592,6 @@ function openCreateDialog() {
     message.error(t('当前账号额度已用尽，API KEY 已暂停', 'This account has exhausted its quota, so API keys are paused'))
     return
   }
-  editingApiKeyHash.value = null
   apiKeyDescription.value = 'Default'
   generatedApiKey.value = null
   generatedApiKeyHash.value = null
@@ -521,15 +603,50 @@ function closeGeneratedApiKey() {
   generatedApiKeyHash.value = null
 }
 
-function editApiKey(row: UserApiKeySummary) {
-  editingApiKeyHash.value = row.api_key_hash
-  apiKeyDescription.value = row.description || 'VSCode'
-  generatedApiKey.value = null
-  generatedApiKeyHash.value = null
-  editorVisible.value = true
+function refreshPluginKeySummaries(): Promise<void> {
+  if (pluginKeySummaryStopped) return Promise.resolve()
+  if (pluginKeySummaryTimer !== null) {
+    clearTimeout(pluginKeySummaryTimer)
+    pluginKeySummaryTimer = null
+  }
+  if (pluginKeySummaryRequest) {
+    pluginKeySummaryRefreshQueued = true
+    return pluginKeySummaryRequest
+  }
+  const request = async () => {
+    do {
+      pluginKeySummaryRefreshQueued = false
+      pluginKeySummaryController = new AbortController()
+      try {
+        const summary = await getCPAHelperPluginKeysSummary(pluginKeySummaryController.signal)
+        if (!pluginKeySummaryStopped && !pluginKeySummaryRefreshQueued) {
+          pluginKeySummaries.value = summary.keys
+          pluginKeySummaryError.value = null
+        }
+      } catch (error) {
+        if (!pluginKeySummaryStopped && !pluginKeySummaryRefreshQueued) {
+          pluginKeySummaries.value = null
+          pluginKeySummaryError.value = error
+        }
+      }
+    } while (pluginKeySummaryRefreshQueued && !pluginKeySummaryStopped)
+  }
+  pluginKeySummaryRequest = request().finally(() => {
+    pluginKeySummaryRequest = null
+    pluginKeySummaryController = null
+    if (!pluginKeySummaryStopped) {
+      pluginKeySummaryTimer = setTimeout(() => {
+        pluginKeySummaryTimer = null
+        void refreshPluginKeySummaries()
+      }, 5000)
+    }
+  })
+  return pluginKeySummaryRequest
 }
 
 async function refresh() {
+  const generation = ++refreshGeneration
+  void refreshPluginKeySummaries()
   isLoading.value = true
   try {
     const [nextApiKeys, overview, quota, guide] = await Promise.all([
@@ -538,21 +655,160 @@ async function refresh() {
       getCurrentUserQuota(),
       getModelRequestGuide(),
     ])
+    if (generation !== refreshGeneration) return
     apiKeys.value = nextApiKeys
     usageSummary.value = overview.summary
     quotaStatus.value = quota
     modelRequestGuide.value = guide
-    if (editingApiKeyHash.value) {
-      const current = apiKeys.value.find((item) => item.api_key_hash === editingApiKeyHash.value)
+    if (pluginKeyPolicyHash.value) {
+      const current = apiKeys.value.find((item) => item.api_key_hash === pluginKeyPolicyHash.value)
       if (!current) {
-        editorVisible.value = false
-        editingApiKeyHash.value = null
+        resetApiKeyEditor()
       }
     }
   } catch (error) {
-    message.error(errorText(error, '加载 API 密钥失败', 'Failed to load API keys'))
+    if (generation === refreshGeneration) message.error(errorText(error, '加载 API 密钥失败', 'Failed to load API keys'))
   } finally {
-    isLoading.value = false
+    if (generation === refreshGeneration) isLoading.value = false
+  }
+  if (generation !== refreshGeneration) return
+  try {
+    const status = await getCPAHelperPluginStatus()
+    if (generation !== refreshGeneration) return
+    pluginStatus.value = status
+    pluginStatusError.value = null
+  } catch (error) {
+    if (generation === refreshGeneration) {
+      pluginStatus.value = null
+      pluginStatusError.value = error
+    }
+  }
+}
+
+async function editApiKey(row: UserApiKeySummary) {
+  if (isPluginPolicySaving.value || pluginKeyToggleHash.value) return
+  const generation = ++pluginKeyPolicyLoadGeneration
+  pluginKeyPolicyHash.value = row.api_key_hash
+  editedApiKeyDescription.value = row.description || ''
+  savedApiKeyDescription.value = editedApiKeyDescription.value.trim()
+  pluginKeyPolicyDraft.value = null
+  pluginKeyPolicyGroups.value = []
+  pluginKeyPolicyGroupOptions.value = []
+  pluginKeyPolicySnapshot.value = ''
+  pluginDirectory.value = null
+  pluginKeyPolicyError.value = null
+  apiKeyEditSaveError.value = null
+  pluginKeyPolicyVisible.value = true
+  isPluginPolicyLoading.value = true
+  try {
+    const [policy, choices] = await Promise.all([
+      getCPAHelperPluginKeyPolicy(row.api_key_hash),
+      getCPAHelperPluginDirectory(row.api_key_hash),
+    ])
+    if (generation !== pluginKeyPolicyLoadGeneration) return
+    pluginKeyPolicyRevision.value = policy.policy_revision
+    const normalizedKey = normalizeCPAHelperPluginKey(policy.key)
+    pluginKeyPolicyGroups.value = [...normalizedKey.group_ids]
+    pluginKeyPolicyGroupOptions.value = policy.groups
+    pluginKeyPolicyDraft.value = JSON.parse(JSON.stringify(normalizedKey)) as CPAHelperPluginKey
+    pluginDirectory.value = choices
+    pluginKeyPolicySnapshot.value = JSON.stringify(pluginKeyPolicyDraft.value)
+  } catch (error) {
+    if (generation === pluginKeyPolicyLoadGeneration) pluginKeyPolicyError.value = error
+  } finally {
+    if (generation === pluginKeyPolicyLoadGeneration) isPluginPolicyLoading.value = false
+  }
+}
+
+async function saveEditedApiKey() {
+  if (isPluginPolicySaving.value || isPluginPolicyLoading.value || pluginKeyToggleHash.value || !pluginKeyPolicyHash.value || !apiKeyEditDirty.value) return
+  const description = editedApiKeyDescription.value.trim()
+  if (!description) {
+    message.error(t('API KEY 描述不能为空', 'API key description is required'))
+    return
+  }
+  const descriptionDirty = description !== savedApiKeyDescription.value
+  const key = pluginKeyPolicyDraft.value && pluginKeyPolicyDirty.value
+    ? JSON.parse(JSON.stringify({ ...pluginKeyPolicyDraft.value, group_ids: pluginKeyPolicyGroups.value })) as CPAHelperPluginKey
+    : null
+  if (key && (!Number.isSafeInteger(key.max_concurrency) || key.max_concurrency < 0)) {
+    message.error(t('并发上限必须为非负整数', 'Concurrency limit must be a non-negative integer'))
+    return
+  }
+  isPluginPolicySaving.value = true
+  apiKeyEditSaveError.value = null
+  let descriptionSaved = false
+  try {
+    if (descriptionDirty) {
+      const saved = await updateApiKey(pluginKeyPolicyHash.value, { description })
+      savedApiKeyDescription.value = saved.description
+      editedApiKeyDescription.value = saved.description
+      apiKeys.value = apiKeys.value.map((row) => row.api_key_hash === saved.api_key_hash ? saved : row)
+      descriptionSaved = true
+    }
+    if (key) {
+      const saved = await updateCPAHelperPluginKeyPolicy(pluginKeyPolicyHash.value, pluginKeyPolicyRevision.value, key)
+      pluginKeyPolicyRevision.value = saved.policy_revision
+      const normalizedKey = normalizeCPAHelperPluginKey(saved.key)
+      pluginKeyPolicyDraft.value = JSON.parse(JSON.stringify(normalizedKey)) as CPAHelperPluginKey
+      pluginKeyPolicyGroups.value = [...normalizedKey.group_ids]
+      pluginKeyPolicySnapshot.value = JSON.stringify(pluginKeyPolicyDraft.value)
+    }
+    message.success(t('API Key 已更新', 'API key updated'))
+    resetApiKeyEditor()
+    invalidateAvailableModelsForTest()
+    await refreshPluginKeySummaries()
+  } catch (error) {
+    const detail = errorText(error, '保存 API Key 失败', 'Failed to save API key')
+    apiKeyEditSaveError.value = descriptionSaved
+      ? t(`描述已保存，插件策略未保存：${detail}。未保存的修改已保留。`, `Description saved; plugin policy was not saved: ${detail}. Unsaved changes have been kept.`)
+      : detail
+    message.error(apiKeyEditSaveError.value)
+    if (descriptionSaved) {
+      invalidateAvailableModelsForTest()
+      await refreshPluginKeySummaries()
+    }
+  } finally {
+    isPluginPolicySaving.value = false
+  }
+}
+
+function resetApiKeyEditor() {
+  pluginKeyPolicyLoadGeneration++
+  isPluginPolicyLoading.value = false
+  pluginKeyPolicyVisible.value = false
+  pluginKeyPolicyHash.value = null
+}
+
+function closePluginKeyPolicy() {
+  if (isPluginPolicySaving.value) return
+  if (!apiKeyEditDirty.value) {
+    resetApiKeyEditor()
+    return
+  }
+  dialog.warning({
+    title: t('放弃修改', 'Discard changes'),
+    content: t('尚未保存的 API Key 修改将被丢弃。', 'Unsaved API key changes will be discarded.'),
+    positiveText: t('放弃', 'Discard'), negativeText: t('继续编辑', 'Keep editing'),
+    onPositiveClick: resetApiKeyEditor,
+  })
+}
+
+async function toggleApiKeyEnabled(row: UserApiKeySummary) {
+  const summary = pluginKeySummaryByHash.value.get(row.api_key_hash)
+  if (!summary || pluginKeyToggleHash.value || isPluginPolicySaving.value || pluginKeyPolicyVisible.value) return
+  const enabled = !summary.enabled
+  pluginKeyToggleHash.value = row.api_key_hash
+  try {
+    const policy = await getCPAHelperPluginKeyPolicy(row.api_key_hash)
+    await updateCPAHelperPluginKeyPolicy(row.api_key_hash, policy.policy_revision, { ...policy.key, enabled })
+    invalidateAvailableModelsForTest()
+    await refreshPluginKeySummaries()
+    message.success(enabled ? t('API Key 已启用', 'API key enabled') : t('API Key 已禁用', 'API key disabled'))
+  } catch (error) {
+    message.error(errorText(error, '修改 API Key 启用状态失败', 'Failed to change API key enabled state'))
+  } finally {
+    pluginKeyToggleHash.value = null
   }
 }
 
@@ -567,21 +823,15 @@ async function saveApiKey() {
   }
   isSaving.value = true
   try {
-    if (editingApiKeyHash.value) {
-      await updateApiKey(editingApiKeyHash.value, { description })
-      message.success(t('API 密钥已更新', 'API key updated'))
-    } else {
-      if (!canCreateApiKey.value) {
-        message.error(t('当前账号额度已用尽，API KEY 已暂停', 'This account has exhausted its quota, so API keys are paused'))
-        return
-      }
-      const created = await createApiKey({ description })
-      generatedApiKey.value = created.api_key ?? null
-      generatedApiKeyHash.value = created.api_key_hash
-      message.success(t('API 密钥已创建并同步到 CPA', 'API key created and synced to CPA'))
+    if (!canCreateApiKey.value) {
+      message.error(t('当前账号额度已用尽，API KEY 已暂停', 'This account has exhausted its quota, so API keys are paused'))
+      return
     }
+    const created = await createApiKey({ description })
+    generatedApiKey.value = created.api_key ?? null
+    generatedApiKeyHash.value = created.api_key_hash
+    message.success(t('API 密钥已创建并同步到 CPA', 'API key created and synced to CPA'))
     editorVisible.value = false
-    editingApiKeyHash.value = null
     await refresh()
   } catch (error) {
     message.error(errorText(error, '保存 API 密钥失败', 'Failed to save API key'))
@@ -602,10 +852,7 @@ function confirmDelete(row: UserApiKeySummary) {
     onPositiveClick: async () => {
       await deleteApiKey(row.api_key_hash)
       message.success(t('API 密钥已删除', 'API key deleted'))
-      if (editingApiKeyHash.value === row.api_key_hash) {
-        editorVisible.value = false
-        editingApiKeyHash.value = null
-      }
+      if (pluginKeyPolicyHash.value === row.api_key_hash) resetApiKeyEditor()
       if (generatedApiKeyHash.value === row.api_key_hash) {
         generatedApiKey.value = null
         generatedApiKeyHash.value = null
@@ -617,9 +864,16 @@ function confirmDelete(row: UserApiKeySummary) {
 
 const columns = computed<DataTableColumns<UserApiKeySummary>>(() => [
   {
+    title: t('Key 描述', 'Key description'),
+    key: 'description',
+    width: 180,
+    ellipsis: { tooltip: true },
+    render: (row) => row.description || '—',
+  },
+  {
     title: renderMaskedKeyTitle,
     key: 'api_key',
-    width: 430,
+    width: 240,
     render: (row) =>
       h(
         'div',
@@ -631,6 +885,7 @@ const columns = computed<DataTableColumns<UserApiKeySummary>>(() => [
               class: 'api-key-visibility-button',
               disabled: !row.api_key,
               title: isApiKeyVisible(row) ? t('隐藏完整密钥', 'Hide full key') : t('显示完整密钥', 'Show full key'),
+              'aria-label': isApiKeyVisible(row) ? t('隐藏完整密钥', 'Hide full key') : t('显示完整密钥', 'Show full key'),
               type: 'button',
               onClick: () => toggleApiKeyVisibility(row),
             },
@@ -646,7 +901,10 @@ const columns = computed<DataTableColumns<UserApiKeySummary>>(() => [
             {
               class: 'api-key-copy-button',
               type: 'button',
-              title: row.api_key ? t('点击复制完整密钥', 'Click to copy full key') : t('无完整密钥可复制', 'No full key available to copy'),
+              title: row.api_key
+                ? `${isApiKeyVisible(row) ? `${row.api_key}\n` : ''}${t('点击复制完整密钥', 'Click to copy full key')}`
+                : t('无完整密钥可复制', 'No full key available to copy'),
+              'aria-label': t('复制完整密钥', 'Copy full key'),
               onClick: () => copyApiKey(row),
             },
             h('span', { class: 'api-key-mask-text' }, displayedApiKey(row)),
@@ -655,49 +913,115 @@ const columns = computed<DataTableColumns<UserApiKeySummary>>(() => [
       ),
   },
   {
-    title: t('描述', 'Description'),
-    key: 'description',
-    width: 240,
-    render: (row) => row.description || '-',
+    title: t('路由规则', 'Route rules'),
+    key: 'group_names',
+    width: 200,
+    render: (row) => {
+      const summary = pluginKeySummaryByHash.value.get(row.api_key_hash)
+      if (!summary) return h('span', { class: 'api-key-unavailable' }, pluginKeySummaryPlaceholder.value)
+      const names = summary.group_names
+      return h('div', { class: 'api-key-rule-tags' }, [
+        h(NTag, {
+          size: 'small', bordered: false, type: summary.enabled ? 'success' : 'error',
+          class: 'api-key-policy-state',
+          title: summary.enabled ? t('此 Key 已启用', 'This key is enabled') : t('插件拒绝此 Key 的所有请求', 'The plugin rejects all requests from this key'),
+        }, { default: () => summary.enabled ? t('已启用', 'Enabled') : t('已禁用', 'Disabled') }),
+        ...(names.length === 0 ? [h('span', { class: 'api-key-unavailable' }, t('未关联', 'None'))] : []),
+        ...names.slice(0, 2).map((name, index) => h(NTag, {
+          key: `${index}:${name}`, size: 'small', bordered: false, class: 'api-key-rule-tag', title: name,
+        }, { default: () => h('span', { class: 'api-key-rule-name' }, name) })),
+        ...(names.length > 2 ? [h('span', {
+          class: 'api-key-rule-more', title: names.slice(2).join('\n'), tabindex: 0,
+          'aria-label': t(`另外 ${names.length - 2} 条规则：${names.slice(2).join('、')}`, `${names.length - 2} more rules: ${names.slice(2).join(', ')}`),
+        }, `+${names.length - 2}`)] : []),
+      ])
+    },
+  },
+  {
+    title: t('当前并发', 'Concurrency'),
+    key: 'current_concurrency',
+    width: 120,
+    render: (row) => {
+      const summary = pluginKeySummaryByHash.value.get(row.api_key_hash)
+      if (!summary) return h('span', { class: 'api-key-unavailable' }, pluginKeySummaryPlaceholder.value)
+      const limit = summary.max_concurrency === 0 ? t('不限', 'Unlimited') : formatInteger(summary.max_concurrency)
+      return h('span', { class: 'api-key-concurrency' }, `${formatInteger(summary.current_concurrency)} / ${limit}`)
+    },
   },
   {
     title: t('创建时间', 'Created at'),
     key: 'created_at',
-    width: 180,
+    width: 170,
     render: (row) => formatDateTime(row.created_at),
   },
   {
     title: '',
     key: 'actions',
-    width: 230,
+    width: 144,
     fixed: 'right',
     render: (row) =>
-      h(NSpace, { size: 4 }, {
-        default: () => [
+      h('div', { class: 'api-key-actions' }, [
           h(
             NButton,
-            { size: 'small', quaternary: true, onClick: () => openRequestTest(row) },
+            {
+              size: 'small', quaternary: true, circle: true,
+              title: t('请求测试', 'Request test'), 'aria-label': t('请求测试', 'Request test'),
+              onClick: () => openRequestTest(row),
+            },
             {
               icon: () => h(NIcon, { component: Send }),
-              default: () => t('请求测试', 'Request test'),
             },
           ),
           h(
             NButton,
-            { size: 'small', quaternary: true, onClick: () => editApiKey(row) },
-            { default: () => t('编辑', 'Edit') },
+            {
+              size: 'small', quaternary: true, circle: true,
+              disabled: isPluginPolicySaving.value || !!pluginKeyToggleHash.value,
+              title: t('编辑 API Key', 'Edit API key'), 'aria-label': t('编辑 API Key', 'Edit API key'),
+              onClick: () => editApiKey(row),
+            },
+            { icon: () => h(NIcon, { component: Pencil }) },
           ),
           h(
             NButton,
-            { size: 'small', quaternary: true, type: 'error', onClick: () => confirmDelete(row) },
-            { default: () => t('删除', 'Delete') },
+            {
+              size: 'small', quaternary: true, circle: true,
+              disabled: !pluginKeySummaryByHash.value.has(row.api_key_hash) || !!pluginKeyToggleHash.value || isPluginPolicySaving.value || pluginKeyPolicyVisible.value,
+              loading: pluginKeyToggleHash.value === row.api_key_hash,
+              type: pluginKeySummaryByHash.value.get(row.api_key_hash)?.enabled ? 'warning' : 'success',
+              title: pluginKeySummaryByHash.value.has(row.api_key_hash)
+                ? pluginKeySummaryByHash.value.get(row.api_key_hash)?.enabled ? t('禁用 API Key', 'Disable API key') : t('启用 API Key', 'Enable API key')
+                : t('启用状态暂不可用，请刷新后重试', 'Enabled state is unavailable; refresh and try again'),
+              'aria-label': pluginKeySummaryByHash.value.has(row.api_key_hash)
+                ? pluginKeySummaryByHash.value.get(row.api_key_hash)?.enabled ? t('禁用 API Key', 'Disable API key') : t('启用 API Key', 'Enable API key')
+                : t('启用状态暂不可用，请刷新后重试', 'Enabled state is unavailable; refresh and try again'),
+              onClick: () => toggleApiKeyEnabled(row),
+            },
+            { icon: () => h(NIcon, { component: Power }) },
           ),
-        ],
-      }),
+          h(
+            NButton,
+            {
+              size: 'small', quaternary: true, circle: true, type: 'error',
+              disabled: isPluginPolicySaving.value || !!pluginKeyToggleHash.value,
+              title: t('删除', 'Delete'), 'aria-label': t('删除', 'Delete'),
+              onClick: () => confirmDelete(row),
+            },
+            { icon: () => h(NIcon, { component: Trash2 }) },
+          ),
+      ]),
   },
 ])
 
 onMounted(refresh)
+onBeforeUnmount(() => {
+  refreshGeneration++
+  pluginKeyPolicyLoadGeneration++
+  invalidateAvailableModelsForTest()
+  pluginKeySummaryStopped = true
+  if (pluginKeySummaryTimer !== null) clearTimeout(pluginKeySummaryTimer)
+  pluginKeySummaryController?.abort()
+})
 </script>
 
 <template>
@@ -728,6 +1052,15 @@ onMounted(refresh)
 
     <section class="panel api-key-panel-shell">
       <div class="panel-inner api-key-panel">
+        <NAlert v-if="pluginStatusError" type="warning" :bordered="false" class="plugin-status-alert">
+          {{ pluginStatusText }}
+        </NAlert>
+        <NAlert v-else-if="pluginKeySummaryError" type="warning" :bordered="false" class="plugin-status-alert">
+          {{ errorText(pluginKeySummaryError, '路由规则与实时并发暂不可用', 'Route rules and live concurrency are unavailable') }}
+        </NAlert>
+        <NAlert v-else-if="pluginStatus" type="success" :bordered="false" class="plugin-status-alert">
+          {{ t('CPA Helper Plugin 已连接，可编辑自己 API Key 的策略。', 'CPA Helper Plugin is connected; you can edit policies for your own API keys.') }}
+        </NAlert>
         <NAlert type="warning" :bordered="false" :title="t('请求链路说明', 'Request path note')">
           {{ t('Agent 发起的模型请求仍需 Agent 直接发送到 CPA，CPA-Helper 不代理或中转这些请求；仅调用 CPA 的 usage 队列、API KEY 创建与删除、凭证管理等接口，用于用量查看、密钥创建和凭证维护。API 密钥拥有当前账号的完整权限，请妥善保管。', 'Model requests from agents must still be sent directly to CPA by the agent. CPA-Helper does not proxy or relay these requests. It only calls CPA usage queue, API key create/delete, and credential management APIs for usage views, key creation, and credential maintenance. API keys have full permissions for the current account; store them carefully.') }}
         </NAlert>
@@ -756,9 +1089,10 @@ onMounted(refresh)
           :loading="isLoading"
           :columns="columns"
           :data="apiKeys"
+          :row-key="(row: UserApiKeySummary) => row.api_key_hash"
           :pagination="{ pageSize: 12 }"
           table-layout="fixed"
-          :scroll-x="1080"
+          :scroll-x="1054"
         />
       </div>
     </section>
@@ -768,7 +1102,7 @@ onMounted(refresh)
       preset="card"
       :mask-closable="false"
       :closable="false"
-      :title="editingApiKeyHash ? t('编辑 API 密钥', 'Edit API key') : t('新建 API 密钥', 'New API key')"
+      :title="t('新建 API 密钥', 'New API key')"
       :style="{ width: 'min(520px, calc(100vw - 32px))' }"
     >
       <NForm label-placement="top">
@@ -785,13 +1119,56 @@ onMounted(refresh)
           <NButton
             type="primary"
             :loading="isSaving"
-            :disabled="isSaving || (!editingApiKeyHash && !canCreateApiKey)"
+            :disabled="isSaving || !canCreateApiKey"
             @click="saveApiKey"
           >
-            {{ editingApiKeyHash ? t('保存', 'Save') : t('创建', 'Create') }}
+            {{ t('创建', 'Create') }}
           </NButton>
         </div>
       </NForm>
+    </NModal>
+
+    <NModal
+      v-model:show="pluginKeyPolicyVisible"
+      preset="card"
+      :mask-closable="false"
+      :close-on-esc="false"
+      :closable="false"
+      :title="t('编辑 API Key', 'Edit API key')"
+      :style="{ width: 'min(900px, calc(100vw - 32px))' }"
+      @esc="closePluginKeyPolicy"
+    >
+      <NForm label-placement="top" :show-feedback="false" class="api-key-edit-description">
+        <NFormItem :label="t('API KEY 描述', 'API key description')">
+          <NInput v-model:value="editedApiKeyDescription" :disabled="isPluginPolicySaving" :placeholder="t('例如：VSCode', 'Example: VSCode')" />
+        </NFormItem>
+      </NForm>
+      <NAlert v-if="apiKeyEditSaveError" type="error" :bordered="false" class="api-key-edit-alert">{{ apiKeyEditSaveError }}</NAlert>
+      <NAlert v-if="isPluginPolicyLoading" type="info" :bordered="false" class="api-key-edit-alert">{{ t('正在加载 Key 策略', 'Loading key policy') }}</NAlert>
+      <NAlert v-else-if="pluginKeyPolicyError" type="warning" :bordered="false" class="api-key-edit-alert">
+        {{ errorText(pluginKeyPolicyError, '加载 API Key 插件策略失败', 'Failed to load API key plugin policy') }}
+        {{ t('描述仍可编辑和保存。', 'You can still edit and save the description.') }}
+      </NAlert>
+      <NAlert v-else-if="pluginKeyPolicyDraft" type="info" :bordered="false" class="api-key-edit-alert">
+        {{ t('你只能修改自己持有的 API Key。拒绝列表始终优先于允许列表；并发上限为 0 表示不限制。', 'You can only edit API keys owned by your account. Deny lists always take precedence; 0 means unlimited concurrency.') }}
+      </NAlert>
+      <NForm v-if="pluginKeyPolicyDraft" label-placement="top">
+        <div class="form-grid">
+          <NFormItem :label="t('允许此 Key 发起请求', 'Allow requests from this key')">
+            <div class="plugin-key-enabled-field">
+              <NSpace align="center"><NSwitch v-model:value="pluginKeyPolicyDraft.enabled" :disabled="isPluginPolicySaving" /><NTag size="small" :bordered="false" :type="pluginKeyPolicyDraft.enabled ? 'success' : 'error'">{{ pluginKeyPolicyDraft.enabled ? t('已启用', 'Enabled') : t('已禁用', 'Disabled') }}</NTag></NSpace>
+              <span class="plugin-key-enabled-hint">{{ t('禁用后，插件拒绝此 Key 的所有请求。', 'When disabled, the plugin rejects all requests from this key.') }}</span>
+            </div>
+          </NFormItem>
+          <NFormItem :label="t('单 Key 并发上限', 'Per-key concurrency limit')"><NInputNumber v-model:value="pluginKeyPolicyDraft.max_concurrency" :min="0" :precision="0" :disabled="isPluginPolicySaving" /></NFormItem>
+          <NFormItem :label="t('关联全局规则', 'Linked global rules')"><NSelect v-model:value="pluginKeyPolicyGroups" multiple :options="pluginKeyPolicyGroupOptions.map((group) => ({ label: group.name, value: group.id }))" :disabled="isPluginPolicySaving" /></NFormItem>
+        </div>
+        <PluginRuleFields :key="pluginKeyPolicyHash ?? ''" v-model="pluginKeyPolicyDraft.rule" :models="pluginDirectory?.models ?? []" :credentials="pluginDirectory?.credentials ?? []" :credential-providers="pluginDirectory?.credential_providers ?? []" :disabled="isPluginPolicySaving" />
+      </NForm>
+      <div class="modal-actions">
+        <NButton secondary :disabled="isPluginPolicySaving" @click="closePluginKeyPolicy">{{ t('取消', 'Cancel') }}</NButton>
+        <NButton type="primary" :loading="isPluginPolicySaving" :disabled="isPluginPolicyLoading || !apiKeyEditDirty" @click="saveEditedApiKey">{{ t('保存', 'Save') }}</NButton>
+      </div>
     </NModal>
 
     <NModal
@@ -871,6 +1248,11 @@ onMounted(refresh)
         </div>
 
         <div class="request-test-section-title">{{ t('请求测试', 'Request test') }}</div>
+
+        <ModelListNotice v-if="availableModels" :status="availableModels.model_list_filter_status" />
+        <NAlert v-if="requestTestModelError" type="error" :bordered="false">
+          {{ serverText(requestTestModelError.message, '当前 Key 模型查询失败', 'Model query failed for this key') }}
+        </NAlert>
 
         <NForm label-placement="top" class="request-test-form">
           <NFormItem :label="t('测试模型', 'Test model')">
@@ -1146,9 +1528,10 @@ onMounted(refresh)
 :global(.api-key-cell) {
   display: inline-flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
   width: 100%;
   min-width: 0;
+  overflow: hidden;
 }
 
 :global(.api-key-visibility-button),
@@ -1182,10 +1565,59 @@ onMounted(refresh)
   white-space: nowrap;
 }
 
-:global(.api-key-title) {
-  display: inline-flex;
+:global(.api-key-rule-tags),
+:global(.api-key-actions) {
+  display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 4px;
+  min-width: 0;
+}
+
+:global(.api-key-rule-tags) {
+  overflow: hidden;
+  flex-wrap: wrap;
+}
+
+:global(.api-key-policy-state) { flex: 0 0 auto; }
+.api-key-edit-description { margin-bottom: 12px; }
+.api-key-edit-alert { margin-bottom: 12px; }
+.plugin-key-enabled-field { display: grid; gap: 8px; }
+.plugin-key-enabled-hint { color: var(--cpa-text-muted); font-size: 12px; }
+
+:global(.api-key-rule-tag) {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+
+:global(.api-key-rule-tag .n-tag__content),
+:global(.api-key-rule-name) {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:global(.api-key-rule-more) {
+  flex: 0 0 auto;
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+}
+
+:global(.api-key-unavailable) {
+  color: var(--cpa-text-muted);
+  font-size: 12px;
+}
+
+:global(.api-key-concurrency) {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+:global(.api-key-actions) {
+  justify-content: flex-end;
+  gap: 2px;
 }
 
 :global(.api-key-mask-icon) {

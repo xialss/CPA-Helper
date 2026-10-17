@@ -175,6 +175,7 @@ function makeEnvironment(query = {}) {
       id: Number(entry.path.split('/').at(-1)), source: 'x'.repeat(64), source_label: '测试渠道 · sk-abcd…wxyz', raw_json: {},
     }
     else if (entry.path === '/api/account/quota') payload = null
+    else if (entry.path === '/api/cpa-helper-plugin/concurrency-summary') payload = { scope: entry.params.scope, current_concurrency: 0 }
     else assert.fail(`Unexpected API call ${entry.path}`)
     const gateIndex = env.gates.findIndex(gate => gate.matches(entry))
     if (gateIndex >= 0) {
@@ -466,7 +467,7 @@ try {
     queuedOverview.release()
     await settle()
     assertSourceRequests(env, sourceA)
-    assert.equal(env.requests.some(isMinuteSummary), false, 'All-history queries do not enable today-only minute summaries')
+    assert.equal(env.requests.some(isMinuteSummary), true, 'Current RPM remains available when history uses the all-time range')
     for (const extra of [{}, { failed: true }, env.state.rankingFilters({ user_id: 17 }), env.state.modelFilters({ key: 'provider-b::model-b' })]) {
       env.state.goRecords(extra)
       const target = env.pushes.at(-1)
@@ -501,6 +502,34 @@ try {
     assertSourceRequests(env, sourceA)
     assert.deepEqual(env.errors, [])
   })
+  for (const nextPhase of ['overview', 'concurrency']) {
+    for (const failOld of [false, true]) {
+      await withView('UsageHistoryView', 'admin', makeEnvironment({ source_key: sourceA, quick_range: 'today' }), async (env) => {
+        const isConcurrency = entry => entry.path === '/api/cpa-helper-plugin/concurrency-summary'
+        const old = env.holdNext(isConcurrency)
+        env.fireTimer(5000)
+        await settle()
+        assert.ok(old.entry, 'Timer reached its delayed concurrency request')
+        old.payload.current_concurrency = 99
+        const replacement = env.holdNext(nextPhase === 'overview' ? isMainOverview : isConcurrency)
+        sourceSelect(env).emit('update:value', sourceB)
+        await settle()
+        assert.ok(replacement.entry, 'Interactive refresh reached the replacement request')
+        const refreshedAt = env.state.lastRefreshedAt.value
+        if (failOld) old.reject(new Error('stale concurrency failure'))
+        else old.release()
+        await settle()
+        assert.equal(env.state.autoRefreshError.value, null, 'Stale concurrency completion cannot publish an error')
+        assert.equal(env.state.lastRefreshedAt.value, refreshedAt, 'Stale concurrency cannot advance the current refresh timestamp')
+        assert.equal(env.state.pluginConcurrency.value, 0, 'Stale counts do not replace the last confirmed value')
+        replacement.release()
+        await settle()
+        assert.equal(env.state.summary.value.total_records, 22)
+        assert.equal(env.state.autoRefreshError.value, null)
+        assert.deepEqual(env.errors, [])
+      })
+    }
+  }
   globalThis.console.log(`Usage source filter smoke passed: ${scenarios} actual SFC scenarios, ${requestCount} serialized API requests; source controls, permissions, timers, stale responses, partial failures and retention navigation`)
 } finally {
   await server.close()

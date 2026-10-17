@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -62,11 +63,12 @@ type AvailableModelKeyError struct {
 }
 
 type AvailableModelsResponse struct {
-	HasAPIKeys           bool                     `json:"has_api_keys"`
-	APIKeyCount          int                      `json:"api_key_count"`
-	QueryableAPIKeyCount int                      `json:"queryable_api_key_count"`
-	Models               []AvailableModelItem     `json:"models"`
-	Errors               []AvailableModelKeyError `json:"errors"`
+	HasAPIKeys            bool                     `json:"has_api_keys"`
+	APIKeyCount           int                      `json:"api_key_count"`
+	QueryableAPIKeyCount  int                      `json:"queryable_api_key_count"`
+	ModelListFilterStatus string                   `json:"model_list_filter_status"`
+	Models                []AvailableModelItem     `json:"models"`
+	Errors                []AvailableModelKeyError `json:"errors"`
 }
 
 func (a *App) handleAvailableModels(w http.ResponseWriter, r *http.Request) error {
@@ -91,10 +93,11 @@ func (a *App) availableModelsForUser(ctx context.Context, userID int) (Available
 		return AvailableModelsResponse{}, err
 	}
 	response := AvailableModelsResponse{
-		HasAPIKeys:  len(bindings) > 0,
-		APIKeyCount: len(bindings),
-		Models:      []AvailableModelItem{},
-		Errors:      []AvailableModelKeyError{},
+		HasAPIKeys:            len(bindings) > 0,
+		APIKeyCount:           len(bindings),
+		ModelListFilterStatus: "not_checked",
+		Models:                []AvailableModelItem{},
+		Errors:                []AvailableModelKeyError{},
 	}
 	if len(bindings) == 0 {
 		return response, nil
@@ -113,11 +116,16 @@ func (a *App) availableModelsForUser(ctx context.Context, userID int) (Available
 	if err != nil {
 		return AvailableModelsResponse{}, err
 	}
+	response.ModelListFilterStatus, err = a.availableModelListFilterStatus(ctx, cfg)
+	if err != nil {
+		return AvailableModelsResponse{}, err
+	}
 	prices, err := a.libraryPriceMap(ctx)
 	if err != nil {
 		return AvailableModelsResponse{}, err
 	}
 	modelsByID := map[string]AvailableModelItem{}
+	successfulQueries := 0
 	for _, binding := range queryable {
 		source := availableModelSource(binding)
 		models, err := fetchAvailableModelItems(ctx, cfg, *binding.APIKey)
@@ -130,21 +138,34 @@ func (a *App) availableModelsForUser(ctx context.Context, userID int) (Available
 			})
 			continue
 		}
+		parsed := make([]AvailableModelItem, 0, len(models))
 		for _, raw := range models {
 			model := parseAvailableModel(raw, source)
 			if model == nil {
-				continue
+				err = fmt.Errorf("CPA 模型列表包含无效模型标识")
+				break
 			}
+			parsed = append(parsed, *model)
+		}
+		if err != nil {
+			response.Errors = append(response.Errors, AvailableModelKeyError{
+				APIKeyHash: source.APIKeyHash, APIKeyPreview: source.APIKeyPreview,
+				Description: source.Description, Message: err.Error(),
+			})
+			continue
+		}
+		successfulQueries++
+		for _, model := range parsed {
 			existing, ok := modelsByID[model.ID]
 			if !ok {
-				modelsByID[model.ID] = *model
+				modelsByID[model.ID] = model
 				continue
 			}
-			mergeAvailableModel(&existing, *model)
+			mergeAvailableModel(&existing, model)
 			modelsByID[model.ID] = existing
 		}
 	}
-	if len(response.Errors) > 0 && len(modelsByID) == 0 {
+	if len(response.Errors) > 0 && successfulQueries == 0 {
 		messages := make([]string, 0, len(response.Errors))
 		for _, item := range response.Errors {
 			messages = append(messages, item.Description+": "+item.Message)
@@ -164,6 +185,36 @@ func (a *App) availableModelsForUser(ctx context.Context, userID int) (Available
 		return strings.ToLower(response.Models[i].ID) < strings.ToLower(response.Models[j].ID)
 	})
 	return response, nil
+}
+
+// The plugin owns rule composition. Its catalog filter does not evaluate
+// credential routing, which is checked when CPA schedules a real request.
+func (a *App) availableModelListFilterStatus(ctx context.Context, cfg AppConfig) (string, error) {
+	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
+		return "not_configured", nil
+	}
+	capabilities, err := a.cpaHelperPluginCapabilities(ctx, cfg)
+	if err != nil {
+		var appErr *AppError
+		if errors.As(err, &appErr) && appErr.Code == "plugin_not_loaded" {
+			return "not_loaded", nil
+		}
+		return "", err
+	}
+	var modules []string
+	var enabled *bool
+	if json.Unmarshal(capabilities["modules"], &modules) != nil || json.Unmarshal(capabilities["model_list_filter_enabled"], &enabled) != nil || enabled == nil {
+		return "unsupported", nil
+	}
+	for _, module := range modules {
+		if module == "model_list_filter" {
+			if *enabled {
+				return "enabled", nil
+			}
+			return "disabled", nil
+		}
+	}
+	return "unsupported", nil
 }
 
 func availableModelPriceFromPrice(price *ModelPrice) *AvailableModelPrice {
@@ -193,6 +244,19 @@ func fetchAvailableModelItems(ctx context.Context, cfg AppConfig, apiKey string)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, fmt.Errorf("CPA 模型列表请求失败：HTTP %d", response.StatusCode)
+	}
+	if code := response.Header.Get("X-CPA-Helper-Error"); code != "" {
+		switch code {
+		case "policy_unavailable":
+			return nil, fmt.Errorf("CPA Helper Plugin 模型列表策略不可用")
+		case "invalid_model_catalog":
+			return nil, fmt.Errorf("CPA Helper Plugin 模型目录无效")
+		default:
+			return nil, fmt.Errorf("CPA Helper Plugin 模型列表查询失败")
+		}
+	}
+	if response.Header.Get("X-CPA-Helper-Model-List") == "unfiltered-identity-unavailable" {
+		return nil, fmt.Errorf("CPA Helper Plugin 无法识别当前 API 密钥，模型列表未按路由规则过滤")
 	}
 	var raw any
 	if err := json.Unmarshal(payload, &raw); err != nil {

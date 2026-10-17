@@ -102,11 +102,7 @@ const ACCOUNT_RECORDS_TABLE_SCROLL_X =
 const RECORDS_TABLE_FALLBACK_MAX_HEIGHT = 'max(320px, calc(100dvh - 318px))'
 const desktopRecordsLayoutQuery = window.matchMedia('(min-width: 861px)')
 const usageTooltipThemeOverrides = {
-  color: 'var(--cpa-surface-raised)',
-  textColor: 'var(--cpa-text)',
-  boxShadow: 'var(--cpa-shadow), 0 0 0 1px var(--cpa-border)',
   padding: '10px 12px',
-  borderRadius: '8px',
 }
 
 const route = useRoute()

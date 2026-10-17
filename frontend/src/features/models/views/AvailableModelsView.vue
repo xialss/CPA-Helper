@@ -16,6 +16,7 @@ import {
 import { Cpu, KeyRound, RefreshCw, ShieldCheck } from 'lucide-vue-next'
 
 import { listAvailableModels } from '@/features/models/api/availableModelsApi'
+import ModelListNotice from '@/features/models/components/ModelListNotice.vue'
 import { useI18n } from '@/shared/i18n'
 import type {
   AvailableModel,
@@ -53,6 +54,14 @@ const queryStatus = computed(() => {
   }
   if (response.value.queryable_api_key_count === 0) {
     return response.value.has_api_keys ? t('不可查询', 'Unavailable') : t('无 Key', 'No keys')
+  }
+  if (response.value.model_list_filter_status === 'disabled'
+    || response.value.model_list_filter_status === 'not_loaded'
+    || response.value.model_list_filter_status === 'unsupported') {
+    return t('未按规则过滤', 'Unfiltered')
+  }
+  if (response.value.model_list_filter_status === 'not_configured') {
+    return t('过滤状态未确认', 'Filtering unverified')
   }
   return response.value.has_api_keys ? t('正常', 'Normal') : t('无 Key', 'No keys')
 })
@@ -283,6 +292,7 @@ onMounted(refresh)
         </NAlert>
 
         <template v-else>
+          <ModelListNotice v-if="response" :status="response.model_list_filter_status" />
           <NAlert
             v-if="response?.errors.length"
             type="warning"

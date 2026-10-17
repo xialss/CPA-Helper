@@ -206,6 +206,158 @@ try {
     'A maximum of 200 channel model prices can be applied at once',
   )
   assert.equal(localizedServerMessage('渠道配置已变化，请刷新后重试'), 'Channel configuration changed. Refresh and try again.')
+  assert.equal(
+    localizedApiErrorMessage('plugin_sync_failed', '插件策略保存后未生效'),
+    'Plugin policy was saved but did not take effect',
+  )
+  const pluginBoundaryErrors = [
+    ['plugin_sync_failed', '插件策略保存后未生效', 'Plugin policy was saved but did not take effect'],
+    ['plugin_sync_failed', '响应核验配置已提交，但插件未确认生效', 'Response verification config was submitted, but the plugin did not confirm activation'],
+    ['plugin_sync_failed', '插件策略已提交，但未确认目标修订号', 'Plugin policy was submitted, but the target revision was not confirmed'],
+    ['plugin_unavailable', 'CPA Helper Plugin 不可达', 'CPA Helper Plugin is unreachable'],
+    ['plugin_auth_failed', 'CPA Helper Plugin 管理端认证失败，请检查管理密钥', 'CPA Helper Plugin management authentication failed. Check the management key.'],
+    ['conflict', 'CPA Helper Plugin 配置已被其他管理端修改，请刷新后重试', 'CPA Helper Plugin configuration was changed by another administrator. Refresh and try again.'],
+    ['precondition_required', 'CPA Helper Plugin 写入缺少版本前置条件', 'CPA Helper Plugin write is missing the version precondition'],
+    ['plugin_validation_failed', 'CPA Helper Plugin 配置校验失败', 'CPA Helper Plugin configuration validation failed'],
+    ['plugin_not_loaded', 'CPA Helper Plugin 未加载或不支持当前管理契约', 'CPA Helper Plugin is not loaded or does not support the current management contract'],
+    ['validation_error', 'CPA Helper Plugin 返回的 JSON 不是对象', 'CPA Helper Plugin returned JSON that is not an object'],
+    ['plugin_incompatible', 'CPA Helper Plugin 管理契约不兼容', 'CPA Helper Plugin management contract is incompatible'],
+    ['validation_error', 'CPA Helper Plugin 策略快照格式无效（groups/keys 必须为对象数组）', 'CPA Helper Plugin policy snapshot is invalid (groups/keys must be arrays of objects)'],
+    ['validation_error', 'CPA Helper Plugin 策略字段格式无效', 'CPA Helper Plugin policy field format is invalid'],
+    ['validation_error', 'CPA Helper Plugin API 密钥 group_ids 字段格式无效', 'CPA Helper Plugin API key group_ids field format is invalid'],
+    ['validation_error', 'CPA Helper Plugin 规则字段格式无效', 'CPA Helper Plugin rule field format is invalid'],
+    ['plugin_incompatible', 'CPA Helper Plugin 版本不兼容', 'CPA Helper Plugin version is incompatible'],
+    ['plugin_incompatible', 'CPA Helper Plugin 当前并发数据缺失或无效', 'CPA Helper Plugin current concurrency data is missing or invalid'],
+    ['plugin_incompatible', 'CPA Helper Plugin 当前并发数据超出可表示范围', 'CPA Helper Plugin current concurrency data exceeds the supported numeric range'],
+    ['validation_error', 'scope 参数无效', 'Invalid scope parameter'],
+    ['forbidden', '需要管理员权限', 'Admin access is required'],
+    ['forbidden', '需要超级管理员权限', 'Super admin access is required'],
+    ['conflict', '当前 API 密钥缺少完整密钥，无法映射插件策略', 'The full API key is missing; its plugin policy cannot be mapped'],
+    ['plugin_incompatible', 'CPA Helper Plugin API 密钥启用状态无效', 'CPA Helper Plugin API key enabled state is invalid'],
+    ['plugin_incompatible', 'CPA Helper Plugin 路由规则关联无效', 'CPA Helper Plugin route rule association is invalid'],
+    ['plugin_incompatible', 'CPA Helper Plugin 并发上限数据无效', 'CPA Helper Plugin concurrency limit data is invalid'],
+    ['not_found', 'API KEY 不存在', 'API key does not exist'],
+    ['validation_error', '插件 API 密钥策略缺少 id', 'Plugin API key policy is missing id'],
+    ['validation_error', 'CPA Helper Plugin capabilities 缺少响应核验配置', 'CPA Helper Plugin capabilities are missing the response verification config'],
+    ['validation_error', '插件目录响应格式无效', 'Plugin directory response format is invalid'],
+    ['validation_error', '插件目录响应缺少 credentials', 'Plugin directory response is missing credentials'],
+    ['validation_error', 'CLIProxyAPI 配置响应不是有效 JSON object', 'CLIProxyAPI configuration response is not a valid JSON object'],
+    ['validation_error', 'CPA 认证文件目录格式无效', 'CPA auth file directory format is invalid'],
+    ['validation_error', 'CPA 凭据缺少宿主 ID', 'CPA credential is missing its host ID'],
+    ['validation_error', 'CPA 凭据目录存在重复标识', 'CPA credential directory contains duplicate identifiers'],
+    ['validation_error', 'CPA 配置与运行时凭据索引不一致', 'CPA configuration does not match the runtime credential index'],
+    ['validation_error', 'CLIProxyAPI v8 配置缺少 access', 'CLIProxyAPI v8 configuration is missing access'],
+    ['validation_error', '读取 CPA API KEY 失败：v8 配置格式无效', 'Failed to read CPA API keys: invalid v8 configuration format'],
+    ['validation_error', 'CLIProxyAPI v8 配置缺少 api-keys', 'CLIProxyAPI v8 configuration is missing api-keys'],
+    ['validation_error', 'CPA 凭据索引格式错误', 'CPA credential index format is invalid'],
+    ['validation_error', 'CPA 上游 Key 格式错误', 'CPA upstream key format is invalid'],
+    ['validation_error', 'CPA 上游配置格式错误', 'CPA upstream configuration format is invalid'],
+    ['validation_error', '插件 API 密钥策略必须包含 policy_revision 和 key', 'Plugin API key policy must include policy_revision and key'],
+    ['forbidden', '插件 API 密钥身份映射不匹配', 'Plugin API key identity mapping does not match'],
+    ['conflict', '插件配置已被其他管理端修改，请刷新后重试', 'Plugin configuration was changed by another administrator. Refresh and try again.'],
+    ['plugin_not_configured', 'CPA 配置未完成：请先到「系统设置」填写 CLIProxyAPI 地址和管理密钥，再返回 API 密钥页操作。', 'CPA settings are incomplete. Fill in the CLIProxyAPI URL and management key in System Settings, then return to API Keys.'],
+    ['plugin_unavailable', 'CPA Helper Plugin 暂不可用（上游 HTTP 502）', 'CPA Helper Plugin is temporarily unavailable (upstream HTTP 502)'],
+    ['plugin_request_failed', 'CPA Helper Plugin 请求失败（上游 HTTP 502）', 'CPA Helper Plugin request failed (upstream HTTP 502)'],
+    ['validation_error', 'CPA 上游配置格式错误: gemini-api-key', 'Invalid CPA upstream configuration format: gemini-api-key'],
+    ['validation_error', 'CPA 上游配置格式错误: openai-compatibility.api-key-entries', 'Invalid CPA upstream configuration format: openai-compatibility.api-key-entries'],
+    ['validation_error', 'CPA 上游配置条目格式错误: openai-compatibility.api-key-entries', 'Invalid CPA upstream configuration entry format: openai-compatibility.api-key-entries'],
+    ['validation_error', 'CPA 上游分组格式错误: gemini', 'Invalid CPA upstream group format: gemini'],
+    ['validation_error', 'CPA 上游凭据格式错误: codex', 'Invalid CPA upstream credential format: codex'],
+    ['validation_error', 'CPA 上游类型不受支持: custom-provider', 'Unsupported CPA upstream provider type: custom-provider'],
+    ['validation_error', 'CLIProxyAPI 管理地址无效：unsupported scheme', 'Invalid CLIProxyAPI management URL: unsupported scheme'],
+    ['validation_error', 'CLIProxyAPI 管理地址无效：CLIProxyAPI 地址不能为空', 'Invalid CLIProxyAPI management URL: CLIProxyAPI URL is required'],
+    ['validation_error', 'CLIProxyAPI 管理地址无效：CLIProxyAPI 地址无效', 'Invalid CLIProxyAPI management URL: CLIProxyAPI URL is invalid'],
+    ['validation_error', 'CLIProxyAPI 管理地址无效：CLIProxyAPI 地址缺少主机名', 'Invalid CLIProxyAPI management URL: CLIProxyAPI URL is missing a hostname'],
+    ['validation_error', 'CLIProxyAPI 管理地址无效：CLIProxyAPI 地址必须使用 http、https、tcp、redis 或 resp 协议', 'Invalid CLIProxyAPI management URL: CLIProxyAPI URL must use http, https, tcp, redis, or resp'],
+    ['validation_error', '查询 CPA 模型目录失败：upstream HTTP 502', 'Failed to query CPA model catalog: upstream HTTP 502'],
+    ['validation_error', '查询 CPA 模型目录失败：CPA 模型列表请求失败：HTTP 502', 'Failed to query CPA model catalog: CPA model list request failed: HTTP 502'],
+    ['validation_error', '查询 CPA 模型目录失败：CPA 模型列表请求失败：unexpected EOF', 'Failed to query CPA model catalog: CPA model list request failed: unexpected EOF'],
+    ['validation_error', '查询 CPA 模型目录失败：CPA 模型列表响应不是有效 JSON', 'Failed to query CPA model catalog: CPA model list response is not valid JSON'],
+    ['validation_error', '查询 CPA 模型目录失败：CPA 模型列表响应格式不支持', 'Failed to query CPA model catalog: CPA model list response format is unsupported'],
+    ['validation_error', '查询 CPA 模型目录失败：CPA 模型列表响应字段 data 不是列表', 'Failed to query CPA model catalog: CPA model list response field data is not a list'],
+    ['validation_error', '查询 CPA 模型目录失败：CPA 模型列表响应缺少模型列表', 'Failed to query CPA model catalog: CPA model list response is missing the model list'],
+    ['validation_error', '查询 CPA 模型目录失败：CPA Helper Plugin 模型列表策略不可用', 'Failed to query CPA model catalog: CPA Helper Plugin model list policy is unavailable'],
+    ['validation_error', '查询 CPA 模型目录失败：CPA Helper Plugin 模型目录无效', 'Failed to query CPA model catalog: CPA Helper Plugin model catalog is invalid'],
+    ['validation_error', '查询 CPA 模型目录失败：CPA Helper Plugin 模型列表查询失败', 'Failed to query CPA model catalog: CPA Helper Plugin model list query failed'],
+    ['validation_error', '查询 CPA 模型目录失败：CPA Helper Plugin 无法识别当前 API 密钥，模型列表未按路由规则过滤', 'Failed to query CPA model catalog: CPA Helper Plugin cannot identify this API key; the model list was not filtered by routing rules'],
+  ]
+  const pluginBackend = await readFile(new URL('../../backend/internal/app/cpa_helper_plugin.go', import.meta.url), 'utf8')
+  const concatenatedPluginErrorPrefixes = [
+    ...pluginBackend.matchAll(/\b(?:validationError|conflictError|notFoundError|forbiddenError)\("([^"]+)"\s*\+/g),
+    ...pluginBackend.matchAll(/\bappError\("[^"]+",\s*[^,\n]+,\s*"([^"]+)"\s*\+/g),
+  ].map((match) => match[1]).filter((input) => /\p{Script=Han}/u.test(input))
+  for (const prefix of new Set(concatenatedPluginErrorPrefixes)) {
+    assert.ok(pluginBoundaryErrors.some(([, covered]) => covered.startsWith(prefix)), `Production concatenated plugin error needs a bilingual fixture: ${prefix}`)
+  }
+  const fixedPluginErrors = [
+    ...pluginBackend.matchAll(/\b(?:validationError|conflictError|notFoundError|forbiddenError)\("([^"]+)"\)/g),
+    ...pluginBackend.matchAll(/\bappError\("[^"]+",\s*[^,\n]+,\s*"([^"]+)"\)/g),
+  ].map((match) => match[1]).filter((input) => /\p{Script=Han}/u.test(input))
+  for (const input of new Set(fixedPluginErrors)) {
+    assert.ok(pluginBoundaryErrors.some(([, covered]) => covered === input), `Production plugin error needs a bilingual fixture: ${input}`)
+  }
+  for (const [code, input, expected] of pluginBoundaryErrors) {
+    const translated = localizedApiErrorMessage(code, input)
+    assert.equal(translated, expected)
+    assert.doesNotMatch(translated, /\p{Script=Han}/u)
+  }
+  // These diagnostic identifiers are already public in the backend error. Translate only the Helper prefix.
+  const pluginOpaqueErrors = [
+    ['validation_error', 'CPA 上游配置格式错误: 自定义字段', 'Invalid CPA upstream configuration format: 自定义字段'],
+    ['validation_error', 'CPA 上游配置条目格式错误: 自定义条目', 'Invalid CPA upstream configuration entry format: 自定义条目'],
+    ['validation_error', 'CPA 上游分组格式错误: 私有渠道（A）', 'Invalid CPA upstream group format: 私有渠道（A）'],
+    ['validation_error', 'CPA 上游凭据格式错误: 私有凭据（B）', 'Invalid CPA upstream credential format: 私有凭据（B）'],
+    ['validation_error', 'CPA 上游类型不受支持: 私有类型（C）', 'Unsupported CPA upstream provider type: 私有类型（C）'],
+  ]
+  for (const [code, input, expected] of pluginOpaqueErrors) assert.equal(localizedApiErrorMessage(code, input), expected)
+  assert.equal(
+    localizedApiErrorMessage('plugin_auth_failed', 'CPA Helper Plugin 管理端认证失败，请检查管理密钥'),
+    'CPA Helper Plugin management authentication failed. Check the management key.',
+  )
+  assert.equal(
+    localizedApiErrorMessage('plugin_not_loaded', 'CPA Helper Plugin 未加载或不支持当前管理契约'),
+    'CPA Helper Plugin is not loaded or does not support the current management contract',
+  )
+  assert.equal(
+    localizedApiErrorMessage('validation_error', 'CPA Helper Plugin 策略快照格式无效（groups/keys 必须为对象数组）'),
+    'CPA Helper Plugin policy snapshot is invalid (groups/keys must be arrays of objects)',
+  )
+  assert.equal(
+    localizedApiErrorMessage('plugin_incompatible', 'CPA Helper Plugin 管理契约不兼容'),
+    'CPA Helper Plugin management contract is incompatible',
+  )
+  assert.equal(
+    localizedApiErrorMessage('plugin_unavailable', 'CPA Helper Plugin 暂不可用（上游 HTTP 502）'),
+    'CPA Helper Plugin is temporarily unavailable (upstream HTTP 502)',
+  )
+  assert.equal(
+    localizedApiErrorMessage('plugin_request_failed', 'CPA Helper Plugin 请求失败（上游 HTTP 502）'),
+    'CPA Helper Plugin request failed (upstream HTTP 502)',
+  )
+  assert.equal(
+    localizedApiErrorMessage('plugin_validation_failed', 'CPA Helper Plugin 配置校验失败'),
+    'CPA Helper Plugin configuration validation failed',
+  )
+  assert.equal(
+    localizedApiErrorMessage('precondition_required', 'CPA Helper Plugin 写入缺少版本前置条件'),
+    'CPA Helper Plugin write is missing the version precondition',
+  )
+  assert.equal(
+    localizedApiErrorMessage('validation_error', 'CPA 上游配置格式错误: gemini-api-key'),
+    'Invalid CPA upstream configuration format: gemini-api-key',
+  )
+  assert.equal(
+    localizedApiErrorMessage('validation_error', 'CPA 上游配置条目格式错误: openai-compatibility.api-key-entries'),
+    'Invalid CPA upstream configuration entry format: openai-compatibility.api-key-entries',
+  )
+  assert.equal(
+    localizedApiErrorMessage('conflict', '插件配置已被其他管理端修改，请刷新后重试'),
+    'Plugin configuration was changed by another administrator. Refresh and try again.',
+  )
+  assert.equal(
+    localizedApiErrorMessage('conflict', 'CPA Helper Plugin 配置已被其他管理端修改，请刷新后重试'),
+    'CPA Helper Plugin configuration was changed by another administrator. Refresh and try again.',
+  )
   assert.equal(localizedServerMessage('请至少选择一个 LiteLLM 模型'), 'Select at least one LiteLLM model')
   assert.equal(localizedServerMessage('所选 LiteLLM 模型包含重复定价身份，请只选择一个大小写或空格变体'), 'Selected LiteLLM models share a price identity. Select only one case or whitespace variant.')
   assert.equal(
@@ -382,6 +534,7 @@ try {
 
   setLanguage('zh')
   assert.equal(localizedApiErrorMessage('validation_error', null), '请求参数无效')
+  for (const [code, input] of [...pluginBoundaryErrors, ...pluginOpaqueErrors]) assert.equal(localizedApiErrorMessage(code, input), input)
   assert.equal(
     localizedApiErrorMessage('usage_record_expired', null),
     '使用明细已超过 7 天保留期',
@@ -485,6 +638,24 @@ try {
       error.code === 'usage_record_expired' &&
       error.message === 'Usage record is outside the 7-day retention period',
   )
+  for (const language of ['en', 'zh']) {
+    setLanguage(language)
+    for (const [code, input, expected] of [...pluginBoundaryErrors, ...pluginOpaqueErrors]) {
+      globalThis.fetch = async () => Response.json({ detail: { code, message: input } }, { status: 503 })
+      await assert.rejects(
+        () => apiClient.put('/cpa-helper-plugin/response-model', {}),
+        (error) => {
+          assert.equal(isApiRequestError(error), true)
+          assert.equal(error.code, code)
+          const rendered = browserCase.i18n.errorText(error, '保存插件配置失败', 'Failed to save plugin config')
+          assert.equal(rendered, language === 'zh' ? input : expected, 'The API error and actual UI localizer render the complete localized message')
+          if (language === 'en' && pluginBoundaryErrors.some(([, fixed]) => fixed === input)) assert.doesNotMatch(rendered, /\p{Script=Han}/u)
+          return true
+        },
+      )
+    }
+  }
+  setLanguage('en')
 
   const { getUsageRecords, isUsageRecordsLegacyRangeValidationError } =
     await server.ssrLoadModule(`/src/features/usage/api/usageApi.ts?case=${moduleCase++}`)

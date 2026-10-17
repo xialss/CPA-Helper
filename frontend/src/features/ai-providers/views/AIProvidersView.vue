@@ -188,11 +188,7 @@ const providerStatusCurrentWindowBucketCount = 3
 const providerStatusBucketIntervalMs = 10 * 60 * 1000
 const providerStatusTimestampPattern = /^\d{4}-\d{2}-\d{2}[T\s]/
 const providerStatusTooltipThemeOverrides = {
-  color: 'var(--cpa-surface-raised)',
-  textColor: 'var(--cpa-text)',
-  boxShadow: '0 12px 30px rgb(15 23 42 / 14%)',
   padding: '10px 12px',
-  borderRadius: '8px',
 }
 
 const emptySummary: AIProviderSummary = {

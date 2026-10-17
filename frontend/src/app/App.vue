@@ -21,6 +21,13 @@ const { language } = useLanguagePreference()
 const naiveLocale = computed(() => (language.value === 'zh' ? zhCN : enUS))
 const naiveDateLocale = computed(() => (language.value === 'zh' ? dateZhCN : dateEnUS))
 
+const floatingThemeOverrides = {
+  color: 'var(--cpa-surface-raised)',
+  textColor: 'var(--cpa-text)',
+  boxShadow: 'var(--cpa-shadow), 0 0 0 1px var(--cpa-border)',
+  borderRadius: 'var(--cpa-radius)',
+}
+
 const themeOverrides = computed<GlobalThemeOverrides>(() => ({
   common: {
     borderRadius: '8px',
@@ -45,6 +52,12 @@ const themeOverrides = computed<GlobalThemeOverrides>(() => ({
   DataTable: {
     thFontWeight: '700',
     borderRadius: '8px',
+  },
+  Popover: floatingThemeOverrides,
+  Tooltip: {
+    ...floatingThemeOverrides,
+    // Tooltip renders a Popover peer; keep both layers on the same surface.
+    peers: { Popover: floatingThemeOverrides },
   },
   Layout: {
     color: naiveThemeIsDark.value ? '#0e171b' : '#f4f8f9',
