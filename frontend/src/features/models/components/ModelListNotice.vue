@@ -10,8 +10,8 @@ const { t } = useI18n()
 const notice = computed(() => {
   if (props.status === 'enabled') {
     return t(
-      '模型目录已按各 Key 的启用状态及关联、独立模型规则过滤；凭据路由限制会在实际请求时校验。',
-      'The catalog is filtered by each key’s enabled state, linked rules and individual model rules. Credential routing restrictions are checked when a request is made.',
+      '模型目录已按各 Key 的启用状态及关联、独立模型规则过滤；插件 v0.1.8 起还根据已同步目录检查凭据限制。实际请求仍受路由规则和凭据可用状态约束。',
+      'The catalog is filtered by each key’s enabled state, linked rules and individual model rules. Plugin v0.1.8 and later also check credential restrictions against the synced catalog. Actual requests remain subject to routing rules and credential availability.',
     )
   }
   if (props.status === 'disabled') {

@@ -216,12 +216,21 @@ try {
     ['plugin_sync_failed', '插件策略已提交，但未确认目标修订号', 'Plugin policy was submitted, but the target revision was not confirmed'],
     ['plugin_unavailable', 'CPA Helper Plugin 不可达', 'CPA Helper Plugin is unreachable'],
     ['plugin_auth_failed', 'CPA Helper Plugin 管理端认证失败，请检查管理密钥', 'CPA Helper Plugin management authentication failed. Check the management key.'],
+    ['conflict', 'API KEY 已过期，请先修改密钥有效期', 'API key has expired; update its expiration first'],
     ['conflict', 'CPA Helper Plugin 配置已被其他管理端修改，请刷新后重试', 'CPA Helper Plugin configuration was changed by another administrator. Refresh and try again.'],
     ['precondition_required', 'CPA Helper Plugin 写入缺少版本前置条件', 'CPA Helper Plugin write is missing the version precondition'],
     ['plugin_validation_failed', 'CPA Helper Plugin 配置校验失败', 'CPA Helper Plugin configuration validation failed'],
     ['plugin_not_loaded', 'CPA Helper Plugin 未加载或不支持当前管理契约', 'CPA Helper Plugin is not loaded or does not support the current management contract'],
     ['validation_error', 'CPA Helper Plugin 返回的 JSON 不是对象', 'CPA Helper Plugin returned JSON that is not an object'],
     ['plugin_incompatible', 'CPA Helper Plugin 管理契约不兼容', 'CPA Helper Plugin management contract is incompatible'],
+    ['model_catalog_unavailable', 'CPA Helper Plugin 模型目录不可用，请同步目录', 'CPA Helper Plugin model catalog is unavailable. Sync the catalog.'],
+    ['model_catalog_out_of_sync', 'CPA Helper Plugin 模型目录已失效，请重新同步', 'CPA Helper Plugin model catalog is out of sync. Sync it again.'],
+    ['model_catalog_unavailable', 'CPA Helper Plugin 模型目录需要管理员同步，请检查管理配置', 'The CPA Helper Plugin model catalog requires an administrator to sync it. Check the management settings.'],
+    ['conflict', 'CPA Helper Plugin 模型目录已被其他管理端修改，请刷新后重试', 'The CPA Helper Plugin model catalog was changed by another administrator. Refresh and try again.'],
+    ['model_catalog_sync_failed', 'CPA Helper Plugin 模型目录已提交，但未确认目标修订号', 'The CPA Helper Plugin model catalog was submitted, but the target revision was not confirmed.'],
+    ['model_catalog_sync_failed', 'CPA Helper Plugin 模型目录已提交，但未确认生效', 'The CPA Helper Plugin model catalog was submitted, but activation was not confirmed.'],
+    ['model_catalog_out_of_sync', '同步期间 CPA 配置或凭据已变化，请刷新后重试', 'CPA configuration or credentials changed during synchronization. Refresh and try again.'],
+    ['model_catalog_sync_failed', 'CPA 凭据模型目录格式错误', 'CPA credential model catalog format is invalid'],
     ['validation_error', 'CPA Helper Plugin 策略快照格式无效（groups/keys 必须为对象数组）', 'CPA Helper Plugin policy snapshot is invalid (groups/keys must be arrays of objects)'],
     ['validation_error', 'CPA Helper Plugin 策略字段格式无效', 'CPA Helper Plugin policy field format is invalid'],
     ['validation_error', 'CPA Helper Plugin API 密钥 group_ids 字段格式无效', 'CPA Helper Plugin API key group_ids field format is invalid'],
@@ -281,7 +290,9 @@ try {
     ['validation_error', '查询 CPA 模型目录失败：CPA Helper Plugin 模型列表查询失败', 'Failed to query CPA model catalog: CPA Helper Plugin model list query failed'],
     ['validation_error', '查询 CPA 模型目录失败：CPA Helper Plugin 无法识别当前 API 密钥，模型列表未按路由规则过滤', 'Failed to query CPA model catalog: CPA Helper Plugin cannot identify this API key; the model list was not filtered by routing rules'],
   ]
-  const pluginBackend = await readFile(new URL('../../backend/internal/app/cpa_helper_plugin.go', import.meta.url), 'utf8')
+  const pluginBackend = (await Promise.all([
+    'cpa_helper_plugin.go', 'cpa_helper_plugin_catalog.go', 'cpa_helper_plugin_credentials.go',
+  ].map((file) => readFile(new URL(`../../backend/internal/app/${file}`, import.meta.url), 'utf8')))).join('\n')
   const concatenatedPluginErrorPrefixes = [
     ...pluginBackend.matchAll(/\b(?:validationError|conflictError|notFoundError|forbiddenError)\("([^"]+)"\s*\+/g),
     ...pluginBackend.matchAll(/\bappError\("[^"]+",\s*[^,\n]+,\s*"([^"]+)"\s*\+/g),
@@ -290,8 +301,8 @@ try {
     assert.ok(pluginBoundaryErrors.some(([, covered]) => covered.startsWith(prefix)), `Production concatenated plugin error needs a bilingual fixture: ${prefix}`)
   }
   const fixedPluginErrors = [
-    ...pluginBackend.matchAll(/\b(?:validationError|conflictError|notFoundError|forbiddenError)\("([^"]+)"\)/g),
-    ...pluginBackend.matchAll(/\bappError\("[^"]+",\s*[^,\n]+,\s*"([^"]+)"\)/g),
+    ...pluginBackend.matchAll(/\b(?:validationError|conflictError|notFoundError|forbiddenError|pluginCatalogSyncFailed)\("([^"]+)"\)/g),
+    ...pluginBackend.matchAll(/\bappError\([^,\n]+,\s*[^,\n]+,\s*"([^"]+)"\)/g),
   ].map((match) => match[1]).filter((input) => /\p{Script=Han}/u.test(input))
   for (const input of new Set(fixedPluginErrors)) {
     assert.ok(pluginBoundaryErrors.some(([, covered]) => covered === input), `Production plugin error needs a bilingual fixture: ${input}`)

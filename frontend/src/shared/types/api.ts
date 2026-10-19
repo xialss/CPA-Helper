@@ -98,6 +98,7 @@ export interface CPAHelperPluginKeySummary {
   api_key_hash: string
   enabled: boolean
   group_names: string[]
+  has_custom_rule: boolean
   current_concurrency: number
   max_concurrency: number
 }
@@ -919,6 +920,9 @@ export interface UserApiKeySummary {
   user_name: string | null
   created_at: string | null
   updated_at: string | null
+  expires_at: string | null
+  expiration_enforced_at: string | null
+  expiration_sync_error: string | null
   records: number
   success_records: number
   failed_records: number
@@ -1072,10 +1076,12 @@ export interface UserApiKeyBindPayload {
 
 export interface ApiKeyCreatePayload {
   description: string
+  expires_at?: string | null
 }
 
 export interface ApiKeyUpdatePayload {
   description: string
+  expires_at?: string | null
 }
 
 export type ModelMonitorSourceType = 'built_in'

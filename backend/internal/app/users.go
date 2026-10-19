@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -35,7 +36,8 @@ type userAPIKeyBindPayload struct {
 }
 
 type apiKeyPayload struct {
-	Description string `json:"description"`
+	Description string          `json:"description"`
+	ExpiresAt   json.RawMessage `json:"expires_at"`
 }
 
 type UserRecord struct {
@@ -68,6 +70,7 @@ type UserAPIKey struct {
 	Description string
 	CreatedAt   *time.Time
 	UpdatedAt   *time.Time
+	ExpiresAt   *time.Time
 }
 
 type UserApiKeySummary struct {
@@ -78,6 +81,9 @@ type UserApiKeySummary struct {
 	UserName              *string    `json:"user_name"`
 	CreatedAt             *time.Time `json:"created_at"`
 	UpdatedAt             *time.Time `json:"updated_at"`
+	ExpiresAt             *string    `json:"expires_at"`
+	ExpirationEnforcedAt  *time.Time `json:"expiration_enforced_at"`
+	ExpirationSyncError   *string    `json:"expiration_sync_error"`
 	Records               int        `json:"records"`
 	SuccessRecords        int        `json:"success_records"`
 	FailedRecords         int        `json:"failed_records"`
@@ -401,7 +407,11 @@ func (a *App) handleCurrentUserAPIKeys(w http.ResponseWriter, r *http.Request) e
 		if err := decodeJSON(r, &payload); err != nil {
 			return err
 		}
-		summary, err := a.createGeneratedAPIKeyForUser(r.Context(), user.ID, user.Username, payload.Description)
+		expiresAt, err := parseAPIKeyExpiration(payload.ExpiresAt)
+		if err != nil {
+			return err
+		}
+		summary, err := a.createGeneratedAPIKeyForUser(r.Context(), user.ID, user.Username, payload.Description, expiresAt)
 		if err != nil {
 			return err
 		}
@@ -427,7 +437,7 @@ func (a *App) handleCurrentUserAPIKeyByHash(w http.ResponseWriter, r *http.Reque
 		if err := decodeJSON(r, &payload); err != nil {
 			return err
 		}
-		summary, err := a.updateCurrentUserAPIKey(r.Context(), user, apiKeyHash, payload.Description)
+		summary, err := a.updateCurrentUserAPIKey(r.Context(), user, apiKeyHash, payload)
 		if err != nil {
 			return err
 		}
@@ -872,13 +882,13 @@ func (a *App) enableUser(ctx context.Context, actor *AuthUser, id int) error {
 		return err
 	}
 	for _, key := range keys {
-		if key.APIKey == nil {
+		if key.APIKey == nil && !key.expired(time.Now()) {
 			return conflictError("存在无法恢复的 API KEY，请重新绑定后再启用")
 		}
 	}
 	restored := []string{}
 	for _, key := range keys {
-		if key.APIKey == nil {
+		if key.APIKey == nil || key.expired(time.Now()) {
 			continue
 		}
 		changed, syncErr := a.addRemoteAPIKeyWithChange(ctx, *key.APIKey)
@@ -960,6 +970,9 @@ func (a *App) restoreRemovedUserAPIKeys(ctx context.Context, keys []UserAPIKey) 
 	var combinedErr error
 	for index := len(keys) - 1; index >= 0; index-- {
 		key := keys[index]
+		if key.expired(time.Now()) {
+			continue
+		}
 		if key.APIKey == nil {
 			combinedErr = combineUserMutationErrors(combinedErr, conflictError("缺少 API KEY 明文，无法恢复远端绑定"))
 			continue
@@ -1223,7 +1236,7 @@ func (a *App) currentUserAPIKeys(ctx context.Context, user *AuthUser) ([]UserApi
 	return result, nil
 }
 
-func (a *App) createGeneratedAPIKeyForUser(ctx context.Context, userID int, username, description string) (UserApiKeySummary, error) {
+func (a *App) createGeneratedAPIKeyForUser(ctx context.Context, userID int, username, description string, expiresAt *time.Time) (UserApiKeySummary, error) {
 	defer a.lockUserMutation(userID)()
 
 	description = strings.TrimSpace(description)
@@ -1245,7 +1258,7 @@ func (a *App) createGeneratedAPIKeyForUser(ctx context.Context, userID int, user
 		return UserApiKeySummary{}, err
 	}
 	apiKeyHash := hashAPIKey(apiKey)
-	if err := a.upsertUserAPIKey(ctx, user.ID, apiKeyHash, apiKey, description); err != nil {
+	if err := a.insertGeneratedAPIKey(ctx, user.ID, apiKeyHash, apiKey, description, expiresAt); err != nil {
 		compensationErr := a.removeRemoteAPIKeyHash(context.WithoutCancel(ctx), apiKeyHash)
 		return UserApiKeySummary{}, combineUserMutationErrors(err, compensationErr)
 	}
@@ -1257,20 +1270,32 @@ func (a *App) createGeneratedAPIKeyForUser(ctx context.Context, userID int, user
 	return summary, nil
 }
 
-func (a *App) updateCurrentUserAPIKey(ctx context.Context, user *AuthUser, apiKeyHash, description string) (UserApiKeySummary, error) {
+func (a *App) updateCurrentUserAPIKey(ctx context.Context, user *AuthUser, apiKeyHash string, payload apiKeyPayload) (UserApiKeySummary, error) {
 	defer a.lockUserMutation(user.ID)()
 
-	description = strings.TrimSpace(description)
+	description := strings.TrimSpace(payload.Description)
 	if description == "" {
 		return UserApiKeySummary{}, validationError("API KEY 描述不能为空")
 	}
-	result, err := a.db.ExecContext(ctx, `UPDATE user_api_keys SET description = ?, updated_at = ? WHERE user_id = ? AND api_key_hash = ?`, description, dbTime(time.Now()), user.ID, apiKeyHash)
+	key, err := a.getAPIKey(ctx, apiKeyHash)
 	if err != nil {
 		return UserApiKeySummary{}, err
 	}
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
+	if key.UserID != user.ID {
 		return UserApiKeySummary{}, notFoundError("API KEY 不存在")
+	}
+	if len(payload.ExpiresAt) > 0 {
+		expiresAt, err := parseAPIKeyExpiration(payload.ExpiresAt)
+		if err != nil {
+			return UserApiKeySummary{}, err
+		}
+		if err := a.updateAPIKeyExpirationLocked(ctx, key, description, expiresAt); err != nil {
+			return UserApiKeySummary{}, err
+		}
+	} else {
+		if _, err := a.db.ExecContext(ctx, `UPDATE user_api_keys SET description = ?, updated_at = ? WHERE user_id = ? AND api_key_hash = ?`, description, dbTime(time.Now()), user.ID, apiKeyHash); err != nil {
+			return UserApiKeySummary{}, err
+		}
 	}
 	_, _ = a.db.ExecContext(ctx, `UPDATE users SET updated_at = ? WHERE id = ?`, dbTime(time.Now()), user.ID)
 	summary, err := a.keySummaryByHash(ctx, apiKeyHash, nil)
@@ -1500,7 +1525,7 @@ func (a *App) ensureUsernameAvailable(ctx context.Context, username string, exce
 }
 
 func (a *App) userAPIKeys(ctx context.Context, userID int) ([]UserAPIKey, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT api_key_hash, user_id, api_key, description, CAST(created_at AS TEXT), CAST(updated_at AS TEXT) FROM user_api_keys WHERE user_id = ? ORDER BY created_at, api_key_hash`, userID)
+	rows, err := a.db.QueryContext(ctx, `SELECT api_key_hash, user_id, api_key, description, CAST(created_at AS TEXT), CAST(updated_at AS TEXT), CAST(expires_at AS TEXT) FROM user_api_keys WHERE user_id = ? ORDER BY created_at, api_key_hash`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -1509,7 +1534,7 @@ func (a *App) userAPIKeys(ctx context.Context, userID int) ([]UserAPIKey, error)
 }
 
 func (a *App) getAPIKey(ctx context.Context, apiKeyHash string) (UserAPIKey, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT api_key_hash, user_id, api_key, description, CAST(created_at AS TEXT), CAST(updated_at AS TEXT) FROM user_api_keys WHERE api_key_hash = ?`, apiKeyHash)
+	rows, err := a.db.QueryContext(ctx, `SELECT api_key_hash, user_id, api_key, description, CAST(created_at AS TEXT), CAST(updated_at AS TEXT), CAST(expires_at AS TEXT) FROM user_api_keys WHERE api_key_hash = ?`, apiKeyHash)
 	if err != nil {
 		return UserAPIKey{}, err
 	}
@@ -1528,13 +1553,18 @@ func scanAPIKeys(rows *sql.Rows) ([]UserAPIKey, error) {
 	var keys []UserAPIKey
 	for rows.Next() {
 		var key UserAPIKey
-		var apiKey, createdAt, updatedAt sql.NullString
-		if err := rows.Scan(&key.APIKeyHash, &key.UserID, &apiKey, &key.Description, &createdAt, &updatedAt); err != nil {
+		var apiKey, createdAt, updatedAt, expiresAt sql.NullString
+		if err := rows.Scan(&key.APIKeyHash, &key.UserID, &apiKey, &key.Description, &createdAt, &updatedAt, &expiresAt); err != nil {
 			return nil, err
 		}
 		key.APIKey = nullableString(apiKey)
 		key.CreatedAt = timePtr(createdAt)
 		key.UpdatedAt = timePtr(updatedAt)
+		parsedExpiration, err := storedAPIKeyExpiration(expiresAt)
+		if err != nil {
+			return nil, err
+		}
+		key.ExpiresAt = parsedExpiration
 		keys = append(keys, key)
 	}
 	return keys, rows.Err()
@@ -1542,7 +1572,7 @@ func scanAPIKeys(rows *sql.Rows) ([]UserAPIKey, error) {
 
 func (a *App) keySummaries(ctx context.Context) ([]UserApiKeySummary, error) {
 	rows, err := a.db.QueryContext(ctx, `
-		SELECT k.api_key_hash, k.user_id, k.api_key, k.description, CAST(k.created_at AS TEXT), CAST(k.updated_at AS TEXT),
+		SELECT k.api_key_hash, k.user_id, k.api_key, k.description, CAST(k.created_at AS TEXT), CAST(k.updated_at AS TEXT), CAST(k.expires_at AS TEXT), CAST(k.expiration_enforced_at AS TEXT), k.expiration_sync_error,
 		       u.nickname, u.username
 		FROM user_api_keys k
 		LEFT JOIN users u ON u.id = k.user_id
@@ -1554,14 +1584,21 @@ func (a *App) keySummaries(ctx context.Context) ([]UserApiKeySummary, error) {
 	var summaries []UserApiKeySummary
 	for rows.Next() {
 		var summary UserApiKeySummary
-		var apiKey, createdAt, updatedAt, nickname, username sql.NullString
+		var apiKey, createdAt, updatedAt, expiresAt, enforcedAt, syncError, nickname, username sql.NullString
 		var userID int
-		if err := rows.Scan(&summary.APIKeyHash, &userID, &apiKey, &summary.Description, &createdAt, &updatedAt, &nickname, &username); err != nil {
+		if err := rows.Scan(&summary.APIKeyHash, &userID, &apiKey, &summary.Description, &createdAt, &updatedAt, &expiresAt, &enforcedAt, &syncError, &nickname, &username); err != nil {
 			return nil, err
 		}
 		summary.APIKey = nullableString(apiKey)
 		summary.CreatedAt = timePtr(createdAt)
 		summary.UpdatedAt = timePtr(updatedAt)
+		parsedExpiration, err := storedAPIKeyExpiration(expiresAt)
+		if err != nil {
+			return nil, err
+		}
+		summary.ExpiresAt = apiKeyExpirationString(parsedExpiration)
+		summary.ExpirationEnforcedAt = timePtr(enforcedAt)
+		summary.ExpirationSyncError = nullableString(syncError)
 		summary.UserID = &userID
 		if username.Valid {
 			label := strings.TrimSpace(nickname.String)
@@ -1589,7 +1626,7 @@ func (a *App) keySummaries(ctx context.Context) ([]UserApiKeySummary, error) {
 
 func (a *App) keySummariesForUser(ctx context.Context, userID int) ([]UserApiKeySummary, error) {
 	rows, err := a.db.QueryContext(ctx, `
-		SELECT k.api_key_hash, k.user_id, k.api_key, k.description, CAST(k.created_at AS TEXT), CAST(k.updated_at AS TEXT),
+		SELECT k.api_key_hash, k.user_id, k.api_key, k.description, CAST(k.created_at AS TEXT), CAST(k.updated_at AS TEXT), CAST(k.expires_at AS TEXT), CAST(k.expiration_enforced_at AS TEXT), k.expiration_sync_error,
 		       u.nickname, u.username
 		FROM user_api_keys k
 		LEFT JOIN users u ON u.id = k.user_id
@@ -1602,14 +1639,21 @@ func (a *App) keySummariesForUser(ctx context.Context, userID int) ([]UserApiKey
 	var summaries []UserApiKeySummary
 	for rows.Next() {
 		var summary UserApiKeySummary
-		var apiKey, createdAt, updatedAt, nickname, username sql.NullString
+		var apiKey, createdAt, updatedAt, expiresAt, enforcedAt, syncError, nickname, username sql.NullString
 		var uid int
-		if err := rows.Scan(&summary.APIKeyHash, &uid, &apiKey, &summary.Description, &createdAt, &updatedAt, &nickname, &username); err != nil {
+		if err := rows.Scan(&summary.APIKeyHash, &uid, &apiKey, &summary.Description, &createdAt, &updatedAt, &expiresAt, &enforcedAt, &syncError, &nickname, &username); err != nil {
 			return nil, err
 		}
 		summary.APIKey = nullableString(apiKey)
 		summary.CreatedAt = timePtr(createdAt)
 		summary.UpdatedAt = timePtr(updatedAt)
+		parsedExpiration, err := storedAPIKeyExpiration(expiresAt)
+		if err != nil {
+			return nil, err
+		}
+		summary.ExpiresAt = apiKeyExpirationString(parsedExpiration)
+		summary.ExpirationEnforcedAt = timePtr(enforcedAt)
+		summary.ExpirationSyncError = nullableString(syncError)
 		summary.UserID = &uid
 		if username.Valid {
 			label := strings.TrimSpace(nickname.String)
@@ -1637,18 +1681,18 @@ func (a *App) keySummariesForUser(ctx context.Context, userID int) ([]UserApiKey
 
 func (a *App) keySummaryByHash(ctx context.Context, apiKeyHash string, fullKey *string) (UserApiKeySummary, error) {
 	var summary UserApiKeySummary
-	var apiKey, createdAt, updatedAt, nickname, username sql.NullString
+	var apiKey, createdAt, updatedAt, expiresAt, enforcedAt, syncError, nickname, username sql.NullString
 	var userID int
 	err := a.db.QueryRowContext(ctx, `
 		SELECT k.api_key_hash, k.user_id, k.api_key, k.description,
-		       CAST(k.created_at AS TEXT), CAST(k.updated_at AS TEXT),
+		       CAST(k.created_at AS TEXT), CAST(k.updated_at AS TEXT), CAST(k.expires_at AS TEXT), CAST(k.expiration_enforced_at AS TEXT), k.expiration_sync_error,
 		       u.nickname, u.username
 		FROM user_api_keys k
 		LEFT JOIN users u ON u.id = k.user_id
 		WHERE k.api_key_hash = ?
 	`, apiKeyHash).Scan(
 		&summary.APIKeyHash, &userID, &apiKey, &summary.Description,
-		&createdAt, &updatedAt, &nickname, &username,
+		&createdAt, &updatedAt, &expiresAt, &enforcedAt, &syncError, &nickname, &username,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return UserApiKeySummary{}, notFoundError("API KEY 不存在")
@@ -1662,6 +1706,13 @@ func (a *App) keySummaryByHash(ctx context.Context, apiKeyHash string, fullKey *
 	}
 	summary.CreatedAt = timePtr(createdAt)
 	summary.UpdatedAt = timePtr(updatedAt)
+	parsedExpiration, err := storedAPIKeyExpiration(expiresAt)
+	if err != nil {
+		return UserApiKeySummary{}, err
+	}
+	summary.ExpiresAt = apiKeyExpirationString(parsedExpiration)
+	summary.ExpirationEnforcedAt = timePtr(enforcedAt)
+	summary.ExpirationSyncError = nullableString(syncError)
 	summary.UserID = &userID
 	if username.Valid {
 		label := strings.TrimSpace(nickname.String)

@@ -57,6 +57,7 @@ type App struct {
 	collector              *CollectorRunner
 	keeper                 *KeeperRunner
 	usageMaintenance       *usageMaintenanceRunner
+	apiKeyExpiration       *apiKeyExpirationRunner
 	usageHourlyMu          sync.Mutex
 	userMutationMu         sync.Mutex // serialize mutations that do not yet have a user ID (create/setup)
 	userMutationLocks      sync.Map   // map[int]*sync.Mutex; serialize state and remote-key mutations per user
@@ -64,6 +65,8 @@ type App struct {
 	keeperUsageCache       keeperWindowUsageCache
 	priceSelectors         modelPriceSelectorSnapshotCache
 	aiProviderWriteMu      sync.Mutex // serialize provider read/validate/write mutations
+	pluginCatalogMu        sync.Mutex
+	pluginCatalogFlights   map[string]*pluginCatalogFlight
 	modelMonitorHTTPClient func(ModelMonitorProxyConfig) (*http.Client, error)
 	aiRadarMu              sync.Mutex // guards aiRadarSnapshot
 	aiRadarSnapshot        aiRadarSnapshot
@@ -208,6 +211,7 @@ func NewWithOptions(ctx context.Context, options NewOptions) (*App, error) {
 }
 
 func (a *App) startBackground(ctx context.Context) {
+	a.startAPIKeyExpiration()
 	a.collector = NewCollectorRunner(a)
 	a.keeper = NewKeeperRunner(a)
 	a.collector.Start()
@@ -226,6 +230,10 @@ func (a *App) startUsageMaintenance(ctx context.Context) {
 }
 
 func (a *App) Close() {
+	if a.apiKeyExpiration != nil {
+		a.apiKeyExpiration.cancel()
+		<-a.apiKeyExpiration.done
+	}
 	if a.usageMaintenance != nil {
 		a.usageMaintenance.Stop()
 	}

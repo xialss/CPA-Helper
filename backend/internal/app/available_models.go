@@ -104,6 +104,10 @@ func (a *App) availableModelsForUser(ctx context.Context, userID int) (Available
 	}
 	queryable := make([]UserAPIKey, 0, len(bindings))
 	for _, binding := range bindings {
+		if binding.expired(time.Now()) {
+			response.Errors = append(response.Errors, AvailableModelKeyError{APIKeyHash: binding.APIKeyHash, APIKeyPreview: maskSecret(binding.APIKey), Description: binding.Description, Message: "API KEY 已过期，请先修改密钥有效期"})
+			continue
+		}
 		if binding.APIKey != nil && strings.TrimSpace(*binding.APIKey) != "" {
 			queryable = append(queryable, binding)
 		}
@@ -126,9 +130,10 @@ func (a *App) availableModelsForUser(ctx context.Context, userID int) (Available
 	}
 	modelsByID := map[string]AvailableModelItem{}
 	successfulQueries := 0
+	recovery := &pluginCatalogRecovery{}
 	for _, binding := range queryable {
 		source := availableModelSource(binding)
-		models, err := fetchAvailableModelItems(ctx, cfg, *binding.APIKey)
+		models, err := a.fetchAvailableModelsWithCatalogRecovery(ctx, cfg, *binding.APIKey, recovery)
 		if err != nil {
 			response.Errors = append(response.Errors, AvailableModelKeyError{
 				APIKeyHash:    source.APIKeyHash,
@@ -187,8 +192,8 @@ func (a *App) availableModelsForUser(ctx context.Context, userID int) (Available
 	return response, nil
 }
 
-// The plugin owns rule composition. Its catalog filter does not evaluate
-// credential routing, which is checked when CPA schedules a real request.
+// The plugin owns rule composition. v0.1.8 also filters registered models by
+// credential restrictions; scheduling and transient upstream health stay in CPA.
 func (a *App) availableModelListFilterStatus(ctx context.Context, cfg AppConfig) (string, error) {
 	if strings.TrimSpace(cfg.Collector.ManagementKey) == "" {
 		return "not_configured", nil
@@ -251,6 +256,8 @@ func fetchAvailableModelItems(ctx context.Context, cfg AppConfig, apiKey string)
 			return nil, fmt.Errorf("CPA Helper Plugin 模型列表策略不可用")
 		case "invalid_model_catalog":
 			return nil, fmt.Errorf("CPA Helper Plugin 模型目录无效")
+		case "model_catalog_unavailable", "model_catalog_out_of_sync":
+			return nil, pluginModelCatalogError(code)
 		default:
 			return nil, fmt.Errorf("CPA Helper Plugin 模型列表查询失败")
 		}

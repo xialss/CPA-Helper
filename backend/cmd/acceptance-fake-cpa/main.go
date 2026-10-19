@@ -1,24 +1,21 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 )
 
 // Loopback CLIProxyAPI management test double for acceptance runs (see
-// .trellis/spec/guides/acceptance-seed-data.md). Serves three brands with three
-// channels each so CPA-Helper can list providers and validate channel prices.
-// Contains no real keys; any Bearer token is accepted.
+// .trellis/spec/guides/acceptance-seed-data.md). Provider lists, v8 credential
+// views and Plugin v0.1.8 share writable, in-memory acceptance state. No real
+// keys or external provider calls are used; state resets when the process exits.
 
-var (
-	mu     sync.Mutex
-	config = map[string]any{
+func initialProviderConfig() map[string][]map[string]any {
+	config := map[string][]map[string]any{
 		"gemini-api-key": []map[string]any{},
 		"claude-api-key": []map[string]any{
 			claudeEntry("sk-ant-test-primary-0001cafe", "claude-primary", "https://api.anthropic.com"),
@@ -29,16 +26,32 @@ var (
 			codexEntry("sk-oai-test-primary-1001cafe", "codex-primary", "https://api.openai.com"),
 			codexEntry("sk-oai-test-backup-1002beef", "codex-backup", "https://api.openai.com"),
 			codexEntry("sk-oai-test-relay-1003feed", "codex-relay", "https://openai-relay.example.com"),
+			codexEntry("tiny-key", "codex-short", "https://short-key.example.com/v1"),
 		},
 		"openai-compatibility": []map[string]any{
 			compatEntry("deepseek", "https://api.deepseek.com/v1", "sk-ds-test-official-2001cafe"),
 			compatEntry("deepseek-silicon", "https://api.siliconflow.cn/v1", "sk-ds-test-silicon-2002beef"),
 			compatEntry("deepseek-volc", "https://ark.volces.example.com/v3", "sk-ds-test-volc-2003feed"),
+			compatEntry("local-keyless", "http://127.0.0.1:19001/v1", ""),
 		},
 		"vertex-api-key": []map[string]any{},
 		"xai-api-key":    []map[string]any{},
 	}
-	pathToKey = map[string]string{
+	config["codex-api-key"][0]["models"] = append(models("gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"), map[string]any{"name": "private-upstream-model", "alias": "codex-route-alias"})
+	config["codex-api-key"][1]["models"] = models("gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra", "codex-backup-only")
+	config["codex-api-key"][3]["models"] = models("short-key-model")
+	config["codex-api-key"][3]["prefix"] = "short"
+	config["openai-compatibility"][0]["api-key-entries"] = []map[string]any{
+		{"api-key": "sk-ds-test-official-2001cafe", "auth-index": "deepseek-key-one"},
+		{"api-key": "sk-ds-test-second-2004beef", "auth-index": "deepseek-key-two"},
+	}
+	config["openai-compatibility"][3]["models"] = models("local-no-key-model")
+	return config
+}
+
+var (
+	defaultFakeCPA = newFakeCPA()
+	pathToKey      = map[string]string{
 		"/v0/management/gemini-api-key":       "gemini-api-key",
 		"/v0/management/codex-api-key":        "codex-api-key",
 		"/v0/management/claude-api-key":       "claude-api-key",
@@ -75,51 +88,21 @@ func codexEntry(key, authIndex, baseURL string) map[string]any {
 }
 
 func compatEntry(name, baseURL, key string) map[string]any {
+	keys := []map[string]any{}
+	if key != "" {
+		keys = append(keys, map[string]any{"api-key": key, "auth-index": name + "-key"})
+	}
 	return map[string]any{
 		"name":            name,
 		"base-url":        baseURL,
-		"api-key-entries": []map[string]any{{"api-key": key}},
+		"auth-index":      name + "-keyless",
+		"api-key-entries": keys,
 		"models":          models("deepseek-v4-pro", "deepseek-v4-flash", "deepseek-reasoner"),
 	}
 }
 
 func handle(w http.ResponseWriter, r *http.Request) {
-	if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
-		http.Error(w, `{"error":"missing management key"}`, http.StatusUnauthorized)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	mu.Lock()
-	defer mu.Unlock()
-	switch {
-	case r.URL.Path == "/v0/management/config" && r.Method == http.MethodGet:
-		_ = json.NewEncoder(w).Encode(config)
-	case r.URL.Path == "/v0/management/api-key-usage" && r.Method == http.MethodGet:
-		_ = json.NewEncoder(w).Encode([]map[string]any{})
-	case r.URL.Path == "/v0/management/usage-statistics-enabled" && r.Method == http.MethodGet:
-		_ = json.NewEncoder(w).Encode(map[string]any{"enabled": false})
-	default:
-		key, ok := pathToKey[r.URL.Path]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		switch r.Method {
-		case http.MethodGet:
-			_ = json.NewEncoder(w).Encode(config[key])
-		case http.MethodPut:
-			var next []map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&next); err != nil {
-				http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
-				return
-			}
-			config[key] = next
-			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		}
-	}
-	log.Printf("%s %s", r.Method, r.URL.Path)
+	defaultFakeCPA.ServeHTTP(w, r)
 }
 
 func main() {

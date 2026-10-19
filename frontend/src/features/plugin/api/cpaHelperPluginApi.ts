@@ -97,6 +97,7 @@ export async function getCPAHelperPluginKeysSummary(signal?: AbortSignal): Promi
       || typeof key.api_key_hash !== 'string' || !key.api_key_hash
       || typeof key.enabled !== 'boolean'
       || !Array.isArray(key.group_names) || !key.group_names.every((name) => typeof name === 'string')
+      || typeof key.has_custom_rule !== 'boolean'
       || typeof key.current_concurrency !== 'number' || !Number.isSafeInteger(key.current_concurrency) || key.current_concurrency < 0
       || typeof key.max_concurrency !== 'number' || !Number.isSafeInteger(key.max_concurrency) || key.max_concurrency < 0) {
       throw new Error(localize('API Key 插件摘要响应格式无效', 'Invalid API key plugin summary response'))
@@ -105,6 +106,7 @@ export async function getCPAHelperPluginKeysSummary(signal?: AbortSignal): Promi
       api_key_hash: key.api_key_hash,
       enabled: key.enabled,
       group_names: key.group_names as string[],
+      has_custom_rule: key.has_custom_rule,
       current_concurrency: key.current_concurrency,
       max_concurrency: key.max_concurrency,
     }

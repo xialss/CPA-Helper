@@ -181,7 +181,61 @@ func TestCPAHelperPluginKeysSummary(t *testing.T) {
 		GroupNames         []string `json:"group_names"`
 		CurrentConcurrency int      `json:"current_concurrency"`
 		MaxConcurrency     int      `json:"max_concurrency"`
+		HasCustomRule      bool     `json:"has_custom_rule"`
 	}
+	t.Run("custom rule has a required boolean wire contract", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			rule any
+			omit bool
+			want bool
+		}{
+			{name: "omitted", omit: true},
+			{name: "null", rule: nil},
+			{name: "empty object", rule: map[string]any{}},
+			{name: "empty lists", rule: map[string]any{"models": []string{}, "denied_models": nil, "credential_ids": []string{}, "denied_credential_ids": []string{}, "credential_providers": []any{}, "denied_credential_providers": []any{}}},
+			{name: "nonempty independent rule", rule: map[string]any{"denied_models": []string{"private-model"}}, want: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				mu.Lock()
+				entry := policy["keys"].([]any)[0].(map[string]any)
+				if tc.omit {
+					delete(entry, "rule")
+				} else {
+					entry["rule"] = tc.rule
+				}
+				mu.Unlock()
+				var wire struct {
+					Keys []map[string]json.RawMessage `json:"keys"`
+				}
+				requestJSON(t, handler, http.MethodGet, "/api/cpa-helper-plugin/keys-summary", nil, memberCookies, &wire)
+				found := false
+				for _, key := range wire.Keys {
+					var hash string
+					if err := json.Unmarshal(key["api_key_hash"], &hash); err != nil {
+						t.Fatal(err)
+					}
+					if hash != memberKey.APIKeyHash {
+						continue
+					}
+					found = true
+					raw, exists := key["has_custom_rule"]
+					if !exists || (string(raw) != "true" && string(raw) != "false") {
+						t.Fatalf("has_custom_rule must be present and boolean: %s", raw)
+					}
+					if string(raw) != map[bool]string{true: "true", false: "false"}[tc.want] {
+						t.Fatalf("has_custom_rule = %s, want %t", raw, tc.want)
+					}
+				}
+				if !found {
+					t.Fatal("member key missing from summary")
+				}
+			})
+		}
+		mu.Lock()
+		delete(policy["keys"].([]any)[0].(map[string]any), "rule")
+		mu.Unlock()
+	})
 	readSummary := func(t *testing.T, cookies []*http.Cookie) map[string]keySummary {
 		t.Helper()
 		mu.Lock()
@@ -205,8 +259,8 @@ func TestCPAHelperPluginKeysSummary(t *testing.T) {
 	t.Run("member scope mapping and absent scope zero", func(t *testing.T) {
 		got := readSummary(t, memberCookies)
 		want := map[string]keySummary{
-			memberKey.APIKeyHash:       {memberKey.APIKeyHash, false, []string{"第二规则", "First rule"}, 3, 5},
-			unconfiguredKey.APIKeyHash: {unconfiguredKey.APIKeyHash, true, []string{}, 0, 0},
+			memberKey.APIKeyHash:       {APIKeyHash: memberKey.APIKeyHash, Enabled: false, GroupNames: []string{"第二规则", "First rule"}, CurrentConcurrency: 3, MaxConcurrency: 5, HasCustomRule: false},
+			unconfiguredKey.APIKeyHash: {APIKeyHash: unconfiguredKey.APIKeyHash, Enabled: true, GroupNames: []string{}, CurrentConcurrency: 0, MaxConcurrency: 0, HasCustomRule: false},
 		}
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("member keys summary = %#v, want %#v", got, want)
@@ -214,7 +268,7 @@ func TestCPAHelperPluginKeysSummary(t *testing.T) {
 	})
 	t.Run("super admin account remains owner scoped", func(t *testing.T) {
 		got := readSummary(t, adminCookies)
-		want := map[string]keySummary{adminKey.APIKeyHash: {adminKey.APIKeyHash, true, []string{"Private admin rule"}, 8, 9}}
+		want := map[string]keySummary{adminKey.APIKeyHash: {APIKeyHash: adminKey.APIKeyHash, Enabled: true, GroupNames: []string{"Private admin rule"}, CurrentConcurrency: 8, MaxConcurrency: 9, HasCustomRule: false}}
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("admin keys summary = %#v, want %#v", got, want)
 		}

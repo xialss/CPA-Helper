@@ -5,6 +5,7 @@ import {
   NAlert,
   NButton,
   NDataTable,
+  NDatePicker,
   NForm,
   NFormItem,
   NIcon,
@@ -93,10 +94,39 @@ const pluginKeyPolicyHash = ref<string | null>(null)
 const pluginKeyPolicyRevision = ref(0)
 const pluginKeyPolicyGroups = ref<CPAHelperPluginKey['group_ids']>([])
 const pluginKeyPolicyGroupOptions = ref<CPAHelperPluginGroup[]>([])
+const pluginLinkedRuleOptions = computed(() => pluginKeyPolicyGroupOptions.value.map((group) => ({
+  label: group.note?.trim() ? `${group.name} · ${group.note.trim()}` : group.name,
+  value: group.id,
+})))
 const pluginKeyPolicyDraft = ref<CPAHelperPluginKey | null>(null)
 const pluginKeyPolicyError = ref<unknown>(null)
 const editedApiKeyDescription = ref('')
 const savedApiKeyDescription = ref('')
+const apiKeyExpiresAt = ref<number | null>(null)
+const editedApiKeyExpiresAt = ref<number | null>(null)
+const savedApiKeyExpiresAt = ref<number | null>(null)
+const quickExpirationDays = [1, 3, 7, 30, 90]
+const expirationNow = ref(Date.now())
+let expirationTimer: ReturnType<typeof setInterval> | null = null
+const expirationDirty = computed(() => editedApiKeyExpiresAt.value !== savedApiKeyExpiresAt.value)
+function setQuickExpiration(target: 'create' | 'edit', days: number) {
+  const expiresAt = Date.now() + days * 24 * 60 * 60 * 1000
+  if (target === 'create') apiKeyExpiresAt.value = expiresAt
+  else editedApiKeyExpiresAt.value = expiresAt
+}
+function quickExpirationLabel(days: number) {
+  return t(`${days} 天`, days === 1 ? '1 day' : `${days} days`)
+}
+function apiKeyExpired(row: UserApiKeySummary) {
+  return row.expires_at != null && new Date(row.expires_at).getTime() <= expirationNow.value
+}
+function validExpiration(value: number | null) {
+  if (value !== null && (!Number.isFinite(value) || value <= Date.now())) {
+    message.error(t('密钥过期时间必须晚于当前时间', 'Key expiration must be in the future'))
+    return false
+  }
+  return true
+}
 const apiKeyEditSaveError = ref<string | null>(null)
 const pluginKeyToggleHash = ref<string | null>(null)
 let pluginKeyPolicyLoadGeneration = 0
@@ -122,7 +152,7 @@ const pluginKeyPolicySnapshot = ref('')
 const pluginKeyPolicyDirty = computed(() => pluginKeyPolicyDraft.value !== null && JSON.stringify({
   ...pluginKeyPolicyDraft.value, group_ids: pluginKeyPolicyGroups.value,
 }) !== pluginKeyPolicySnapshot.value)
-const apiKeyEditDirty = computed(() => editedApiKeyDescription.value.trim() !== savedApiKeyDescription.value || pluginKeyPolicyDirty.value)
+const apiKeyEditDirty = computed(() => editedApiKeyDescription.value.trim() !== savedApiKeyDescription.value || expirationDirty.value || pluginKeyPolicyDirty.value)
 const pluginStatusText = computed(() => {
   if (!pluginStatusError.value) return ''
   if (pluginStatusError.value instanceof ApiRequestError && pluginStatusError.value.code === 'plugin_not_loaded') return t('CPA Helper Plugin 未加载或契约不兼容，原有 API Key 管理仍可使用。', 'CPA Helper Plugin is not loaded or its contract is incompatible; regular API key management remains available.')
@@ -446,6 +476,10 @@ function renderMaskedKeyTitle() {
   return t('密钥', 'Key')
 }
 
+function renderLinkedRuleOptionLabel(option: { label: string }) {
+  return h('span', { class: 'plugin-linked-rule-option-label', title: option.label }, option.label)
+}
+
 function isApiKeyVisible(row: UserApiKeySummary): boolean {
   return visibleApiKeyHashes.value.has(row.api_key_hash)
 }
@@ -593,6 +627,7 @@ function openCreateDialog() {
     return
   }
   apiKeyDescription.value = 'Default'
+  apiKeyExpiresAt.value = null
   generatedApiKey.value = null
   generatedApiKeyHash.value = null
   editorVisible.value = true
@@ -691,6 +726,8 @@ async function editApiKey(row: UserApiKeySummary) {
   pluginKeyPolicyHash.value = row.api_key_hash
   editedApiKeyDescription.value = row.description || ''
   savedApiKeyDescription.value = editedApiKeyDescription.value.trim()
+  editedApiKeyExpiresAt.value = row.expires_at ? new Date(row.expires_at).getTime() : null
+  savedApiKeyExpiresAt.value = editedApiKeyExpiresAt.value
   pluginKeyPolicyDraft.value = null
   pluginKeyPolicyGroups.value = []
   pluginKeyPolicyGroupOptions.value = []
@@ -728,6 +765,7 @@ async function saveEditedApiKey() {
     return
   }
   const descriptionDirty = description !== savedApiKeyDescription.value
+  if (expirationDirty.value && !validExpiration(editedApiKeyExpiresAt.value)) return
   const key = pluginKeyPolicyDraft.value && pluginKeyPolicyDirty.value
     ? JSON.parse(JSON.stringify({ ...pluginKeyPolicyDraft.value, group_ids: pluginKeyPolicyGroups.value })) as CPAHelperPluginKey
     : null
@@ -739,10 +777,15 @@ async function saveEditedApiKey() {
   apiKeyEditSaveError.value = null
   let descriptionSaved = false
   try {
-    if (descriptionDirty) {
-      const saved = await updateApiKey(pluginKeyPolicyHash.value, { description })
+    if (descriptionDirty || expirationDirty.value) {
+      const saved = await updateApiKey(pluginKeyPolicyHash.value, {
+        description,
+        ...(expirationDirty.value ? { expires_at: editedApiKeyExpiresAt.value === null ? null : new Date(editedApiKeyExpiresAt.value).toISOString() } : {}),
+      })
       savedApiKeyDescription.value = saved.description
       editedApiKeyDescription.value = saved.description
+      editedApiKeyExpiresAt.value = saved.expires_at ? new Date(saved.expires_at).getTime() : null
+      savedApiKeyExpiresAt.value = editedApiKeyExpiresAt.value
       apiKeys.value = apiKeys.value.map((row) => row.api_key_hash === saved.api_key_hash ? saved : row)
       descriptionSaved = true
     }
@@ -761,7 +804,7 @@ async function saveEditedApiKey() {
   } catch (error) {
     const detail = errorText(error, '保存 API Key 失败', 'Failed to save API key')
     apiKeyEditSaveError.value = descriptionSaved
-      ? t(`描述已保存，插件策略未保存：${detail}。未保存的修改已保留。`, `Description saved; plugin policy was not saved: ${detail}. Unsaved changes have been kept.`)
+      ? t(`密钥信息已保存，插件策略未保存：${detail}。未保存的修改已保留。`, `Key details saved; plugin policy was not saved: ${detail}. Unsaved changes have been kept.`)
       : detail
     message.error(apiKeyEditSaveError.value)
     if (descriptionSaved) {
@@ -817,6 +860,7 @@ async function saveApiKey() {
     return
   }
   const description = apiKeyDescription.value.trim()
+  if (!validExpiration(apiKeyExpiresAt.value)) return
   if (!description) {
     message.error(t('API KEY 描述不能为空', 'API key description is required'))
     return
@@ -827,7 +871,7 @@ async function saveApiKey() {
       message.error(t('当前账号额度已用尽，API KEY 已暂停', 'This account has exhausted its quota, so API keys are paused'))
       return
     }
-    const created = await createApiKey({ description })
+    const created = await createApiKey({ description, expires_at: apiKeyExpiresAt.value === null ? null : new Date(apiKeyExpiresAt.value).toISOString() })
     generatedApiKey.value = created.api_key ?? null
     generatedApiKeyHash.value = created.api_key_hash
     message.success(t('API 密钥已创建并同步到 CPA', 'API key created and synced to CPA'))
@@ -926,7 +970,10 @@ const columns = computed<DataTableColumns<UserApiKeySummary>>(() => [
           class: 'api-key-policy-state',
           title: summary.enabled ? t('此 Key 已启用', 'This key is enabled') : t('插件拒绝此 Key 的所有请求', 'The plugin rejects all requests from this key'),
         }, { default: () => summary.enabled ? t('已启用', 'Enabled') : t('已禁用', 'Disabled') }),
-        ...(names.length === 0 ? [h('span', { class: 'api-key-unavailable' }, t('未关联', 'None'))] : []),
+        ...(names.length === 0 && !summary.has_custom_rule ? [h('span', { class: 'api-key-unavailable' }, t('未配置路由规则', 'No route rules configured'))] : []),
+        ...(summary.has_custom_rule ? [h(NTag, {
+          size: 'small', bordered: false, type: 'info', class: 'api-key-rule-tag',
+        }, { default: () => t('自定义规则', 'Custom rule') })] : []),
         ...names.slice(0, 2).map((name, index) => h(NTag, {
           key: `${index}:${name}`, size: 'small', bordered: false, class: 'api-key-rule-tag', title: name,
         }, { default: () => h('span', { class: 'api-key-rule-name' }, name) })),
@@ -955,6 +1002,16 @@ const columns = computed<DataTableColumns<UserApiKeySummary>>(() => [
     render: (row) => formatDateTime(row.created_at),
   },
   {
+    title: t('密钥有效期', 'Key expiration'),
+    key: 'expires_at',
+    width: 230,
+    render: (row) => h('div', {}, [
+      h('div', {}, row.expires_at ? formatDateTime(row.expires_at) : t('永久不过期', 'Never expires')),
+      ...(apiKeyExpired(row) ? [h(NTag, { size: 'small', type: row.expiration_enforced_at ? 'default' : 'warning' }, { default: () => row.expiration_enforced_at ? t('已过期 · 已撤销', 'Expired · Revoked') : t('已过期 · 等待 CPA 撤销', 'Expired · Awaiting CPA revocation') })] : []),
+      ...(row.expiration_sync_error ? [h('div', { class: 'api-key-expiration-error' }, t('CPA 撤销失败，将自动重试：', 'CPA revocation failed; retrying: ') + serverText(row.expiration_sync_error))] : []),
+    ]),
+  },
+  {
     title: '',
     key: 'actions',
     width: 144,
@@ -966,6 +1023,7 @@ const columns = computed<DataTableColumns<UserApiKeySummary>>(() => [
             {
               size: 'small', quaternary: true, circle: true,
               title: t('请求测试', 'Request test'), 'aria-label': t('请求测试', 'Request test'),
+              disabled: apiKeyExpired(row),
               onClick: () => openRequestTest(row),
             },
             {
@@ -1013,8 +1071,12 @@ const columns = computed<DataTableColumns<UserApiKeySummary>>(() => [
   },
 ])
 
-onMounted(refresh)
+onMounted(() => {
+  void refresh()
+  expirationTimer = setInterval(() => { expirationNow.value = Date.now() }, 1000)
+})
 onBeforeUnmount(() => {
+  if (expirationTimer !== null) clearInterval(expirationTimer)
   refreshGeneration++
   pluginKeyPolicyLoadGeneration++
   invalidateAvailableModelsForTest()
@@ -1114,6 +1176,14 @@ onBeforeUnmount(() => {
             @keyup.enter="saveApiKey"
           />
         </NFormItem>
+        <NFormItem class="api-key-expiration-item" :label="t('密钥有效期', 'Key expiration')">
+          <div class="api-key-expiration-field">
+            <NDatePicker v-model:value="apiKeyExpiresAt" type="datetime" clearable :disabled="isSaving" :placeholder="t('永久不过期', 'Never expires')" />
+            <div class="api-key-expiration-presets">
+              <NButton v-for="days in quickExpirationDays" :key="days" class="api-key-expiration-preset" size="small" quaternary :disabled="isSaving" @click="setQuickExpiration('create', days)">{{ quickExpirationLabel(days) }}</NButton>
+            </div>
+          </div>
+        </NFormItem>
         <div class="modal-actions">
           <NButton secondary :disabled="isSaving" @click="editorVisible = false">{{ t('取消', 'Cancel') }}</NButton>
           <NButton
@@ -1142,12 +1212,20 @@ onBeforeUnmount(() => {
         <NFormItem :label="t('API KEY 描述', 'API key description')">
           <NInput v-model:value="editedApiKeyDescription" :disabled="isPluginPolicySaving" :placeholder="t('例如：VSCode', 'Example: VSCode')" />
         </NFormItem>
+        <NFormItem class="api-key-expiration-item" :label="t('密钥有效期', 'Key expiration')">
+          <div class="api-key-expiration-field">
+            <NDatePicker v-model:value="editedApiKeyExpiresAt" type="datetime" clearable :disabled="isPluginPolicySaving" :placeholder="t('永久不过期', 'Never expires')" />
+            <div class="api-key-expiration-presets">
+              <NButton v-for="days in quickExpirationDays" :key="days" class="api-key-expiration-preset" size="small" quaternary :disabled="isPluginPolicySaving" @click="setQuickExpiration('edit', days)">{{ quickExpirationLabel(days) }}</NButton>
+            </div>
+          </div>
+        </NFormItem>
       </NForm>
       <NAlert v-if="apiKeyEditSaveError" type="error" :bordered="false" class="api-key-edit-alert">{{ apiKeyEditSaveError }}</NAlert>
       <NAlert v-if="isPluginPolicyLoading" type="info" :bordered="false" class="api-key-edit-alert">{{ t('正在加载 Key 策略', 'Loading key policy') }}</NAlert>
       <NAlert v-else-if="pluginKeyPolicyError" type="warning" :bordered="false" class="api-key-edit-alert">
         {{ errorText(pluginKeyPolicyError, '加载 API Key 插件策略失败', 'Failed to load API key plugin policy') }}
-        {{ t('描述仍可编辑和保存。', 'You can still edit and save the description.') }}
+        {{ t('描述与有效期仍可编辑和保存。', 'You can still edit and save the description and expiration.') }}
       </NAlert>
       <NAlert v-else-if="pluginKeyPolicyDraft" type="info" :bordered="false" class="api-key-edit-alert">
         {{ t('你只能修改自己持有的 API Key。拒绝列表始终优先于允许列表；并发上限为 0 表示不限制。', 'You can only edit API keys owned by your account. Deny lists always take precedence; 0 means unlimited concurrency.') }}
@@ -1161,7 +1239,7 @@ onBeforeUnmount(() => {
             </div>
           </NFormItem>
           <NFormItem :label="t('单 Key 并发上限', 'Per-key concurrency limit')"><NInputNumber v-model:value="pluginKeyPolicyDraft.max_concurrency" :min="0" :precision="0" :disabled="isPluginPolicySaving" /></NFormItem>
-          <NFormItem :label="t('关联全局规则', 'Linked global rules')"><NSelect v-model:value="pluginKeyPolicyGroups" multiple :options="pluginKeyPolicyGroupOptions.map((group) => ({ label: group.name, value: group.id }))" :disabled="isPluginPolicySaving" /></NFormItem>
+          <NFormItem :label="t('关联全局规则', 'Linked global rules')"><NSelect v-model:value="pluginKeyPolicyGroups" multiple filterable :options="pluginLinkedRuleOptions" :render-label="renderLinkedRuleOptionLabel" :disabled="isPluginPolicySaving" /></NFormItem>
         </div>
         <PluginRuleFields :key="pluginKeyPolicyHash ?? ''" v-model="pluginKeyPolicyDraft.rule" :models="pluginDirectory?.models ?? []" :credentials="pluginDirectory?.credentials ?? []" :credential-providers="pluginDirectory?.credential_providers ?? []" :disabled="isPluginPolicySaving" />
       </NForm>
@@ -1581,8 +1659,20 @@ onBeforeUnmount(() => {
 :global(.api-key-policy-state) { flex: 0 0 auto; }
 .api-key-edit-description { margin-bottom: 12px; }
 .api-key-edit-alert { margin-bottom: 12px; }
+.api-key-expiration-error { color: var(--cpa-danger); font-size: 12px; }
+.api-key-expiration-item { margin-top: 4px; }
+.api-key-expiration-field { display: grid; gap: 4px; width: 100%; min-width: 0; }
+.api-key-expiration-field :deep(.n-date-picker) { width: 100%; }
+.api-key-expiration-presets { display: flex; flex-wrap: wrap; gap: 4px; }
+.api-key-expiration-presets :deep(.api-key-expiration-preset) { border: 1px solid var(--cpa-border); border-radius: 6px; font-weight: 400; }
 .plugin-key-enabled-field { display: grid; gap: 8px; }
 .plugin-key-enabled-hint { color: var(--cpa-text-muted); font-size: 12px; }
+
+:global(.n-base-select-option .plugin-linked-rule-option-label) {
+  display: block;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 
 :global(.api-key-rule-tag) {
   flex: 0 1 auto;

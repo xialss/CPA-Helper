@@ -7,14 +7,14 @@ import { createServer, transformWithEsbuild } from 'vite'
 import { createRenderer, nextTick } from 'vue'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
-const env = { errors: [], successes: [], models: [], policyWrites: [], descriptionWrites: [], writes: [], policyReads: [], statusReads: [], keyReads: [], revision: 1, failPolicy: false, failDescription: false, failPolicyLoad: false, deferPolicyReads: false, deferStatusReads: false, deferKeyReads: false }
+const env = { errors: [], successes: [], models: [], policyWrites: [], descriptionWrites: [], writes: [], policyReads: [], statusReads: [], keyReads: [], revision: 1, failPolicy: false, failDescription: false, failPolicyLoad: false, failDirectory: false, deferPolicyReads: false, deferStatusReads: false, deferKeyReads: false, groups: [], directory: { models: [], credentials: [], credential_providers: [] }, summary: { group_names: [], has_custom_rule: false } }
 globalThis.__apiKeyPolicySmoke = env
 globalThis.localStorage = { getItem: () => 'zh', setItem() {} }
 globalThis.document = { documentElement: { lang: 'zh-CN' } }
-const row = { api_key_hash: 'member-hash', description: 'Member', api_key: 'sk-member-secret-key', models: [], last_model: null }
+const row = { api_key_hash: 'member-hash', description: 'Member', api_key: 'sk-member-secret-key', models: [], last_model: null, expires_at: null, expiration_enforced_at: null, expiration_sync_error: null }
 const keyPolicy = { id: 'member-scope', label: 'Member', enabled: true, group_ids: [], max_concurrency: 0, rule: {} }
 env.key = structuredClone(keyPolicy)
-const policyResponse = () => ({ policy_revision: env.revision, groups: [], key: env.key })
+const policyResponse = () => ({ policy_revision: env.revision, groups: env.groups, key: env.key })
 const apiError = (message, status = 503) => Response.json({ detail: { code: 'plugin_unavailable', message } }, { status })
 globalThis.fetch = async (url, init) => {
   const path = new URL(url, 'http://api-key-smoke.invalid').pathname
@@ -33,6 +33,7 @@ globalThis.fetch = async (url, init) => {
     env.writes.push('description')
     if (env.failDescription) return apiError('描述保存失败')
     row.description = payload.description
+    if ('expires_at' in payload) row.expires_at = payload.expires_at
     return Response.json(row)
   }
   if (path === '/api/usage/overview') return Response.json({ summary: {} })
@@ -42,10 +43,10 @@ globalThis.fetch = async (url, init) => {
     if (env.deferStatusReads) return new Promise((resolve, reject) => env.statusReads.push({ resolve, reject }))
     return Response.json({ loaded: true, capabilities: {}, health: {} })
   }
-  if (path === '/api/cpa-helper-plugin/keys-summary') return Response.json({ keys: [{ api_key_hash: row.api_key_hash, enabled: env.key.enabled, group_names: [], current_concurrency: 0, max_concurrency: env.key.max_concurrency }] })
+  if (path === '/api/cpa-helper-plugin/keys-summary') return Response.json({ keys: [{ api_key_hash: row.api_key_hash, enabled: env.key.enabled, ...env.summary, current_concurrency: 0, max_concurrency: env.key.max_concurrency }] })
   if (path === '/api/cpa-helper-plugin/directory') {
     assert.equal(new URL(url, 'http://api-key-smoke.invalid').searchParams.get('api_key_hash'), row.api_key_hash, 'Policy editor requests the selected key model catalog')
-    return Response.json({ models: [], credentials: [], credential_providers: [] })
+    return env.failDirectory ? apiError('插件凭据目录不可用') : Response.json(env.directory)
   }
   if (path === '/api/cpa-helper-plugin/policy/key/member-hash' && (init.method ?? 'GET') === 'GET') {
     if (env.deferPolicyReads) return new Promise((resolve, reject) => env.policyReads.push({ resolve, reject }))
@@ -64,8 +65,9 @@ globalThis.fetch = async (url, init) => {
   }
   assert.fail(`Unexpected API call ${path}`)
 }
-const passiveUI = ['NAlert', 'NButton', 'NDataTable', 'NForm', 'NFormItem', 'NIcon', 'NInput', 'NInputNumber', 'NModal', 'NRadioButton', 'NRadioGroup', 'NSelect', 'NSpace', 'NSwitch', 'NTag']
+const passiveUI = ['NAlert', 'NButton', 'NDatePicker', 'NForm', 'NFormItem', 'NIcon', 'NInput', 'NInputNumber', 'NRadioButton', 'NRadioGroup', 'NSelect', 'NSpace', 'NSwitch', 'NTag']
 const icons = ['Activity', 'CircleDollarSign', 'Copy', 'Eye', 'EyeOff', 'KeyRound', 'Layers3', 'Pencil', 'Power', 'Send', 'Trash2']
+const views = { view: 'src/features/api-keys/views/ApiKeysView.vue', fields: 'src/features/plugin/components/PluginRuleFields.vue', notice: 'src/features/models/components/ModelListNotice.vue' }
 const server = await createServer({
   root, logLevel: 'error',
   ssr: { noExternal: ['naive-ui', 'lucide-vue-next'] },
@@ -75,20 +77,25 @@ const server = await createServer({
     name: 'api-key-policy-smoke', enforce: 'pre',
     resolveId(id) {
       if (id === '/__api-key-policy-smoke.ts') return '\0api-key-policy-view'
+      for (const name of ['fields', 'notice']) if (id.replaceAll('\\', '/').endsWith(views[name])) return `\0api-key-policy-${name}`
       if (id === 'naive-ui' || id === 'lucide-vue-next') return `\0api-key-policy:${id}`
     },
     async load(id) {
-      if (id === '\0api-key-policy-view') {
-        const filename = `${root}/src/features/api-keys/views/ApiKeysView.vue`
+      const name = id.replace('\0api-key-policy-', '')
+      if (views[name]) {
+        const filename = `${root}/${views[name]}`
         const { descriptor, errors } = parse(await readFile(filename, 'utf8'), { filename })
         assert.deepEqual(errors, [])
-        const script = compileScript(descriptor, { id: 'api-key-policy', genDefaultAs: '__view' })
-        const template = compileTemplate({ id: 'api-key-policy', filename, source: descriptor.template.content, compilerOptions: { bindingMetadata: script.bindings } })
+        const script = compileScript(descriptor, { id: `api-key-policy-${name}`, genDefaultAs: '__view' })
+        const template = compileTemplate({ id: `api-key-policy-${name}`, filename, source: descriptor.template.content, compilerOptions: { bindingMetadata: script.bindings } })
         assert.deepEqual(template.errors, [])
         return (await transformWithEsbuild(`${script.content}\n${template.code}\n__view.render = render; export default __view`, filename, { loader: 'ts' })).code
       }
       if (id === '\0api-key-policy:naive-ui') return `
-        ${passiveUI.map(name => `export const ${name} = { render: () => null };`).join('\n')}
+        import { h } from 'vue';
+        ${passiveUI.map(name => `export const ${name} = { inheritAttrs: false, setup(_, { attrs, slots }) { return () => h('stub-${name}', attrs, slots.default?.()); } };`).join('\n')}
+        export const NModal = { inheritAttrs: false, props: { show: Boolean }, setup(props, { attrs, slots }) { return () => props.show ? h('stub-NModal', attrs, slots.default?.()) : null; } };
+        export const NDataTable = { inheritAttrs: false, setup(_, { attrs }) { return () => h('stub-NDataTable', attrs, (attrs.data ?? []).flatMap(row => (attrs.columns ?? []).map(column => h('stub-table-cell', { 'data-key': column.key, 'data-hash': row.api_key_hash }, column.render ? column.render(row) : row[column.key])))); } };
         export const useMessage = () => ({ error: message => globalThis.__apiKeyPolicySmoke.errors.push(message), success: message => globalThis.__apiKeyPolicySmoke.successes.push(message), info() {} });
         export const useDialog = () => ({ warning() {} });`
       if (id === '\0api-key-policy:lucide-vue-next') return icons.map(name => `export const ${name} = { render: () => null };`).join('\n')
@@ -96,10 +103,39 @@ const server = await createServer({
   }],
 })
 const renderer = createRenderer({
-  createElement: () => ({}), createText: () => ({}), createComment: () => ({}),
-  insert() {}, remove() {}, setText() {}, setElementText() {}, patchProp() {}, parentNode: () => null, nextSibling: () => null,
+  createElement: (type) => ({ type, props: {}, children: [] }),
+  createText: (text) => ({ type: 'text', text }), createComment: () => ({ type: 'comment' }),
+  insert(node, parent, anchor = null) {
+    if (node.parent) { const oldIndex = node.parent.children.indexOf(node); if (oldIndex >= 0) node.parent.children.splice(oldIndex, 1) }
+    const index = anchor ? parent.children.indexOf(anchor) : -1
+    parent.children.splice(index >= 0 ? index : parent.children.length, 0, node)
+    node.parent = parent
+  },
+  remove(node) { if (node.parent) node.parent.children.splice(node.parent.children.indexOf(node), 1) },
+  setText(node, text) { node.text = text }, setElementText(node, text) { node.text = text; node.children = [] },
+  patchProp(node, key, _, value) { node.props[key] = value },
+  parentNode: (node) => node.parent, nextSibling: (node) => node.parent?.children[node.parent.children.indexOf(node) + 1] ?? null,
 })
 const settle = async () => { await nextTick(); await nextTurn(); await nextTick() }
+const descendants = (node) => [node, ...(node.children ?? []).flatMap(descendants)]
+const textContent = (node) => (node.text ?? '') + (node.children ?? []).map(textContent).join('')
+const ui = (host, type) => descendants(host).filter((node) => node.type === `stub-${type}`)
+const expirationButtons = (host, title) => {
+  const modal = ui(host, 'NModal').find((node) => node.props.title === title)
+  assert.ok(modal, `The ${title} modal is rendered`)
+  assert.ok(!textContent(modal).includes('留空表示永久不过期。到期后'), 'Expiration hint is removed from the form')
+  return descendants(modal).filter((node) => node.type === 'stub-NButton' && /^\d+ 天$/.test(textContent(node)))
+}
+const select = (host, label) => ui(ui(host, 'NFormItem').find((node) => node.props.label === label), 'NSelect')[0]
+const updateValue = (node, value) => {
+  const listeners = node.props['onUpdate:value']
+  for (const listener of Array.isArray(listeners) ? listeners : [listeners]) listener(value)
+}
+const click = (node) => {
+  const listeners = node.props.onClick
+  for (const listener of Array.isArray(listeners) ? listeners : [listeners]) listener()
+}
+const optionLabel = (node, option) => (node.props['render-label'] ?? node.props.renderLabel)(option)
 const catalog = (id) => ({
   has_api_keys: true, api_key_count: 1, queryable_api_key_count: 1, model_list_filter_status: 'enabled', errors: [],
   models: [{ id, name: id, sources: [{ api_key_hash: row.api_key_hash, api_key_preview: 'sk-mem...-key', description: 'Member' }] }],
@@ -107,11 +143,61 @@ const catalog = (id) => ({
 let app
 try {
   const { default: component } = await server.ssrLoadModule('/__api-key-policy-smoke.ts')
+  const { setLanguage } = await server.ssrLoadModule('/src/shared/i18n/index.ts')
   let state
+  const host = { children: [] }
   app = renderer.createApp({ ...component, setup(props, context) { state = component.setup(props, context); return state } })
-  app.mount({})
+  app.mount(host)
   await settle()
   assert.deepEqual(env.errors, [], 'Initial page loading succeeds')
+
+  state.openCreateDialog()
+  await settle()
+  const createExpirationButtons = expirationButtons(host, '新建 API 密钥')
+  assert.deepEqual(createExpirationButtons.map(textContent), ['1 天', '3 天', '7 天', '30 天', '90 天'], 'The create form offers all quick expiration durations')
+  state.isSaving.value = true
+  await settle()
+  assert.ok(createExpirationButtons.every((button) => button.props.disabled), 'Create expiration buttons disable while creating')
+  state.isSaving.value = false
+  await settle()
+  for (const [index, days] of [1, 3, 7, 30, 90].entries()) {
+    const clickedAt = Date.UTC(2026, 9, 19, 12, 0, index)
+    const originalNow = Date.now
+    Date.now = () => clickedAt
+    try {
+      assert.equal(typeof createExpirationButtons[index].props.onClick, 'function', 'Each create duration has a click handler')
+      click(createExpirationButtons[index])
+    } finally {
+      Date.now = originalNow
+    }
+    assert.equal(state.apiKeyExpiresAt.value, clickedAt + days * 24 * 60 * 60 * 1000, `Create ${days}-day expiration starts at click time`)
+  }
+  state.editorVisible.value = false
+
+  await state.editApiKey(row)
+  await settle()
+  const editExpirationButtons = expirationButtons(host, '编辑 API Key')
+  assert.deepEqual(editExpirationButtons.map(textContent), ['1 天', '3 天', '7 天', '30 天', '90 天'], 'The edit form offers all quick expiration durations')
+  state.isPluginPolicySaving.value = true
+  await settle()
+  assert.ok(editExpirationButtons.every((button) => button.props.disabled), 'Edit expiration buttons disable while saving')
+  state.isPluginPolicySaving.value = false
+  await settle()
+  for (const [index, days] of [1, 3, 7, 30, 90].entries()) {
+    const clickedAt = Date.UTC(2026, 9, 19, 12, 1, index)
+    const originalNow = Date.now
+    Date.now = () => clickedAt
+    try {
+      assert.equal(typeof editExpirationButtons[index].props.onClick, 'function', 'Each edit duration has a click handler')
+      click(editExpirationButtons[index])
+    } finally {
+      Date.now = originalNow
+    }
+    assert.equal(state.editedApiKeyExpiresAt.value, clickedAt + days * 24 * 60 * 60 * 1000, `Edit ${days}-day expiration starts at click time`)
+  }
+  state.editedApiKeyExpiresAt.value = state.savedApiKeyExpiresAt.value
+  state.closePluginKeyPolicy()
+  await settle()
 
   env.deferStatusReads = true
   const oldStatusFailure = state.refresh()
@@ -262,7 +348,7 @@ try {
   assert.equal(state.savedApiKeyDescription.value, 'Keep description draft', 'The committed description is recorded')
   assert.equal(state.pluginKeyPolicyDraft.value.max_concurrency, 7, 'The unsaved policy draft survives')
   assert.equal(state.pluginKeyPolicyDirty.value, true)
-  assert.match(state.apiKeyEditSaveError.value, /描述已保存.*插件策略未保存/, 'Partial success is explicit')
+  assert.match(state.apiKeyEditSaveError.value, /密钥信息已保存.*插件策略未保存/, 'Partial success is explicit')
   assert.equal(env.successes.length, successesBeforeDescriptionFailure, 'Partial failure does not report complete success')
   const descriptionWritesBeforeRetry = env.descriptionWrites.length
   env.failPolicy = false
@@ -337,6 +423,144 @@ try {
   await state.toggleApiKeyEnabled(row)
   assert.equal(env.policyWrites.length, writesBeforeUnknown, 'Unknown enabled state cannot be toggled')
 
+  const ruleCell = () => descendants(host).find((node) => node.type === 'stub-table-cell' && node.props['data-key'] === 'group_names')
+  const routeCases = [
+    { group_names: [], has_custom_rule: true, enabled: true, max_concurrency: 0 },
+    { group_names: ['Global batch'], has_custom_rule: false, enabled: true, max_concurrency: 0 },
+    { group_names: ['Global batch'], has_custom_rule: true, enabled: true, max_concurrency: 0 },
+    { group_names: [], has_custom_rule: false, enabled: false, max_concurrency: 7 },
+  ]
+  for (const language of ['zh', 'en']) {
+    setLanguage(language)
+    for (const summary of routeCases) {
+      env.summary = { group_names: summary.group_names, has_custom_rule: summary.has_custom_rule }
+      env.key.enabled = summary.enabled
+      env.key.max_concurrency = summary.max_concurrency
+      await state.refreshPluginKeySummaries()
+      await settle()
+      const text = textContent(ruleCell())
+      assert.equal(text.includes(language === 'zh' ? '自定义规则' : 'Custom rule'), summary.has_custom_rule, 'The rendered table uses the backend custom-rule flag')
+      assert.equal(text.includes('Global batch'), summary.group_names.length > 0, 'Linked global rules remain visible alongside a custom rule')
+      assert.equal(text.includes(language === 'zh' ? '未配置路由规则' : 'No route rules configured'), !summary.has_custom_rule && summary.group_names.length === 0, 'Only an empty routing state gets the no-rules label')
+      assert.ok(text.includes(summary.enabled ? language === 'zh' ? '已启用' : 'Enabled' : language === 'zh' ? '已禁用' : 'Disabled'), 'Enabled state stays independent from routing rules')
+    }
+  }
+  setLanguage('zh')
+  for (const invalidCustomState of [undefined, 'false', 1, null]) {
+    env.summary = { group_names: [], has_custom_rule: invalidCustomState }
+    await state.refreshPluginKeySummaries()
+    assert.equal(state.pluginKeySummaries.value, null, 'Missing or non-boolean custom state is not reported as an empty rule')
+    assert.match(state.pluginKeySummaryError.value.message, /摘要响应格式无效/)
+  }
+
+  const longNote = `${'Nightly routing for the batch team. '.repeat(20)}End of note`
+  env.groups = [
+    { id: 'with-note', name: 'With note', note: 'Interactive requests', rule: {} },
+    { id: 'no-note', name: 'No note', note: '', rule: {} },
+    { id: 'long-note', name: 'Long note', note: longNote, rule: {} },
+  ]
+  const allowedRef = `sha256:${'a'.repeat(64)}`
+  const deniedRef = `sha256:${'b'.repeat(64)}`
+  const missingAllowedRef = `sha256:${'c'.repeat(64)}`
+  const missingDeniedRef = `sha256:${'d'.repeat(64)}`
+  env.directory = {
+    models: ['route-model'],
+    credentials: [
+      { ref: allowedRef, label: 'Codex primary · https://codex-a.invalid/v1 · sk-upa...1234', source: 'ai-providers', provider: 'codex', status: 'active', auth_index: '101' },
+      { ref: deniedRef, label: 'Codex other · https://codex-b.invalid/v1 · sk-upb...5678', source: 'ai-providers', provider: 'codex', status: 'active', auth_index: '102' },
+    ],
+    credential_providers: [{ source: 'ai-providers', provider: 'codex', label: 'Codex' }],
+  }
+  const references = {
+    credential_ids: [allowedRef, missingAllowedRef], denied_credential_ids: [deniedRef, missingDeniedRef],
+    credential_providers: [{ source: 'ai-providers', provider: 'codex' }],
+    denied_credential_providers: [{ source: 'auth-files', provider: 'retired-file-provider' }],
+  }
+  env.key = { ...env.key, enabled: true, group_ids: ['with-note', 'long-note'], rule: { ...env.key.rule, models: ['route-model'], ...references } }
+  env.summary = { group_names: ['With note', 'Long note'], has_custom_rule: true }
+  await state.refreshPluginKeySummaries()
+  await state.editApiKey(row)
+  await settle()
+  const linkedRules = select(host, '关联全局规则')
+  assert.ok(linkedRules.props.filterable === true || linkedRules.props.filterable === '', 'Rule names and notes are searchable in the actual select')
+  assert.deepEqual(linkedRules.props.options, [
+    { label: 'With note · Interactive requests', value: 'with-note' },
+    { label: 'No note', value: 'no-note' },
+    { label: `Long note · ${longNote}`, value: 'long-note' },
+  ], 'The actual select shows notes and keeps rule IDs as values')
+  const renderedLongNote = optionLabel(linkedRules, linkedRules.props.options[2])
+  assert.equal(renderedLongNote.props.title, `Long note · ${longNote}`, 'The full long note remains available in the selected-label tooltip')
+  assert.equal(renderedLongNote.children, `Long note · ${longNote}`, 'The label renderer does not shorten a long note')
+  const allowedCredentials = select(host, '允许的凭据')
+  const deniedCredentials = select(host, '禁止的凭据')
+  for (const credential of env.directory.credentials) {
+    const option = allowedCredentials.props.options.find((value) => value.value === credential.ref)
+    assert.equal(option.label, credential.label, 'Backend channel labels remain intact without appended auth indexes')
+    assert.equal(optionLabel(allowedCredentials, option).props.title, credential.label)
+  }
+  assert.match(allowedCredentials.props.options.find((option) => option.value === missingAllowedRef).label, /当前目录缺失/)
+  assert.match(deniedCredentials.props.options.find((option) => option.value === missingDeniedRef).label, /当前目录缺失/)
+  assert.match(select(host, '禁止的凭据类别').props.options.find((option) => option.value === 'auth-files/retired-file-provider').label, /当前目录缺失/)
+  assert.match(textContent(host), /原引用仍会保留并保存/)
+  setLanguage('en')
+  await settle()
+  assert.match(select(host, 'Allowed credentials').props.options.find((option) => option.value === missingAllowedRef).label, /Selected credential \(missing from directory\)/)
+  assert.match(select(host, 'Denied credential categories').props.options.find((option) => option.value === 'auth-files/retired-file-provider').label, /Selected category \(missing from directory\)/)
+  assert.match(textContent(host), /Their references will be kept when saving/)
+  setLanguage('zh')
+  await settle()
+  updateValue(select(host, '关联全局规则'), ['with-note', 'long-note'])
+  updateValue(select(host, '允许的凭据'), references.credential_ids)
+  updateValue(select(host, '禁止的凭据'), references.denied_credential_ids)
+  updateValue(select(host, '允许的模型'), ['edited-route-model'])
+  await state.saveEditedApiKey()
+  assert.deepEqual(env.policyWrites.at(-1).key.group_ids, ['with-note', 'long-note'], 'Saving note-rich selections sends unchanged group IDs')
+  for (const [field, value] of Object.entries(references)) assert.deepEqual(env.policyWrites.at(-1).key.rule[field], value, 'The real Key PUT retains both allowed and denied credential references')
+
+  env.groups[0].note = 'Updated operator note'
+  for (const [index, channelName] of ['Codex renamed', 'Codex renamed again', 'Codex other', 'Codex'].entries()) {
+    env.directory.credentials[0].label = `${channelName} · https://codex-a.invalid/v1 · sk-upa...1234`
+    await state.editApiKey(row)
+    await settle()
+    const options = select(host, '允许的凭据').props.options
+    assert.equal(options.find((option) => option.value === allowedRef).label, env.directory.credentials[0].label, 'A fresh directory updates the label for the same reference')
+    assert.equal(options.find((option) => option.value === deniedRef).label, env.directory.credentials[1].label, 'Renaming one channel does not relabel another')
+    assert.equal(select(host, '关联全局规则').props.options[0].label, 'With note · Updated operator note')
+    updateValue(select(host, '允许的模型'), [`renamed-route-model-${index}`])
+    await state.saveEditedApiKey()
+    for (const [field, value] of Object.entries(references)) assert.deepEqual(env.policyWrites.at(-1).key.rule[field], value, 'Directory label changes never rebind saved Key rules')
+  }
+
+  env.directory = { models: [], credentials: [], credential_providers: [] }
+  await state.editApiKey(row)
+  await settle()
+  assert.deepEqual(select(host, '允许的凭据').props.value, references.credential_ids)
+  assert.deepEqual(select(host, '禁止的凭据').props.value, references.denied_credential_ids)
+  for (const ref of [...references.credential_ids, ...references.denied_credential_ids]) assert.match(select(host, '允许的凭据').props.options.find((option) => option.value === ref).label, /当前目录缺失/, 'Every selected missing reference remains a labelled option')
+  updateValue(select(host, '允许的凭据类别'), ['ai-providers/codex'])
+  updateValue(select(host, '禁止的凭据类别'), ['auth-files/retired-file-provider'])
+  updateValue(select(host, '允许的模型'), ['keep-missing-references'])
+  env.failPolicy = true
+  const successesBeforeMissingFailure = env.successes.length
+  await state.saveEditedApiKey()
+  assert.equal(env.successes.length, successesBeforeMissingFailure)
+  assert.equal(state.pluginKeyPolicyVisible.value, true, 'A failed save keeps the editor and reference warning visible')
+  for (const [field, value] of Object.entries(references)) assert.deepEqual(state.pluginKeyPolicyDraft.value.rule[field], value, 'A failed save preserves selected missing allowed and denied references')
+  env.failPolicy = false
+  await state.saveEditedApiKey()
+  for (const [field, value] of Object.entries(references)) assert.deepEqual(env.policyWrites.at(-1).key.rule[field], value)
+  const writesBeforeDirectoryFailure = env.policyWrites.length
+  env.failDirectory = true
+  await state.editApiKey(row)
+  assert.ok(state.pluginKeyPolicyError.value, 'A failed directory read stays an explicit error')
+  assert.equal(env.policyWrites.length, writesBeforeDirectoryFailure, 'A failed directory read never writes a cleared policy')
+  for (const [field, value] of Object.entries(references)) assert.deepEqual(env.key.rule[field], value)
+  env.failDirectory = false
+  await state.editApiKey(row)
+  await settle()
+  for (const [field, value] of Object.entries(references)) assert.deepEqual(state.pluginKeyPolicyDraft.value.rule[field], value, 'Recovery reloads the original saved references')
+  state.closePluginKeyPolicy()
+
   const errorsBeforeUnmount = env.errors.length
   const beforeUnmount = state.loadAvailableModelsForTest()
   await settle()
@@ -360,7 +584,7 @@ try {
   env.deferStatusReads = false
   let detachedState
   app = renderer.createApp({ ...component, setup(props, context) { detachedState = component.setup(props, context); return detachedState } })
-  app.mount({})
+  app.mount({ children: [] })
   await settle()
   env.deferStatusReads = true
   const lateStatusSuccess = detachedState.refresh()
@@ -373,7 +597,7 @@ try {
   await lateStatusSuccess
   assert.equal(JSON.stringify(detachedState.pluginStatus.value), detachedStatusSnapshot, 'Unmount suppresses a current late status success')
   assert.equal(detachedState.pluginStatusError.value, null)
-  console.log('API key policy smoke passed: combined/partial/description-only saves, unavailable policy, fresh quick toggles, duplicate/failure guards, stale refresh/status/editor/model queries and unmount')
+  console.log('API key policy smoke passed: four routing states, required custom flag, notes and long labels, lossless allowed/denied references through rename/missing/error recovery, combined saves, quick toggles, stale queries and unmount')
 } finally {
   app?.unmount()
   await server.close()
