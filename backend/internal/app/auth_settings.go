@@ -619,6 +619,9 @@ func (a *App) testCurrentUserModelRequest(ctx context.Context, user *AuthUser, p
 	if apiKey.UserID != user.ID {
 		return modelRequestTestResponse{}, notFoundError("API KEY 不存在")
 	}
+	if apiKey.expired(time.Now()) {
+		return modelRequestTestResponse{}, conflictError("API KEY 已过期，请先修改密钥有效期")
+	}
 	if apiKey.APIKey == nil || strings.TrimSpace(*apiKey.APIKey) == "" {
 		return modelRequestTestResponse{}, conflictError("当前 API KEY 缺少完整密钥，无法发起测试")
 	}
@@ -937,6 +940,9 @@ func (a *App) collectorState(ctx context.Context) (collectorState, error) {
 }
 
 func (a *App) addRemoteAPIKey(ctx context.Context, apiKey string) error {
+	if err := a.requireAPIKeyNotExpired(ctx, hashAPIKey(apiKey)); err != nil {
+		return err
+	}
 	cfg, err := a.loadConfig(ctx)
 	if err != nil {
 		return err
@@ -972,6 +978,9 @@ func (a *App) addRemoteAPIKey(ctx context.Context, apiKey string) error {
 // operation. Callers that need compensation can then remove only keys they
 // actually introduced, instead of deleting a pre-existing shared binding.
 func (a *App) addRemoteAPIKeyWithChange(ctx context.Context, apiKey string) (bool, error) {
+	if err := a.requireAPIKeyNotExpired(ctx, hashAPIKey(apiKey)); err != nil {
+		return false, err
+	}
 	cfg, err := a.loadConfig(ctx)
 	if err != nil {
 		return false, err

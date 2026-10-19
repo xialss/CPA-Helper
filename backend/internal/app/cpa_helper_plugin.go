@@ -29,6 +29,7 @@ type cpaHelperPluginKeyMetadata struct {
 
 type cpaHelperPluginClientError struct {
 	status int
+	code   string
 }
 
 func (e *cpaHelperPluginClientError) Error() string {
@@ -48,8 +49,21 @@ func newIdempotencyKey() string {
 	return fmt.Sprintf("cpa-helper-%d", time.Now().UnixNano())
 }
 
-func pluginErrorFromResponse(status int, _ []byte) error {
-	return &cpaHelperPluginClientError{status: status}
+func pluginErrorFromResponse(status int, payload []byte) error {
+	var problem struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(payload, &problem)
+	// Only recognize documented codes. The upstream message, body and unknown
+	// codes never cross the browser boundary.
+	code := ""
+	switch problem.Error.Code {
+	case "model_catalog_unavailable", "model_catalog_out_of_sync":
+		code = problem.Error.Code
+	}
+	return &cpaHelperPluginClientError{status: status, code: code}
 }
 
 func (a *App) cpaHelperPluginRequest(ctx context.Context, cfg AppConfig, method, path string, body []byte, headers http.Header) (int, http.Header, []byte, error) {
@@ -101,6 +115,9 @@ func appErrorFromPlugin(err error, status int) error {
 	var remote *cpaHelperPluginClientError
 	if !errors.As(err, &remote) {
 		return err
+	}
+	if remote.status >= 500 && remote.code != "" {
+		return pluginModelCatalogError(remote.code)
 	}
 	switch remote.status {
 	case http.StatusUnauthorized, http.StatusForbidden:
@@ -504,6 +521,8 @@ func pluginUsesV8Management(capabilities map[string]json.RawMessage) (bool, erro
 		expectedCPATarget = "v8.0.17"
 	case "0.1.7":
 		expectedCPATarget = "v8.0.29"
+	case "0.1.8":
+		expectedCPATarget = pluginModelCatalogCPA
 	default:
 		return false, appError("plugin_incompatible", http.StatusServiceUnavailable, "CPA Helper Plugin 版本不兼容")
 	}
@@ -517,6 +536,7 @@ type cpaHelperPluginKeySummary struct {
 	APIKeyHash         string   `json:"api_key_hash"`
 	Enabled            bool     `json:"enabled"`
 	GroupNames         []string `json:"group_names"`
+	HasCustomRule      bool     `json:"has_custom_rule"`
 	CurrentConcurrency int      `json:"current_concurrency"`
 	MaxConcurrency     int      `json:"max_concurrency"`
 }
@@ -659,10 +679,56 @@ func (a *App) pluginKeysSummary(ctx context.Context, user *AuthUser, cfg AppConf
 			if err := json.Unmarshal(key["max_concurrency"], &summary.MaxConcurrency); err != nil || summary.MaxConcurrency < 0 {
 				return nil, appError("plugin_incompatible", http.StatusServiceUnavailable, "CPA Helper Plugin 并发上限数据无效")
 			}
+			summary.HasCustomRule, err = pluginKeyHasCustomRule(key["rule"])
+			if err != nil {
+				return nil, err
+			}
+		}
+		if apiKeyExpirationPassed(localKey.ExpiresAt, time.Now()) {
+			summary.Enabled = false
 		}
 		summaries = append(summaries, summary)
 	}
 	return summaries, nil
+}
+
+func pluginKeyHasCustomRule(raw json.RawMessage) (bool, error) {
+	if len(raw) == 0 || rawJSONNull(raw) {
+		return false, nil
+	}
+	var rule map[string]json.RawMessage
+	if json.Unmarshal(raw, &rule) != nil || rule == nil {
+		return false, pluginIncompatibleError()
+	}
+	custom := false
+	for _, field := range []string{"models", "denied_models", "credential_ids", "denied_credential_ids", "credential_providers", "denied_credential_providers"} {
+		value, exists := rule[field]
+		if !exists || rawJSONNull(value) {
+			continue
+		}
+		var items []json.RawMessage
+		if json.Unmarshal(value, &items) != nil {
+			return false, pluginIncompatibleError()
+		}
+		for _, item := range items {
+			if field == "credential_providers" || field == "denied_credential_providers" {
+				var selector struct {
+					Source   string `json:"source"`
+					Provider string `json:"provider"`
+				}
+				if json.Unmarshal(item, &selector) != nil || strings.TrimSpace(selector.Source) == "" || strings.TrimSpace(selector.Provider) == "" {
+					return false, pluginIncompatibleError()
+				}
+			} else {
+				var selection string
+				if json.Unmarshal(item, &selection) != nil || strings.TrimSpace(selection) == "" {
+					return false, pluginIncompatibleError()
+				}
+			}
+		}
+		custom = custom || len(items) > 0
+	}
+	return custom, nil
 }
 
 func setPluginPolicyMeta(policy map[string]json.RawMessage, revision uint64) {
@@ -963,6 +1029,9 @@ func (a *App) pluginDirectory(ctx context.Context, cfg AppConfig, user *AuthUser
 		if key.APIKey == nil || strings.TrimSpace(*key.APIKey) == "" {
 			return nil, conflictError("当前 API 密钥缺少完整密钥，无法映射插件策略")
 		}
+		if key.expired(time.Now()) {
+			return nil, conflictError("API KEY 已过期，请先修改密钥有效期")
+		}
 		keys = []string{*key.APIKey}
 	} else if !user.IsSuperAdmin {
 		localKeys, err := a.keySummariesForUser(ctx, user.ID)
@@ -970,7 +1039,7 @@ func (a *App) pluginDirectory(ctx context.Context, cfg AppConfig, user *AuthUser
 			return nil, err
 		}
 		for _, key := range localKeys {
-			if key.APIKey != nil && strings.TrimSpace(*key.APIKey) != "" {
+			if key.APIKey != nil && strings.TrimSpace(*key.APIKey) != "" && !apiKeyExpirationPassed(key.ExpiresAt, time.Now()) {
 				keys = append(keys, *key.APIKey)
 			}
 		}
@@ -980,6 +1049,10 @@ func (a *App) pluginDirectory(ctx context.Context, cfg AppConfig, user *AuthUser
 		return nil, err
 	}
 	v8Management, err := pluginUsesV8Management(capabilities)
+	if err != nil {
+		return nil, err
+	}
+	aliases, err := a.modelPriceChannelAliasLabels(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -994,10 +1067,13 @@ func (a *App) pluginDirectory(ctx context.Context, cfg AppConfig, user *AuthUser
 	var pluginCredentials []map[string]any
 	if raw, ok := value["credentials"]; ok {
 		var entries []map[string]json.RawMessage
-		if json.Unmarshal(raw, &entries) != nil {
+		if json.Unmarshal(raw, &entries) != nil || entries == nil {
 			return nil, validationError("插件目录响应格式无效")
 		}
 		for _, entry := range entries {
+			if entry == nil {
+				return nil, validationError("插件目录响应格式无效")
+			}
 			// Deliberately copy only the documented display fields.  A future
 			// plugin field must not accidentally expose credential material.
 			credential := map[string]any{
@@ -1014,34 +1090,44 @@ func (a *App) pluginDirectory(ctx context.Context, cfg AppConfig, user *AuthUser
 		return nil, validationError("插件目录响应缺少 credentials")
 	}
 
-	configPath := "/v0/management/config"
-	if v8Management {
-		configPath = "/v8/management/config"
-	}
-	rawConfig, err := a.aiProviderManagementPayload(ctx, cfg, http.MethodGet, configPath, nil, aiProviderManagementTimeout)
-	if err != nil {
-		return nil, err
-	}
-	config, err := pluginDecodeNumberObject(rawConfig)
-	if err != nil {
-		return nil, validationError("CLIProxyAPI 配置响应不是有效 JSON object")
-	}
+	catalogSupported := pluginSupportsModelCatalog(capabilities)
+	var catalog pluginCatalogSyncResult
+	var config map[string]any
+	var hostCredentials []pluginHostCredential
 	var files []map[string]any
-	if v8Management {
-		rawCredentials, credentialsErr := a.aiProviderManagementPayload(ctx, cfg, http.MethodGet, "/v8/management/credentials", nil, aiProviderManagementTimeout)
-		if credentialsErr != nil {
-			return nil, credentialsErr
+	if catalogSupported {
+		catalog, err = a.syncPluginModelCatalog(ctx, cfg, capabilities)
+		if err != nil {
+			return nil, err
+		}
+		config, hostCredentials = catalog.Config, catalog.Credentials
+	} else {
+		configPath, credentialsPath := "/v0/management/config", "/v0/management/auth-files"
+		if v8Management {
+			configPath, credentialsPath = "/v8/management/config", "/v8/management/credentials"
+		}
+		rawConfig, readErr := a.aiProviderManagementPayload(ctx, cfg, http.MethodGet, configPath, nil, aiProviderManagementTimeout)
+		if readErr != nil {
+			return nil, readErr
+		}
+		config, err = pluginDecodeNumberObject(rawConfig)
+		if err != nil {
+			return nil, validationError("CLIProxyAPI 配置响应不是有效 JSON object")
+		}
+		rawCredentials, readErr := a.aiProviderManagementPayload(ctx, cfg, http.MethodGet, credentialsPath, nil, aiProviderManagementTimeout)
+		if readErr != nil {
+			return nil, readErr
 		}
 		files, err = pluginDirectoryObjects(rawCredentials, []string{"credentials", "files", "items", "data", "value"})
-	} else {
-		rawFiles, filesErr := a.aiProviderManagementPayload(ctx, cfg, http.MethodGet, "/v0/management/auth-files", nil, aiProviderManagementTimeout)
-		if filesErr != nil {
-			return nil, filesErr
+		if err != nil {
+			return nil, validationError("CPA 认证文件目录格式无效")
 		}
-		files, err = pluginDirectoryObjects(rawFiles, []string{"files", "items", "data", "value"})
-	}
-	if err != nil {
-		return nil, validationError("CPA 认证文件目录格式无效")
+		if v8Management {
+			hostCredentials, err = pluginV8HostCredentials(config, files)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	credentialsByRef := make(map[string]map[string]any, len(pluginCredentials))
@@ -1051,74 +1137,42 @@ func (a *App) pluginDirectory(ctx context.Context, cfg AppConfig, user *AuthUser
 		}
 	}
 	if v8Management {
-		if err := pluginAddV8ConfiguredCredentials(credentialsByRef, config); err != nil {
+		if err := pluginMergeHostDirectory(credentialsByRef, hostCredentials, aliases); err != nil {
 			return nil, err
 		}
 	} else {
-		if err := pluginAddConfiguredCredentials(credentialsByRef, config); err != nil {
+		if err := pluginAddConfiguredCredentialsWithAliases(credentialsByRef, config, aliases); err != nil {
 			return nil, err
 		}
 	}
-	seenDirectoryIDs := make(map[string]bool, len(files))
-	for _, file := range files {
-		id := pluginAnyText(file["id"])
-		if id == "" {
-			if v8Management {
-				return nil, validationError("CPA 凭据缺少宿主 ID")
-			}
-			continue
-		}
-		if !v8Management && pluginDirectoryFileExcluded(file) {
-			continue
-		}
-		authIndex := ""
-		if v8Management {
-			parsedIndex, present, indexErr := pluginV8AuthIndex(file)
-			if indexErr != nil {
-				return nil, indexErr
-			}
-			if !present {
-				// CPA's v8 sanitizer can leave records without an auth_index.
-				// They are not usable scheduler credentials and must not make
-				// otherwise valid directory entries fail.
+	if !v8Management {
+		for _, file := range files {
+			id := pluginAnyText(file["id"])
+			if id == "" {
 				continue
 			}
-			if seenDirectoryIDs[id] {
-				return nil, validationError("CPA 凭据目录存在重复标识")
+			if pluginDirectoryFileExcluded(file) {
+				continue
 			}
-			seenDirectoryIDs[id] = true
-			authIndex = parsedIndex
-		}
-		provider := strings.ToLower(pluginAnyString(file, "provider", "type"))
-		label := pluginJoinLabel(pluginAnyString(file, "name", "id"), pluginAnyString(file, "label"), pluginAnyString(file, "email", "account"))
-		if authIndex != "" {
-			label = pluginJoinLabel(label, "索引 "+authIndex)
-		}
-		status := pluginAnyString(file, "status")
-		if pluginAnyBool(file["disabled"]) {
-			status = "disabled"
-		}
-		ref := pluginCredentialRef(id)
-		if existing, ok := credentialsByRef[ref]; ok {
-			if existingIndex := pluginAnyText(existing["auth_index"]); existingIndex != "" && existingIndex != authIndex {
-				return nil, validationError("CPA 配置与运行时凭据索引不一致")
+			provider := strings.ToLower(pluginAnyString(file, "provider", "type"))
+			label := pluginJoinLabel(pluginAnyString(file, "name", "id"), pluginAnyString(file, "label"), pluginAnyString(file, "email", "account"))
+			status := pluginAnyString(file, "status")
+			if pluginAnyBool(file["disabled"]) {
+				status = "disabled"
 			}
+			ref := pluginCredentialRef(id)
+			entry := map[string]any{"ref": ref, "source": "auth-files", "provider": provider, "label": label, "status": status}
+			credentialsByRef[ref] = entry
 		}
-		entry := map[string]any{"ref": ref, "source": "auth-files", "provider": provider, "label": label, "status": status}
-		if authIndex != "" {
-			entry["auth_index"] = authIndex
-		}
-		if v8Management && pluginDirectoryFileExcluded(file) {
-			entry["source"] = "ai-providers"
-		}
-		credentialsByRef[ref] = entry
 	}
 	models := []string{}
 	// Global rules need the union of every downstream key's catalog. Account
 	// and per-key editors only query their own selected keys. Downstream keys
 	// are query identities, never scheduler credentials or provider categories.
 	if user.IsSuperAdmin && localHash == "" {
-		if v8Management {
+		if catalogSupported {
+			models = pluginCatalogModels(catalog.Snapshot)
+		} else if v8Management {
 			keys, err = pluginV8DownstreamKeys(config)
 		} else {
 			keys, err = a.remoteAPIKeys(ctx, cfg)
@@ -1142,6 +1196,10 @@ func (a *App) pluginDirectory(ctx context.Context, cfg AppConfig, user *AuthUser
 		seenKeys[rawKey] = true
 		items, fetchErr := fetchAvailableModelItems(ctx, modelConfig, rawKey)
 		if fetchErr != nil {
+			var problem *AppError
+			if errors.As(fetchErr, &problem) {
+				return nil, fetchErr
+			}
 			return nil, validationError("查询 CPA 模型目录失败：" + fetchErr.Error())
 		}
 		for _, item := range items {
@@ -1314,7 +1372,7 @@ func pluginConfiguredDisabled(value map[string]any) bool {
 	return err == nil && parsed <= 0
 }
 
-func pluginConfiguredCredentialRef(kind string, parts []string, counters map[string]int) string {
+func pluginConfiguredCredentialID(kind string, parts []string, counters map[string]int) string {
 	base := kind
 	for _, part := range parts {
 		base += "\x00" + strings.TrimSpace(part)
@@ -1326,7 +1384,11 @@ func pluginConfiguredCredentialRef(kind string, parts []string, counters map[str
 	if count > 0 {
 		id += fmt.Sprintf("-%d", count)
 	}
-	return pluginCredentialRef(id)
+	return id
+}
+
+func pluginConfiguredCredentialRef(kind string, parts []string, counters map[string]int) string {
+	return pluginCredentialRef(pluginConfiguredCredentialID(kind, parts, counters))
 }
 
 func pluginMaskKey(value string) string {
@@ -1361,6 +1423,10 @@ func pluginConfiguredHeaders(value map[string]any) string {
 }
 
 func pluginAddConfiguredCredentials(target map[string]map[string]any, config map[string]any) error {
+	return pluginAddConfiguredCredentialsWithAliases(target, config, nil)
+}
+
+func pluginAddConfiguredCredentialsWithAliases(target map[string]map[string]any, config map[string]any, aliases map[modelPriceChannelGroupIdentity]string) error {
 	counters := map[string]int{}
 	fields := []struct{ key, provider string }{
 		{"gemini-api-key", "gemini"}, {"interactions-api-key", "gemini-interactions"}, {"claude-api-key", "claude"},
@@ -1385,7 +1451,12 @@ func pluginAddConfiguredCredentials(target map[string]map[string]any, config map
 			if apiKey == "" && baseURL == "" {
 				continue
 			}
-			label := pluginJoinLabel(pluginConfiguredString(entry, "name"), baseURL, pluginMaskKey(apiKey))
+			name := pluginChannelName(field.provider, pluginConfiguredString(entry, "name"), apiKey)
+			channel := pluginChannelIdentity(aiProviderBrand(field.provider), pluginConfiguredString(entry, "auth-index", "auth_index"), apiKey, name)
+			if alias := aliases[modelPriceChannelAliasKey(modelPriceChannelAuthTypeAPIKey, field.provider, channel)]; alias != "" {
+				name = alias
+			}
+			label := pluginChannelLabel(name, baseURL, pluginMaskKey(apiKey))
 			add(field.provider+":apikey", []string{apiKey, baseURL, pluginConfiguredString(entry, "proxy-url", "proxy_url"), pluginConfiguredString(entry, "prefix"), pluginConfiguredHeaders(entry)}, field.provider, pluginConfiguredDisabled(entry), label)
 		}
 	}
@@ -1442,7 +1513,12 @@ func pluginAddConfiguredCredentials(target map[string]map[string]any, config map
 		if apiKey == "" && baseURL == "" {
 			continue
 		}
-		add("vertex:apikey", []string{apiKey, baseURL, pluginConfiguredString(entry, "proxy-url", "proxy_url")}, "vertex", pluginConfiguredDisabled(entry), pluginJoinLabel(pluginConfiguredString(entry, "name"), baseURL, pluginMaskKey(apiKey)))
+		name := pluginChannelName("vertex", pluginConfiguredString(entry, "name"), apiKey)
+		channel := pluginChannelIdentity(aiProviderBrandVertex, pluginConfiguredString(entry, "auth-index", "auth_index"), apiKey, name)
+		if alias := aliases[modelPriceChannelAliasKey(modelPriceChannelAuthTypeAPIKey, "vertex", channel)]; alias != "" {
+			name = alias
+		}
+		add("vertex:apikey", []string{apiKey, baseURL, pluginConfiguredString(entry, "proxy-url", "proxy_url")}, "vertex", pluginConfiguredDisabled(entry), pluginChannelLabel(name, baseURL, pluginMaskKey(apiKey)))
 	}
 	return nil
 }
@@ -1587,158 +1663,6 @@ func pluginV8Headers(value any) string {
 		builder.WriteByte('\x00')
 	}
 	return builder.String()
-}
-
-// pluginAddV8ConfiguredCredentials mirrors internal/plugin/web/directory.js.
-// It bridges configured scheduler IDs, which v8.0.12 does not return from
-// /credentials, while retaining auth_index only as display metadata.
-func pluginAddV8ConfiguredCredentials(target map[string]map[string]any, config map[string]any) error {
-	counters := map[string]int{}
-	seen := map[string]bool{}
-	add := func(kind string, parts []string, provider, authIndex, label string, disabled bool) error {
-		ref := pluginConfiguredCredentialRef(kind, parts, counters)
-		if existing, ok := target[ref]; ok {
-			if existingIndex := pluginAnyText(existing["auth_index"]); existingIndex != "" && existingIndex != authIndex {
-				return validationError("CPA 配置与运行时凭据索引不一致")
-			}
-			// Runtime metadata is authoritative; configuration supplies the label.
-			existing["label"] = label
-			return nil
-		}
-		status := "active"
-		if disabled {
-			status = "disabled"
-		}
-		entry := map[string]any{"ref": ref, "source": "ai-providers", "provider": provider, "label": label, "status": status}
-		if authIndex != "" {
-			entry["auth_index"] = authIndex
-		}
-		target[ref] = entry
-		return nil
-	}
-	providerConfig, ok := config["api-keys"].(map[string]any)
-	if !ok && config["api-keys"] != nil {
-		return validationError("CPA 上游配置格式错误")
-	}
-	providers := make([]string, 0, len(providerConfig))
-	for provider := range providerConfig {
-		providers = append(providers, provider)
-	}
-	sort.Strings(providers)
-	for _, provider := range providers {
-		groups, err := pluginV8ConfiguredEntries(config, provider)
-		if err != nil {
-			return err
-		}
-		for _, group := range groups {
-			if provider == "openai-compatibility" && pluginAnyBool(group["disabled"]) {
-				continue
-			}
-			base := pluginV8String(group, "base-url", "base_url")
-			keysRaw, hasKeys := group["keys"]
-			if provider == "openai-compatibility" && !hasKeys {
-				return validationError("CPA 上游分组格式错误: " + provider)
-			}
-			if provider == "openai-compatibility" && hasKeys && keysRaw == nil {
-				keysRaw = []any{}
-			}
-			keys, keysArray := keysRaw.([]any)
-			if provider == "openai-compatibility" && keysArray && len(keys) == 0 {
-				index, present, indexErr := pluginV8AuthIndex(group)
-				if indexErr != nil {
-					return indexErr
-				}
-				if present {
-					name := strings.ToLower(pluginV8String(group, "name"))
-					if name == "" {
-						name = "openai-compatibility"
-					}
-					runtimeProvider := name
-					if runtimeProvider != "openai-compatibility" && !strings.HasPrefix(runtimeProvider, "openai-compatible-") {
-						runtimeProvider = "openai-compatible-" + runtimeProvider
-					}
-					if err := add("openai-compatibility:"+name, []string{base}, runtimeProvider, index, pluginJoinLabel(pluginV8String(group, "name"), base), pluginV8Disabled(group)); err != nil {
-						return err
-					}
-				}
-				continue
-			}
-			if !keysArray {
-				return validationError("CPA 上游分组格式错误: " + provider)
-			}
-			for _, raw := range keys {
-				entry, ok := raw.(map[string]any)
-				if !ok {
-					return validationError("CPA 上游凭据格式错误: " + provider)
-				}
-				index, present, indexErr := pluginV8AuthIndex(entry)
-				if indexErr != nil {
-					return indexErr
-				}
-				if !present {
-					continue
-				}
-				key, keyErr := pluginV8APIKey(entry)
-				if keyErr != nil {
-					return keyErr
-				}
-				proxy := pluginV8String(entry, "proxy-url", "proxy_url")
-				if provider != "openai-compatibility" {
-					proxy = pluginAnyText(pluginV8Inherited(entry, group, "proxy-url"))
-				}
-				name := strings.ToLower(pluginV8String(group, "name"))
-				if provider == "openai-compatibility" {
-					if name == "" {
-						name = "openai-compatibility"
-					}
-					runtimeProvider := name
-					if runtimeProvider != "openai-compatibility" && !strings.HasPrefix(runtimeProvider, "openai-compatible-") {
-						runtimeProvider = "openai-compatible-" + runtimeProvider
-					}
-					if err := add("openai-compatibility:"+name, []string{key, base, proxy}, runtimeProvider, index, pluginJoinLabel(pluginV8String(entry, "name"), pluginV8String(group, "name"), base, pluginMaskKey(key), "索引 "+index), pluginV8Disabled(entry)); err != nil {
-						return err
-					}
-					continue
-				}
-				runtimeProvider := provider
-				if runtimeProvider == "interactions" {
-					runtimeProvider = "gemini-interactions"
-				}
-				if !map[string]bool{"gemini": true, "interactions": true, "claude": true, "codex": true, "xai": true, "meta": true, "vertex": true}[provider] {
-					return validationError("CPA 上游类型不受支持: " + provider)
-				}
-				prefix := strings.Trim(pluginAnyText(pluginV8Inherited(entry, group, "prefix")), "/")
-				if strings.Contains(prefix, "/") {
-					prefix = ""
-				}
-				headerString := pluginV8Headers(pluginV8Inherited(entry, group, "headers"))
-				effectiveBase := base
-				if effectiveBase == "" && provider == "meta" {
-					effectiveBase = "https://api.meta.ai/v1"
-				}
-				parts := []string{key, effectiveBase, proxy}
-				if provider != "vertex" {
-					parts = append(parts, prefix, headerString)
-				}
-				dedup := provider + "\x00" + key + "|" + effectiveBase
-				if provider != "vertex" {
-					dedup = runtimeProvider + ":apikey"
-					for _, part := range parts {
-						dedup += "\x00" + strings.TrimSpace(part)
-					}
-				}
-				if (provider == "gemini" || provider == "interactions" || provider == "vertex") && seen[dedup] {
-					continue
-				}
-				seen[dedup] = true
-				kind := runtimeProvider + ":apikey"
-				if err := add(kind, parts, runtimeProvider, index, pluginJoinLabel(pluginV8String(entry, "name"), pluginV8String(group, "name"), base, pluginMaskKey(key), "索引 "+index), pluginV8Disabled(entry)); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	return nil
 }
 
 func (a *App) handleCPAHelperPlugin(w http.ResponseWriter, r *http.Request) error {

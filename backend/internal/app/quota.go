@@ -440,7 +440,7 @@ func (a *App) restoreQuotaPausedUserIfAvailableLocked(ctx context.Context, userI
 		return err
 	}
 	for _, key := range keys {
-		if key.APIKey == nil {
+		if key.APIKey == nil && !key.expired(time.Now()) {
 			missingKeyErr := conflictError("存在无法恢复的 API KEY，请重新绑定后再恢复")
 			persistCtx := context.WithoutCancel(ctx)
 			if persistErr := a.setQuotaSyncError(persistCtx, userID, missingKeyErr); persistErr != nil {
@@ -451,7 +451,7 @@ func (a *App) restoreQuotaPausedUserIfAvailableLocked(ctx context.Context, userI
 	}
 	restored := []string{}
 	for _, key := range keys {
-		if key.APIKey == nil {
+		if key.APIKey == nil || key.expired(time.Now()) {
 			continue
 		}
 		changed, syncErr := a.addRemoteAPIKeyWithChange(ctx, *key.APIKey)

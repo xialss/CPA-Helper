@@ -109,6 +109,11 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if !testColumnExists(t, app.db, "users", "is_super_admin") {
 		t.Fatal("users.is_super_admin was not created")
 	}
+	for _, column := range []string{"expires_at", "expiration_enforced_at", "expiration_sync_error"} {
+		if !testColumnExists(t, app.db, "user_api_keys", column) {
+			t.Fatalf("user_api_keys.%s was not created", column)
+		}
+	}
 	if !testTableExists(t, app.db, "user_quota_charges") {
 		t.Fatal("user_quota_charges was not created")
 	}
@@ -225,6 +230,37 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	}
 	if modelMonitorEnabledSourceIDs != `["ai-input-im","openai","anthropic","deepseek"]` {
 		t.Fatalf("model monitor enabled source IDs default = %q", modelMonitorEnabledSourceIDs)
+	}
+}
+
+func TestAPIKeyExpirationMigrationPreservesExistingKeysAsPermanent(t *testing.T) {
+	dataDir := t.TempDir()
+	dbPath := prepareMigrationTestDatabase(t, dataDir, 202609200001)
+	db, err := sql.Open("sqlite", sqliteDSN(dbPath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`INSERT INTO users (id, username, created_at, updated_at) VALUES (1, 'legacy', '2026-01-01', '2026-01-01')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO user_api_keys (api_key_hash, user_id, api_key, description, created_at, updated_at) VALUES ('legacy-hash', 1, 'legacy-key', 'legacy', '2026-01-01', '2026-01-01')`); err != nil {
+		t.Fatal(err)
+	}
+	goose.SetBaseFS(backendMigrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpContext(context.Background(), db, "."); err != nil {
+		t.Fatalf("upgrade database: %v", err)
+	}
+	var expiresAt, enforcedAt, syncError sql.NullString
+	if err := db.QueryRow(`SELECT CAST(expires_at AS TEXT), CAST(expiration_enforced_at AS TEXT), expiration_sync_error FROM user_api_keys WHERE api_key_hash = 'legacy-hash'`).Scan(&expiresAt, &enforcedAt, &syncError); err != nil {
+		t.Fatal(err)
+	}
+	if expiresAt.Valid || enforcedAt.Valid || syncError.Valid {
+		t.Fatalf("legacy expiration state = %v %v %v, want permanent and unsynchronized", expiresAt, enforcedAt, syncError)
 	}
 }
 

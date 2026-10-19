@@ -1,6 +1,32 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestV8ConfigReturnsRootConfiguration(t *testing.T) {
+	fixture := newFakeCPA()
+	request := httptest.NewRequest(http.MethodGet, "/v8/management/config", nil)
+	request.Header.Set("Authorization", "Bearer acceptance-management-key")
+	response := httptest.NewRecorder()
+	fixture.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("config status = %d", response.Code)
+	}
+	var config map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &config); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"api-keys", "access", "plugins"} {
+		var section map[string]json.RawMessage
+		if err := json.Unmarshal(config[field], &section); err != nil || section == nil {
+			t.Fatalf("native v8 config is missing the root %q object: %v", field, err)
+		}
+	}
+}
 
 func TestValidateLoopbackListenAddress(t *testing.T) {
 	for _, test := range []struct {

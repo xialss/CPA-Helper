@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -23,6 +24,7 @@ var pluginManagementReleases = []pluginManagementRelease{
 	{version: "0.1.5", cpaTarget: "v8.0.12", v8: true},
 	{version: "0.1.6", cpaTarget: "v8.0.17", v8: true},
 	{version: "0.1.7", cpaTarget: "v8.0.29", v8: true},
+	{version: "0.1.8", cpaTarget: "v8.0.32", v8: true},
 }
 
 type pluginManagementSnapshot struct {
@@ -35,6 +37,7 @@ type pluginManagementSnapshot struct {
 type pluginManagementFixture struct {
 	mu                 sync.Mutex
 	validationResponse map[string]json.RawMessage
+	catalog            *pluginModelCatalogSnapshot
 	pluginManagementSnapshot
 }
 
@@ -123,6 +126,58 @@ func newPluginManagementFixture(t *testing.T, release pluginManagementRelease) (
 			payload = map[string]any{"api-keys": []string{"compat-downstream-secret"}}
 		case "GET /v1/models":
 			payload = map[string]any{"data": []any{map[string]any{"id": "compat-model"}}}
+		case "GET /v8/management/credentials/models":
+			if release.version != "0.1.8" {
+				http.NotFound(w, r)
+				return
+			}
+			id := r.URL.Query().Get("name")
+			configuredID := pluginConfiguredCredentialID("codex:apikey", []string{"compat-upstream-secret", "https://compat.invalid", "", "", ""}, map[string]int{})
+			if id != "oauth-file" && id != configuredID {
+				t.Error("models endpoint received an auth_index/ref instead of the host auth ID")
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			payload = map[string]any{"models": []any{map[string]any{"id": "compat-model"}}}
+		case "GET /v0/management/plugins/cpa-helper-plugin/v1/model-catalog":
+			if release.version != "0.1.8" {
+				http.NotFound(w, r)
+				return
+			}
+			revision, healthStatus := uint64(0), "unavailable"
+			if fixture.catalog != nil {
+				revision, healthStatus = fixture.catalog.Revision, "ok"
+			}
+			w.Header().Set("ETag", fmt.Sprintf("\"%d\"", revision))
+			payload = map[string]any{"snapshot": fixture.catalog, "health": map[string]any{"catalog_revision": revision, "status": healthStatus}}
+		case "PUT /v0/management/plugins/cpa-helper-plugin/v1/model-catalog":
+			if release.version != "0.1.8" {
+				http.NotFound(w, r)
+				return
+			}
+			revision := uint64(0)
+			if fixture.catalog != nil {
+				revision = fixture.catalog.Revision
+			}
+			if r.Header.Get("If-Match") != fmt.Sprintf("\"%d\"", revision) || r.Header.Get("Idempotency-Key") == "" {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			var next pluginModelCatalogSnapshot
+			if err := json.NewDecoder(r.Body).Decode(&next); err != nil || next.Revision != revision+1 {
+				t.Error("invalid catalog transaction")
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			fixture.catalog = &next
+			payload = map[string]any{"catalog_revision": next.Revision}
+		case "GET /v0/management/plugins/cpa-helper-plugin/v1/health":
+			if fixture.catalog == nil {
+				t.Error("health read before catalog publication")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			payload = map[string]any{"model_catalog": map[string]any{"catalog_revision": fixture.catalog.Revision, "status": "ok"}}
 		case "POST /v0/management/plugins/cpa-helper-plugin/v1/response-model/validate":
 			var next map[string]json.RawMessage
 			if err := json.NewDecoder(r.Body).Decode(&next); err != nil {
@@ -188,7 +243,12 @@ func TestPluginManagementReleaseDirectory(t *testing.T) {
 	for _, release := range pluginManagementReleases {
 		t.Run(release.version, func(t *testing.T) {
 			fixture, cfg := newPluginManagementFixture(t, release)
-			application := &App{}
+			t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+			application, err := NewWithOptions(context.Background(), NewOptions{Migrate: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(application.Close)
 			directory, err := application.pluginDirectory(context.Background(), cfg, &AuthUser{IsSuperAdmin: true}, "")
 			if err != nil {
 				t.Fatal(err)
@@ -228,7 +288,18 @@ func TestPluginManagementReleaseDirectory(t *testing.T) {
 			} else {
 				wantRequests = append(wantRequests, "GET /v0/management/config", "GET /v0/management/auth-files", "GET /v0/management/api-keys")
 			}
-			wantRequests = append(wantRequests, "GET /v1/models")
+			if release.version == "0.1.8" {
+				wantRequests = append(wantRequests,
+					"GET /v0/management/plugins/cpa-helper-plugin/v1/model-catalog",
+					"GET /v8/management/credentials/models", "GET /v8/management/credentials/models",
+					"GET /v8/management/config", "GET /v8/management/credentials",
+					"PUT /v0/management/plugins/cpa-helper-plugin/v1/model-catalog",
+					"GET /v0/management/plugins/cpa-helper-plugin/v1/health",
+					"GET /v0/management/plugins/cpa-helper-plugin/v1/model-catalog",
+				)
+			} else {
+				wantRequests = append(wantRequests, "GET /v1/models")
+			}
 			if got := fixture.snapshot().requests; !reflect.DeepEqual(got, wantRequests) {
 				t.Fatalf("requests = %v; want %v", got, wantRequests)
 			}
@@ -299,6 +370,8 @@ func TestPluginManagementCapabilitiesRejectUnsupportedReleases(t *testing.T) {
 		{version: "0.1.7", cpaTarget: "v8.0.17"},
 		{version: "0.1.7"},
 		{version: "0.1.8", cpaTarget: "v8.0.29"},
+		{version: "0.1.8"},
+		{version: "0.1.9", cpaTarget: "v8.0.32"},
 		{version: "0.2.0", cpaTarget: "v8.0.29"},
 		{version: "0.1.7-private-secret", cpaTarget: "untrusted-cpa-secret"},
 		{version: "0.1.7", cpaTarget: "untrusted-cpa-secret"},

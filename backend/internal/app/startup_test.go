@@ -214,6 +214,7 @@ func TestRequireSchemaShapeRejectsMissingModelMonitorColumns(t *testing.T) {
 			statements := []string{
 				appSettingsSchemaForStartupTest(missing),
 				`CREATE TABLE users (username TEXT, is_super_admin BOOLEAN, must_change_password BOOLEAN, session_version INTEGER)`,
+				apiKeyExpirationSchemaForStartupTest,
 				`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
 				codexKeeperAuthStateSchemaForStartupTest,
 				modelPriceSchemaForStartupTest,
@@ -265,6 +266,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceChannelColumns(t *testing.T) 
 			statements := []string{
 				appSettingsSchemaForStartupTest(""),
 				`CREATE TABLE users (username TEXT, is_super_admin BOOLEAN, must_change_password BOOLEAN, session_version INTEGER)`,
+				apiKeyExpirationSchemaForStartupTest,
 				`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
 				codexKeeperAuthStateSchemaForStartupTest,
 				`CREATE TABLE model_prices (` + strings.Join(columns, ", ") + `)`,
@@ -295,6 +297,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceLibraryConflictsTable(t *test
 	statements := []string{
 		appSettingsSchemaForStartupTest(""),
 		`CREATE TABLE users (username TEXT, is_super_admin BOOLEAN, must_change_password BOOLEAN, session_version INTEGER)`,
+		apiKeyExpirationSchemaForStartupTest,
 		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
 		codexKeeperAuthStateSchemaForStartupTest,
 		`CREATE TABLE model_prices (
@@ -327,6 +330,7 @@ func TestRequireSchemaShapeRejectsMissingKeeperAuthIndex(t *testing.T) {
 	statements := []string{
 		appSettingsSchemaForStartupTest(""),
 		`CREATE TABLE users (username TEXT, is_super_admin BOOLEAN, must_change_password BOOLEAN, session_version INTEGER)`,
+		apiKeyExpirationSchemaForStartupTest,
 		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
 		`CREATE TABLE codex_keeper_auth_states (auth_name TEXT)`,
 		`CREATE TABLE model_prices (
@@ -347,6 +351,40 @@ func TestRequireSchemaShapeRejectsMissingKeeperAuthIndex(t *testing.T) {
 	err = requireSchemaShape(context.Background(), db)
 	if !errors.Is(err, ErrDatabaseNeedsMigration) || !strings.Contains(err.Error(), "codex_keeper_auth_states.auth_index") {
 		t.Fatalf("requireSchemaShape error = %v, want missing codex_keeper_auth_states.auth_index", err)
+	}
+}
+
+func TestRequireSchemaShapeRejectsMissingAPIKeyExpirationColumns(t *testing.T) {
+	columns := []string{"expires_at", "expiration_enforced_at", "expiration_sync_error"}
+	for _, missing := range columns {
+		t.Run(missing, func(t *testing.T) {
+			db, err := sql.Open("sqlite", ":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			db.SetMaxOpenConns(1)
+
+			keyColumns := make([]string, 0, len(columns))
+			for _, column := range columns {
+				if column != missing {
+					keyColumns = append(keyColumns, column+" TEXT")
+				}
+			}
+			for _, statement := range []string{
+				appSettingsSchemaForStartupTest(""),
+				`CREATE TABLE users (username TEXT, is_super_admin BOOLEAN, must_change_password BOOLEAN, session_version INTEGER)`,
+				`CREATE TABLE user_api_keys (` + strings.Join(keyColumns, ", ") + `)`,
+			} {
+				if _, err := db.Exec(statement); err != nil {
+					t.Fatalf("create test schema: %v", err)
+				}
+			}
+			err = requireSchemaShape(context.Background(), db)
+			if !errors.Is(err, ErrDatabaseNeedsMigration) || !strings.Contains(err.Error(), "user_api_keys."+missing) {
+				t.Fatalf("requireSchemaShape error = %v, want missing user_api_keys.%s", err, missing)
+			}
+		})
 	}
 }
 
@@ -509,6 +547,8 @@ func quoteStartupTestIdentifier(value string) string {
 }
 
 const codexKeeperAuthStateSchemaForStartupTest = `CREATE TABLE codex_keeper_auth_states (auth_index TEXT)`
+
+const apiKeyExpirationSchemaForStartupTest = `CREATE TABLE user_api_keys (expires_at TEXT, expiration_enforced_at TEXT, expiration_sync_error TEXT)`
 
 const modelPriceSchemaForStartupTest = `CREATE TABLE model_prices (
 	request_usd TEXT, billing_unit TEXT, priority_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
