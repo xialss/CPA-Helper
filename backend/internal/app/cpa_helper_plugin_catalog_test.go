@@ -57,6 +57,10 @@ type catalogHTTPFixture struct {
 	modelRelease        chan struct{}
 	version             string
 	cpaTarget           string
+	registered          []pluginRegisteredCredentialModels
+	registeredReads     int
+	registeredResponse  []byte
+	onSecondRegistered  func(*catalogHTTPFixture)
 	downstream          []string
 	policy              map[string]json.RawMessage
 	needsSync           map[string]string
@@ -127,7 +131,7 @@ func newCatalogHTTPFixture(t *testing.T) (*catalogHTTPFixture, AppConfig) {
 		var payload any
 		switch r.Method + " " + r.URL.Path {
 		case "GET /v0/management/plugins/cpa-helper-plugin/v1/capabilities":
-			payload = map[string]any{"contract_version": "v1", "plugin_version": fixture.version, "cpa_version": fixture.cpaTarget, "modules": []string{"model_list_filter"}, "model_list_filter_enabled": true}
+			payload = map[string]any{"contract_version": "v1", "plugin_version": fixture.version, "cpa_version": fixture.cpaTarget, "abi_version": 1, "schema_version": 7, "modules": []string{"model_list_filter"}, "model_list_filter_enabled": true}
 		case "GET /v0/management/plugins/cpa-helper-plugin/v1/directory":
 			payload = map[string]any{"credentials": []any{}}
 		case "GET /v8/management/config":
@@ -162,6 +166,16 @@ func newCatalogHTTPFixture(t *testing.T) (*catalogHTTPFixture, AppConfig) {
 			}
 			_, _ = w.Write(models)
 			return
+		case "GET /v0/management/plugins/cpa-helper-plugin/v1/credential-models":
+			fixture.registeredReads++
+			if fixture.registeredReads == 2 && fixture.onSecondRegistered != nil {
+				fixture.onSecondRegistered(fixture)
+			}
+			if fixture.registeredResponse != nil {
+				_, _ = w.Write(fixture.registeredResponse)
+				return
+			}
+			payload = map[string]any{"credentials": fixture.registered}
 		case "GET /v0/management/plugins/cpa-helper-plugin/v1/model-catalog":
 			w.Header().Set("ETag", fmt.Sprintf("\"%d\"", fixture.revision))
 			if fixture.stateResponse != nil {
@@ -184,7 +198,7 @@ func newCatalogHTTPFixture(t *testing.T) (*catalogHTTPFixture, AppConfig) {
 				_, _ = w.Write([]byte(`{"error":{"code":"revision_conflict","message":"catalog-management-secret"}}`))
 				return
 			}
-			if err := validateCatalogHTTPBody(body, fixture.revision+1); err != nil {
+			if err := validateCatalogHTTPBody(body, fixture.revision+1, fixture.version, fixture.cpaTarget); err != nil {
 				t.Error(err)
 				w.WriteHeader(http.StatusBadRequest)
 				return
@@ -249,7 +263,7 @@ func newCatalogHTTPFixture(t *testing.T) (*catalogHTTPFixture, AppConfig) {
 
 // The fake validates the published field sets independently of the production
 // decoder, and implements actual conditional state changes rather than fixed OKs.
-func validateCatalogHTTPBody(raw []byte, revision uint64) error {
+func validateCatalogHTTPBody(raw []byte, revision uint64, version, cpaTarget string) error {
 	var object map[string]json.RawMessage
 	if json.Unmarshal(raw, &object) != nil || len(object) != 6 {
 		return errors.New("catalog body is not a complete six-field object")
@@ -259,7 +273,7 @@ func validateCatalogHTTPBody(raw []byte, revision uint64) error {
 			return fmt.Errorf("catalog lacks required field %s", field)
 		}
 	}
-	if string(object["contract_version"]) != `"v1"` || string(object["plugin_version"]) != `"0.1.8"` || string(object["cpa_version"]) != `"v8.0.32"` || rawUint(object["catalog_revision"]) != revision {
+	if string(object["contract_version"]) != `"v1"` || rawString(object["plugin_version"]) != version || rawString(object["cpa_version"]) != cpaTarget || rawUint(object["catalog_revision"]) != revision {
 		return errors.New("catalog envelope has wrong version or independent revision")
 	}
 	var generated time.Time
@@ -832,8 +846,18 @@ func TestPluginModelCatalogRecoveryKeepsUserScopeAndGlobalRegistry(t *testing.T)
 				}
 			}
 			requestJSONForPricingTest(t, handler, http.MethodGet, "/api/cpa-helper-plugin/directory?api_key_hash="+memberKey.APIKeyHash, nil, member, &directory)
-			if !reflect.DeepEqual(directory.Models, []string{"secondary-public"}) {
-				t.Fatalf("per-Key editor broadened model permissions: %#v", directory.Models)
+			if !reflect.DeepEqual(directory.Models, want) {
+				t.Fatalf("per-Key editor lost candidates outside its current rule: %#v", directory.Models)
+			}
+			afterKeyDirectory, _ := fixture.recorded()
+			for _, request := range afterKeyDirectory[len(afterGlobal):] {
+				if request.path == "/v1/models" {
+					t.Fatal("per-Key editor used the caller-filtered downstream model list")
+				}
+			}
+			requestJSONForPricingTest(t, handler, http.MethodGet, "/api/account/models", nil, member, &models)
+			if len(models.Models) != 1 || models.Models[0].ID != "secondary-public" {
+				t.Fatalf("editor candidates changed account model permissions: %#v", models.Models)
 			}
 			for _, endpoint := range []struct{ method, prefix string }{
 				{http.MethodGet, "/api/cpa-helper-plugin/directory?api_key_hash="},

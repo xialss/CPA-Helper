@@ -124,6 +124,11 @@ func TestUsageSourceOptionsRequireConsistentIdentity(t *testing.T) {
 		wantName  string
 	}{
 		{
+			name:      "masked source retains independently matched auth index alias",
+			providers: []aiProviderItem{native(aiProviderBrandGemini, "Auth.json", originalSource, "one")},
+			aliases:   []modelPriceChannelAlias{nativeAlias}, rows: []evidence{base}, source: "sk-opt...3456", wantName: "Shared name",
+		},
+		{
 			name:      "same identity across models",
 			providers: []aiProviderItem{native(aiProviderBrandGemini, "Auth.json", originalSource, "one", "two")},
 			aliases:   []modelPriceChannelAlias{nativeAlias}, rows: []evidence{googleOne, googleTwo}, wantName: "Shared name",

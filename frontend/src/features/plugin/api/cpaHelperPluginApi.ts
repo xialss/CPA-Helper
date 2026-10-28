@@ -10,6 +10,7 @@ import type {
   CPAHelperPluginRule,
   CPAHelperPluginPolicy,
   CPAHelperPluginStatus,
+  CPAHelperPluginClaudeTTLFeature,
   CPAHelperResponseModelConfig,
 } from '@/shared/types/api'
 
@@ -36,6 +37,9 @@ function normalizeRule(value: unknown): CPAHelperPluginRule {
 
 export function normalizeCPAHelperPluginKey(value: unknown): CPAHelperPluginKey {
   const source = isRecord(value) ? value : {}
+  if (Object.prototype.hasOwnProperty.call(source, 'claude_cache_ttl') && source.claude_cache_ttl !== '' && source.claude_cache_ttl !== '5m' && source.claude_cache_ttl !== '1h') {
+    throw new Error(localize('API Key 缓存 TTL 格式无效', 'Invalid API key cache TTL'))
+  }
   const concurrency = typeof source.max_concurrency === 'number' && Number.isFinite(source.max_concurrency)
     ? Math.max(0, Math.trunc(source.max_concurrency))
     : 0
@@ -83,8 +87,32 @@ function normalizeKeyPolicy(value: unknown): CPAHelperPluginKeyPolicy {
   }
 }
 
-export function getCPAHelperPluginStatus(): Promise<CPAHelperPluginStatus> {
-  return apiClient.get<CPAHelperPluginStatus>('/cpa-helper-plugin/status')
+export async function getCPAHelperPluginStatus(): Promise<CPAHelperPluginStatus> {
+  const response = await apiClient.get<unknown>('/cpa-helper-plugin/status')
+  if (!isRecord(response) || typeof response.loaded !== 'boolean'
+    || !isRecord(response.capabilities) || !isRecord(response.health)
+    || typeof response.response_model_verification_supported !== 'boolean') {
+    throw new Error(localize('插件能力响应格式无效', 'Invalid plugin capability response'))
+  }
+  const feature = response.claude_cache_ttl
+  if (!isRecord(feature) || typeof feature.supported !== 'boolean'
+    || typeof feature.status !== 'string' || !['configured', 'disabled', 'unavailable', 'unsupported'].includes(feature.status)
+    || (feature.metadata_version !== undefined && feature.metadata_version !== 'v1')
+    || (feature.supported && (feature.status === 'unsupported' || feature.metadata_version !== 'v1'))
+    || (!feature.supported && feature.status !== 'unsupported')) {
+    throw new Error(localize('Claude 缓存 TTL 能力响应格式无效', 'Invalid Claude cache TTL capability response'))
+  }
+  return {
+    loaded: response.loaded,
+    capabilities: response.capabilities,
+    health: response.health,
+    response_model_verification_supported: response.response_model_verification_supported,
+    claude_cache_ttl: {
+      supported: feature.supported,
+      status: feature.status as CPAHelperPluginClaudeTTLFeature['status'],
+      ...(feature.metadata_version === 'v1' ? { metadata_version: 'v1' as const } : {}),
+    },
+  }
 }
 
 export async function getCPAHelperPluginKeysSummary(signal?: AbortSignal): Promise<CPAHelperPluginKeysSummaryResponse> {

@@ -4,6 +4,14 @@ type MessagePair = readonly [zh: string, en: string]
 type ServerMessagePattern = readonly [RegExp, (match: RegExpMatchArray) => string]
 
 const exactServerMessages: MessagePair[] = [
+  ['Claude 缓存 TTL 只能配置在 API 密钥上', 'Claude cache TTL can only be configured on an API key'],
+  ['Claude 缓存 TTL 必须为继承 CPA、5m 或 1h', 'Claude cache TTL must be Inherit CPA, 5m or 1h'],
+  ['Claude 缓存 TTL 尚未完成插件配置校验', 'Claude cache TTL plugin configuration has not been verified'],
+  ['插件 API 密钥缓存 TTL 保存后未生效', 'The plugin API key cache TTL was saved but did not take effect'],
+  ['当前 CPA Helper Plugin 不支持响应模型核验', 'The current CPA Helper Plugin does not support response model verification'],
+  ['同步期间 CPA 凭据模型注册已变化，请刷新后重试', 'CPA credential model registration changed during synchronization. Refresh and try again.'],
+  ['CPA 注册凭据与元数据不一致，请重新同步', 'CPA registered credentials do not match the metadata. Sync again.'],
+  ['CPA 凭据元数据未被宿主注册目录完整覆盖，请重新同步', 'The host registered catalog does not fully cover the CPA credential metadata. Sync again.'],
   ['插件策略保存后未生效', 'Plugin policy was saved but did not take effect'],
   ['响应核验配置已提交，但插件未确认生效', 'Response verification config was submitted, but the plugin did not confirm activation'],
   ['插件策略已提交，但未确认目标修订号', 'Plugin policy was submitted, but the target revision was not confirmed'],

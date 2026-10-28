@@ -530,7 +530,58 @@ try {
       })
     }
   }
-  globalThis.console.log(`Usage source filter smoke passed: ${scenarios} actual SFC scenarios, ${requestCount} serialized API requests; source controls, permissions, timers, stale responses, partial failures and retention navigation`)
+  await withView('UsageRecordsView', 'account', makeEnvironment({ quick_range: 'today' }), async (env) => {
+    const record = {
+      id: 901, timestamp: '2026-10-28T16:00:00+08:00', model: 'claude-sonnet', provider: 'claude',
+      failed: false, input_tokens: 100, output_tokens: 10, total_tokens: 210, reasoning_tokens: 0,
+      cached_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 100, estimated_cost_usd: 1,
+      execution_id: 'e229118e-a1be-4fa4-93ea-7b003d5b9761', request_id: 'different-request-id',
+      cache_creation_ttl: '1h', cache_creation_5m_tokens: null, cache_creation_1h_tokens: null,
+      cache_creation_ttl_source: 'enforced_request', cache_creation_ttl_status: 'matched',
+      cache_creation_ttl_reason: null, cache_creation_policy_revision: 7, cache_creation_observed_at: '2026-10-28T16:00:01+08:00',
+      cost_breakdown: { normal_input_tokens: 100, cache_read_tokens: 0, cache_creation_tokens: 100, items: [], total_usd: 1 },
+    }
+    for (const language of ['zh', 'en']) {
+      env.state.currentLanguage.value = language
+      const label = (zh, en) => language === 'zh' ? zh : en
+      const rows = () => new Map(env.state.detailRows.value.map((row) => [row.label, row.value]))
+      env.state.selectedRecord.value = record
+      assert.equal(rows().get(label('缓存写 TTL', 'Cache write TTL')), label('1 小时', '1 hour'))
+      assert.equal(rows().get(label('TTL 来源', 'TTL source')), label('执行策略归属（非上游观测）', 'Execution policy attribution (not observed upstream)'))
+      assert.equal(rows().get(label('TTL 归属状态', 'TTL attribution status')), label('已关联', 'Matched'))
+      assert.equal(rows().get(label('执行 ID', 'Execution ID')), record.execution_id, 'Request details retain execution identity separately from request ID')
+      assert.equal(rows().get(label('执行策略版本', 'Execution policy revision')), '7')
+      assert.ok(rows().get(label('TTL 归属记录时间', 'TTL attribution recorded at')))
+      assert.equal(env.state.renderCacheCreationTokens(record).props.title, rows().get(label('TTL 来源', 'TTL source')), 'Table TTL labels also disclose attribution provenance')
+
+      env.state.selectedRecord.value = { ...record, cache_creation_ttl: '5m' }
+      assert.equal(rows().get(label('缓存写 TTL', 'Cache write TTL')), label('5 分钟', '5 min'))
+      env.state.selectedRecord.value = { ...record, cache_creation_ttl: 'mixed', cache_creation_ttl_source: 'upstream', cache_creation_ttl_status: 'conflict', cache_creation_5m_tokens: 40, cache_creation_1h_tokens: 60 }
+      assert.equal(rows().get(label('缓存写 TTL', 'Cache write TTL')), `${label('混合', 'Mixed')} (5m 40 / 1h 60)`)
+      assert.equal(rows().get(label('TTL 来源', 'TTL source')), label('上游用量', 'Upstream usage'))
+      assert.equal(rows().get(label('TTL 归属状态', 'TTL attribution status')), label('归属冲突，保留原计费依据', 'Attribution conflict; original billing basis retained'))
+      env.state.selectedRecord.value = { ...record, cache_creation_ttl: 'unknown', cache_creation_ttl_source: 'unknown', cache_creation_ttl_status: 'error' }
+      assert.equal(rows().get(label('TTL 来源', 'TTL source')), label('未知', 'Unknown'))
+      assert.equal(rows().get(label('TTL 归属状态', 'TTL attribution status')), label('归属查询失败', 'Attribution lookup failed'))
+      for (const [reason, zh, en] of [
+        ['metadata_expired', '已超出归属数据保留期', 'The attribution retention window has expired'],
+        ['execution_id_missing', '原请求缺少有效执行 ID', 'The original request has no valid execution ID'],
+        ['caller_scope_mismatch', '执行归属与请求身份不匹配', 'Execution attribution does not match the request identity'],
+        ['upstream_policy_conflict', '上游 TTL 与执行策略不一致，按上游事实计价', 'Upstream TTL differs from the execution policy; upstream facts determine pricing'],
+        ['unknown-new-code-with-secret-path', '归属说明不可用，请以已记录的计费依据为准。', 'Attribution details are unavailable; the recorded billing basis applies.'],
+      ]) {
+        env.state.selectedRecord.value = { ...record, cache_creation_ttl_reason: reason }
+        assert.equal(rows().get(label('TTL 归属说明', 'TTL attribution details')), label(zh, en), 'Stable reasons are localized without dumping unknown internal values')
+      }
+      env.state.selectedRecord.value = { ...record, cache_creation_ttl_source: null, cache_creation_ttl_status: 'legacy' }
+      assert.equal(rows().get(label('TTL 来源', 'TTL source')), label('未记录', 'Not recorded'), 'A TTL value does not manufacture an upstream source')
+      env.state.selectedRecord.value = { ...record, cache_creation_tokens: 0, cache_creation_ttl: null, cost_breakdown: { ...record.cost_breakdown, cache_creation_tokens: 0 } }
+      assert.equal(rows().has(label('缓存写 TTL', 'Cache write TTL')), false, 'Zero cache writes do not display a synthetic TTL')
+      assert.equal(rows().has(label('TTL 来源', 'TTL source')), false)
+    }
+    env.state.currentLanguage.value = 'zh'
+  })
+  globalThis.console.log(`Usage source filter smoke passed: ${scenarios} actual SFC scenarios, ${requestCount} serialized API requests; source controls, permissions, timers, stale responses, partial failures, TTL provenance and retention navigation`)
 } finally {
   await server.close()
 }

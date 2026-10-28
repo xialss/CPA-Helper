@@ -455,7 +455,7 @@ func TestClaudeCacheTTLMigrationBackfillsOnlyCanonicalRawUsage(t *testing.T) {
 	if err := goose.SetDialect("sqlite3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := goose.UpToContext(ctx, db, ".", backendMigrations.LatestVersion); err != nil {
+	if err := goose.UpToContext(ctx, db, ".", 202610270001); err != nil {
 		t.Fatalf("upgrade usage database with Claude TTL migration: %v", err)
 	}
 	for _, test := range []struct {

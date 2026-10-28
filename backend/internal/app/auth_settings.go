@@ -904,17 +904,21 @@ func (a *App) handleCollectorStatus(w http.ResponseWriter, r *http.Request) erro
 		"last_error":             state.LastError,
 		"remote_enabled":         state.RemoteEnabled,
 		"records_collected":      state.RecordsCollected,
+		"ttl_pending_records":    state.TTLPendingRecords,
+		"ttl_pending_reason":     state.TTLPendingReason,
 	})
 	return nil
 }
 
 type collectorState struct {
-	Running          bool
-	LastPollAt       *time.Time
-	LastSuccessAt    *time.Time
-	LastError        *string
-	RemoteEnabled    *bool
-	RecordsCollected int
+	Running           bool
+	LastPollAt        *time.Time
+	LastSuccessAt     *time.Time
+	LastError         *string
+	RemoteEnabled     *bool
+	RecordsCollected  int
+	TTLPendingRecords int
+	TTLPendingReason  *string
 }
 
 func (a *App) collectorState(ctx context.Context) (collectorState, error) {
@@ -936,6 +940,15 @@ func (a *App) collectorState(ctx context.Context) (collectorState, error) {
 		value := remote.Bool
 		state.RemoteEnabled = &value
 	}
+	if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_collector_inbox WHERE state IN ('pending', 'ready')`).Scan(&state.TTLPendingRecords); err != nil {
+		return collectorState{}, err
+	}
+	var pendingReason sql.NullString
+	err = a.db.QueryRowContext(ctx, `SELECT last_error_code FROM usage_collector_inbox WHERE state IN ('pending', 'ready') ORDER BY id LIMIT 1`).Scan(&pendingReason)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return collectorState{}, err
+	}
+	state.TTLPendingReason = nullableString(pendingReason)
 	return state, nil
 }
 

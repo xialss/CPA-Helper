@@ -58,7 +58,32 @@ type pluginCatalogRecovery struct {
 }
 
 func pluginSupportsModelCatalog(capabilities map[string]json.RawMessage) bool {
-	return rawString(capabilities["plugin_version"]) == pluginModelCatalogVersion && rawString(capabilities["cpa_version"]) == pluginModelCatalogCPA
+	target := pluginCatalogCPATarget(rawString(capabilities["plugin_version"]))
+	return target != "" && rawString(capabilities["cpa_version"]) == target
+}
+
+func pluginCatalogCPATarget(version string) string {
+	switch version {
+	case "0.1.8":
+		return pluginModelCatalogCPA
+	case "0.1.9", "0.1.10":
+		return "v8.0.45"
+	default:
+		return ""
+	}
+}
+
+func pluginCatalogProducerCompatible(version, producer string) bool {
+	switch version {
+	case "0.1.8":
+		return producer == "0.1.8"
+	case "0.1.9":
+		return producer == "0.1.8" || producer == "0.1.9"
+	case "0.1.10":
+		return producer == "0.1.8" || producer == "0.1.9" || producer == "0.1.10"
+	default:
+		return false
+	}
 }
 
 func pluginModelCatalogError(code string) error {
@@ -80,7 +105,7 @@ func (a *App) syncPluginModelCatalog(ctx context.Context, cfg AppConfig, capabil
 	if !pluginSupportsModelCatalog(capabilities) {
 		return pluginCatalogSyncResult{}, pluginIncompatibleError()
 	}
-	key := strings.TrimRight(strings.TrimSpace(cfg.Collector.CLIProxyURL), "/") + "\x00" + strings.TrimSpace(cfg.Collector.ManagementKey)
+	key := strings.TrimRight(strings.TrimSpace(cfg.Collector.CLIProxyURL), "/") + "\x00" + strings.TrimSpace(cfg.Collector.ManagementKey) + "\x00" + rawString(capabilities["plugin_version"])
 	a.pluginCatalogMu.Lock()
 	if flight := a.pluginCatalogFlights[key]; flight != nil {
 		a.pluginCatalogMu.Unlock()
@@ -101,7 +126,7 @@ func (a *App) syncPluginModelCatalog(ctx context.Context, cfg AppConfig, capabil
 	// the leader. Each caller still observes its own cancellation while the
 	// in-flight work keeps running for all other waiters.
 	go func() {
-		result, err := a.performPluginCatalogSync(context.WithoutCancel(ctx), cfg)
+		result, err := a.performPluginCatalogSync(context.WithoutCancel(ctx), cfg, capabilities)
 		a.pluginCatalogMu.Lock()
 		flight.result, flight.err = result, err
 		delete(a.pluginCatalogFlights, key)
@@ -137,7 +162,7 @@ func (a *App) pluginV8HostDirectory(ctx context.Context, cfg AppConfig) (map[str
 	return config, credentials, err
 }
 
-func (a *App) pluginCatalogState(ctx context.Context, cfg AppConfig) (uint64, *pluginModelCatalogSnapshot, error) {
+func (a *App) pluginCatalogState(ctx context.Context, cfg AppConfig, capabilities map[string]json.RawMessage) (uint64, *pluginModelCatalogSnapshot, error) {
 	status, headers, payload, err := a.cpaHelperPluginRequest(ctx, cfg, http.MethodGet, cpaHelperPluginManagementPrefix+"/model-catalog", nil, nil)
 	if err != nil {
 		return 0, nil, appErrorFromPlugin(err, status)
@@ -164,18 +189,29 @@ func (a *App) pluginCatalogState(ctx context.Context, cfg AppConfig) (uint64, *p
 	if err != nil {
 		return 0, nil, err
 	}
+	if !pluginCatalogProducerCompatible(rawString(capabilities["plugin_version"]), snapshot.PluginVersion) {
+		return 0, nil, pluginIncompatibleError()
+	}
 	if snapshot.Revision != revision || rawString(health["status"]) != "ok" {
 		return 0, nil, pluginModelCatalogError("model_catalog_unavailable")
 	}
 	return revision, &snapshot, nil
 }
 
-func (a *App) performPluginCatalogSync(ctx context.Context, cfg AppConfig) (pluginCatalogSyncResult, error) {
+func (a *App) performPluginCatalogSync(ctx context.Context, cfg AppConfig, capabilities map[string]json.RawMessage) (pluginCatalogSyncResult, error) {
 	config, credentials, err := a.pluginV8HostDirectory(ctx, cfg)
 	if err != nil {
 		return pluginCatalogSyncResult{}, err
 	}
-	base, _, err := a.pluginCatalogState(ctx, cfg)
+	version := rawString(capabilities["plugin_version"])
+	var registered []pluginRegisteredCredentialModels
+	if version != pluginModelCatalogVersion {
+		registered, err = a.pluginRegisteredCredentialModels(ctx, cfg)
+		if err != nil {
+			return pluginCatalogSyncResult{}, err
+		}
+	}
+	base, _, err := a.pluginCatalogState(ctx, cfg, capabilities)
 	if err != nil {
 		return pluginCatalogSyncResult{}, err
 	}
@@ -183,23 +219,30 @@ func (a *App) performPluginCatalogSync(ctx context.Context, cfg AppConfig) (plug
 		return pluginCatalogSyncResult{}, pluginIncompatibleError()
 	}
 	snapshot := pluginModelCatalogSnapshot{
-		ContractVersion: "v1", PluginVersion: pluginModelCatalogVersion, CPAVersion: pluginModelCatalogCPA,
+		ContractVersion: "v1", PluginVersion: version, CPAVersion: pluginCatalogCPATarget(version),
 		Revision: base + 1, GeneratedAt: time.Now().UTC(), Credentials: make([]pluginModelCatalogCredential, 0, len(credentials)),
 	}
-	for _, credential := range credentials {
-		query := url.Values{"name": []string{credential.AuthID}}
-		status, _, payload, err := a.cpaHelperPluginRequest(ctx, cfg, http.MethodGet, "/v8/management/credentials/models?"+query.Encode(), nil, nil)
-		if err != nil {
-			return pluginCatalogSyncResult{}, appErrorFromPlugin(err, status)
-		}
-		models, err := pluginRegisteredModels(payload)
+	if version != pluginModelCatalogVersion {
+		snapshot.Credentials, credentials, err = pluginJoinRegisteredCredentialModels(credentials, registered)
 		if err != nil {
 			return pluginCatalogSyncResult{}, err
 		}
-		snapshot.Credentials = append(snapshot.Credentials, pluginModelCatalogCredential{
-			Ref: credential.Ref, Source: credential.Source, Provider: credential.Provider,
-			Enabled: credential.Status != "disabled", Models: models,
-		})
+	} else {
+		for _, credential := range credentials {
+			query := url.Values{"name": []string{credential.AuthID}}
+			status, _, payload, err := a.cpaHelperPluginRequest(ctx, cfg, http.MethodGet, "/v8/management/credentials/models?"+query.Encode(), nil, nil)
+			if err != nil {
+				return pluginCatalogSyncResult{}, appErrorFromPlugin(err, status)
+			}
+			models, err := pluginRegisteredModels(payload)
+			if err != nil {
+				return pluginCatalogSyncResult{}, err
+			}
+			snapshot.Credentials = append(snapshot.Credentials, pluginModelCatalogCredential{
+				Ref: credential.Ref, Source: credential.Source, Provider: credential.Provider,
+				Enabled: credential.Status != "disabled", Models: models,
+			})
+		}
 	}
 	// Validate the complete storage projection before any write. Browser labels,
 	// auth IDs, auth indexes and raw configuration are never part of this body.
@@ -216,6 +259,15 @@ func (a *App) performPluginCatalogSync(ctx context.Context, cfg AppConfig) (plug
 	}
 	if !reflect.DeepEqual(config, latestConfig) || !pluginHostIdentityEqual(credentials, latestCredentials) {
 		return pluginCatalogSyncResult{}, appError("model_catalog_out_of_sync", http.StatusConflict, "同步期间 CPA 配置或凭据已变化，请刷新后重试")
+	}
+	if version != pluginModelCatalogVersion {
+		latestRegistered, err := a.pluginRegisteredCredentialModels(ctx, cfg)
+		if err != nil {
+			return pluginCatalogSyncResult{}, err
+		}
+		if !reflect.DeepEqual(registered, latestRegistered) {
+			return pluginCatalogSyncResult{}, appError("model_catalog_out_of_sync", http.StatusConflict, "同步期间 CPA 凭据模型注册已变化，请刷新后重试")
+		}
 	}
 	headers := http.Header{}
 	headers.Set("If-Match", fmt.Sprintf("\"%d\"", base))
@@ -243,7 +295,7 @@ func (a *App) performPluginCatalogSync(ctx context.Context, cfg AppConfig) (plug
 	if err != nil || rawString(modelHealth["status"]) != "ok" || rawUint(modelHealth["catalog_revision"]) != snapshot.Revision {
 		return pluginCatalogSyncResult{}, pluginCatalogSyncFailed("CPA Helper Plugin 模型目录已提交，但未确认生效")
 	}
-	_, confirmed, err := a.pluginCatalogState(ctx, cfg)
+	_, confirmed, err := a.pluginCatalogState(ctx, cfg, capabilities)
 	if err != nil {
 		return pluginCatalogSyncResult{}, err
 	}
@@ -259,7 +311,7 @@ func pluginHostIdentityEqual(left, right []pluginHostCredential) bool {
 	}
 	for index, a := range left {
 		b := right[index]
-		if a.Ref != b.Ref || a.AuthID != b.AuthID || a.Source != b.Source || a.Provider != b.Provider || (a.Status == "disabled") != (b.Status == "disabled") {
+		if a.Ref != b.Ref || a.AuthID != b.AuthID || a.AuthIndex != b.AuthIndex || a.Source != b.Source || a.Provider != b.Provider || (a.Status == "disabled") != (b.Status == "disabled") {
 			return false
 		}
 	}
@@ -327,7 +379,7 @@ func decodePluginCatalogSnapshot(raw []byte) (pluginModelCatalogSnapshot, error)
 		return pluginModelCatalogSnapshot{}, err
 	}
 	var snapshot pluginModelCatalogSnapshot
-	if json.Unmarshal(mapToRawObject(object), &snapshot) != nil || snapshot.ContractVersion != "v1" || snapshot.PluginVersion != pluginModelCatalogVersion || snapshot.CPAVersion != pluginModelCatalogCPA || snapshot.GeneratedAt.IsZero() {
+	if json.Unmarshal(mapToRawObject(object), &snapshot) != nil || snapshot.ContractVersion != "v1" || pluginCatalogCPATarget(snapshot.PluginVersion) == "" || snapshot.CPAVersion != pluginCatalogCPATarget(snapshot.PluginVersion) || snapshot.GeneratedAt.IsZero() {
 		return pluginModelCatalogSnapshot{}, pluginIncompatibleError()
 	}
 	if _, err := pluginCatalogRevision(object["catalog_revision"], false); err != nil {

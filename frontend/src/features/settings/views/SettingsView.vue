@@ -24,6 +24,7 @@ import {
   updateSettings,
 } from '@/features/settings/api/settingsApi'
 import {
+  getCPAHelperPluginStatus,
   getCPAHelperResponseModelConfig,
   updateCPAHelperResponseModelConfig,
 } from '@/features/plugin/api/cpaHelperPluginApi'
@@ -37,7 +38,8 @@ const message = useMessage()
 const dialog = useDialog()
 const { errorText, serverText, t } = useI18n()
 const { currentUser } = useCurrentUser()
-const canManageResponseVerification = computed(() => currentUser.value?.is_super_admin === true)
+const responseVerificationSupported = ref(false)
+const canManageResponseVerification = computed(() => currentUser.value?.is_super_admin === true && responseVerificationSupported.value)
 const isLoading = ref(false)
 const isSaving = ref(false)
 const collectorStatus = ref<CollectorStatus | null>(null)
@@ -74,6 +76,12 @@ const remoteStatusText = computed(() => {
 
 const collectorEnabledText = computed(() => (collectorStatus.value?.enabled ? t('开启', 'On') : t('关闭', 'Off')))
 const collectorRunningText = computed(() => (collectorStatus.value?.running ? t('运行中', 'Running') : t('空闲', 'Idle')))
+const pendingTTLText = computed(() => {
+  if ((collectorStatus.value?.ttl_pending_records ?? 0) <= 0) return ''
+  if (collectorStatus.value?.ttl_pending_reason === 'metadata_unavailable') return t('TTL 归属服务暂不可用；相关请求仍在处理归属或入账。', 'The TTL attribution service is temporarily unavailable; attribution or accounting is still in progress for these requests.')
+  if (collectorStatus.value?.ttl_pending_reason === 'collector_origin_changed') return t('采集源已切换；仍有请求正在处理归属或入账。', 'The collection source changed; attribution or accounting is still in progress for some requests.')
+  return t('正在处理 TTL 归属或入账。', 'TTL attribution or accounting is in progress.')
+})
 const isManagementKeySet = ref(false)
 const responseModelConfigLoading = ref(false)
 const responseModelConfigSaving = ref(false)
@@ -82,6 +90,7 @@ const responseModelLoaded = ref(false)
 const savedResponseModelSnapshot = ref('')
 let settingsLoadGeneration = 0
 let responseModelConfigGeneration = 0
+let savedCPAURL: string | null = null
 const responseConfig = reactive<CPAHelperResponseModelConfig>({
   enabled: false, stream_enabled: true,
   max_buffer_bytes: 2097152, max_total_buffer_bytes: 8388608,
@@ -96,7 +105,7 @@ const responseModelSnapshot = () => JSON.stringify({
   acceptedModelRows: acceptedModelRows.value,
 })
 const responseModelDirty = computed(() => responseModelLoaded.value && responseModelSnapshot() !== savedResponseModelSnapshot.value)
-const responseModelFormDisabled = computed(() => responseModelConfigLoading.value || responseModelConfigSaving.value || !responseModelLoaded.value || !!responseModelConfigError.value)
+const responseModelFormDisabled = computed(() => isSaving.value || responseModelConfigLoading.value || responseModelConfigSaving.value || !responseModelLoaded.value || !!responseModelConfigError.value)
 const responseModelConfigErrorText = computed(() => {
   if (!responseModelConfigError.value) return ''
   if (responseModelConfigError.value instanceof ApiRequestError && responseModelConfigError.value.code === 'plugin_not_loaded') return t('CPA Helper Plugin 未加载或契约不兼容；系统其他设置仍可使用。', 'CPA Helper Plugin is not loaded or its contract is incompatible; other system settings remain available.')
@@ -117,6 +126,9 @@ function refresh() {
 }
 
 function applyResponseModelConfig(config: CPAHelperResponseModelConfig) {
+  for (const key of Object.keys(responseConfig)) {
+    if (!Object.prototype.hasOwnProperty.call(config, key)) delete responseConfig[key]
+  }
   Object.assign(responseConfig, config)
   ignoredModelsText.value = config.ignored_models.join('\n')
   acceptedModelRows.value = Object.entries(config.accepted_models).map(([request, responses]) => ({ request, responses: responses.join(', ') }))
@@ -125,11 +137,31 @@ function applyResponseModelConfig(config: CPAHelperResponseModelConfig) {
   savedResponseModelSnapshot.value = responseModelSnapshot()
 }
 
+function invalidateResponseModelConfig() {
+  responseModelConfigGeneration++
+  responseVerificationSupported.value = false
+  responseModelLoaded.value = false
+  responseModelConfigLoading.value = false
+  responseModelConfigError.value = null
+  savedResponseModelSnapshot.value = ''
+  ignoredModelsText.value = ''
+  acceptedModelRows.value = []
+}
+
 async function loadResponseModelConfig() {
-  if (!canManageResponseVerification.value || responseModelConfigSaving.value) return
+  if (currentUser.value?.is_super_admin !== true || responseModelConfigSaving.value) return
   const generation = ++responseModelConfigGeneration
   responseModelConfigLoading.value = true
   try {
+    const status = await getCPAHelperPluginStatus()
+    if (generation !== responseModelConfigGeneration) return
+    responseVerificationSupported.value = status.response_model_verification_supported
+    if (!responseVerificationSupported.value) {
+      responseModelLoaded.value = false
+      responseModelConfigError.value = null
+      savedResponseModelSnapshot.value = ''
+      return
+    }
     const loaded = await getCPAHelperResponseModelConfig()
     if (generation !== responseModelConfigGeneration) return
     applyResponseModelConfig(loaded)
@@ -150,6 +182,7 @@ async function loadSettings(includeResponseConfig = true) {
       includeResponseConfig ? loadResponseModelConfig() : Promise.resolve(),
     ])
     if (generation !== settingsLoadGeneration) return
+    savedCPAURL = settings.cliaproxy_url
     settingsForm.cliaproxy_url = settings.cliaproxy_url
     settingsForm.model_request_url = settings.model_request_url
     settingsForm.management_key = ''
@@ -167,7 +200,7 @@ async function loadSettings(includeResponseConfig = true) {
 }
 
 async function saveResponseModelConfig() {
-  if (!canManageResponseVerification.value || !responseModelLoaded.value || responseModelConfigSaving.value) return
+  if (isSaving.value || !canManageResponseVerification.value || !responseModelLoaded.value || responseModelConfigSaving.value) return
   const acceptedModels: Record<string, string[]> = Object.create(null)
   for (const row of acceptedModelRows.value) {
     const request = row.request.trim()
@@ -207,7 +240,7 @@ async function saveResponseModelConfig() {
 }
 
 async function saveSettings() {
-  if (isLoading.value || isSaving.value) return
+  if (isLoading.value || isSaving.value || responseModelConfigSaving.value) return
   settingsLoadGeneration++
   isSaving.value = true
   try {
@@ -224,10 +257,13 @@ async function saveSettings() {
       payload.management_key = trimmedKey
     }
     const saved = await updateSettings(payload)
+    const connectionChanged = saved.cliaproxy_url !== savedCPAURL || !!trimmedKey
+    savedCPAURL = saved.cliaproxy_url
+    if (connectionChanged) invalidateResponseModelConfig()
     settingsForm.management_key = ''
     isManagementKeySet.value = saved.management_key_set
     message.success(t('设置已保存', 'Settings saved'))
-    await loadSettings(false)
+    await loadSettings(connectionChanged)
   } catch (error) {
     message.error(errorText(error, '保存设置失败', 'Failed to save settings'))
   } finally {
@@ -251,7 +287,7 @@ onBeforeUnmount(() => {
       </div>
       <NSpace>
         <NButton secondary :loading="isLoading" :disabled="isSaving || responseModelConfigSaving" @click="refresh">{{ t('刷新', 'Refresh') }}</NButton>
-        <NButton type="primary" :loading="isSaving" :disabled="isLoading" @click="saveSettings">{{ t('保存设置', 'Save settings') }}</NButton>
+        <NButton type="primary" :loading="isSaving" :disabled="isLoading || responseModelConfigSaving" @click="saveSettings">{{ t('保存设置', 'Save settings') }}</NButton>
       </NSpace>
     </div>
 
@@ -356,6 +392,9 @@ onBeforeUnmount(() => {
             <NDescriptionsItem :label="t('累计写入', 'Records written')">
               {{ formatInteger(collectorStatus?.records_collected ?? 0) }}
             </NDescriptionsItem>
+            <NDescriptionsItem :label="t('TTL 归属或入账处理中', 'TTL attribution or accounting in progress')">
+              {{ formatInteger(collectorStatus?.ttl_pending_records ?? 0) }}
+            </NDescriptionsItem>
             <NDescriptionsItem :label="t('最后轮询', 'Last poll')">
               {{ formatDateTime(collectorStatus?.last_poll_at ?? null) }}
             </NDescriptionsItem>
@@ -363,6 +402,7 @@ onBeforeUnmount(() => {
               {{ formatDateTime(collectorStatus?.last_success_at ?? null) }}
             </NDescriptionsItem>
           </NDescriptions>
+          <p v-if="pendingTTLText" class="form-help" role="status">{{ pendingTTLText }}</p>
           <NAlert
             v-if="collectorStatus?.last_error"
             type="warning"
@@ -374,6 +414,9 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
+      <NAlert v-if="currentUser?.is_super_admin && responseModelConfigError && !canManageResponseVerification" type="warning" :bordered="false" class="status-alert">
+        {{ responseModelConfigErrorText }}
+      </NAlert>
       <section v-if="canManageResponseVerification" class="panel response-verification-panel">
         <div class="panel-inner">
           <div class="section-heading-row">
@@ -381,7 +424,7 @@ onBeforeUnmount(() => {
               <h2 class="section-title">{{ t('响应核验', 'Response verification') }}</h2>
               <p class="form-help">{{ t('仅超级管理员可修改，保存前会由插件校验并确认热更新。', 'Super admins only. The plugin validates and confirms hot reload before success.') }}</p>
             </div>
-            <NButton type="primary" :loading="responseModelConfigSaving" :disabled="responseModelConfigLoading || !responseModelLoaded || !!responseModelConfigError" @click="saveResponseModelConfig">
+            <NButton type="primary" :loading="responseModelConfigSaving" :disabled="isSaving || responseModelConfigLoading || !responseModelLoaded || !!responseModelConfigError" @click="saveResponseModelConfig">
               {{ t('保存核验配置', 'Save verification config') }}
             </NButton>
           </div>

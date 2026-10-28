@@ -83,6 +83,7 @@ func newPluginManagementFixture(t *testing.T, release pluginManagementRelease) (
 		case "GET /v0/management/plugins/cpa-helper-plugin/v1/capabilities":
 			payload = map[string]any{
 				"plugin_version": release.version, "cpa_version": release.cpaTarget, "contract_version": "v1",
+				"abi_version": 1, "schema_version": 7,
 				"response_model_mismatch": fixture.settings["response_model_mismatch"],
 			}
 		case "GET /v0/management/plugins/cpa-helper-plugin/v1/directory":
@@ -308,7 +309,9 @@ func TestPluginManagementReleaseDirectory(t *testing.T) {
 }
 
 func TestPluginManagementReleaseResponseModelSave(t *testing.T) {
-	for _, release := range pluginManagementReleases {
+	releases := append([]pluginManagementRelease(nil), pluginManagementReleases...)
+	releases = append(releases, pluginManagementRelease{version: "0.1.9", cpaTarget: "v8.0.45", v8: true})
+	for _, release := range releases {
 		t.Run(release.version, func(t *testing.T) {
 			fixture, cfg := newPluginManagementFixture(t, release)
 			before := fixture.snapshot()

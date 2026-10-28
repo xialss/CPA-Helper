@@ -90,6 +90,7 @@ export interface CPAHelperPluginKey {
   enabled: boolean
   group_ids: string[]
   max_concurrency: number
+  claude_cache_ttl?: '' | '5m' | '1h'
   rule: CPAHelperPluginRule
   [key: string]: unknown
 }
@@ -136,10 +137,18 @@ export interface CPAHelperPluginKeyMetadata {
   key_preview: string
 }
 
+export interface CPAHelperPluginClaudeTTLFeature {
+  supported: boolean
+  status: 'configured' | 'disabled' | 'unavailable' | 'unsupported'
+  metadata_version?: 'v1'
+}
+
 export interface CPAHelperPluginStatus {
   loaded: boolean
   capabilities: Record<string, unknown>
   health: Record<string, unknown>
+  claude_cache_ttl: CPAHelperPluginClaudeTTLFeature
+  response_model_verification_supported: boolean
 }
 
 export interface CPAHelperResponseModelConfig {
@@ -332,6 +341,8 @@ export interface CollectorStatus {
   last_error: string | null
   remote_enabled: boolean | null
   records_collected: number
+  ttl_pending_records: number
+  ttl_pending_reason: string | null
 }
 
 export interface CodexKeeperPriorityRule {
@@ -629,6 +640,7 @@ export interface UsageRecordListItem {
   source: string | null
   source_label: string | null
   request_id: string | null
+  execution_id: string | null
   auth_index: string | null
   auth: string | null
   latency_ms: number | null
@@ -642,6 +654,11 @@ export interface UsageRecordListItem {
   cache_creation_ttl: '5m' | '1h' | 'mixed' | 'unknown' | null
   cache_creation_5m_tokens: number | null
   cache_creation_1h_tokens: number | null
+  cache_creation_ttl_source: 'upstream' | 'enforced_request' | 'unknown' | null
+  cache_creation_ttl_status: 'pending' | 'matched' | 'missing' | 'expired' | 'unsupported' | 'error' | 'conflict' | 'not_applicable' | 'legacy' | null
+  cache_creation_ttl_reason: string | null
+  cache_creation_policy_revision: number | null
+  cache_creation_observed_at: string | null
   reasoning_tokens: number
   total_tokens: number
   estimated_cost_usd: number

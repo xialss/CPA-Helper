@@ -222,6 +222,12 @@ func cloneUsageAnalyticsHourlyString(value *string) *string {
 
 func usageAnalyticsRecordSourceKey(record UsageRecord) *string {
 	if record.analyticsSourceKey != nil {
+		// A nonempty direct-import correction can replace the retained source.
+		// An unchanged mask keeps the pre-mask identity captured by the inbox.
+		if rawSource := sourceFromUsageRawJSON(record.RawJSON); rawSource != nil &&
+			(usageSourceAPIKeyHash(rawSource) != "" || record.Source == nil || strings.TrimSpace(*rawSource) != strings.TrimSpace(*record.Source)) {
+			return usageSourceKey(rawSource)
+		}
 		return record.analyticsSourceKey
 	}
 	return usageSourceKey(usageAnalyticsRecordSource(record))

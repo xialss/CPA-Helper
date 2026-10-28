@@ -9,6 +9,8 @@ import { createServer, transformWithEsbuild } from 'vite'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const responsePath = '/api/cpa-helper-plugin/response-model'
+const pluginStatusPath = '/api/cpa-helper-plugin/status'
+const settingsPath = '/api/settings'
 const directoryPath = '/api/cpa-helper-plugin/directory'
 const env = {
   errors: [], successes: [], warnings: [], dialogs: [], reads: [], writes: [], pendingReads: [], pendingWrites: [],
@@ -16,6 +18,7 @@ const env = {
   settings: { cliaproxy_url: 'http://cpa.invalid', model_request_url: 'http://cpa.invalid', management_key: '', management_key_set: true, collector_enabled: true, queue_name: 'usage', batch_size: 100, poll_interval_seconds: 2, retry_interval_seconds: 10 },
   responseConfig: { enabled: false, stream_enabled: true, responses_only_stream: true, max_buffer_bytes: 2097152, max_total_buffer_bytes: 8388608, action: 'reject', unknown_action: 'pass', case_sensitive: false, ignore_thinking_suffix: true, ignored_models: ['ignored-model'], accepted_models: { 'request-model': ['response-model'] } },
   policy: { contract_version: 'v1', plugin_version: '0.1.5', policy_revision: 1, generated_at: '', groups: [{ id: 'existing', name: 'Existing', note: '', rule: {} }], keys: [], future_policy_field: { preserve: true } },
+  status: { loaded: true, capabilities: {}, health: {}, response_model_verification_supported: true, claude_cache_ttl: { supported: false, status: 'unsupported' } },
 }
 const originalGlobals = new Map(['fetch', 'localStorage', 'document', 'crypto'].map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))
 globalThis.__pluginFormsSmoke = env
@@ -47,11 +50,11 @@ globalThis.fetch = async (url, init) => {
   } else {
     env.reads.push(path)
     if (path === '/api/settings') snapshot = env.settings
-    else if (path === '/api/collector/status') snapshot = { enabled: env.settings.collector_enabled, running: false, records_collected: 0 }
+    else if (path === '/api/collector/status') snapshot = { enabled: env.settings.collector_enabled, running: false, records_collected: 0, ttl_pending_records: 3 }
     else if (path === responsePath) snapshot = env.responseConfig
     else if (path === '/api/cpa-helper-plugin/policy') snapshot = env.policy
     else if (path === directoryPath) snapshot = { models: [], credentials: [], credential_providers: [] }
-    else if (path === '/api/cpa-helper-plugin/status') snapshot = { loaded: true, capabilities: {}, health: {} }
+    else if (path === '/api/cpa-helper-plugin/status') snapshot = env.status
     else assert.fail(`Unexpected read ${path}`)
   }
   snapshot = structuredClone(snapshot)
@@ -257,9 +260,12 @@ try {
   const savingResponse = state.saveResponseModelConfig()
   await settle()
   const beforeDuplicateResponse = writeCount(responsePath)
+  const beforeConcurrentSettings = writeCount(settingsPath)
   await state.saveResponseModelConfig()
+  await state.saveSettings()
   state.refresh()
   assert.equal(writeCount(responsePath), beforeDuplicateResponse, 'Verification save has a duplicate submission guard')
+  assert.equal(writeCount(settingsPath), beforeConcurrentSettings, 'A pending verification save cannot change its CPA connection')
   lastWrite(responsePath).resolve(jsonResponse(lastWrite(responsePath).snapshot))
   await savingResponse
   env.deferredWrites.delete(responsePath)
@@ -274,6 +280,122 @@ try {
   await unmountedResponse
   assert.equal(state.responseModelConfigError.value, null)
   env.deferredReads.delete(responsePath)
+
+  env.status = { ...env.status, response_model_verification_supported: false, capabilities: { modules: ['model_rules', 'claude_cache_ttl'] }, claude_cache_ttl: { supported: true, status: 'configured', metadata_version: 'v1' } }
+  const beforeRemovedReads = readCount(responsePath)
+  const beforeRemovedWrites = writeCount(responsePath)
+  const removedVerifier = await mount('settings')
+  assert.equal(removedVerifier.state.canManageResponseVerification.value, false)
+  assert.equal(removedVerifier.state.responseModelLoaded.value, false)
+  assert.equal(readCount(responsePath), beforeRemovedReads, 'Plugin without verification capability never receives the removed GET')
+  assert.ok(!textContent(removedVerifier.host).includes('响应核验'), 'Removed verification has no settings entry')
+  assert.ok(ui(removedVerifier.host, 'NDescriptionsItem').some((node) => node.props.label === 'TTL 归属或入账处理中' && textContent(node) === '3'), 'Pending attribution/accounting count is visible during recovery')
+  assert.match(textContent(removedVerifier.host), /正在处理 TTL 归属或入账/)
+  await removedVerifier.state.saveResponseModelConfig()
+  assert.equal(writeCount(responsePath), beforeRemovedWrites, 'No removed verifier save is sent')
+  removedVerifier.state.settingsForm.batch_size = 300
+  await removedVerifier.state.saveSettings()
+  assert.equal(env.settings.batch_size, 300, 'Other settings remain usable after feature removal')
+  assert.equal(readCount(responsePath), beforeRemovedReads)
+
+  const switched = removedVerifier.state
+  const supportedStatus = { ...env.status, response_model_verification_supported: true, capabilities: { modules: ['model_rules', 'response_model_mismatch'] } }
+  const removedStatus = structuredClone(env.status)
+  env.status = supportedStatus
+  switched.settingsForm.cliaproxy_url = 'http://legacy-cpa.invalid'
+  const beforeRestoredProbe = readCount(pluginStatusPath)
+  await switched.saveSettings()
+  assert.equal(readCount(pluginStatusPath), beforeRestoredProbe + 1, 'A saved CPA target is re-probed')
+  assert.equal(readCount(responsePath), beforeRemovedReads + 1, 'Switching back to a capable target loads its verifier config')
+  assert.equal(switched.canManageResponseVerification.value, true)
+  assert.ok(textContent(removedVerifier.host).includes('响应核验'), 'A capable replacement restores the entry without a remount')
+
+  switched.ignoredModelsText.value = 'old-target-draft'
+  switched.settingsForm.cliaproxy_url = 'http://ttl-cpa.invalid'
+  env.failedWrites.add(settingsPath)
+  await switched.saveSettings()
+  env.failedWrites.delete(settingsPath)
+  assert.equal(switched.ignoredModelsText.value, 'old-target-draft', 'A failed connection save preserves the verifier draft')
+  assert.equal(switched.responseModelDirty.value, true)
+  assert.equal(switched.canManageResponseVerification.value, true)
+
+  env.status = removedStatus
+  env.deferredWrites.add(settingsPath)
+  const changeTarget = switched.saveSettings()
+  await settle()
+  assert.equal(switched.responseModelFormDisabled.value, true, 'Verifier controls are disabled during a connection save')
+  assert.equal(button(removedVerifier.host, '保存核验配置').props.disabled, true)
+  const beforeTargetVerifierReads = readCount(responsePath)
+  const beforeTargetVerifierWrites = writeCount(responsePath)
+  await switched.saveResponseModelConfig()
+  assert.equal(writeCount(responsePath), beforeTargetVerifierWrites, 'A connection save cannot submit the old verifier draft')
+  lastWrite(settingsPath).resolve(jsonResponse(lastWrite(settingsPath).snapshot))
+  await changeTarget
+  env.deferredWrites.delete(settingsPath)
+  assert.equal(switched.canManageResponseVerification.value, false)
+  assert.equal(switched.responseModelLoaded.value, false)
+  assert.equal(switched.responseModelDirty.value, false)
+  assert.equal(switched.ignoredModelsText.value, '')
+  assert.deepEqual(switched.acceptedModelRows.value, [])
+  assert.ok(!textContent(removedVerifier.host).includes('响应核验'), 'The removed entry does not survive a saved CPA target change')
+  await switched.saveResponseModelConfig()
+  assert.equal(readCount(responsePath), beforeTargetVerifierReads, 'A removed target receives no verifier GET')
+  assert.equal(writeCount(responsePath), beforeTargetVerifierWrites, 'A removed target receives no verifier PUT or validate request')
+
+  env.status = supportedStatus
+  env.responseConfig = { ...env.responseConfig, ignored_models: ['new-identity-model'] }
+  delete env.responseConfig.responses_only_stream
+  switched.settingsForm.management_key = 'fixture-management-identity-a'
+  const beforeIdentityProbe = readCount(pluginStatusPath)
+  await switched.saveSettings()
+  assert.equal(readCount(pluginStatusPath), beforeIdentityProbe + 1, 'A management identity change re-probes even at the same URL')
+  assert.equal(switched.canManageResponseVerification.value, true)
+  assert.equal(switched.ignoredModelsText.value, 'new-identity-model')
+  assert.equal(Object.hasOwn(switched.responseConfig, 'responses_only_stream'), false, 'A new connection cannot inherit fields absent from its config')
+  env.status = removedStatus
+  switched.settingsForm.management_key = 'fixture-management-identity-b'
+  await switched.saveSettings()
+  assert.equal(switched.canManageResponseVerification.value, false, 'A same-URL management identity can remove the capability')
+  assert.ok(!textContent(removedVerifier.host).includes('响应核验'))
+
+  for (const delayedPath of [pluginStatusPath, responsePath]) {
+    for (const outcome of ['success', 'failure']) {
+      env.status = supportedStatus
+      switched.settingsForm.cliaproxy_url = `http://legacy-${outcome}-${delayedPath === pluginStatusPath ? 'status' : 'config'}.invalid`
+      await switched.saveSettings()
+      assert.equal(switched.canManageResponseVerification.value, true)
+      env.deferredReads.add(delayedPath)
+      const oldTargetLoad = switched.loadResponseModelConfig()
+      await settle()
+      const oldTargetRead = lastRead(delayedPath)
+      env.status = removedStatus
+      switched.settingsForm.cliaproxy_url = `http://removed-${outcome}-${delayedPath === pluginStatusPath ? 'status' : 'config'}.invalid`
+      const replaceTarget = switched.saveSettings()
+      await settle()
+      const replacementProbe = delayedPath === pluginStatusPath ? lastRead(pluginStatusPath) : null
+      const readsAfterReplacement = readCount(responsePath)
+      assert.equal(switched.canManageResponseVerification.value, false, 'A replacement connection immediately invalidates the old capability')
+      if (outcome === 'success') oldTargetRead.resolve(jsonResponse(oldTargetRead.snapshot))
+      else oldTargetRead.reject(new Error('obsolete CPA target response'))
+      await oldTargetLoad
+      assert.equal(switched.canManageResponseVerification.value, false, `Delayed old ${delayedPath} ${outcome} cannot restore the entry`)
+      assert.equal(switched.responseModelLoaded.value, false)
+      assert.equal(switched.responseModelConfigError.value, null, 'An old connection cannot publish a late error')
+      assert.equal(readCount(responsePath), readsAfterReplacement, 'An old capability response cannot dispatch a verifier GET on the replacement target')
+      if (replacementProbe) {
+        assert.notEqual(replacementProbe, oldTargetRead)
+        assert.equal(switched.responseModelConfigLoading.value, true, 'Old cleanup cannot finish the replacement capability probe')
+        replacementProbe.resolve(jsonResponse(replacementProbe.snapshot))
+      }
+      await replaceTarget
+      env.deferredReads.delete(delayedPath)
+      assert.equal(switched.responseModelConfigLoading.value, false)
+      assert.equal(switched.responseModelConfigError.value, null)
+      assert.ok(!textContent(removedVerifier.host).includes('响应核验'))
+    }
+  }
+  app.unmount()
+  app = null
 
   const rules = await mount('rules')
   const route = rules.state
@@ -480,7 +602,7 @@ try {
   removedDirectory.reject(new Error('unmounted directory read'))
   await removedRefresh
   assert.equal(env.errors.length, beforeUnmountError)
-  console.log('Plugin forms smoke passed: HTTP rule IDs, independent saves, lossless model-name mappings, complete dirty snapshots, stale success/error/finally, Escape/discard/save guards, duplicate delete and unmount')
+  console.log('Plugin forms smoke passed: HTTP rule IDs, independent saves, CPA target/identity capability transitions, stale target success/error/finally, lossless model-name mappings, complete dirty snapshots, Escape/discard/save guards, duplicate delete and unmount')
 } finally {
   app?.unmount()
   await server.close()

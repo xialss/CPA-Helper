@@ -219,6 +219,9 @@ func mapToRawObject(value map[string]json.RawMessage) []byte {
 }
 
 func (a *App) cpaHelperPluginPolicy(ctx context.Context, cfg AppConfig) (map[string]json.RawMessage, string, error) {
+	if _, err := a.cpaHelperPluginCapabilities(ctx, cfg); err != nil {
+		return nil, "", err
+	}
 	status, headers, payload, err := a.cpaHelperPluginRequest(ctx, cfg, http.MethodGet, cpaHelperPluginManagementPrefix+"/policy", nil, nil)
 	if err != nil {
 		return nil, "", appErrorFromPlugin(err, status)
@@ -360,6 +363,9 @@ func normalizePluginPolicy(policy map[string]json.RawMessage) error {
 		return err
 	}
 	for _, group := range groups {
+		if _, exists := group["claude_cache_ttl"]; exists {
+			return validationError("Claude 缓存 TTL 只能配置在 API 密钥上")
+		}
 		if err := normalizePluginPolicyRule(group); err != nil {
 			return err
 		}
@@ -370,6 +376,15 @@ func normalizePluginPolicy(policy map[string]json.RawMessage) error {
 }
 
 func normalizePluginPolicyKey(key map[string]json.RawMessage) error {
+	if raw, exists := key["claude_cache_ttl"]; exists {
+		var ttl string
+		if rawJSONNull(raw) || json.Unmarshal(raw, &ttl) != nil || (ttl != "" && ttl != "5m" && ttl != "1h") {
+			return validationError("Claude 缓存 TTL 必须为继承 CPA、5m 或 1h")
+		}
+		if ttl == "" {
+			delete(key, "claude_cache_ttl")
+		}
+	}
 	if raw, ok := key["enabled"]; !ok || rawJSONNull(raw) {
 		key["enabled"] = mustRawBool(true)
 	}
@@ -504,6 +519,11 @@ func (a *App) cpaHelperPluginCapabilities(ctx context.Context, cfg AppConfig) (m
 	if _, err := pluginUsesV8Management(capabilities); err != nil {
 		return nil, err
 	}
+	if version := rawString(capabilities["plugin_version"]); version == "0.1.9" || version == "0.1.10" {
+		if rawUint(capabilities["abi_version"]) != 1 || rawUint(capabilities["schema_version"]) != 7 {
+			return nil, pluginIncompatibleError()
+		}
+	}
 	return capabilities, nil
 }
 
@@ -523,6 +543,8 @@ func pluginUsesV8Management(capabilities map[string]json.RawMessage) (bool, erro
 		expectedCPATarget = "v8.0.29"
 	case "0.1.8":
 		expectedCPATarget = pluginModelCatalogCPA
+	case "0.1.9", "0.1.10":
+		expectedCPATarget = "v8.0.45"
 	default:
 		return false, appError("plugin_incompatible", http.StatusServiceUnavailable, "CPA Helper Plugin 版本不兼容")
 	}
@@ -843,6 +865,18 @@ func (a *App) putCPAHelperPluginPolicy(ctx context.Context, cfg AppConfig, curre
 	if err := validatePluginPolicyArrays(policy, false); err != nil {
 		return nil, err
 	}
+	if err := normalizePluginPolicy(policy); err != nil {
+		return nil, err
+	}
+	if pluginPolicyEnablesTTL(current, policy) {
+		feature, err := a.pluginClaudeTTLFeature(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		if !feature.Supported || feature.Status != "configured" {
+			return nil, appError("plugin_claude_ttl_unavailable", http.StatusServiceUnavailable, "Claude 缓存 TTL 尚未完成插件配置校验")
+		}
+	}
 	delete(policy, pluginKeyMetadataField)
 	if err := a.projectLocalPluginKeyLabels(ctx, policy); err != nil {
 		return nil, err
@@ -882,6 +916,9 @@ func (a *App) putCPAHelperPluginPolicy(ctx context.Context, cfg AppConfig, curre
 	if rawUint(latest["policy_revision"]) != acceptedRevision {
 		return nil, appError("plugin_sync_failed", http.StatusServiceUnavailable, "插件策略保存后未生效")
 	}
+	if !pluginPolicyTTLMatches(policy, latest) {
+		return nil, appError("plugin_sync_failed", http.StatusServiceUnavailable, "插件 API 密钥缓存 TTL 保存后未生效")
+	}
 	return latest, nil
 }
 
@@ -889,6 +926,9 @@ func (a *App) pluginResponseModelConfig(ctx context.Context, cfg AppConfig) (map
 	capabilities, err := a.cpaHelperPluginCapabilities(ctx, cfg)
 	if err != nil {
 		return nil, err
+	}
+	if !pluginSupportsResponseVerification(capabilities) {
+		return nil, pluginResponseVerificationUnsupported()
 	}
 	var config map[string]json.RawMessage
 	if raw, ok := capabilities["response_model_mismatch"]; ok {
@@ -955,6 +995,9 @@ func (a *App) updatePluginResponseModelConfig(ctx context.Context, cfg AppConfig
 	capabilities, capErr := a.cpaHelperPluginCapabilities(ctx, cfg)
 	if capErr != nil {
 		return nil, capErr
+	}
+	if !pluginSupportsResponseVerification(capabilities) {
+		return nil, pluginResponseVerificationUnsupported()
 	}
 	v8, versionErr := pluginUsesV8Management(capabilities)
 	if versionErr != nil {
@@ -1166,13 +1209,14 @@ func (a *App) pluginDirectory(ctx context.Context, cfg AppConfig, user *AuthUser
 		}
 	}
 	models := []string{}
-	// Global rules need the union of every downstream key's catalog. Account
-	// and per-key editors only query their own selected keys. Downstream keys
-	// are query identities, never scheduler credentials or provider categories.
-	if user.IsSuperAdmin && localHash == "" {
-		if catalogSupported {
-			models = pluginCatalogModels(catalog.Snapshot)
-		} else if v8Management {
+	if catalogSupported {
+		// Editors need the complete registry even after saving a restrictive
+		// policy. Querying the selected Key would filter out its other choices.
+		models = pluginCatalogModels(catalog.Snapshot)
+		keys = nil
+	} else if user.IsSuperAdmin && localHash == "" {
+		// Keep the legacy lookup only for releases without a registry catalog.
+		if v8Management {
 			keys, err = pluginV8DownstreamKeys(config)
 		} else {
 			keys, err = a.remoteAPIKeys(ctx, cfg)
@@ -1777,6 +1821,7 @@ func (a *App) handleCPAHelperPlugin(w http.ResponseWriter, r *http.Request) erro
 		if err != nil {
 			return err
 		}
+		responseVerificationSupported := pluginSupportsResponseVerification(capabilities)
 		if !user.IsSuperAdmin {
 			capabilities = cloneRawObject(capabilities)
 			delete(capabilities, "response_model_mismatch")
@@ -1784,7 +1829,17 @@ func (a *App) handleCPAHelperPlugin(w http.ResponseWriter, r *http.Request) erro
 		// Live activity is available through the authorized account/admin
 		// summary endpoints, without exposing caller-scope identities.
 		delete(healthObject, "active")
-		writeJSON(w, http.StatusOK, map[string]any{"loaded": true, "capabilities": capabilities, "health": healthObject})
+		feature, err := a.pluginClaudeTTLFeatureFromState(r.Context(), cfg, capabilities, healthObject)
+		if err != nil {
+			return err
+		}
+		if _, exists := capabilities["claude_cache_ttl"]; exists {
+			capabilities["claude_cache_ttl"] = mustRaw(feature)
+		}
+		if _, exists := healthObject["claude_cache_ttl"]; exists {
+			healthObject["claude_cache_ttl"] = mustRaw(feature)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"loaded": true, "capabilities": capabilities, "health": healthObject, "claude_cache_ttl": feature, "response_model_verification_supported": responseVerificationSupported})
 		return nil
 	case "/policy":
 		if !user.IsSuperAdmin {
