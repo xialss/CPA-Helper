@@ -24,6 +24,8 @@ const modelBillingUnitRequest = "request"
 const usageCostKindInput = "input"
 const usageCostKindCacheRead = "cache_read"
 const usageCostKindCacheCreation = "cache_creation"
+const usageCostKindCacheCreation5m = "cache_creation_5m"
+const usageCostKindCacheCreation1h = "cache_creation_1h"
 const usageCostKindOutput = "output"
 const usageCostKindRequest = "request"
 const serviceTierPriority = "priority"
@@ -59,65 +61,70 @@ var defaultPriorityMultipliers = map[string]float64{
 }
 
 type ModelPrice struct {
-	TimePricing                *PriceTimeRule                        `json:"time_pricing"`
-	ID                         int                                   `json:"id"`
-	Provider                   string                                `json:"provider"`
-	Model                      string                                `json:"model"`
-	PriceScope                 string                                `json:"price_scope"`
-	ChannelAuthType            *string                               `json:"channel_auth_type"`
-	ChannelBrand               *string                               `json:"channel_brand"`
-	ChannelKey                 *string                               `json:"channel_key"`
-	InputUSDPerMillion         float64                               `json:"input_usd_per_million"`
-	OutputUSDPerMillion        float64                               `json:"output_usd_per_million"`
-	CacheReadUSDPerMillion     float64                               `json:"cache_read_usd_per_million"`
-	CacheCreationUSDPerMillion float64                               `json:"cache_creation_usd_per_million"`
-	RequestUSD                 *float64                              `json:"request_usd"`
-	PriorityMultiplier         *float64                              `json:"priority_multiplier"`
-	LongContext                *ModelPriceLongContext                `json:"long_context"`
-	PreservedLongContext       *ModelPriceLibraryConflictLongContext `json:"preserved_long_context"`
-	BillingUnit                string                                `json:"billing_unit"`
-	Source                     string                                `json:"source"`
-	SourceModel                *string                               `json:"source_model"`
-	AutoSynced                 bool                                  `json:"auto_synced"`
-	LastSyncedAt               *time.Time                            `json:"last_synced_at"`
-	UpdatedAt                  time.Time                             `json:"updated_at"`
-	longContextInvalid         bool
-	cacheCreationExplicit      bool
+	TimePricing                  *PriceTimeRule                        `json:"time_pricing"`
+	ID                           int                                   `json:"id"`
+	Provider                     string                                `json:"provider"`
+	Model                        string                                `json:"model"`
+	PriceScope                   string                                `json:"price_scope"`
+	ChannelAuthType              *string                               `json:"channel_auth_type"`
+	ChannelBrand                 *string                               `json:"channel_brand"`
+	ChannelKey                   *string                               `json:"channel_key"`
+	InputUSDPerMillion           float64                               `json:"input_usd_per_million"`
+	OutputUSDPerMillion          float64                               `json:"output_usd_per_million"`
+	CacheReadUSDPerMillion       float64                               `json:"cache_read_usd_per_million"`
+	CacheCreationUSDPerMillion   float64                               `json:"cache_creation_usd_per_million"`
+	CacheCreation1hUSDPerMillion *float64                              `json:"cache_creation_1h_usd_per_million"`
+	RequestUSD                   *float64                              `json:"request_usd"`
+	PriorityMultiplier           *float64                              `json:"priority_multiplier"`
+	LongContext                  *ModelPriceLongContext                `json:"long_context"`
+	PreservedLongContext         *ModelPriceLibraryConflictLongContext `json:"preserved_long_context"`
+	BillingUnit                  string                                `json:"billing_unit"`
+	Source                       string                                `json:"source"`
+	SourceModel                  *string                               `json:"source_model"`
+	AutoSynced                   bool                                  `json:"auto_synced"`
+	LastSyncedAt                 *time.Time                            `json:"last_synced_at"`
+	UpdatedAt                    time.Time                             `json:"updated_at"`
+	longContextInvalid           bool
+	cacheCreationExplicit        bool
 }
 
 type ModelPriceLibraryConflict struct {
-	OriginalID               int                                   `json:"original_id"`
-	SelectedPriceID          int                                   `json:"selected_price_id"`
-	ConflictReason           string                                `json:"conflict_reason"`
-	Price                    ModelPrice                            `json:"price"`
-	ArchivedLongContext      *ModelPriceLibraryConflictLongContext `json:"archived_long_context"`
-	requestUSD               sql.NullFloat64
-	billingUnit              sql.NullString
-	priorityMultiplier       sql.NullFloat64
-	longContextThreshold     sql.NullInt64
-	longContextInput         sql.NullFloat64
-	longContextOutput        sql.NullFloat64
-	longContextCacheRead     sql.NullFloat64
-	longContextCacheCreation sql.NullFloat64
-	lastSyncedAtRaw          sql.NullString
-	updatedAtRaw             string
+	OriginalID                 int                                   `json:"original_id"`
+	SelectedPriceID            int                                   `json:"selected_price_id"`
+	ConflictReason             string                                `json:"conflict_reason"`
+	Price                      ModelPrice                            `json:"price"`
+	ArchivedLongContext        *ModelPriceLibraryConflictLongContext `json:"archived_long_context"`
+	requestUSD                 sql.NullFloat64
+	billingUnit                sql.NullString
+	priorityMultiplier         sql.NullFloat64
+	longContextThreshold       sql.NullInt64
+	longContextInput           sql.NullFloat64
+	longContextOutput          sql.NullFloat64
+	longContextCacheRead       sql.NullFloat64
+	longContextCacheCreation   sql.NullFloat64
+	cacheCreation1h            sql.NullFloat64
+	longContextCacheCreation1h sql.NullFloat64
+	lastSyncedAtRaw            sql.NullString
+	updatedAtRaw               string
 }
 
 type ModelPriceLibraryConflictLongContext struct {
-	ThresholdInputTokens       *int64            `json:"threshold_input_tokens"`
-	InputUSDPerMillion         *float64          `json:"input_usd_per_million"`
-	OutputUSDPerMillion        *float64          `json:"output_usd_per_million"`
-	CacheReadUSDPerMillion     *float64          `json:"cache_read_usd_per_million"`
-	CacheCreationUSDPerMillion *float64          `json:"cache_creation_usd_per_million"`
-	NonFiniteFields            map[string]string `json:"non_finite_fields,omitempty"`
+	ThresholdInputTokens         *int64            `json:"threshold_input_tokens"`
+	InputUSDPerMillion           *float64          `json:"input_usd_per_million"`
+	OutputUSDPerMillion          *float64          `json:"output_usd_per_million"`
+	CacheReadUSDPerMillion       *float64          `json:"cache_read_usd_per_million"`
+	CacheCreationUSDPerMillion   *float64          `json:"cache_creation_usd_per_million"`
+	CacheCreation1hUSDPerMillion *float64          `json:"cache_creation_1h_usd_per_million"`
+	NonFiniteFields              map[string]string `json:"non_finite_fields,omitempty"`
 }
 
 type ModelPriceLongContext struct {
-	ThresholdInputTokens       int64   `json:"threshold_input_tokens"`
-	InputUSDPerMillion         float64 `json:"input_usd_per_million"`
-	OutputUSDPerMillion        float64 `json:"output_usd_per_million"`
-	CacheReadUSDPerMillion     float64 `json:"cache_read_usd_per_million"`
-	CacheCreationUSDPerMillion float64 `json:"cache_creation_usd_per_million"`
+	ThresholdInputTokens         int64    `json:"threshold_input_tokens"`
+	InputUSDPerMillion           float64  `json:"input_usd_per_million"`
+	OutputUSDPerMillion          float64  `json:"output_usd_per_million"`
+	CacheReadUSDPerMillion       float64  `json:"cache_read_usd_per_million"`
+	CacheCreationUSDPerMillion   float64  `json:"cache_creation_usd_per_million"`
+	CacheCreation1hUSDPerMillion *float64 `json:"cache_creation_1h_usd_per_million"`
 }
 
 type usageTokenBreakdown struct {
@@ -166,34 +173,36 @@ type usageRequestCostBreakdownItem struct {
 func (usageRequestCostBreakdownItem) isUsageCostBreakdownItem() {}
 
 type modelPricePayload struct {
-	TimePricing                *PriceTimeRule                `json:"time_pricing"`
-	TimePricingSet             bool                          `json:"time_pricing_set"`
-	Provider                   string                        `json:"provider"`
-	Model                      string                        `json:"model"`
-	PriceScope                 string                        `json:"price_scope"`
-	ChannelAuthType            *string                       `json:"channel_auth_type"`
-	ChannelBrand               *string                       `json:"channel_brand"`
-	ChannelKey                 *string                       `json:"channel_key"`
-	ChannelIdentityHash        *string                       `json:"channel_identity_hash"`
-	BillingUnit                string                        `json:"billing_unit"`
-	InputUSDPerMillion         float64                       `json:"input_usd_per_million"`
-	OutputUSDPerMillion        float64                       `json:"output_usd_per_million"`
-	CacheReadUSDPerMillion     float64                       `json:"cache_read_usd_per_million"`
-	CacheCreationUSDPerMillion float64                       `json:"cache_creation_usd_per_million"`
-	RequestUSD                 *float64                      `json:"request_usd"`
-	LongContext                *modelPriceLongContextPayload `json:"long_context"`
-	PreserveInvalidLongContext *bool                         `json:"preserve_invalid_long_context"`
+	TimePricing                  *PriceTimeRule                `json:"time_pricing"`
+	TimePricingSet               bool                          `json:"time_pricing_set"`
+	Provider                     string                        `json:"provider"`
+	Model                        string                        `json:"model"`
+	PriceScope                   string                        `json:"price_scope"`
+	ChannelAuthType              *string                       `json:"channel_auth_type"`
+	ChannelBrand                 *string                       `json:"channel_brand"`
+	ChannelKey                   *string                       `json:"channel_key"`
+	ChannelIdentityHash          *string                       `json:"channel_identity_hash"`
+	BillingUnit                  string                        `json:"billing_unit"`
+	InputUSDPerMillion           float64                       `json:"input_usd_per_million"`
+	OutputUSDPerMillion          float64                       `json:"output_usd_per_million"`
+	CacheReadUSDPerMillion       float64                       `json:"cache_read_usd_per_million"`
+	CacheCreationUSDPerMillion   float64                       `json:"cache_creation_usd_per_million"`
+	CacheCreation1hUSDPerMillion *float64                      `json:"cache_creation_1h_usd_per_million"`
+	RequestUSD                   *float64                      `json:"request_usd"`
+	LongContext                  *modelPriceLongContextPayload `json:"long_context"`
+	PreserveInvalidLongContext   *bool                         `json:"preserve_invalid_long_context"`
 	// CorrectLatestVersion overwrites the newest channel price version in place
 	// instead of appending a new effective-dated version. Ignored for library prices.
 	CorrectLatestVersion bool `json:"correct_latest_version"`
 }
 
 type modelPriceLongContextPayload struct {
-	ThresholdInputTokens       *int64   `json:"threshold_input_tokens"`
-	InputUSDPerMillion         *float64 `json:"input_usd_per_million"`
-	OutputUSDPerMillion        *float64 `json:"output_usd_per_million"`
-	CacheReadUSDPerMillion     *float64 `json:"cache_read_usd_per_million"`
-	CacheCreationUSDPerMillion *float64 `json:"cache_creation_usd_per_million"`
+	ThresholdInputTokens         *int64   `json:"threshold_input_tokens"`
+	InputUSDPerMillion           *float64 `json:"input_usd_per_million"`
+	OutputUSDPerMillion          *float64 `json:"output_usd_per_million"`
+	CacheReadUSDPerMillion       *float64 `json:"cache_read_usd_per_million"`
+	CacheCreationUSDPerMillion   *float64 `json:"cache_creation_usd_per_million"`
+	CacheCreation1hUSDPerMillion *float64 `json:"cache_creation_1h_usd_per_million"`
 }
 
 type priorityMultiplierPayload struct {
@@ -853,8 +862,13 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 		!finiteNonNegative(payload.OutputUSDPerMillion) ||
 		!finiteNonNegative(payload.CacheReadUSDPerMillion) ||
 		!finiteNonNegative(payload.CacheCreationUSDPerMillion) ||
+		(payload.CacheCreation1hUSDPerMillion != nil && !finiteNonNegative(*payload.CacheCreation1hUSDPerMillion)) ||
 		(payload.RequestUSD != nil && !finiteNonNegative(*payload.RequestUSD)) {
 		return payload, validationError("价格不能为负数")
+	}
+	if !modelPricePayloadIsClaude(payload) && (payload.CacheCreation1hUSDPerMillion != nil ||
+		(payload.LongContext != nil && payload.LongContext.CacheCreation1hUSDPerMillion != nil)) {
+		return payload, validationError("1 小时缓存价格仅支持 Claude 价格")
 	}
 	if payload.LongContext != nil {
 		if payload.BillingUnit != modelBillingUnitToken {
@@ -873,21 +887,22 @@ func validatePricePayload(payload modelPricePayload) (modelPricePayload, error) 
 func modelPriceFromPayload(payload modelPricePayload, priorityMultiplier *float64) ModelPrice {
 	longContext, _ := longContextFromPayload(payload.LongContext)
 	return ModelPrice{
-		TimePricing:                payload.TimePricing,
-		Provider:                   payload.Provider,
-		Model:                      payload.Model,
-		PriceScope:                 payload.PriceScope,
-		ChannelAuthType:            payload.ChannelAuthType,
-		ChannelBrand:               payload.ChannelBrand,
-		ChannelKey:                 payload.ChannelKey,
-		BillingUnit:                payload.BillingUnit,
-		InputUSDPerMillion:         payload.InputUSDPerMillion,
-		OutputUSDPerMillion:        payload.OutputUSDPerMillion,
-		CacheReadUSDPerMillion:     payload.CacheReadUSDPerMillion,
-		CacheCreationUSDPerMillion: payload.CacheCreationUSDPerMillion,
-		RequestUSD:                 payload.RequestUSD,
-		PriorityMultiplier:         priorityMultiplier,
-		LongContext:                longContext,
+		TimePricing:                  payload.TimePricing,
+		Provider:                     payload.Provider,
+		Model:                        payload.Model,
+		PriceScope:                   payload.PriceScope,
+		ChannelAuthType:              payload.ChannelAuthType,
+		ChannelBrand:                 payload.ChannelBrand,
+		ChannelKey:                   payload.ChannelKey,
+		BillingUnit:                  payload.BillingUnit,
+		InputUSDPerMillion:           payload.InputUSDPerMillion,
+		OutputUSDPerMillion:          payload.OutputUSDPerMillion,
+		CacheReadUSDPerMillion:       payload.CacheReadUSDPerMillion,
+		CacheCreationUSDPerMillion:   payload.CacheCreationUSDPerMillion,
+		CacheCreation1hUSDPerMillion: payload.CacheCreation1hUSDPerMillion,
+		RequestUSD:                   payload.RequestUSD,
+		PriorityMultiplier:           priorityMultiplier,
+		LongContext:                  longContext,
 	}
 }
 
@@ -1060,11 +1075,12 @@ func longContextFromPayload(payload *modelPriceLongContextPayload) (*ModelPriceL
 		return nil, validationError("长上下文价格必须完整填写")
 	}
 	result := &ModelPriceLongContext{
-		ThresholdInputTokens:       *payload.ThresholdInputTokens,
-		InputUSDPerMillion:         *payload.InputUSDPerMillion,
-		OutputUSDPerMillion:        *payload.OutputUSDPerMillion,
-		CacheReadUSDPerMillion:     *payload.CacheReadUSDPerMillion,
-		CacheCreationUSDPerMillion: *payload.CacheCreationUSDPerMillion,
+		ThresholdInputTokens:         *payload.ThresholdInputTokens,
+		InputUSDPerMillion:           *payload.InputUSDPerMillion,
+		OutputUSDPerMillion:          *payload.OutputUSDPerMillion,
+		CacheReadUSDPerMillion:       *payload.CacheReadUSDPerMillion,
+		CacheCreationUSDPerMillion:   *payload.CacheCreationUSDPerMillion,
+		CacheCreation1hUSDPerMillion: payload.CacheCreation1hUSDPerMillion,
 	}
 	if !validLongContextPrice(result) {
 		return nil, validationError("长上下文阈值必须为正整数，价格必须是有限非负数")
@@ -1081,12 +1097,14 @@ func longContextPayloadFromPrice(price *ModelPriceLongContext) *modelPriceLongCo
 	outputUSD := price.OutputUSDPerMillion
 	cacheReadUSD := price.CacheReadUSDPerMillion
 	cacheCreationUSD := price.CacheCreationUSDPerMillion
+	cacheCreation1hUSD := price.CacheCreation1hUSDPerMillion
 	return &modelPriceLongContextPayload{
-		ThresholdInputTokens:       &threshold,
-		InputUSDPerMillion:         &inputUSD,
-		OutputUSDPerMillion:        &outputUSD,
-		CacheReadUSDPerMillion:     &cacheReadUSD,
-		CacheCreationUSDPerMillion: &cacheCreationUSD,
+		ThresholdInputTokens:         &threshold,
+		InputUSDPerMillion:           &inputUSD,
+		OutputUSDPerMillion:          &outputUSD,
+		CacheReadUSDPerMillion:       &cacheReadUSD,
+		CacheCreationUSDPerMillion:   &cacheCreationUSD,
+		CacheCreation1hUSDPerMillion: cacheCreation1hUSD,
 	}
 }
 
@@ -1096,11 +1114,12 @@ func defaultLongContextPrice(provider, model string) *ModelPriceLongContext {
 		return nil
 	}
 	result := &ModelPriceLongContext{
-		ThresholdInputTokens:       value.ThresholdInputTokens,
-		InputUSDPerMillion:         value.InputUSDPerMillion,
-		OutputUSDPerMillion:        value.OutputUSDPerMillion,
-		CacheReadUSDPerMillion:     value.CacheReadUSDPerMillion,
-		CacheCreationUSDPerMillion: value.CacheCreationUSDPerMillion,
+		ThresholdInputTokens:         value.ThresholdInputTokens,
+		InputUSDPerMillion:           value.InputUSDPerMillion,
+		OutputUSDPerMillion:          value.OutputUSDPerMillion,
+		CacheReadUSDPerMillion:       value.CacheReadUSDPerMillion,
+		CacheCreationUSDPerMillion:   value.CacheCreationUSDPerMillion,
+		CacheCreation1hUSDPerMillion: nil,
 	}
 	if !validLongContextPrice(result) {
 		return nil
@@ -1113,7 +1132,16 @@ func validLongContextPrice(price *ModelPriceLongContext) bool {
 		finiteNonNegative(price.InputUSDPerMillion) &&
 		finiteNonNegative(price.OutputUSDPerMillion) &&
 		finiteNonNegative(price.CacheReadUSDPerMillion) &&
-		finiteNonNegative(price.CacheCreationUSDPerMillion)
+		finiteNonNegative(price.CacheCreationUSDPerMillion) &&
+		(price.CacheCreation1hUSDPerMillion == nil || finiteNonNegative(*price.CacheCreation1hUSDPerMillion))
+}
+
+func modelPricePayloadIsClaude(payload modelPricePayload) bool {
+	if payload.PriceScope == modelPriceScopeChannel {
+		return aiProviderBrand(strings.TrimSpace(aiProviderOptionalString(payload.ChannelBrand))) == aiProviderBrandClaude
+	}
+	provider := strings.TrimSpace(payload.Provider)
+	return isClaudeProvider(&provider)
 }
 
 func modelPriceForAPI(price ModelPrice) ModelPrice {
@@ -1130,8 +1158,47 @@ func modelPriceForAPI(price ModelPrice) ModelPrice {
 	if price.longContextInvalid || (price.LongContext != nil && !validLongContextPrice(price.LongContext)) {
 		price.LongContext = nil
 	}
+	if !modelPriceSupportsClaudeCacheTTL(price) {
+		// The 1h cache-write field is Claude-only at the API boundary too. A
+		// legacy row must not leak or accidentally expose a value that billing
+		// intentionally ignores for non-Claude prices.
+		price.CacheCreation1hUSDPerMillion = nil
+		if price.LongContext != nil {
+			longContext := *price.LongContext
+			longContext.CacheCreation1hUSDPerMillion = nil
+			price.LongContext = &longContext
+		}
+		price.PreservedLongContext = stripNonClaudeLongContextAudit(price.PreservedLongContext)
+		if price.TimePricing != nil {
+			rule := *price.TimePricing
+			if rule.OffpeakRates != nil {
+				rates := *rule.OffpeakRates
+				rates.CacheCreation1h = nil
+				rule.OffpeakRates = &rates
+			}
+			price.TimePricing = &rule
+		}
+	}
 	price.PreservedLongContext = modelPriceLongContextAuditForAPI(price.PreservedLongContext)
 	return price
+}
+
+func stripNonClaudeLongContextAudit(value *ModelPriceLibraryConflictLongContext) *ModelPriceLibraryConflictLongContext {
+	if value == nil {
+		return nil
+	}
+	result := *value
+	result.CacheCreation1hUSDPerMillion = nil
+	if value.NonFiniteFields != nil {
+		fields := make(map[string]string, len(value.NonFiniteFields))
+		for field, invalid := range value.NonFiniteFields {
+			if field != "cache_creation_1h_usd_per_million" {
+				fields[field] = invalid
+			}
+		}
+		result.NonFiniteFields = fields
+	}
+	return &result
 }
 
 func modelPriceLongContextAuditForAPI(value *ModelPriceLibraryConflictLongContext) *ModelPriceLibraryConflictLongContext {
@@ -1155,6 +1222,7 @@ func modelPriceLongContextAuditForAPI(value *ModelPriceLibraryConflictLongContex
 		{"output_usd_per_million", &result.OutputUSDPerMillion},
 		{"cache_read_usd_per_million", &result.CacheReadUSDPerMillion},
 		{"cache_creation_usd_per_million", &result.CacheCreationUSDPerMillion},
+		{"cache_creation_1h_usd_per_million", &result.CacheCreation1hUSDPerMillion},
 	} {
 		if raw := *field.value; raw != nil && (math.IsNaN(*raw) || math.IsInf(*raw, 0)) {
 			if result.NonFiniteFields == nil {
@@ -1180,6 +1248,9 @@ func modelPriceLibraryConflictsForAPI(conflicts []ModelPriceLibraryConflict) []M
 	for index, conflict := range conflicts {
 		conflict.Price = modelPriceForAPI(conflict.Price)
 		conflict.ArchivedLongContext = modelPriceLongContextAuditForAPI(conflict.ArchivedLongContext)
+		if !modelPriceSupportsClaudeCacheTTL(conflict.Price) && conflict.ArchivedLongContext != nil {
+			conflict.ArchivedLongContext = stripNonClaudeLongContextAudit(conflict.ArchivedLongContext)
+		}
 		result[index] = conflict
 	}
 	return result
@@ -1232,33 +1303,7 @@ func (a *App) listPrices(ctx context.Context) ([]ModelPrice, error) {
 }
 
 func listPricesWithQueryer(ctx context.Context, queryer modelPriceQueryer) ([]ModelPrice, error) {
-	rows, err := queryer.QueryContext(ctx, `
-		SELECT id, provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
-		       input_usd_per_million, output_usd_per_million,
-		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
-		       priority_multiplier, long_context_threshold_tokens,
-		       long_context_input_usd_per_million, long_context_output_usd_per_million,
-		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
-		       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT), time_pricing
-		FROM model_prices
-		ORDER BY price_scope DESC, auto_synced ASC, lower(provider), lower(model)
-	`)
-	if isMissingBillingUnitColumnError(err) {
-		// A read-only migration test (and older maintenance commands) can open
-		// a pre-migration database before the new column is added. Keep that
-		// read path available; the migration backfills the persisted value.
-		rows, err = queryer.QueryContext(ctx, `
-			SELECT id, provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
-			       input_usd_per_million, output_usd_per_million,
-			       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd,
-			       priority_multiplier, long_context_threshold_tokens,
-			       long_context_input_usd_per_million, long_context_output_usd_per_million,
-			       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
-			       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
-			FROM model_prices
-			ORDER BY price_scope DESC, auto_synced ASC, lower(provider), lower(model)
-		`)
-	}
+	rows, err := queryModelPriceRows(ctx, queryer, " ORDER BY price_scope DESC, auto_synced ASC, lower(provider), lower(model)")
 	if err != nil {
 		return nil, err
 	}
@@ -1266,12 +1311,73 @@ func listPricesWithQueryer(ctx context.Context, queryer modelPriceQueryer) ([]Mo
 	return scanPrices(rows)
 }
 
-func isMissingBillingUnitColumnError(err error) bool {
+const modelPriceReadColumns = `id, provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
+	input_usd_per_million, output_usd_per_million,
+	cache_read_usd_per_million, cache_creation_usd_per_million, cache_creation_1h_usd_per_million, request_usd, billing_unit,
+	priority_multiplier, long_context_threshold_tokens,
+	long_context_input_usd_per_million, long_context_output_usd_per_million,
+	long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million, long_context_cache_creation_1h_usd_per_million,
+	source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT), time_pricing`
+
+func queryModelPriceRows(ctx context.Context, queryer modelPriceQueryer, suffix string, args ...any) (*sql.Rows, error) {
+	rows, err := queryer.QueryContext(ctx, "SELECT "+modelPriceReadColumns+" FROM model_prices"+suffix, args...)
+	if !isMissingPriceSchemaColumnError(err) {
+		return rows, err
+	}
+	// Maintenance reads may precede migrations. Inspect the actual schema so a
+	// missing new column never discards older, explicitly persisted attributes.
+	schemaRows, err := queryer.QueryContext(ctx, "SELECT * FROM model_prices LIMIT 0")
+	if err != nil {
+		return nil, err
+	}
+	columns, err := schemaRows.Columns()
+	closeErr := schemaRows.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	present := make(map[string]bool, len(columns))
+	for _, column := range columns {
+		present[column] = true
+	}
+	projection := modelPriceReadColumns
+	for _, column := range []string{"billing_unit", "time_pricing", "cache_creation_1h_usd_per_million", "long_context_cache_creation_1h_usd_per_million"} {
+		if !present[column] {
+			// Match complete comma-delimited expressions, not the 1h field's
+			// substring inside its long-context counterpart.
+			fields := strings.Split(projection, ",")
+			for i, field := range fields {
+				if strings.TrimSpace(field) == column {
+					fields[i] = "NULL AS " + column
+				}
+			}
+			projection = strings.Join(fields, ",")
+		}
+	}
+	return queryer.QueryContext(ctx, "SELECT "+projection+" FROM model_prices"+suffix, args...)
+}
+
+func isMissingPriceSchemaColumnError(err error) bool {
 	if err == nil {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "no such column") && strings.Contains(message, "billing_unit")
+	if !strings.Contains(message, "no such column") && !strings.Contains(message, "has no column named") {
+		return false
+	}
+	for _, column := range []string{
+		"billing_unit",
+		"time_pricing",
+		"cache_creation_1h_usd_per_million",
+		"long_context_cache_creation_1h_usd_per_million",
+	} {
+		if strings.Contains(message, column) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) billingPriceIndex(ctx context.Context) (modelPriceBillingIndex, error) {
@@ -2195,6 +2301,8 @@ func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 	}
 	hasBillingUnit := false
 	hasTimePricing := false
+	hasCacheCreation1h := false
+	hasLongContextCacheCreation1h := false
 	for _, column := range columns {
 		if strings.EqualFold(column, "time_pricing") {
 			hasTimePricing = true
@@ -2202,24 +2310,41 @@ func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 		if strings.EqualFold(column, "billing_unit") {
 			hasBillingUnit = true
 		}
+		if strings.EqualFold(column, "cache_creation_1h_usd_per_million") {
+			hasCacheCreation1h = true
+		}
+		if strings.EqualFold(column, "long_context_cache_creation_1h_usd_per_million") {
+			hasLongContextCacheCreation1h = true
+		}
 	}
 	for rows.Next() {
 		var price ModelPrice
 		var channelAuthType, channelBrand, channelKey, sourceModel, lastSynced, updatedAt sql.NullString
 		var requestUSD, priorityMultiplier sql.NullFloat64
+		var cacheCreation1h sql.NullFloat64
 		var billingUnit sql.NullString
 		var timeRule sql.NullString
 		var longContextThreshold sql.NullInt64
 		var longContextInput, longContextOutput, longContextCacheRead, longContextCacheCreation sql.NullFloat64
+		var longContextCacheCreation1h sql.NullFloat64
 		scanTargets := []any{
 			&price.ID, &price.Provider, &price.Model, &price.PriceScope, &channelAuthType, &channelBrand, &channelKey,
-			&price.InputUSDPerMillion, &price.OutputUSDPerMillion, &price.CacheReadUSDPerMillion, &price.CacheCreationUSDPerMillion, &requestUSD,
+			&price.InputUSDPerMillion, &price.OutputUSDPerMillion, &price.CacheReadUSDPerMillion, &price.CacheCreationUSDPerMillion,
 		}
+		if hasCacheCreation1h {
+			scanTargets = append(scanTargets, &cacheCreation1h)
+		}
+		scanTargets = append(scanTargets, &requestUSD)
 		if hasBillingUnit {
 			scanTargets = append(scanTargets, &billingUnit)
 		}
 		scanTargets = append(scanTargets,
 			&priorityMultiplier, &longContextThreshold, &longContextInput, &longContextOutput, &longContextCacheRead, &longContextCacheCreation,
+		)
+		if hasLongContextCacheCreation1h {
+			scanTargets = append(scanTargets, &longContextCacheCreation1h)
+		}
+		scanTargets = append(scanTargets,
 			&price.Source, &sourceModel, &price.AutoSynced, &lastSynced, &updatedAt,
 		)
 		if hasTimePricing {
@@ -2231,6 +2356,7 @@ func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 		if requestUSD.Valid {
 			price.RequestUSD = &requestUSD.Float64
 		}
+		price.CacheCreation1hUSDPerMillion = nullableFloat(cacheCreation1h)
 		price.TimePricing, err = parsePriceTimeRule(timeRule)
 		if err != nil {
 			return nil, err
@@ -2241,23 +2367,25 @@ func scanPrices(rows *sql.Rows) ([]ModelPrice, error) {
 		price.ChannelAuthType = nullableString(channelAuthType)
 		price.ChannelBrand = nullableString(channelBrand)
 		price.ChannelKey = nullableString(channelKey)
-		longContextConfigured := longContextThreshold.Valid || longContextInput.Valid || longContextOutput.Valid || longContextCacheRead.Valid || longContextCacheCreation.Valid
+		longContextConfigured := longContextThreshold.Valid || longContextInput.Valid || longContextOutput.Valid || longContextCacheRead.Valid || longContextCacheCreation.Valid || longContextCacheCreation1h.Valid
 		if longContextConfigured {
 			price.LongContext = &ModelPriceLongContext{
-				ThresholdInputTokens:       longContextThreshold.Int64,
-				InputUSDPerMillion:         longContextInput.Float64,
-				OutputUSDPerMillion:        longContextOutput.Float64,
-				CacheReadUSDPerMillion:     longContextCacheRead.Float64,
-				CacheCreationUSDPerMillion: longContextCacheCreation.Float64,
+				ThresholdInputTokens:         longContextThreshold.Int64,
+				InputUSDPerMillion:           longContextInput.Float64,
+				OutputUSDPerMillion:          longContextOutput.Float64,
+				CacheReadUSDPerMillion:       longContextCacheRead.Float64,
+				CacheCreationUSDPerMillion:   longContextCacheCreation.Float64,
+				CacheCreation1hUSDPerMillion: nullableFloat(longContextCacheCreation1h),
 			}
 			price.longContextInvalid = !longContextThreshold.Valid || !longContextInput.Valid || !longContextOutput.Valid || !longContextCacheRead.Valid || !longContextCacheCreation.Valid || !validLongContextPrice(price.LongContext)
 			if price.longContextInvalid {
 				price.PreservedLongContext = &ModelPriceLibraryConflictLongContext{
-					ThresholdInputTokens:       nullableInt64(longContextThreshold),
-					InputUSDPerMillion:         nullableFloat(longContextInput),
-					OutputUSDPerMillion:        nullableFloat(longContextOutput),
-					CacheReadUSDPerMillion:     nullableFloat(longContextCacheRead),
-					CacheCreationUSDPerMillion: nullableFloat(longContextCacheCreation),
+					ThresholdInputTokens:         nullableInt64(longContextThreshold),
+					InputUSDPerMillion:           nullableFloat(longContextInput),
+					OutputUSDPerMillion:          nullableFloat(longContextOutput),
+					CacheReadUSDPerMillion:       nullableFloat(longContextCacheRead),
+					CacheCreationUSDPerMillion:   nullableFloat(longContextCacheCreation),
+					CacheCreation1hUSDPerMillion: nullableFloat(longContextCacheCreation1h),
 				}
 			}
 		}
@@ -2280,10 +2408,10 @@ func (a *App) listModelPriceLibraryConflicts(ctx context.Context) ([]ModelPriceL
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT original_id, selected_price_id, conflict_reason, provider, model,
 		       input_usd_per_million, output_usd_per_million,
-		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
+		       cache_read_usd_per_million, cache_creation_usd_per_million, cache_creation_1h_usd_per_million, request_usd, billing_unit,
 		       priority_multiplier, long_context_threshold_tokens,
 		       long_context_input_usd_per_million, long_context_output_usd_per_million,
-		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
+		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million, long_context_cache_creation_1h_usd_per_million,
 		       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
 		FROM model_price_library_conflicts
 		ORDER BY lower(provider), lower(model), original_id
@@ -2304,10 +2432,10 @@ func scanModelPriceLibraryConflicts(rows *sql.Rows) ([]ModelPriceLibraryConflict
 			&conflict.OriginalID, &conflict.SelectedPriceID, &conflict.ConflictReason,
 			&conflict.Price.Provider, &conflict.Price.Model,
 			&conflict.Price.InputUSDPerMillion, &conflict.Price.OutputUSDPerMillion,
-			&conflict.Price.CacheReadUSDPerMillion, &conflict.Price.CacheCreationUSDPerMillion,
+			&conflict.Price.CacheReadUSDPerMillion, &conflict.Price.CacheCreationUSDPerMillion, &conflict.cacheCreation1h,
 			&conflict.requestUSD, &conflict.billingUnit, &conflict.priorityMultiplier, &conflict.longContextThreshold,
 			&conflict.longContextInput, &conflict.longContextOutput,
-			&conflict.longContextCacheRead, &conflict.longContextCacheCreation,
+			&conflict.longContextCacheRead, &conflict.longContextCacheCreation, &conflict.longContextCacheCreation1h,
 			&conflict.Price.Source, &sourceModel, &conflict.Price.AutoSynced,
 			&conflict.lastSyncedAtRaw, &conflict.updatedAtRaw,
 		); err != nil {
@@ -2316,27 +2444,30 @@ func scanModelPriceLibraryConflicts(rows *sql.Rows) ([]ModelPriceLibraryConflict
 		conflict.Price.ID = conflict.OriginalID
 		conflict.Price.PriceScope = modelPriceScopeLibrary
 		conflict.Price.RequestUSD = nullableFloat(conflict.requestUSD)
+		conflict.Price.CacheCreation1hUSDPerMillion = nullableFloat(conflict.cacheCreation1h)
 		conflict.Price.PriorityMultiplier = nullableFloat(conflict.priorityMultiplier)
 		conflict.Price.SourceModel = nullableString(sourceModel)
 		conflict.Price.LastSyncedAt = timePtr(conflict.lastSyncedAtRaw)
 		if parsed, ok := parseDBTime(conflict.updatedAtRaw); ok {
 			conflict.Price.UpdatedAt = parsed
 		}
-		longContextConfigured := conflict.longContextThreshold.Valid || conflict.longContextInput.Valid || conflict.longContextOutput.Valid || conflict.longContextCacheRead.Valid || conflict.longContextCacheCreation.Valid
+		longContextConfigured := conflict.longContextThreshold.Valid || conflict.longContextInput.Valid || conflict.longContextOutput.Valid || conflict.longContextCacheRead.Valid || conflict.longContextCacheCreation.Valid || conflict.longContextCacheCreation1h.Valid
 		if longContextConfigured {
 			conflict.ArchivedLongContext = &ModelPriceLibraryConflictLongContext{
-				ThresholdInputTokens:       nullableInt64(conflict.longContextThreshold),
-				InputUSDPerMillion:         nullableFloat(conflict.longContextInput),
-				OutputUSDPerMillion:        nullableFloat(conflict.longContextOutput),
-				CacheReadUSDPerMillion:     nullableFloat(conflict.longContextCacheRead),
-				CacheCreationUSDPerMillion: nullableFloat(conflict.longContextCacheCreation),
+				ThresholdInputTokens:         nullableInt64(conflict.longContextThreshold),
+				InputUSDPerMillion:           nullableFloat(conflict.longContextInput),
+				OutputUSDPerMillion:          nullableFloat(conflict.longContextOutput),
+				CacheReadUSDPerMillion:       nullableFloat(conflict.longContextCacheRead),
+				CacheCreationUSDPerMillion:   nullableFloat(conflict.longContextCacheCreation),
+				CacheCreation1hUSDPerMillion: nullableFloat(conflict.longContextCacheCreation1h),
 			}
 			conflict.Price.LongContext = &ModelPriceLongContext{
-				ThresholdInputTokens:       conflict.longContextThreshold.Int64,
-				InputUSDPerMillion:         conflict.longContextInput.Float64,
-				OutputUSDPerMillion:        conflict.longContextOutput.Float64,
-				CacheReadUSDPerMillion:     conflict.longContextCacheRead.Float64,
-				CacheCreationUSDPerMillion: conflict.longContextCacheCreation.Float64,
+				ThresholdInputTokens:         conflict.longContextThreshold.Int64,
+				InputUSDPerMillion:           conflict.longContextInput.Float64,
+				OutputUSDPerMillion:          conflict.longContextOutput.Float64,
+				CacheReadUSDPerMillion:       conflict.longContextCacheRead.Float64,
+				CacheCreationUSDPerMillion:   conflict.longContextCacheCreation.Float64,
+				CacheCreation1hUSDPerMillion: nullableFloat(conflict.longContextCacheCreation1h),
 			}
 			conflict.Price.longContextInvalid = !conflict.longContextThreshold.Valid || !conflict.longContextInput.Valid || !conflict.longContextOutput.Valid || !conflict.longContextCacheRead.Valid || !conflict.longContextCacheCreation.Valid || !validLongContextPrice(conflict.Price.LongContext)
 		}
@@ -2361,10 +2492,10 @@ func getModelPriceLibraryConflictWithQuerier(ctx context.Context, querier priceR
 	rows, err := querier.QueryContext(ctx, `
 		SELECT original_id, selected_price_id, conflict_reason, provider, model,
 		       input_usd_per_million, output_usd_per_million,
-		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
+		       cache_read_usd_per_million, cache_creation_usd_per_million, cache_creation_1h_usd_per_million, request_usd, billing_unit,
 		       priority_multiplier, long_context_threshold_tokens,
 		       long_context_input_usd_per_million, long_context_output_usd_per_million,
-		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
+		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million, long_context_cache_creation_1h_usd_per_million,
 		       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT)
 		FROM model_price_library_conflicts
 		WHERE original_id = ?
@@ -2403,16 +2534,7 @@ func modelPriceLibraryConflictReferencesPrice(ctx context.Context, querier price
 }
 
 func getPriceWithQuerier(ctx context.Context, querier priceRowsQuerier, id int) (ModelPrice, error) {
-	rows, err := querier.QueryContext(ctx, `
-		SELECT id, provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
-		       input_usd_per_million, output_usd_per_million,
-		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
-		       priority_multiplier, long_context_threshold_tokens,
-		       long_context_input_usd_per_million, long_context_output_usd_per_million,
-		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
-		       source, source_model, auto_synced, CAST(last_synced_at AS TEXT), CAST(updated_at AS TEXT), time_pricing
-		FROM model_prices WHERE id = ?
-	`, id)
+	rows, err := queryModelPriceRows(ctx, querier, " WHERE id = ?", id)
 	if err != nil {
 		return ModelPrice{}, err
 	}
@@ -2458,15 +2580,15 @@ func (a *App) createPrice(ctx context.Context, payload modelPricePayload) (Model
 		INSERT INTO model_prices (
 			provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 			input_usd_per_million, output_usd_per_million,
-			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
+			cache_read_usd_per_million, cache_creation_usd_per_million, cache_creation_1h_usd_per_million, request_usd, billing_unit,
 			priority_multiplier, long_context_threshold_tokens,
 			long_context_input_usd_per_million, long_context_output_usd_per_million,
-			long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
+			long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million, long_context_cache_creation_1h_usd_per_million,
 			source, source_model, auto_synced, last_synced_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
 	`, payload.Provider, payload.Model, payload.PriceScope, nullableStringArg(payload.ChannelAuthType), nullableStringArg(payload.ChannelBrand), nullableStringArg(payload.ChannelKey),
-		payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), payload.BillingUnit, nullableFloatArg(priorityMultiplier),
-		nullableLongContextThreshold(longContext), nullableLongContextInput(longContext), nullableLongContextOutput(longContext), nullableLongContextCacheRead(longContext), nullableLongContextCacheCreation(longContext), now)
+		payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.CacheCreation1hUSDPerMillion), nullableFloatArg(payload.RequestUSD), payload.BillingUnit, nullableFloatArg(priorityMultiplier),
+		nullableLongContextThreshold(longContext), nullableLongContextInput(longContext), nullableLongContextOutput(longContext), nullableLongContextCacheRead(longContext), nullableLongContextCacheCreation(longContext), nullableLongContextCacheCreation1h(longContext), now)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return ModelPrice{}, conflictError(modelPriceConflictMessage(payload))
@@ -2584,26 +2706,28 @@ func (a *App) updatePrice(ctx context.Context, id int, payload modelPricePayload
 	longContextOutput := nullableLongContextOutput(longContext)
 	longContextCacheRead := nullableLongContextCacheRead(longContext)
 	longContextCacheCreation := nullableLongContextCacheCreation(longContext)
+	longContextCacheCreation1h := nullableLongContextCacheCreation1h(longContext)
 	if preserveInvalidLongContext {
 		longContextThreshold = nullableInt64PtrArg(existing.PreservedLongContext.ThresholdInputTokens)
 		longContextInput = nullableFloatArg(existing.PreservedLongContext.InputUSDPerMillion)
 		longContextOutput = nullableFloatArg(existing.PreservedLongContext.OutputUSDPerMillion)
 		longContextCacheRead = nullableFloatArg(existing.PreservedLongContext.CacheReadUSDPerMillion)
 		longContextCacheCreation = nullableFloatArg(existing.PreservedLongContext.CacheCreationUSDPerMillion)
+		longContextCacheCreation1h = nullableFloatArg(existing.PreservedLongContext.CacheCreation1hUSDPerMillion)
 	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE model_prices
 		SET provider = ?, model = ?, price_scope = ?, channel_auth_type = ?, channel_brand = ?, channel_key = ?,
 		    input_usd_per_million = ?, output_usd_per_million = ?,
-		    cache_read_usd_per_million = ?, cache_creation_usd_per_million = ?,
+		    cache_read_usd_per_million = ?, cache_creation_usd_per_million = ?, cache_creation_1h_usd_per_million = ?,
 		    request_usd = ?, billing_unit = ?, priority_multiplier = ?, long_context_threshold_tokens = ?,
 		    long_context_input_usd_per_million = ?, long_context_output_usd_per_million = ?,
-		    long_context_cache_read_usd_per_million = ?, long_context_cache_creation_usd_per_million = ?, source = 'manual',
+		    long_context_cache_read_usd_per_million = ?, long_context_cache_creation_usd_per_million = ?, long_context_cache_creation_1h_usd_per_million = ?, source = 'manual',
 		    source_model = NULL, auto_synced = 0, last_synced_at = NULL, updated_at = ?
 		WHERE id = ?
 	`, payload.Provider, payload.Model, payload.PriceScope, nullableStringArg(payload.ChannelAuthType), nullableStringArg(payload.ChannelBrand), nullableStringArg(payload.ChannelKey),
-		payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), payload.BillingUnit, nullableFloatArg(priorityMultiplier),
-		longContextThreshold, longContextInput, longContextOutput, longContextCacheRead, longContextCacheCreation, dbTime(time.Now()), id)
+		payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.CacheCreation1hUSDPerMillion), nullableFloatArg(payload.RequestUSD), payload.BillingUnit, nullableFloatArg(priorityMultiplier),
+		longContextThreshold, longContextInput, longContextOutput, longContextCacheRead, longContextCacheCreation, longContextCacheCreation1h, dbTime(time.Now()), id)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return ModelPrice{}, conflictError(modelPriceConflictMessage(payload))
@@ -2804,18 +2928,18 @@ func (a *App) replaceActiveModelPriceLibraryConflict(ctx context.Context, origin
 		INSERT INTO model_price_library_conflicts (
 			original_id, selected_price_id, conflict_reason, provider, model,
 			input_usd_per_million, output_usd_per_million,
-			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
+			cache_read_usd_per_million, cache_creation_usd_per_million, cache_creation_1h_usd_per_million, request_usd, billing_unit,
 			priority_multiplier, long_context_threshold_tokens,
 			long_context_input_usd_per_million, long_context_output_usd_per_million,
-			long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
+			long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million, long_context_cache_creation_1h_usd_per_million,
 			source, source_model, auto_synced, last_synced_at, updated_at
 		)
 		SELECT ?, ?, ?, provider, model,
 		       input_usd_per_million, output_usd_per_million,
-		       cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
+		       cache_read_usd_per_million, cache_creation_usd_per_million, cache_creation_1h_usd_per_million, request_usd, billing_unit,
 		       priority_multiplier, long_context_threshold_tokens,
 		       long_context_input_usd_per_million, long_context_output_usd_per_million,
-		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
+		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million, long_context_cache_creation_1h_usd_per_million,
 		       source, source_model, auto_synced, last_synced_at, updated_at
 		FROM model_prices WHERE id = ?
 	`, conflict.OriginalID, active.ID, conflict.ConflictReason, active.ID); err != nil {
@@ -2839,18 +2963,18 @@ func insertModelPriceLibraryConflictAsActive(ctx context.Context, tx *sql.Tx, co
 		INSERT INTO model_prices (
 			provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 			input_usd_per_million, output_usd_per_million,
-			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
+			cache_read_usd_per_million, cache_creation_usd_per_million, cache_creation_1h_usd_per_million, request_usd, billing_unit,
 			priority_multiplier, long_context_threshold_tokens,
 			long_context_input_usd_per_million, long_context_output_usd_per_million,
-			long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
+			long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million, long_context_cache_creation_1h_usd_per_million,
 			source, source_model, auto_synced, last_synced_at, updated_at
-		) VALUES (?, ?, 'library', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
+		) VALUES (?, ?, 'library', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, 0, NULL, ?)
 	`, provider, model,
 		conflict.Price.InputUSDPerMillion, conflict.Price.OutputUSDPerMillion,
-		conflict.Price.CacheReadUSDPerMillion, conflict.Price.CacheCreationUSDPerMillion,
+		conflict.Price.CacheReadUSDPerMillion, conflict.Price.CacheCreationUSDPerMillion, nullableFloatArg(conflict.Price.CacheCreation1hUSDPerMillion),
 		nullableSQLFloatArg(conflict.requestUSD), conflict.Price.BillingUnit, nullableSQLFloatArg(conflict.priorityMultiplier), nullableInt64Arg(conflict.longContextThreshold),
 		nullableSQLFloatArg(conflict.longContextInput), nullableSQLFloatArg(conflict.longContextOutput),
-		nullableSQLFloatArg(conflict.longContextCacheRead), nullableSQLFloatArg(conflict.longContextCacheCreation),
+		nullableSQLFloatArg(conflict.longContextCacheRead), nullableSQLFloatArg(conflict.longContextCacheCreation), nullableSQLFloatArg(conflict.longContextCacheCreation1h),
 		dbTime(time.Now()))
 	if err != nil {
 		return 0, err
@@ -2867,18 +2991,18 @@ func updateActiveModelPriceFromLibraryConflict(ctx context.Context, tx *sql.Tx, 
 		UPDATE model_prices
 		SET provider = ?, model = ?, price_scope = 'library', channel_auth_type = NULL, channel_brand = NULL, channel_key = NULL,
 		    input_usd_per_million = ?, output_usd_per_million = ?,
-		    cache_read_usd_per_million = ?, cache_creation_usd_per_million = ?, request_usd = ?, billing_unit = ?,
+		    cache_read_usd_per_million = ?, cache_creation_usd_per_million = ?, cache_creation_1h_usd_per_million = ?, request_usd = ?, billing_unit = ?,
 		    priority_multiplier = ?, long_context_threshold_tokens = ?,
 		    long_context_input_usd_per_million = ?, long_context_output_usd_per_million = ?,
-		    long_context_cache_read_usd_per_million = ?, long_context_cache_creation_usd_per_million = ?,
+		    long_context_cache_read_usd_per_million = ?, long_context_cache_creation_usd_per_million = ?, long_context_cache_creation_1h_usd_per_million = ?,
 		    source = 'manual', source_model = NULL, auto_synced = 0, last_synced_at = NULL, updated_at = ?
 		WHERE id = ?
 	`, conflict.Price.Provider, conflict.Price.Model,
 		conflict.Price.InputUSDPerMillion, conflict.Price.OutputUSDPerMillion,
-		conflict.Price.CacheReadUSDPerMillion, conflict.Price.CacheCreationUSDPerMillion,
+		conflict.Price.CacheReadUSDPerMillion, conflict.Price.CacheCreationUSDPerMillion, nullableFloatArg(conflict.Price.CacheCreation1hUSDPerMillion),
 		nullableSQLFloatArg(conflict.requestUSD), conflict.Price.BillingUnit, nullableSQLFloatArg(conflict.priorityMultiplier), nullableInt64Arg(conflict.longContextThreshold),
 		nullableSQLFloatArg(conflict.longContextInput), nullableSQLFloatArg(conflict.longContextOutput),
-		nullableSQLFloatArg(conflict.longContextCacheRead), nullableSQLFloatArg(conflict.longContextCacheCreation),
+		nullableSQLFloatArg(conflict.longContextCacheRead), nullableSQLFloatArg(conflict.longContextCacheCreation), nullableSQLFloatArg(conflict.longContextCacheCreation1h),
 		dbTime(time.Now()), activeID)
 	return err
 }
@@ -3032,6 +3156,8 @@ func (a *App) syncLiteLLMPricesWithSelection(ctx context.Context, sourceURL stri
 		longContextOutput := nullableLongContextOutput(longContext)
 		longContextCacheRead := nullableLongContextCacheRead(longContext)
 		longContextCacheCreation := nullableLongContextCacheCreation(longContext)
+		longContextCacheCreation1h := nullableLongContextCacheCreation1h(longContext)
+		payload.CacheCreation1hUSDPerMillion = nil
 		finalLongContext := longContext
 		finalLongContextValid := true
 		if hasOverride {
@@ -3040,6 +3166,8 @@ func (a *App) syncLiteLLMPricesWithSelection(ctx context.Context, sourceURL stri
 			longContextOutput = nullableSQLFloatArg(override.longContextOutput)
 			longContextCacheRead = nullableSQLFloatArg(override.longContextCacheRead)
 			longContextCacheCreation = nullableSQLFloatArg(override.longContextCacheCreation)
+			longContextCacheCreation1h = nullableSQLFloatArg(override.longContextCacheCreation1h)
+			payload.CacheCreation1hUSDPerMillion = nullableFloat(override.cacheCreation1h)
 			finalLongContext, finalLongContextValid = longContextFromLiteLLMOverride(override)
 		}
 		var priorityMultiplier *float64
@@ -3059,22 +3187,24 @@ func (a *App) syncLiteLLMPricesWithSelection(ctx context.Context, sourceURL stri
 		// distinguish an idempotent refresh from a real update.
 		var existing struct {
 			input, output, cacheRead, cacheCreation                 float64
+			cacheCreation1h                                         sql.NullFloat64
 			request, priority                                       sql.NullFloat64
 			billing                                                 sql.NullString
 			threshold                                               sql.NullInt64
 			longInput, longOutput, longCacheRead, longCacheCreation sql.NullFloat64
+			longCacheCreation1h                                     sql.NullFloat64
 			source, sourceModel                                     sql.NullString
 		}
 		existingErr := tx.QueryRowContext(ctx, `SELECT input_usd_per_million, output_usd_per_million,
-			cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
+			cache_read_usd_per_million, cache_creation_usd_per_million, cache_creation_1h_usd_per_million, request_usd, billing_unit,
 			priority_multiplier, long_context_threshold_tokens, long_context_input_usd_per_million,
 			long_context_output_usd_per_million, long_context_cache_read_usd_per_million,
-			long_context_cache_creation_usd_per_million, source, source_model
+			long_context_cache_creation_usd_per_million, long_context_cache_creation_1h_usd_per_million, source, source_model
 			FROM model_prices WHERE price_scope = 'library' AND lower(provider) = lower(?) AND lower(model) = lower(?)
 			LIMIT 1`, payload.Provider, payload.Model).Scan(
-			&existing.input, &existing.output, &existing.cacheRead, &existing.cacheCreation,
+			&existing.input, &existing.output, &existing.cacheRead, &existing.cacheCreation, &existing.cacheCreation1h,
 			&existing.request, &existing.billing, &existing.priority, &existing.threshold,
-			&existing.longInput, &existing.longOutput, &existing.longCacheRead, &existing.longCacheCreation,
+			&existing.longInput, &existing.longOutput, &existing.longCacheRead, &existing.longCacheCreation, &existing.longCacheCreation1h,
 			&existing.source, &existing.sourceModel)
 		if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
 			return nil, existingErr
@@ -3086,22 +3216,25 @@ func (a *App) syncLiteLLMPricesWithSelection(ctx context.Context, sourceURL stri
 			nullFloatEqual(existing.priority, nullableFloatArg(priorityMultiplier)) &&
 			nullIntEqual(existing.threshold, longContextThreshold) &&
 			nullFloatEqual(existing.longInput, longContextInput) && nullFloatEqual(existing.longOutput, longContextOutput) &&
-			nullFloatEqual(existing.longCacheRead, longContextCacheRead) && nullFloatEqual(existing.longCacheCreation, longContextCacheCreation)
+			nullFloatEqual(existing.longCacheRead, longContextCacheRead) && nullFloatEqual(existing.longCacheCreation, longContextCacheCreation) &&
+			nullFloatEqual(existing.cacheCreation1h, nullableFloatArg(payload.CacheCreation1hUSDPerMillion)) &&
+			nullFloatEqual(existing.longCacheCreation1h, longContextCacheCreation1h)
 		result, err := tx.ExecContext(ctx, `
 			INSERT INTO model_prices (
 				provider, model, price_scope, channel_auth_type, channel_brand, channel_key,
 				input_usd_per_million, output_usd_per_million,
-				cache_read_usd_per_million, cache_creation_usd_per_million, request_usd, billing_unit,
+				cache_read_usd_per_million, cache_creation_usd_per_million, cache_creation_1h_usd_per_million, request_usd, billing_unit,
 				priority_multiplier, long_context_threshold_tokens,
 				long_context_input_usd_per_million, long_context_output_usd_per_million,
-				long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
+				long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million, long_context_cache_creation_1h_usd_per_million,
 				source, source_model, auto_synced, last_synced_at, updated_at
-			) VALUES (?, ?, 'library', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'litellm', ?, 1, ?, ?)
+			) VALUES (?, ?, 'library', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'litellm', ?, 1, ?, ?)
 			ON CONFLICT DO UPDATE SET
 				input_usd_per_million = excluded.input_usd_per_million,
 				output_usd_per_million = excluded.output_usd_per_million,
 				cache_read_usd_per_million = excluded.cache_read_usd_per_million,
 				cache_creation_usd_per_million = excluded.cache_creation_usd_per_million,
+				cache_creation_1h_usd_per_million = excluded.cache_creation_1h_usd_per_million,
 				request_usd = excluded.request_usd, billing_unit = excluded.billing_unit,
 				priority_multiplier = excluded.priority_multiplier,
 				long_context_threshold_tokens = excluded.long_context_threshold_tokens,
@@ -3109,13 +3242,14 @@ func (a *App) syncLiteLLMPricesWithSelection(ctx context.Context, sourceURL stri
 				long_context_output_usd_per_million = excluded.long_context_output_usd_per_million,
 				long_context_cache_read_usd_per_million = excluded.long_context_cache_read_usd_per_million,
 				long_context_cache_creation_usd_per_million = excluded.long_context_cache_creation_usd_per_million,
+				long_context_cache_creation_1h_usd_per_million = excluded.long_context_cache_creation_1h_usd_per_million,
 				source_model = excluded.source_model, auto_synced = 1,
 				last_synced_at = excluded.last_synced_at, updated_at = excluded.updated_at
 			WHERE model_prices.source = 'litellm' AND NOT EXISTS (
 				SELECT 1 FROM model_price_library_conflicts WHERE selected_price_id = model_prices.id
 			)
-		`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.RequestUSD), payload.BillingUnit, nullableFloatArg(priorityMultiplier),
-			longContextThreshold, longContextInput, longContextOutput, longContextCacheRead, longContextCacheCreation, row.modelName, now, now)
+		`, payload.Provider, payload.Model, payload.InputUSDPerMillion, payload.OutputUSDPerMillion, payload.CacheReadUSDPerMillion, payload.CacheCreationUSDPerMillion, nullableFloatArg(payload.CacheCreation1hUSDPerMillion), nullableFloatArg(payload.RequestUSD), payload.BillingUnit, nullableFloatArg(priorityMultiplier),
+			longContextThreshold, longContextInput, longContextOutput, longContextCacheRead, longContextCacheCreation, longContextCacheCreation1h, row.modelName, now, now)
 		if err != nil {
 			return nil, err
 		}
@@ -3162,12 +3296,14 @@ func (a *App) syncLiteLLMPricesWithSelection(ctx context.Context, sourceURL stri
 }
 
 type liteLLMPriceOverride struct {
-	priorityMultiplier       sql.NullFloat64
-	longContextThreshold     sql.NullInt64
-	longContextInput         sql.NullFloat64
-	longContextOutput        sql.NullFloat64
-	longContextCacheRead     sql.NullFloat64
-	longContextCacheCreation sql.NullFloat64
+	priorityMultiplier         sql.NullFloat64
+	cacheCreation1h            sql.NullFloat64
+	longContextThreshold       sql.NullInt64
+	longContextInput           sql.NullFloat64
+	longContextOutput          sql.NullFloat64
+	longContextCacheRead       sql.NullFloat64
+	longContextCacheCreation   sql.NullFloat64
+	longContextCacheCreation1h sql.NullFloat64
 }
 
 func nullFloatEqual(value sql.NullFloat64, expected any) bool {
@@ -3200,7 +3336,7 @@ func nullIntEqual(value sql.NullInt64, expected any) bool {
 
 func longContextFromLiteLLMOverride(override liteLLMPriceOverride) (*ModelPriceLongContext, bool) {
 	configured := override.longContextThreshold.Valid || override.longContextInput.Valid || override.longContextOutput.Valid ||
-		override.longContextCacheRead.Valid || override.longContextCacheCreation.Valid
+		override.longContextCacheRead.Valid || override.longContextCacheCreation.Valid || override.longContextCacheCreation1h.Valid
 	if !configured {
 		return nil, true
 	}
@@ -3209,20 +3345,22 @@ func longContextFromLiteLLMOverride(override liteLLMPriceOverride) (*ModelPriceL
 		return nil, false
 	}
 	price := &ModelPriceLongContext{
-		ThresholdInputTokens:       override.longContextThreshold.Int64,
-		InputUSDPerMillion:         override.longContextInput.Float64,
-		OutputUSDPerMillion:        override.longContextOutput.Float64,
-		CacheReadUSDPerMillion:     override.longContextCacheRead.Float64,
-		CacheCreationUSDPerMillion: override.longContextCacheCreation.Float64,
+		ThresholdInputTokens:         override.longContextThreshold.Int64,
+		InputUSDPerMillion:           override.longContextInput.Float64,
+		OutputUSDPerMillion:          override.longContextOutput.Float64,
+		CacheReadUSDPerMillion:       override.longContextCacheRead.Float64,
+		CacheCreationUSDPerMillion:   override.longContextCacheCreation.Float64,
+		CacheCreation1hUSDPerMillion: nullableFloat(override.longContextCacheCreation1h),
 	}
 	return price, validLongContextPrice(price)
 }
 
 func liteLLMPriceOverrideSnapshot(ctx context.Context, tx *sql.Tx) (map[[2]string]liteLLMPriceOverride, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT provider, model, priority_multiplier, long_context_threshold_tokens,
+		SELECT provider, model, priority_multiplier, cache_creation_1h_usd_per_million, long_context_threshold_tokens,
 		       long_context_input_usd_per_million, long_context_output_usd_per_million,
-		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million
+		       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
+		       long_context_cache_creation_1h_usd_per_million
 		FROM model_prices
 		WHERE source = 'litellm' AND price_scope = 'library'
 	`)
@@ -3235,8 +3373,8 @@ func liteLLMPriceOverrideSnapshot(ctx context.Context, tx *sql.Tx) (map[[2]strin
 	for rows.Next() {
 		var provider, model string
 		var override liteLLMPriceOverride
-		if err := rows.Scan(&provider, &model, &override.priorityMultiplier, &override.longContextThreshold,
-			&override.longContextInput, &override.longContextOutput, &override.longContextCacheRead, &override.longContextCacheCreation); err != nil {
+		if err := rows.Scan(&provider, &model, &override.priorityMultiplier, &override.cacheCreation1h, &override.longContextThreshold,
+			&override.longContextInput, &override.longContextOutput, &override.longContextCacheRead, &override.longContextCacheCreation, &override.longContextCacheCreation1h); err != nil {
 			return nil, err
 		}
 		result[priceKey(provider, model)] = override
@@ -3752,6 +3890,9 @@ func priorityMultiplierProducesRoundableCost(price ModelPrice, multiplier float6
 		price.CacheCreationUSDPerMillion,
 		price.OutputUSDPerMillion,
 	}
+	if price.CacheCreation1hUSDPerMillion != nil {
+		prices = append(prices, *price.CacheCreation1hUSDPerMillion)
+	}
 	if price.LongContext != nil {
 		prices = append(prices,
 			price.LongContext.InputUSDPerMillion,
@@ -3759,6 +3900,9 @@ func priorityMultiplierProducesRoundableCost(price ModelPrice, multiplier float6
 			price.LongContext.CacheCreationUSDPerMillion,
 			price.LongContext.OutputUSDPerMillion,
 		)
+		if price.LongContext.CacheCreation1hUSDPerMillion != nil {
+			prices = append(prices, *price.LongContext.CacheCreation1hUSDPerMillion)
+		}
 	}
 	for _, usdPerMillion := range prices {
 		if usdPerMillion == 0 {
@@ -3789,6 +3933,7 @@ func selectLongContextPrice(price ModelPrice, contextInputTokens int) (ModelPric
 	selected.OutputUSDPerMillion = price.LongContext.OutputUSDPerMillion
 	selected.CacheReadUSDPerMillion = price.LongContext.CacheReadUSDPerMillion
 	selected.CacheCreationUSDPerMillion = price.LongContext.CacheCreationUSDPerMillion
+	selected.CacheCreation1hUSDPerMillion = price.LongContext.CacheCreation1hUSDPerMillion
 	return selected, true, false
 }
 
@@ -3907,7 +4052,12 @@ func calculateRecordCostForMatch(record UsageRecord, price *ModelPrice, matchSta
 	if multiplier != nil {
 		breakdown.TierMultiplier = multiplier
 	}
-	cacheCreationHasSeparatePrice := modelPriceIsClaudeChannel(*price) || price.CacheCreationUSDPerMillion > 0 || (price.cacheCreationExplicit && !longContextApplied)
+	cacheCreationTTL := valueOr(usageRecordCacheCreationTTL(record), "unknown")
+	claudeCacheTTLRequest := usageUsesClaudeTokenSemantics(record, channelBrand) && cacheCreationTTL != "unknown"
+	// Keep the legacy generic cache-write decision for aggregate-only/unknown
+	// records. Only an explicit upstream TTL opts a Claude record into the
+	// 5m/1h buckets; this preserves old zero-rate library pricing semantics.
+	cacheCreationHasSeparatePrice := claudeCacheTTLRequest || modelPriceIsClaudeChannel(*price) || price.CacheCreationUSDPerMillion > 0 || (price.cacheCreationExplicit && !longContextApplied)
 	billableInputTokens := tokens.NormalInputTokens
 	if !cacheCreationHasSeparatePrice {
 		billableInputTokens += tokens.CacheCreationTokens
@@ -3918,7 +4068,40 @@ func calculateRecordCostForMatch(record UsageRecord, price *ModelPrice, matchSta
 		return breakdown
 	}
 	if cacheCreationHasSeparatePrice {
-		if !appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindCacheCreation, tokens.CacheCreationTokens, applyTierMultiplier(price.CacheCreationUSDPerMillion, multiplier)) {
+		if claudeCacheTTLRequest {
+			switch cacheCreationTTL {
+			case "5m":
+				if !appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindCacheCreation5m, tokens.CacheCreationTokens, applyTierMultiplier(price.CacheCreationUSDPerMillion, multiplier)) {
+					markCostBreakdownUnpriced(&breakdown, priceMatchStatusInvalidPrice)
+					return breakdown
+				}
+			case "1h":
+				if price.CacheCreation1hUSDPerMillion == nil || !appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindCacheCreation1h, tokens.CacheCreationTokens, applyTierMultiplier(*price.CacheCreation1hUSDPerMillion, multiplier)) {
+					markCostBreakdownUnpriced(&breakdown, priceMatchStatusInvalidPrice)
+					return breakdown
+				}
+			case "mixed":
+				five := record.CacheCreation5mTokens
+				oneHour := record.CacheCreation1hTokens
+				aggregate := nonNegativeTokens(record.CacheCreationTokens)
+				if five == nil || oneHour == nil || *five < 0 || *oneHour < 0 || *five > aggregate || *oneHour != aggregate-*five {
+					markCostBreakdownUnpriced(&breakdown, priceMatchStatusInvalidPrice)
+					return breakdown
+				}
+				if !appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindCacheCreation5m, *five, applyTierMultiplier(price.CacheCreationUSDPerMillion, multiplier)) ||
+					(price.CacheCreation1hUSDPerMillion == nil && *oneHour > 0) ||
+					(price.CacheCreation1hUSDPerMillion != nil && !appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindCacheCreation1h, *oneHour, applyTierMultiplier(*price.CacheCreation1hUSDPerMillion, multiplier))) {
+					markCostBreakdownUnpriced(&breakdown, priceMatchStatusInvalidPrice)
+					return breakdown
+				}
+			default:
+				// Unknown TTL keeps the legacy cache-write price for old records.
+				if !appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindCacheCreation, tokens.CacheCreationTokens, applyTierMultiplier(price.CacheCreationUSDPerMillion, multiplier)) {
+					markCostBreakdownUnpriced(&breakdown, priceMatchStatusInvalidPrice)
+					return breakdown
+				}
+			}
+		} else if !appendUsageTokenCostItem(&breakdown, collectItems, usageCostKindCacheCreation, tokens.CacheCreationTokens, applyTierMultiplier(price.CacheCreationUSDPerMillion, multiplier)) {
 			markCostBreakdownUnpriced(&breakdown, priceMatchStatusInvalidPrice)
 			return breakdown
 		}
@@ -3982,6 +4165,14 @@ func appendUsageTokenCostItem(breakdown *usageCostBreakdown, collectItem bool, k
 
 func modelPriceIsClaudeChannel(price ModelPrice) bool {
 	return price.PriceScope == modelPriceScopeChannel && price.ChannelBrand != nil && aiProviderBrand(strings.TrimSpace(*price.ChannelBrand)) == aiProviderBrandClaude
+}
+
+func modelPriceSupportsClaudeCacheTTL(price ModelPrice) bool {
+	if price.PriceScope == modelPriceScopeChannel {
+		return modelPriceIsClaudeChannel(price)
+	}
+	provider := strings.TrimSpace(price.Provider)
+	return isClaudeProvider(&provider)
 }
 
 func matchedModelPriceChannelBrand(price *ModelPrice, record UsageRecord, matchContexts ...modelPriceMatchContext) *aiProviderBrand {
@@ -4180,6 +4371,13 @@ func nullableLongContextCacheCreation(value *ModelPriceLongContext) any {
 		return nil
 	}
 	return value.CacheCreationUSDPerMillion
+}
+
+func nullableLongContextCacheCreation1h(value *ModelPriceLongContext) any {
+	if value == nil {
+		return nil
+	}
+	return nullableFloatArg(value.CacheCreation1hUSDPerMillion)
 }
 
 func floatPtrEqual(left, right *float64) bool {

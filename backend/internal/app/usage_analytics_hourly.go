@@ -222,6 +222,12 @@ func cloneUsageAnalyticsHourlyString(value *string) *string {
 
 func usageAnalyticsRecordSourceKey(record UsageRecord) *string {
 	if record.analyticsSourceKey != nil {
+		// A nonempty direct-import correction can replace the retained source.
+		// An unchanged mask keeps the pre-mask identity captured by the inbox.
+		if rawSource := sourceFromUsageRawJSON(record.RawJSON); rawSource != nil &&
+			(usageSourceAPIKeyHash(rawSource) != "" || record.Source == nil || strings.TrimSpace(*rawSource) != strings.TrimSpace(*record.Source)) {
+			return usageSourceKey(rawSource)
+		}
 		return record.analyticsSourceKey
 	}
 	return usageSourceKey(usageAnalyticsRecordSource(record))
@@ -353,10 +359,22 @@ func (a *App) rebuildUsageAnalyticsHourlyLocked(ctx context.Context, pricing mod
 		SELECT usage_record_id, CAST(timestamp AS TEXT), usage_username, api_key_description,
 		       provider, model, service_tier, endpoint, source_key, auth, auth_index, source_account, ttft_ms,
 		       failed, input_tokens, output_tokens, cached_tokens, cache_read_tokens,
-		       cache_creation_tokens, reasoning_tokens, total_tokens
+		       cache_creation_tokens, reasoning_tokens, total_tokens,
+		       cache_creation_ttl, cache_creation_5m_tokens, cache_creation_1h_tokens
 		FROM usage_analytics_facts
 		ORDER BY timestamp, usage_record_id
 	`)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no such column") {
+		rows, err = tx.QueryContext(ctx, `
+			SELECT usage_record_id, CAST(timestamp AS TEXT), usage_username, api_key_description,
+			       provider, model, service_tier, endpoint, source_key, auth, auth_index, source_account, ttft_ms,
+			       failed, input_tokens, output_tokens, cached_tokens, cache_read_tokens,
+			       cache_creation_tokens, reasoning_tokens, total_tokens,
+			       NULL, NULL, NULL
+			FROM usage_analytics_facts
+			ORDER BY timestamp, usage_record_id
+		`)
+	}
 	if err != nil {
 		return modelPriceBillingIndex{}, usageAnalyticsState{}, err
 	}
@@ -591,7 +609,8 @@ func visitFilteredUsageAnalyticsFactsWithQueryer(ctx context.Context, queryer us
 		facts.api_key_description, facts.provider, facts.model, facts.service_tier, facts.endpoint,
 		facts.source_key, facts.auth, facts.auth_index, facts.source_account, facts.ttft_ms, facts.failed,
 		facts.input_tokens, facts.output_tokens, facts.cached_tokens, facts.cache_read_tokens,
-		facts.cache_creation_tokens, facts.reasoning_tokens, facts.total_tokens, catalog.source
+		facts.cache_creation_tokens, facts.reasoning_tokens, facts.total_tokens,
+		facts.cache_creation_ttl, facts.cache_creation_5m_tokens, facts.cache_creation_1h_tokens, catalog.source
 		FROM usage_analytics_facts AS facts
 		LEFT JOIN usage_source_catalog AS catalog ON catalog.source_key = facts.source_key ` + where
 	if minimumRecordID > 0 {

@@ -133,6 +133,20 @@ function renderPriceValue(row: AvailableModel, field: PriceField) {
   return formatUsdPerMtok(row.price[field])
 }
 
+function renderCacheCreationPrices(row: AvailableModel) {
+  if (modelBillingUnit(row) === 'request' || !row.price
+    || !['claude', 'anthropic'].includes(row.price.provider.trim().toLowerCase())) {
+    return renderPriceValue(row, 'cache_creation_usd_per_million')
+  }
+  const price = row.price
+  return h('div', { class: 'available-cache-write-price-pair' }, [
+    h('span', [h('small', '5m'), formatUsdPerMtok(price.cache_creation_usd_per_million)]),
+    h('span', [h('small', '1h'), price.cache_creation_1h_usd_per_million === null
+      ? t('未配置', 'Not configured')
+      : formatUsdPerMtok(price.cache_creation_1h_usd_per_million)]),
+  ])
+}
+
 const SOURCE_PREVIEW_LIMIT = 2
 
 function renderSourceTag(source: AvailableModel['sources'][number]) {
@@ -258,7 +272,7 @@ const columns = computed<DataTableColumns<AvailableModel>>(() => [
     title: t('缓存写 ($/MTok)', 'Cache write ($/MTok)'),
     key: 'cache_creation_usd_per_million',
     width: 145,
-    render: (row) => renderPriceValue(row, 'cache_creation_usd_per_million'),
+    render: renderCacheCreationPrices,
   },
 ])
 
@@ -416,6 +430,21 @@ onMounted(refresh)
 }
 
 .model-price-muted {
+  color: var(--cpa-text-muted);
+}
+
+:global(.available-cache-write-price-pair) {
+  display: grid;
+  gap: 4px;
+}
+
+:global(.available-cache-write-price-pair > span) {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+:global(.available-cache-write-price-pair small) {
   color: var(--cpa-text-muted);
 }
 

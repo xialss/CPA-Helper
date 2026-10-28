@@ -57,6 +57,7 @@ type usageSourceLabelEvidence struct {
 	Provider  string
 	Model     string
 	Source    *string
+	SourceKey *string
 	AuthIndex *string
 }
 
@@ -117,7 +118,7 @@ func (labels *usageSourceLabelContext) labelFor(record UsageRecord) *string {
 	}
 	matched := labels.resolve(usageSourceLabelEvidence{
 		Provider: aiProviderOptionalString(record.Provider), Model: aiProviderOptionalString(record.Model),
-		Source: usageAnalyticsRecordSource(record), AuthIndex: authIndex,
+		Source: usageAnalyticsRecordSource(record), SourceKey: record.analyticsSourceKey, AuthIndex: authIndex,
 	})
 	if matched == nil {
 		return nil
@@ -148,10 +149,10 @@ func (labels *usageSourceLabelContext) resolve(evidence usageSourceLabelEvidence
 			if count != 1 {
 				return nil
 			}
-			if matched.Brand == aiProviderBrandOpenAICompatibility && labels.hasNativeCredentialConflict(evidence.Source, provider, authIndex) {
+			if matched.Brand == aiProviderBrandOpenAICompatibility && labels.hasNativeCredentialConflict(evidence.Source, evidence.SourceKey, provider, authIndex) {
 				return nil
 			}
-			return labels.channelLabel(evidence.Source, matched)
+			return labels.channelLabel(evidence.Source, evidence.SourceKey, matched)
 		}
 	}
 	if strings.TrimSpace(aiProviderOptionalString(authIndex)) == "" {
@@ -160,22 +161,22 @@ func (labels *usageSourceLabelContext) resolve(evidence usageSourceLabelEvidence
 			if compatibleCount > 0 {
 				return nil
 			}
-			return labels.keyHashLabel(evidence.Source, provider)
+			return labels.keyHashLabel(evidence.Source, evidence.SourceKey, provider)
 		}
 	}
 	matched, count := configuredModelPriceCandidates(labels.selectors, provider, "", authIndex)
 	if count != 1 {
 		return nil
 	}
-	return labels.channelLabel(evidence.Source, matched)
+	return labels.channelLabel(evidence.Source, evidence.SourceKey, matched)
 }
 
-func (labels *usageSourceLabelContext) hasNativeCredentialConflict(source *string, provider string, authIndexValue *string) bool {
+func (labels *usageSourceLabelContext) hasNativeCredentialConflict(source, sourceKey *string, provider string, authIndexValue *string) bool {
 	brands := matchingNativePriceBrands(provider)
 	if len(brands) == 0 {
 		return false
 	}
-	sourceHash := usageSourceAPIKeyHash(source)
+	sourceHash := usageSourceAPIKeyHashWithIdentity(source, sourceKey)
 	if sourceHash == "" {
 		return false
 	}
@@ -198,7 +199,7 @@ func (labels *usageSourceLabelContext) hasNativeCredentialConflict(source *strin
 	return false
 }
 
-func (labels *usageSourceLabelContext) channelLabel(source *string, matched modelPriceChannelIdentity) *usageSourceLabelMatch {
+func (labels *usageSourceLabelContext) channelLabel(source, sourceKey *string, matched modelPriceChannelIdentity) *usageSourceLabelMatch {
 	identity := modelPriceChannelAliasKey(modelPriceChannelAuthTypeAPIKey, string(matched.Brand), matched.ChannelKey)
 	channel := labels.channels[identity]
 	// Model evidence cannot make a duplicate alias identity unique or choose
@@ -207,7 +208,7 @@ func (labels *usageSourceLabelContext) channelLabel(source *string, matched mode
 		return nil
 	}
 	if matched.Brand != aiProviderBrandOpenAICompatibility {
-		if sourceHash := usageSourceAPIKeyHash(source); sourceHash != "" && channel.APIKeyHash != "" && sourceHash != channel.APIKeyHash {
+		if sourceHash := usageSourceAPIKeyHashWithIdentity(source, sourceKey); sourceHash != "" && channel.APIKeyHash != "" && sourceHash != channel.APIKeyHash {
 			return nil
 		}
 	}
@@ -222,8 +223,8 @@ func (labels *usageSourceLabelContext) channelLabel(source *string, matched mode
 	return nil
 }
 
-func (labels *usageSourceLabelContext) keyHashLabel(source *string, provider string) *usageSourceLabelMatch {
-	sourceHash := usageSourceAPIKeyHash(source)
+func (labels *usageSourceLabelContext) keyHashLabel(source, sourceKey *string, provider string) *usageSourceLabelMatch {
+	sourceHash := usageSourceAPIKeyHashWithIdentity(source, sourceKey)
 	if sourceHash == "" {
 		return nil
 	}
@@ -258,4 +259,21 @@ func usageSourceAPIKeyHash(source *string) string {
 		return ""
 	}
 	return hashAPIKey(value)
+}
+
+// Only authenticated, conflict-free catalog/record callers supply this persisted
+// digest. It was computed before collector masking, never from a client hash.
+func usageSourceAPIKeyHashWithIdentity(source, sourceKey *string) string {
+	if hash := usageSourceAPIKeyHash(source); hash != "" {
+		return hash
+	}
+	if sourceKey != nil && validUsageCallerScope(*sourceKey) {
+		if maskedKey := usageSourceKey(source); maskedKey != nil && *maskedKey == *sourceKey {
+			// Legacy callers may already have supplied a mask. Its digest is a
+			// grouping identity, never proof of the original credential.
+			return ""
+		}
+		return *sourceKey
+	}
+	return ""
 }

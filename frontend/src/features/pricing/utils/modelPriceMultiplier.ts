@@ -24,5 +24,13 @@ export function multiplyModelPrice(template: ModelPrice, multiplier: number): Mo
       if (!Number.isFinite(result.long_context[field]) || result.long_context[field] < 0) return null
     }
   }
+  if (template.cache_creation_1h_usd_per_million !== null) {
+    result.cache_creation_1h_usd_per_million = scaledPrice(template.cache_creation_1h_usd_per_million, multiplier)
+    if (!Number.isFinite(result.cache_creation_1h_usd_per_million) || result.cache_creation_1h_usd_per_million < 0) return null
+  }
+  if (result.long_context?.cache_creation_1h_usd_per_million !== null && result.long_context) {
+    result.long_context.cache_creation_1h_usd_per_million = scaledPrice(result.long_context.cache_creation_1h_usd_per_million, multiplier)
+    if (!Number.isFinite(result.long_context.cache_creation_1h_usd_per_million) || result.long_context.cache_creation_1h_usd_per_million < 0) return null
+  }
   return result
 }

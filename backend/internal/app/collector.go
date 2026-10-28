@@ -106,6 +106,10 @@ func (r *CollectorRunner) loop(ctx context.Context) {
 		r.mu.Unlock()
 	}()
 
+	var unpersisted []string
+	var batchCollector CollectorConfig
+	var batchReceivedAt time.Time
+	var batchPricing modelPriceBillingIndex
 	for {
 		select {
 		case <-r.stop:
@@ -119,8 +123,47 @@ func (r *CollectorRunner) loop(ctx context.Context) {
 			continue
 		}
 		collector := cfg.Collector
+		if len(unpersisted) > 0 {
+			if err := r.app.persistCollectorUsageBatch(ctx, batchCollector, unpersisted, batchReceivedAt, batchPricing); err != nil {
+				r.setCollectorError(fmt.Errorf("persist dequeued usage batch: %w", err), durationSeconds(collector.RetryIntervalSeconds))
+				continue
+			}
+			unpersisted = nil
+		}
+		// Deadline resolution and successful-quota receipt completion remain
+		// available after restart even when remote pricing selectors are offline.
+		if _, err := r.app.processCollectorUsageInboxWithPricing(ctx, cfg, nil, time.Now()); err != nil {
+			r.setCollectorError(fmt.Errorf("recover persisted usage batch: %w", err), durationSeconds(collector.RetryIntervalSeconds))
+			continue
+		}
 		if strings.TrimSpace(collector.ManagementKey) != "" {
 			r.syncRemoteUsageEnabled(ctx, cfg)
+		}
+		if !collector.Enabled {
+			var pending bool
+			if err := r.app.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM usage_collector_inbox WHERE state IN ('pending', 'ready'))`).Scan(&pending); err != nil {
+				r.setCollectorError(err, durationSeconds(collector.RetryIntervalSeconds))
+				continue
+			}
+			if !pending {
+				_ = r.updateState(ctx, collectorPatch{Running: boolPtr(false)})
+				if r.sleepOrStop(durationSeconds(minFloat(collector.PollIntervalSeconds, 5))) {
+					return
+				}
+				continue
+			}
+		}
+		// Pending receipts survive disabled collection and origin changes. They
+		// are processed without removing a second copy from the upstream queue.
+		pricing, err := r.loadCollectorPricing(ctx, collector)
+		if err != nil {
+			r.setCollectorError(err, durationSeconds(collector.RetryIntervalSeconds))
+			continue
+		}
+		_, err = r.app.processCollectorUsageInbox(ctx, cfg, pricing, time.Now())
+		if err != nil {
+			r.setCollectorError(fmt.Errorf("process persisted usage batch: %w", err), durationSeconds(collector.RetryIntervalSeconds))
+			continue
 		}
 		if !collector.Enabled {
 			_ = r.updateState(ctx, collectorPatch{Running: boolPtr(false)})
@@ -132,21 +175,23 @@ func (r *CollectorRunner) loop(ctx context.Context) {
 
 		now := time.Now()
 		_ = r.updateState(ctx, collectorPatch{Running: boolPtr(true), LastPollAt: &now})
-		pricing, messages, err := r.loadCollectorBatch(ctx, collector)
-		if err != nil {
-			r.setCollectorError(err, durationSeconds(collector.RetryIntervalSeconds))
-			continue
-		}
-		inserted := 0
-		for _, message := range messages {
-			_, created, err := r.app.saveUsageMessage(ctx, []byte(message), pricing, usageCollectorOrigin(collector))
-			if err != nil {
-				r.setCollectorError(err, durationSeconds(collector.RetryIntervalSeconds))
+		messages, queueErr := consumeRespQueue(ctx, collector)
+		if len(messages) > 0 {
+			unpersisted, batchCollector, batchReceivedAt, batchPricing = messages, collector, now, pricing
+			if err := r.app.persistCollectorUsageBatch(ctx, batchCollector, unpersisted, batchReceivedAt, batchPricing); err != nil {
+				r.setCollectorError(fmt.Errorf("persist dequeued usage batch: %w", err), durationSeconds(collector.RetryIntervalSeconds))
 				continue
 			}
-			if created {
-				inserted++
-			}
+			unpersisted = nil
+		}
+		if queueErr != nil {
+			r.setCollectorError(queueErr, durationSeconds(collector.RetryIntervalSeconds))
+			continue
+		}
+		_, err = r.app.processCollectorUsageInbox(ctx, cfg, pricing, time.Now())
+		if err != nil {
+			r.setCollectorError(fmt.Errorf("process persisted usage batch: %w", err), durationSeconds(collector.RetryIntervalSeconds))
+			continue
 		}
 		successAt := time.Now()
 		emptyError := ""
@@ -154,7 +199,6 @@ func (r *CollectorRunner) loop(ctx context.Context) {
 			Running:       boolPtr(true),
 			LastSuccessAt: &successAt,
 			LastError:     &emptyError,
-			RecordsDelta:  inserted,
 		})
 		if r.sleepOrStop(durationSeconds(collector.PollIntervalSeconds)) {
 			return
@@ -186,35 +230,40 @@ func (r *CollectorRunner) selectorRefreshLoop(ctx context.Context, done chan str
 }
 
 func (r *CollectorRunner) loadCollectorBatch(ctx context.Context, collector CollectorConfig) (modelPriceBillingIndex, []string, error) {
+	pricing, err := r.loadCollectorPricing(ctx, collector)
+	if err != nil {
+		return modelPriceBillingIndex{}, nil, err
+	}
+	messages, err := consumeRespQueue(ctx, collector)
+	return pricing, messages, err
+}
+
+func (r *CollectorRunner) loadCollectorPricing(ctx context.Context, collector CollectorConfig) (modelPriceBillingIndex, error) {
 	cfg := AppConfig{Collector: collector}
 	configKey := modelPriceSelectorConfigKey(cfg)
 	pricing, err := r.app.billingPriceIndexWithoutSelectors(ctx)
 	if err != nil {
-		return modelPriceBillingIndex{}, nil, err
+		return modelPriceBillingIndex{}, err
 	}
 	pricing, selectorsCurrent := r.app.attachCachedBillingPriceSelectorsForConfig(pricing, cfg)
 	var refreshErr error
 	if !selectorsCurrent {
 		refreshErr = r.app.refreshModelPriceSelectorsIfStale(ctx, cfg)
 		if refreshErr != nil && (ctx.Err() != nil || pricing.MatchContext.SelectorsRequired) {
-			return modelPriceBillingIndex{}, nil, refreshErr
+			return modelPriceBillingIndex{}, refreshErr
 		}
 		pricing, selectorsCurrent = r.app.attachCachedBillingPriceSelectorsForConfig(pricing, cfg)
 	}
 	if !selectorsCurrent {
 		if refreshErr != nil {
 			if pricing.MatchContext.SelectorsRequired {
-				return modelPriceBillingIndex{}, nil, refreshErr
+				return modelPriceBillingIndex{}, refreshErr
 			}
 		} else if configKey != "" || pricing.MatchContext.SelectorsRequired {
-			return modelPriceBillingIndex{}, nil, errCollectorSelectorConfigMismatch
+			return modelPriceBillingIndex{}, errCollectorSelectorConfigMismatch
 		}
 	}
-	messages, err := consumeRespQueue(ctx, collector)
-	if err != nil {
-		return modelPriceBillingIndex{}, nil, err
-	}
-	return pricing, messages, nil
+	return pricing, nil
 }
 
 func (r *CollectorRunner) setCollectorError(err error, delay time.Duration) {

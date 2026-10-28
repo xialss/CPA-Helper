@@ -23,13 +23,35 @@ const draft = ref<CPAHelperPluginRule>({ ...props.modelValue })
 
 watch(() => props.modelValue, (value) => { draft.value = { ...value } }, { deep: true })
 
+function modelIdentity(value: string) {
+  return value.toLowerCase()
+}
+
+const availableModelNames = computed(() => new Map(
+  props.models.map((value) => [modelIdentity(value), value]),
+))
+
 function modelOptions(field: 'models' | 'denied_models') {
-  const selected = draft.value[field] ?? []
-  return [...new Set([...props.models, ...selected])]
-    .map((value) => ({ label: value, value }))
+  const selected = [...new Set(draft.value[field] ?? [])]
+  const selectedIdentities = new Set(selected.map(modelIdentity))
+  const directoryOptions = [...availableModelNames.value]
+    .filter(([identity]) => !selectedIdentities.has(identity))
+    .map(([, value]) => ({ label: value, value }))
+  const selectedOptions = selected.map((value) => {
+    const directoryName = availableModelNames.value.get(modelIdentity(value))
+    return {
+      label: directoryName ?? `${t('已选模型（当前目录缺失）', 'Selected model (missing from directory)')} · ${value}`,
+      value,
+    }
+  })
+  return [...directoryOptions, ...selectedOptions]
 }
 const allowedModelOptions = computed(() => modelOptions('models'))
 const deniedModelOptions = computed(() => modelOptions('denied_models'))
+const missingModelValues = computed(() => {
+  const selected = new Set([...(draft.value.models ?? []), ...(draft.value.denied_models ?? [])])
+  return [...selected].filter((value) => !availableModelNames.value.has(modelIdentity(value)))
+})
 const selectedCredentialRefs = computed(() => [...new Set([
   ...(draft.value.credential_ids ?? []), ...(draft.value.denied_credential_ids ?? []),
 ])])
@@ -92,8 +114,8 @@ function setProviders(field: keyof CPAHelperPluginRule, values: string[]) {
 
 <template>
   <p class="plugin-rule-hint">{{ t('关联规则与独立规则的同类列表取并集，禁止优先；某项的允许列表全部为空时，该项才不限制。', 'Linked and independent rules merge matching lists by union. Deny takes precedence; a restriction is absent only when all of its allow lists are empty.') }}</p>
-  <NAlert v-if="missingCredentialRefs.length > 0 || missingProviderValues.length > 0" type="warning" :bordered="false" class="plugin-rule-missing">
-    {{ t('部分已选凭据或类别不在当前目录中，原引用仍会保留并保存。请确认后再移除，避免改变路由限制。', 'Some selected credentials or categories are missing from the current directory. Their references will be kept when saving. Confirm before removing them to avoid changing routing restrictions.') }}
+  <NAlert v-if="missingModelValues.length > 0 || missingCredentialRefs.length > 0 || missingProviderValues.length > 0" type="warning" :bordered="false" class="plugin-rule-missing">
+    {{ t('部分已选模型、凭据或类别不在当前目录中，原引用仍会保留并保存。请确认后再移除，避免改变路由限制。', 'Some selected models, credentials or categories are missing from the current directory. Their references will be kept when saving. Confirm before removing them to avoid changing routing restrictions.') }}
   </NAlert>
   <div class="plugin-rule-grid">
     <NFormItem :label="t('允许的模型', 'Allowed models')">

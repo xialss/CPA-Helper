@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"net/http"
@@ -195,13 +196,65 @@ func (a *App) applyQuotaCharge(ctx context.Context, record UsageRecord, pricing 
 	if err != nil {
 		return err
 	}
+	return a.applyQuotaChargeForUser(ctx, record, pricing, user, 0)
+}
+
+// Inbox owners are bound at dequeue time. A deleted/reused username must never
+// move an earlier execution's charge to a different user.
+func (a *App) applyQuotaChargeForOwner(ctx context.Context, record UsageRecord, pricing modelPriceBillingIndex, owner frozenUsageOwner) error {
+	var handled bool
+	if err := a.db.QueryRowContext(ctx, `SELECT quota_handled FROM usage_collector_inbox WHERE id = ?`, owner.InboxID).Scan(&handled); err != nil {
+		return err
+	}
+	if handled {
+		return nil
+	}
+	if owner.UserID == nil {
+		return markCollectorQuotaHandled(ctx, a.db, owner.InboxID)
+	}
+	user, err := a.getUser(ctx, *owner.UserID)
+	var missing *AppError
+	if errors.As(err, &missing) && missing.Code == "not_found" {
+		return markCollectorQuotaHandled(ctx, a.db, owner.InboxID)
+	}
+	if err != nil {
+		return err
+	}
+	return a.applyQuotaChargeForUser(ctx, record, pricing, user, owner.InboxID)
+}
+
+func markCollectorQuotaHandled(ctx context.Context, executor usageAnalyticsExecutor, inboxID int64) error {
+	if inboxID == 0 {
+		return nil
+	}
+	result, err := executor.ExecContext(ctx, `UPDATE usage_collector_inbox SET quota_handled = 1 WHERE id = ? AND state IN ('pending', 'ready')`, inboxID)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err == nil && count != 1 {
+		return fmt.Errorf("collector quota outcome has no unfinished receipt")
+	}
+	return err
+}
+
+func (a *App) applyQuotaChargeForUser(ctx context.Context, record UsageRecord, pricing modelPriceBillingIndex, user UserRecord, inboxID int64) error {
 	userID := user.ID
 	unlock := a.lockUserMutation(userID)
 	defer unlock()
-	// The username lookup above only identifies the lock key. Re-read inside
+	if inboxID != 0 {
+		var handled bool
+		if err := a.db.QueryRowContext(ctx, `SELECT quota_handled FROM usage_collector_inbox WHERE id = ?`, inboxID).Scan(&handled); err != nil {
+			return err
+		}
+		if handled {
+			return nil
+		}
+	}
+	// The owner lookup above only identifies the lock key. Re-read inside
 	// the critical section so concurrent charges always build on the latest
 	// quota snapshot instead of overwriting a sibling update.
-	user, err = a.getUser(ctx, userID)
+	user, err := a.getUser(ctx, userID)
 	if err != nil {
 		return err
 	}
@@ -222,13 +275,15 @@ func (a *App) applyQuotaCharge(ctx context.Context, record UsageRecord, pricing 
 		}
 	}
 	if quotaIsUnlimited(user) {
-		return nil
+		// Freeze the successful no-charge outcome under the same user lock.
+		// A later quota activation cannot turn receipt recovery into a charge.
+		return markCollectorQuotaHandled(ctx, a.db, inboxID)
 	}
 
 	var existing int
 	err = a.db.QueryRowContext(ctx, `SELECT id FROM user_quota_charges WHERE usage_record_id = ?`, record.ID).Scan(&existing)
 	if err == nil {
-		return nil
+		return markCollectorQuotaHandled(ctx, a.db, inboxID)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
@@ -292,6 +347,9 @@ func (a *App) applyQuotaCharge(ctx context.Context, record UsageRecord, pricing 
 		WHERE id = ?
 	`, mathRound(user.QuotaMonthUsedUSD, 8), quotaAmountArg(user.QuotaLifetimeUSD), user.QuotaUnpricedRecords, now, user.ID)
 	if err != nil {
+		return err
+	}
+	if err := markCollectorQuotaHandled(ctx, tx, inboxID); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

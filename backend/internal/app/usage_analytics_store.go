@@ -15,21 +15,46 @@ type usageAnalyticsExecutor interface {
 const usageAnalyticsPendingFactBatchSize = 500
 
 func (a *App) upsertUsageAnalyticsFact(ctx context.Context, executor usageAnalyticsExecutor, record UsageRecord) error {
+	columns, err := usageAnalyticsTableColumns(ctx, executor, "usage_analytics_facts")
+	if err != nil {
+		return err
+	}
+	return a.upsertUsageAnalyticsFactWithColumns(ctx, executor, record, columns)
+}
+
+func (a *App) upsertUsageAnalyticsFactWithColumns(ctx context.Context, executor usageAnalyticsExecutor, record UsageRecord, columns map[string]bool) error {
 	source := usageAnalyticsRecordSource(record)
 	authIndex := usageAnalyticsRecordAuthIndex(record)
-	sourceKey := usageSourceKey(source)
+	sourceKey := usageAnalyticsRecordSourceKey(record)
 	sourceAccount := usageAnalyticsRecordSourceAccount(record, source)
 	auth, authConflict := usageSourceCatalogAuth(record)
 	if err := persistUsageRecordAnalyticsMetadata(ctx, executor, record); err != nil {
 		return err
+	}
+	if !columns["cache_creation_ttl"] || !columns["cache_creation_5m_tokens"] || !columns["cache_creation_1h_tokens"] {
+		return a.upsertUsageAnalyticsFactLegacy(ctx, executor, record)
+	}
+	metadataColumn, metadataPlaceholder, metadataUpdate := "", "", ""
+	arguments := []any{record.ID, dbTime(record.Timestamp), nullableStringArg(record.UsageUsername), nullableStringArg(record.APIKeyDescription), nullableStringArg(record.Provider), nullableStringArg(record.Model),
+		nullableStringArg(record.ServiceTier), nullableStringArg(record.Endpoint), nullableStringArg(sourceKey), nullableStringArg(auth), nullableStringArg(authIndex), nullableStringArg(sourceAccount), nullableFloatArg(record.TTFTMS),
+		record.Failed, record.InputTokens, record.OutputTokens, record.CachedTokens, record.CacheReadTokens, record.CacheCreationTokens, record.ReasoningTokens, record.TotalTokens,
+		nullableStringArg(record.CacheCreationTTL), nullableUsageIntArg(record.CacheCreation5mTokens), nullableUsageIntArg(record.CacheCreation1hTokens)}
+	if columns["cache_creation_metadata"] {
+		encoded, err := encodeUsageCacheCreationMetadata(usageCacheCreationMetadataForRecord(record))
+		if err != nil {
+			return err
+		}
+		metadataColumn, metadataPlaceholder, metadataUpdate = ", cache_creation_metadata", ", ?", ", cache_creation_metadata = excluded.cache_creation_metadata"
+		arguments = append(arguments, encoded)
 	}
 	if _, err := executor.ExecContext(ctx, `
 		INSERT INTO usage_analytics_facts (
 			usage_record_id, timestamp, usage_username, api_key_description, provider, model,
 			service_tier, endpoint, source_key, auth, auth_index, source_account, ttft_ms,
 			failed, input_tokens, output_tokens, cached_tokens, cache_read_tokens,
-			cache_creation_tokens, reasoning_tokens, total_tokens
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			cache_creation_tokens, reasoning_tokens, total_tokens, cache_creation_ttl,
+			cache_creation_5m_tokens, cache_creation_1h_tokens`+metadataColumn+`
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`+metadataPlaceholder+`)
 		ON CONFLICT(usage_record_id) DO UPDATE SET
 			timestamp = excluded.timestamp,
 			usage_username = excluded.usage_username,
@@ -49,7 +74,47 @@ func (a *App) upsertUsageAnalyticsFact(ctx context.Context, executor usageAnalyt
 			cached_tokens = excluded.cached_tokens,
 			cache_read_tokens = excluded.cache_read_tokens,
 			cache_creation_tokens = excluded.cache_creation_tokens,
+			cache_creation_ttl = excluded.cache_creation_ttl,
+			cache_creation_5m_tokens = excluded.cache_creation_5m_tokens,
+			cache_creation_1h_tokens = excluded.cache_creation_1h_tokens,
 			reasoning_tokens = excluded.reasoning_tokens,
+			total_tokens = excluded.total_tokens`+metadataUpdate, arguments...); err != nil {
+		return err
+	}
+	if sourceKey != nil {
+		if err := upsertUsageSourceCatalog(ctx, executor, *sourceKey, source, auth, sourceAccount, authIndex, authConflict); err != nil {
+			return err
+		}
+	}
+	if _, err := executor.ExecContext(ctx, `DELETE FROM usage_analytics_pending_facts WHERE usage_record_id = ?`, record.ID); err != nil {
+		return err
+	}
+	return markUsageAnalyticsFactUpserted(ctx, executor, record.ID)
+}
+
+func (a *App) upsertUsageAnalyticsFactLegacy(ctx context.Context, executor usageAnalyticsExecutor, record UsageRecord) error {
+	source := usageAnalyticsRecordSource(record)
+	authIndex := usageAnalyticsRecordAuthIndex(record)
+	sourceKey := usageAnalyticsRecordSourceKey(record)
+	sourceAccount := usageAnalyticsRecordSourceAccount(record, source)
+	auth, authConflict := usageSourceCatalogAuth(record)
+	if _, err := executor.ExecContext(ctx, `
+		INSERT INTO usage_analytics_facts (
+			usage_record_id, timestamp, usage_username, api_key_description, provider, model,
+			service_tier, endpoint, source_key, auth, auth_index, source_account, ttft_ms,
+			failed, input_tokens, output_tokens, cached_tokens, cache_read_tokens,
+			cache_creation_tokens, reasoning_tokens, total_tokens
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(usage_record_id) DO UPDATE SET
+			timestamp = excluded.timestamp, usage_username = excluded.usage_username,
+			api_key_description = excluded.api_key_description, provider = excluded.provider,
+			model = excluded.model, service_tier = excluded.service_tier, endpoint = excluded.endpoint,
+			source_key = COALESCE(excluded.source_key, usage_analytics_facts.source_key),
+			auth = COALESCE(excluded.auth, usage_analytics_facts.auth), auth_index = COALESCE(excluded.auth_index, usage_analytics_facts.auth_index),
+			source_account = COALESCE(excluded.source_account, usage_analytics_facts.source_account), ttft_ms = excluded.ttft_ms,
+			failed = excluded.failed, input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens,
+			cached_tokens = excluded.cached_tokens, cache_read_tokens = excluded.cache_read_tokens,
+			cache_creation_tokens = excluded.cache_creation_tokens, reasoning_tokens = excluded.reasoning_tokens,
 			total_tokens = excluded.total_tokens
 	`, record.ID, dbTime(record.Timestamp), nullableStringArg(record.UsageUsername), nullableStringArg(record.APIKeyDescription), nullableStringArg(record.Provider), nullableStringArg(record.Model),
 		nullableStringArg(record.ServiceTier), nullableStringArg(record.Endpoint), nullableStringArg(sourceKey), nullableStringArg(auth), nullableStringArg(authIndex), nullableStringArg(sourceAccount), nullableFloatArg(record.TTFTMS),
@@ -112,6 +177,14 @@ func persistUsageRecordAnalyticsMetadata(ctx context.Context, executor usageAnal
 	if source == nil && sourceAccount == nil && auth == nil && authIndex == nil {
 		return nil
 	}
+	if record.analyticsSourceKey != nil {
+		correctedKey := usageAnalyticsRecordSourceKey(record)
+		if !sameOptionalUsageText(correctedKey, record.analyticsSourceKey) {
+			if _, err := executor.ExecContext(ctx, `UPDATE usage_records SET source_key = ? WHERE id = ?`, nullableStringArg(correctedKey), record.ID); err != nil {
+				return err
+			}
+		}
+	}
 	sourceArg := nullableStringArg(source)
 	sourceAccountArg := nullableStringArg(sourceAccount)
 	authArg := nullableStringArg(auth)
@@ -139,6 +212,11 @@ func usageSourceCatalogAuth(record UsageRecord) (*string, bool) {
 	rawAuth := authFromUsageRawJSON(record.RawJSON)
 	if rawAuth != nil {
 		return rawAuth, storedAuth != nil && usageAuthTypeKey(storedAuth) != usageAuthTypeKey(rawAuth)
+	}
+	if strings.TrimSpace(record.RawJSON) == "" && record.analyticsSourceKey != nil && validUsageCallerScope(*record.analyticsSourceKey) && record.CacheCreationMetadata.Version == "v1" {
+		// New inbox records retain the normalized authentication beside their
+		// pre-mask digest. Raw retention must not invalidate that frozen fact.
+		return storedAuth, false
 	}
 	// List/detail rendering retains the legacy stored-auth fallback. The source
 	// catalog cannot prove that fallback agrees with an absent, blank, or
@@ -286,8 +364,13 @@ func (a *App) ensureUsageAnalyticsFacts(ctx context.Context) error {
 		if len(records) == 0 {
 			return tx.Commit()
 		}
+		columns, err := usageAnalyticsTableColumns(ctx, tx, "usage_analytics_facts")
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 		for _, record := range records {
-			if err := a.upsertUsageAnalyticsFact(ctx, tx, record); err != nil {
+			if err := a.upsertUsageAnalyticsFactWithColumns(ctx, tx, record, columns); err != nil {
 				_ = tx.Rollback()
 				return err
 			}
@@ -307,6 +390,17 @@ func (a *App) usageAnalyticsFactsPending(ctx context.Context) (bool, error) {
 }
 
 func pendingUsageAnalyticsFactRecords(ctx context.Context, tx *sql.Tx) ([]UsageRecord, error) {
+	metadataProjection, sourceKeyProjection := "NULL", "NULL"
+	columns, err := usageAnalyticsTableColumns(ctx, tx, "usage_records")
+	if err != nil {
+		return nil, err
+	}
+	if columns["cache_creation_metadata"] {
+		metadataProjection = "records.cache_creation_metadata"
+	}
+	if columns["source_key"] {
+		sourceKeyProjection = "records.source_key"
+	}
 	// Analytics does not consume response-model presentation fields. NULL slots
 	// also allow historical migration repair to run before those columns exist.
 	rows, err := tx.QueryContext(ctx, `
@@ -316,12 +410,28 @@ func pendingUsageAnalyticsFactRecords(ctx context.Context, tx *sql.Tx) ([]UsageR
 		       records.request_id, records.auth, records.auth_index, records.latency_ms, records.ttft_ms,
 		       records.failed, records.input_tokens, records.output_tokens, records.cached_tokens,
 		       records.cache_read_tokens, records.cache_creation_tokens, records.reasoning_tokens,
-		       records.total_tokens, records.dedupe_key, records.raw_json, NULL, NULL
+		       records.total_tokens, records.dedupe_key, records.raw_json, NULL, NULL,
+	       records.cache_creation_ttl, records.cache_creation_5m_tokens, records.cache_creation_1h_tokens, `+metadataProjection+`, `+sourceKeyProjection+`
 		FROM usage_analytics_pending_facts AS pending
 		JOIN usage_records AS records ON records.id = pending.usage_record_id
 		ORDER BY records.id
 		LIMIT ?
 	`, usageAnalyticsPendingFactBatchSize)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no such column") {
+		rows, err = tx.QueryContext(ctx, `
+			SELECT records.id, CAST(records.timestamp AS TEXT), records.usage_username,
+			       records.api_key_description, records.provider, records.model, records.service_tier,
+			       records.reasoning_effort, records.endpoint, records.source, records.source_account,
+			       records.request_id, records.auth, records.auth_index, records.latency_ms, records.ttft_ms,
+			       records.failed, records.input_tokens, records.output_tokens, records.cached_tokens,
+			       records.cache_read_tokens, records.cache_creation_tokens, records.reasoning_tokens,
+			       records.total_tokens, records.dedupe_key, records.raw_json, NULL, NULL, NULL, NULL, NULL, `+metadataProjection+`, `+sourceKeyProjection+`
+			FROM usage_analytics_pending_facts AS pending
+			JOIN usage_records AS records ON records.id = pending.usage_record_id
+			ORDER BY records.id
+			LIMIT ?
+		`, usageAnalyticsPendingFactBatchSize)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -396,11 +506,14 @@ func usageFactsWhere(filters UsageFilters, alias string) (string, []any, error) 
 func scanUsageAnalyticsFactRecord(scanner usageRecordScanner) (UsageRecord, error) {
 	var record UsageRecord
 	var timestamp, usageUsername, description, provider, model, serviceTier, endpoint, sourceKey, auth, authIndex, sourceAccount sql.NullString
+	var cacheCreationTTL sql.NullString
+	var cacheCreation5mTokens, cacheCreation1hTokens sql.NullInt64
 	var ttftMS sql.NullFloat64
 	if err := scanner.Scan(
 		&record.ID, &timestamp, &usageUsername, &description, &provider, &model, &serviceTier, &endpoint,
 		&sourceKey, &auth, &authIndex, &sourceAccount, &ttftMS, &record.Failed, &record.InputTokens, &record.OutputTokens,
 		&record.CachedTokens, &record.CacheReadTokens, &record.CacheCreationTokens, &record.ReasoningTokens, &record.TotalTokens,
+		&cacheCreationTTL, &cacheCreation5mTokens, &cacheCreation1hTokens,
 	); err != nil {
 		return UsageRecord{}, err
 	}
@@ -418,6 +531,9 @@ func scanUsageAnalyticsFactRecord(scanner usageRecordScanner) (UsageRecord, erro
 	record.AuthIndex = nullableString(authIndex)
 	record.SourceAccount = nullableString(sourceAccount)
 	record.TTFTMS = nullableFloat(ttftMS)
+	record.CacheCreationTTL = nullableString(cacheCreationTTL)
+	record.CacheCreation5mTokens = nullableInt(cacheCreation5mTokens)
+	record.CacheCreation1hTokens = nullableInt(cacheCreation1hTokens)
 	record.resolvedAuth = record.Auth
 	record.authResolved = true
 	return record, nil
@@ -426,12 +542,14 @@ func scanUsageAnalyticsFactRecord(scanner usageRecordScanner) (UsageRecord, erro
 func scanUsageAnalyticsFactRecordWithSource(scanner usageRecordScanner) (UsageRecord, error) {
 	var record UsageRecord
 	var timestamp, usageUsername, description, provider, model, serviceTier, endpoint, sourceKey, auth, authIndex, sourceAccount, source sql.NullString
+	var cacheCreationTTL sql.NullString
+	var cacheCreation5mTokens, cacheCreation1hTokens sql.NullInt64
 	var ttftMS sql.NullFloat64
 	if err := scanner.Scan(
 		&record.ID, &timestamp, &usageUsername, &description, &provider, &model, &serviceTier, &endpoint,
 		&sourceKey, &auth, &authIndex, &sourceAccount, &ttftMS, &record.Failed, &record.InputTokens, &record.OutputTokens,
 		&record.CachedTokens, &record.CacheReadTokens, &record.CacheCreationTokens, &record.ReasoningTokens, &record.TotalTokens,
-		&source,
+		&cacheCreationTTL, &cacheCreation5mTokens, &cacheCreation1hTokens, &source,
 	); err != nil {
 		return UsageRecord{}, err
 	}
@@ -450,6 +568,9 @@ func scanUsageAnalyticsFactRecordWithSource(scanner usageRecordScanner) (UsageRe
 	record.SourceAccount = nullableString(sourceAccount)
 	record.Source = nullableString(source)
 	record.TTFTMS = nullableFloat(ttftMS)
+	record.CacheCreationTTL = nullableString(cacheCreationTTL)
+	record.CacheCreation5mTokens = nullableInt(cacheCreation5mTokens)
+	record.CacheCreation1hTokens = nullableInt(cacheCreation1hTokens)
 	record.resolvedAuth = record.Auth
 	record.authResolved = true
 	return record, nil

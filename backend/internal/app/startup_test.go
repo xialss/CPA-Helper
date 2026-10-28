@@ -215,7 +215,7 @@ func TestRequireSchemaShapeRejectsMissingModelMonitorColumns(t *testing.T) {
 				appSettingsSchemaForStartupTest(missing),
 				`CREATE TABLE users (username TEXT, is_super_admin BOOLEAN, must_change_password BOOLEAN, session_version INTEGER)`,
 				apiKeyExpirationSchemaForStartupTest,
-				`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
+				`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, cache_creation_ttl TEXT, cache_creation_5m_tokens TEXT, cache_creation_1h_tokens TEXT, service_tier TEXT)`,
 				codexKeeperAuthStateSchemaForStartupTest,
 				modelPriceSchemaForStartupTest,
 				modelPriceLibraryConflictSchemaForStartupTest,
@@ -248,6 +248,8 @@ func TestRequireSchemaShapeRejectsMissingModelPriceChannelColumns(t *testing.T) 
 		"long_context_output_usd_per_million",
 		"long_context_cache_read_usd_per_million",
 		"long_context_cache_creation_usd_per_million",
+		"cache_creation_1h_usd_per_million",
+		"long_context_cache_creation_1h_usd_per_million",
 	}
 	for _, missing := range []string{"price_scope", "channel_auth_type", "channel_brand", "channel_key"} {
 		t.Run(missing, func(t *testing.T) {
@@ -267,7 +269,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceChannelColumns(t *testing.T) 
 				appSettingsSchemaForStartupTest(""),
 				`CREATE TABLE users (username TEXT, is_super_admin BOOLEAN, must_change_password BOOLEAN, session_version INTEGER)`,
 				apiKeyExpirationSchemaForStartupTest,
-				`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
+				`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, cache_creation_ttl TEXT, cache_creation_5m_tokens TEXT, cache_creation_1h_tokens TEXT, service_tier TEXT)`,
 				codexKeeperAuthStateSchemaForStartupTest,
 				`CREATE TABLE model_prices (` + strings.Join(columns, ", ") + `)`,
 				modelPriceLibraryConflictSchemaForStartupTest,
@@ -298,13 +300,14 @@ func TestRequireSchemaShapeRejectsMissingModelPriceLibraryConflictsTable(t *test
 		appSettingsSchemaForStartupTest(""),
 		`CREATE TABLE users (username TEXT, is_super_admin BOOLEAN, must_change_password BOOLEAN, session_version INTEGER)`,
 		apiKeyExpirationSchemaForStartupTest,
-		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
+		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, cache_creation_ttl TEXT, cache_creation_5m_tokens TEXT, cache_creation_1h_tokens TEXT, service_tier TEXT)`,
 		codexKeeperAuthStateSchemaForStartupTest,
 		`CREATE TABLE model_prices (
 			request_usd TEXT, billing_unit TEXT, priority_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
 			long_context_threshold_tokens TEXT, long_context_input_usd_per_million TEXT,
 			long_context_output_usd_per_million TEXT, long_context_cache_read_usd_per_million TEXT,
-			long_context_cache_creation_usd_per_million TEXT
+			long_context_cache_creation_usd_per_million TEXT,
+			cache_creation_1h_usd_per_million TEXT, long_context_cache_creation_1h_usd_per_million TEXT
 		)`,
 		`CREATE TABLE user_quota_charges (lifetime_deducted_usd TEXT)`,
 	}
@@ -331,13 +334,14 @@ func TestRequireSchemaShapeRejectsMissingKeeperAuthIndex(t *testing.T) {
 		appSettingsSchemaForStartupTest(""),
 		`CREATE TABLE users (username TEXT, is_super_admin BOOLEAN, must_change_password BOOLEAN, session_version INTEGER)`,
 		apiKeyExpirationSchemaForStartupTest,
-		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, service_tier TEXT)`,
+		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, cache_creation_ttl TEXT, cache_creation_5m_tokens TEXT, cache_creation_1h_tokens TEXT, service_tier TEXT)`,
 		`CREATE TABLE codex_keeper_auth_states (auth_name TEXT)`,
 		`CREATE TABLE model_prices (
 			request_usd TEXT, billing_unit TEXT, priority_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
 			long_context_threshold_tokens TEXT, long_context_input_usd_per_million TEXT,
 			long_context_output_usd_per_million TEXT, long_context_cache_read_usd_per_million TEXT,
-			long_context_cache_creation_usd_per_million TEXT
+			long_context_cache_creation_usd_per_million TEXT,
+			cache_creation_1h_usd_per_million TEXT, long_context_cache_creation_1h_usd_per_million TEXT
 		)`,
 		modelPriceLibraryConflictSchemaForStartupTest,
 		`CREATE TABLE user_quota_charges (lifetime_deducted_usd TEXT)`,
@@ -472,6 +476,28 @@ func TestRequireSchemaShapeRejectsMissingNewModelPricingSchema(t *testing.T) {
 		{table: "ai_radar_points", column: "created_at"},
 		{table: "ai_radar_state", column: "backfill_completed_at", dropTable: true},
 		{table: "ai_radar_state", column: "updated_at"},
+		{table: "usage_records", column: "cache_creation_metadata"},
+		{table: "usage_records", column: "source_key"},
+		{table: "usage_analytics_facts", column: "cache_creation_metadata"},
+		{table: "usage_collector_inbox", column: "id", dropTable: true},
+		{table: "usage_collector_inbox", column: "id"},
+		{table: "usage_collector_inbox", column: "collector_origin"},
+		{table: "usage_collector_inbox", column: "dedupe_key"},
+		{table: "usage_collector_inbox", column: "execution_id"},
+		{table: "usage_collector_inbox", column: "caller_scope"},
+		{table: "usage_collector_inbox", column: "payload_json"},
+		{table: "usage_collector_inbox", column: "usage_user_id"},
+		{table: "usage_collector_inbox", column: "usage_username"},
+		{table: "usage_collector_inbox", column: "api_key_description"},
+		{table: "usage_collector_inbox", column: "received_at"},
+		{table: "usage_collector_inbox", column: "next_attempt_at"},
+		{table: "usage_collector_inbox", column: "deadline_at"},
+		{table: "usage_collector_inbox", column: "attempts"},
+		{table: "usage_collector_inbox", column: "state"},
+		{table: "usage_collector_inbox", column: "last_error_code"},
+		{table: "usage_collector_inbox", column: "usage_record_id"},
+		{table: "usage_collector_inbox", column: "quota_handled"},
+		{table: "usage_collector_inbox", column: "completed_at"},
 	} {
 		t.Run(test.table+"."+test.column, func(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "schema.sqlite3")
@@ -554,7 +580,8 @@ const modelPriceSchemaForStartupTest = `CREATE TABLE model_prices (
 	request_usd TEXT, billing_unit TEXT, priority_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
 	long_context_threshold_tokens TEXT, long_context_input_usd_per_million TEXT,
 	long_context_output_usd_per_million TEXT, long_context_cache_read_usd_per_million TEXT,
-	long_context_cache_creation_usd_per_million TEXT
+	long_context_cache_creation_usd_per_million TEXT,
+	cache_creation_1h_usd_per_million TEXT, long_context_cache_creation_1h_usd_per_million TEXT
 )`
 
 const modelPriceLibraryConflictSchemaForStartupTest = `CREATE TABLE model_price_library_conflicts (
@@ -564,12 +591,14 @@ const modelPriceLibraryConflictSchemaForStartupTest = `CREATE TABLE model_price_
 	request_usd TEXT, billing_unit TEXT, priority_multiplier TEXT, long_context_threshold_tokens TEXT,
 	long_context_input_usd_per_million TEXT, long_context_output_usd_per_million TEXT,
 	long_context_cache_read_usd_per_million TEXT, long_context_cache_creation_usd_per_million TEXT,
+	cache_creation_1h_usd_per_million TEXT, long_context_cache_creation_1h_usd_per_million TEXT,
 	source TEXT, source_model TEXT, auto_synced TEXT, last_synced_at TEXT, updated_at TEXT
 )`
 
 var usageAnalyticsSchemasForStartupTest = []string{
 	`CREATE TABLE usage_analytics_facts (
-		usage_record_id TEXT, timestamp TEXT, source_key TEXT, auth TEXT, auth_index TEXT, source_account TEXT
+		usage_record_id TEXT, timestamp TEXT, source_key TEXT, auth TEXT, auth_index TEXT, source_account TEXT,
+		cache_creation_ttl TEXT, cache_creation_5m_tokens TEXT, cache_creation_1h_tokens TEXT
 	)`,
 	`CREATE TABLE usage_source_catalog (source_key TEXT, source TEXT, auth_conflict TEXT)`,
 	`CREATE TABLE usage_analytics_pending_facts (usage_record_id TEXT)`,

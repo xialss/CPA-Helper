@@ -186,14 +186,18 @@ const timePricingEnabled = ref(false)
 const timeRule = ref<PriceTimeRule | null>(null)
 const timeRuleLoading = ref(false)
 let timeTemplateRequest = 0
-function supportsDeepSeekTimePricingForm(
+function supportsTimePricingForm(
   priceScope: PriceScope,
   billingUnit: ModelPriceBillingUnit,
   model: string,
+  channelBrand: string | null,
 ): boolean {
-  return priceScope === 'channel' && billingUnit === 'token' && (model.split('/').pop()?.toLowerCase().startsWith('deepseek-') ?? false)
+  return priceScope === 'channel' && billingUnit === 'token' && (
+    channelBrand?.trim().toLowerCase() === 'claude' ||
+    (model.split('/').pop()?.toLowerCase().startsWith('deepseek-') ?? false)
+  )
 }
-const deepSeekForm = computed(() => supportsDeepSeekTimePricingForm(form.price_scope, form.billing_unit, form.model))
+const timePricingForm = computed(() => supportsTimePricingForm(form.price_scope, form.billing_unit, form.model, form.channel_brand))
 const priceLabels = computed(() => Object.fromEntries(priceRows.value.filter(row => row.price).map(row => [row.price!.id, row.provider])))
 const currentVersionId = computed(() => priceVersions.value.filter(version => Date.parse(version.effective_at) <= Date.now()).pop()?.id)
 const latestVersionId = computed(() => priceVersions.value[priceVersions.value.length - 1]?.id)
@@ -205,6 +209,14 @@ const visiblePriceVersions = computed(() => {
   return showAllVersions.value ? newestFirst : newestFirst.slice(0, collapsedVersionCount)
 })
 const editingSupportsFast = computed(() => supportsPriorityMultiplier(prices.value.find(price => price.id === editingId.value) ?? null))
+function isClaudePriceEntry(price: Pick<ModelPrice, 'price_scope' | 'channel_brand' | 'provider'> | null | undefined): boolean {
+  if (!price) return false
+  if (price.price_scope === 'channel') return price.channel_brand === 'claude'
+  return ['claude', 'anthropic'].includes(price.provider.trim().toLowerCase())
+}
+const isClaudePriceForm = computed(() => form.price_scope === 'channel'
+  ? form.channel_brand === 'claude'
+  : ['claude', 'anthropic'].includes(form.provider.trim().toLowerCase()))
 function invalidateTimeTemplateRequest() {
   timeTemplateRequest += 1
   timeRuleLoading.value = false
@@ -212,7 +224,7 @@ function invalidateTimeTemplateRequest() {
 
 async function toggleTimePricing(enabled: boolean) {
   invalidateTimeTemplateRequest()
-  if (!deepSeekForm.value) {
+  if (!timePricingForm.value) {
     timePricingEnabled.value = false
     timeRule.value = null
     return
@@ -296,6 +308,7 @@ const form = reactive<ModelPricePayload>({
   output_usd_per_million: 0,
   cache_read_usd_per_million: 0,
   cache_creation_usd_per_million: 0,
+  cache_creation_1h_usd_per_million: null,
   request_usd: null,
   long_context: null,
 })
@@ -305,6 +318,7 @@ const longContextForm = reactive<ModelPriceLongContext>({
   output_usd_per_million: 0,
   cache_read_usd_per_million: 0,
   cache_creation_usd_per_million: 0,
+  cache_creation_1h_usd_per_million: null,
 })
 let beforeCorrection: {
   form: ModelPricePayload
@@ -338,6 +352,7 @@ watch(correctLatestVersion, (correct) => {
     form.output_usd_per_million = latest.output_usd_per_million
     form.cache_read_usd_per_million = latest.cache_read_usd_per_million
     form.cache_creation_usd_per_million = latest.cache_creation_usd_per_million
+    form.cache_creation_1h_usd_per_million = latest.cache_creation_1h_usd_per_million
     form.request_usd = latest.request_usd
     preservedLongContext.value = null
     preserveInvalidLongContext.value = false
@@ -368,7 +383,8 @@ const preservedLongContextSummary = computed(() => {
     `${t('输入', 'Input')} ${formatPreservedLongContextPrice(value, 'input_usd_per_million')}`,
     `${t('输出', 'Output')} ${formatPreservedLongContextPrice(value, 'output_usd_per_million')}`,
     `${t('缓存读', 'Cache read')} ${formatPreservedLongContextPrice(value, 'cache_read_usd_per_million')}`,
-    `${t('缓存写', 'Cache write')} ${formatPreservedLongContextPrice(value, 'cache_creation_usd_per_million')}`,
+    `${t(isClaudePriceForm.value ? '缓存写 5m' : '缓存写', isClaudePriceForm.value ? 'Cache write 5m' : 'Cache write')} ${formatPreservedLongContextPrice(value, 'cache_creation_usd_per_million')}`,
+    ...(isClaudePriceForm.value ? [`${t('缓存写 1h', 'Cache write 1h')} ${formatPreservedLongContextPrice(value, 'cache_creation_1h_usd_per_million')}`] : []),
   ].join(' · ')
 })
 
@@ -1123,6 +1139,7 @@ function resetForm() {
   form.output_usd_per_million = 0
   form.cache_read_usd_per_million = 0
   form.cache_creation_usd_per_million = 0
+  form.cache_creation_1h_usd_per_million = null
   form.request_usd = null
   form.long_context = null
   longContextEnabled.value = false
@@ -1142,6 +1159,7 @@ function resetForm() {
   longContextForm.output_usd_per_million = 0
   longContextForm.cache_read_usd_per_million = 0
   longContextForm.cache_creation_usd_per_million = 0
+  longContextForm.cache_creation_1h_usd_per_million = null
 }
 
 async function refresh() {
@@ -1180,6 +1198,7 @@ function openCreate(prefill: Partial<ModelPricePayload> = {}, channelLabel = '')
   form.output_usd_per_million = prefill.output_usd_per_million ?? 0
   form.cache_read_usd_per_million = prefill.cache_read_usd_per_million ?? 0
   form.cache_creation_usd_per_million = prefill.cache_creation_usd_per_million ?? 0
+  form.cache_creation_1h_usd_per_million = prefill.cache_creation_1h_usd_per_million ?? null
   form.request_usd = prefill.request_usd ?? null
   if (prefill.long_context) {
     setLongContextForm(prefill.long_context)
@@ -1202,6 +1221,7 @@ function openCreateForRow(row: PriceDisplayRow) {
     output_usd_per_million: template?.output_usd_per_million ?? 0,
     cache_read_usd_per_million: template?.cache_read_usd_per_million ?? 0,
     cache_creation_usd_per_million: template?.cache_creation_usd_per_million ?? 0,
+    cache_creation_1h_usd_per_million: template?.cache_creation_1h_usd_per_million ?? null,
     request_usd: template?.request_usd ?? null,
     long_context: template?.long_context ?? null,
   }, row.provider)
@@ -1229,8 +1249,9 @@ function openEdit(row: PriceDisplayRow) {
   form.output_usd_per_million = price.output_usd_per_million
   form.cache_read_usd_per_million = price.cache_read_usd_per_million
   form.cache_creation_usd_per_million = price.cache_creation_usd_per_million
+  form.cache_creation_1h_usd_per_million = price.cache_creation_1h_usd_per_million
   form.request_usd = price.request_usd
-  const supportsTimePricing = supportsDeepSeekTimePricingForm(price.price_scope, form.billing_unit, price.model)
+  const supportsTimePricing = supportsTimePricingForm(price.price_scope, form.billing_unit, price.model, price.channel_brand)
   timeRule.value = supportsTimePricing && price.time_pricing ? JSON.parse(JSON.stringify(price.time_pricing)) : null
   timePricingEnabled.value = supportsTimePricing && !!price.time_pricing
   if (price.long_context) {
@@ -1273,6 +1294,7 @@ function setLongContextForm(value: ModelPriceLongContext) {
   longContextForm.output_usd_per_million = value.output_usd_per_million
   longContextForm.cache_read_usd_per_million = value.cache_read_usd_per_million
   longContextForm.cache_creation_usd_per_million = value.cache_creation_usd_per_million
+  longContextForm.cache_creation_1h_usd_per_million = value.cache_creation_1h_usd_per_million
 }
 
 function setPreservedLongContextForm(value: ModelPriceLibraryConflictLongContext) {
@@ -1284,6 +1306,7 @@ function setPreservedLongContextForm(value: ModelPriceLibraryConflictLongContext
   longContextForm.output_usd_per_million = value.output_usd_per_million ?? 0
   longContextForm.cache_read_usd_per_million = value.cache_read_usd_per_million ?? 0
   longContextForm.cache_creation_usd_per_million = value.cache_creation_usd_per_million ?? 0
+  longContextForm.cache_creation_1h_usd_per_million = value.cache_creation_1h_usd_per_million ?? null
 }
 
 function validLongContextForm(): boolean {
@@ -1295,7 +1318,9 @@ function validLongContextForm(): boolean {
       longContextForm.output_usd_per_million,
       longContextForm.cache_read_usd_per_million,
       longContextForm.cache_creation_usd_per_million,
-    ].every((value) => Number.isFinite(value) && value >= 0)
+    ].every((value) => Number.isFinite(value) && value >= 0) &&
+    (longContextForm.cache_creation_1h_usd_per_million === null ||
+      (Number.isFinite(longContextForm.cache_creation_1h_usd_per_million) && longContextForm.cache_creation_1h_usd_per_million >= 0))
   )
 }
 
@@ -1312,7 +1337,7 @@ async function savePrice() {
     preservedLongContext.value !== null &&
     preserveInvalidLongContext.value
   const longContext = !requestPriceMode && !preservePartialLongContext && longContextEnabled.value
-    ? { ...longContextForm }
+    ? { ...longContextForm, cache_creation_1h_usd_per_million: isClaudePriceForm.value ? longContextForm.cache_creation_1h_usd_per_million : null }
     : null
   const payload: ModelPricePayload = {
     provider: form.provider.trim(),
@@ -1327,9 +1352,10 @@ async function savePrice() {
     output_usd_per_million: form.output_usd_per_million,
     cache_read_usd_per_million: form.cache_read_usd_per_million,
     cache_creation_usd_per_million: form.cache_creation_usd_per_million,
+    cache_creation_1h_usd_per_million: isClaudePriceForm.value ? form.cache_creation_1h_usd_per_million ?? null : null,
     request_usd: requestUSD,
     long_context: longContext,
-    time_pricing: deepSeekForm.value && timePricingEnabled.value ? timeRule.value : null,
+    time_pricing: timePricingForm.value && timePricingEnabled.value ? timeRule.value : null,
     time_pricing_set: true,
   }
   if (!requestPriceMode && preservedLongContext.value !== null) {
@@ -1494,6 +1520,7 @@ function applyChannelPriceMultiplier() {
     form.output_usd_per_million = converted.output_usd_per_million
     form.cache_read_usd_per_million = converted.cache_read_usd_per_million
     form.cache_creation_usd_per_million = converted.cache_creation_usd_per_million
+    form.cache_creation_1h_usd_per_million = converted.cache_creation_1h_usd_per_million
     if (converted.long_context) setLongContextForm(converted.long_context)
   }
   message.success(t('已按倍率换算并填入固定价格', 'Multiplier applied as fixed prices'))
@@ -1778,6 +1805,29 @@ function renderTokenPriceValue(row: PriceTableRow, field: PriceFieldName) {
   return formatPriceValue(row.price?.[field])
 }
 
+function renderCacheCreationPrices(row: PriceTableRow) {
+  if (isPriceGroupRow(row)) {
+    if (row.mode === 'provider') return h('span', { class: 'price-muted' }, '')
+    const library = groupLibraryPrice(row)
+    if (modelGroupLibraryPriceState(library, groupHasConfiguredChannelPrice(row)) === 'empty') {
+      return h('span', { class: 'price-muted' }, '')
+    }
+    if (!library) return t('未配置', 'Not configured')
+    if (library.billing_unit !== 'token') return h('span', { class: 'price-muted' }, '-')
+    return renderCacheCreationRatePair(library)
+  }
+  if (row.billing_unit !== 'token') return h('span', { class: 'price-muted' }, '-')
+  return row.price ? renderCacheCreationRatePair(row.price) : h('span', { class: 'price-muted' }, '-')
+}
+
+function renderCacheCreationRatePair(price: ModelPrice) {
+  if (!isClaudePriceEntry(price)) return formatPriceValue(price.cache_creation_usd_per_million)
+  return h('div', { class: 'cache-write-price-pair' }, [
+    h('span', [h('small', '5m'), formatPriceValue(price.cache_creation_usd_per_million)]),
+    h('span', [h('small', '1h'), formatPriceValue(price.cache_creation_1h_usd_per_million)]),
+  ])
+}
+
 function renderRequestPriceValue(row: PriceTableRow) {
   if (isPriceGroupRow(row)) {
     if (row.mode === 'provider') {
@@ -1870,6 +1920,10 @@ function renderLongContextPrice(row: PriceTableRow) {
     )
   }
   const archivedLongContext = row.migrationConflict?.archived_long_context ?? row.price?.preserved_long_context
+  const claudePrice = isClaudePriceEntry(row.price ?? row.migrationConflict?.price) ||
+    (!row.price && !row.migrationConflict && (row.priceScope === 'channel'
+      ? row.channelBrand === 'claude'
+      : ['claude', 'anthropic'].includes(row.provider.trim().toLowerCase())))
   if (archivedLongContext) {
     const threshold = archivedLongContext.threshold_input_tokens
     const label = threshold === null ? t('部分配置', 'Partial') : `>${formatThreshold(threshold)}`
@@ -1878,7 +1932,8 @@ function renderLongContextPrice(row: PriceTableRow) {
       `${t('输入', 'Input')} ${formatPreservedLongContextPrice(archivedLongContext, 'input_usd_per_million')}`,
       `${t('输出', 'Output')} ${formatPreservedLongContextPrice(archivedLongContext, 'output_usd_per_million')}`,
       `${t('缓存读', 'Cache read')} ${formatPreservedLongContextPrice(archivedLongContext, 'cache_read_usd_per_million')}`,
-      `${t('缓存写', 'Cache write')} ${formatPreservedLongContextPrice(archivedLongContext, 'cache_creation_usd_per_million')}`,
+      `${t(claudePrice ? '缓存写 5m' : '缓存写', claudePrice ? 'Cache write 5m' : 'Cache write')} ${formatPreservedLongContextPrice(archivedLongContext, 'cache_creation_usd_per_million')}`,
+      ...(claudePrice ? [`${t('缓存写 1h', 'Cache write 1h')} ${formatPreservedLongContextPrice(archivedLongContext, 'cache_creation_1h_usd_per_million')}`] : []),
     ].join(' · ')
     return h(
       NTooltip,
@@ -1898,7 +1953,8 @@ function renderLongContextPrice(row: PriceTableRow) {
     `${t('输入', 'Input')} ${formatPriceValue(longContext.input_usd_per_million)}`,
     `${t('输出', 'Output')} ${formatPriceValue(longContext.output_usd_per_million)}`,
     `${t('缓存读', 'Cache read')} ${formatPriceValue(longContext.cache_read_usd_per_million)}`,
-    `${t('缓存写', 'Cache write')} ${formatPriceValue(longContext.cache_creation_usd_per_million)}`,
+    `${t(claudePrice ? '缓存写 5m' : '缓存写', claudePrice ? 'Cache write 5m' : 'Cache write')} ${formatPriceValue(longContext.cache_creation_usd_per_million)}`,
+    ...(claudePrice ? [`${t('缓存写 1h', 'Cache write 1h')} ${formatPriceValue(longContext.cache_creation_1h_usd_per_million)}`] : []),
   ].join(' · ')
   return h(
     NTooltip,
@@ -2277,7 +2333,7 @@ const columns = computed<DataTableColumns<PriceTableRow>>(() => [
     title: t('缓存写 ($/MTok)', 'Cache write ($/MTok)'),
     key: 'cache_creation_usd_per_million',
     width: 125,
-    render: (row) => renderTokenPriceValue(row, 'cache_creation_usd_per_million'),
+    render: renderCacheCreationPrices,
   },
   {
     title: t('长上下文', 'Long context'),
@@ -2595,8 +2651,17 @@ onBeforeUnmount(() => {
             <NFormItem :label="t('缓存读', 'Cache read')">
               <NInputNumber v-model:value="form.cache_read_usd_per_million" :min="0" />
             </NFormItem>
-            <NFormItem :label="t('缓存写', 'Cache write')">
+            <NFormItem :label="isClaudePriceForm ? t('缓存写 5m', 'Cache write 5m') : t('缓存写', 'Cache write')">
               <NInputNumber v-model:value="form.cache_creation_usd_per_million" :min="0" />
+            </NFormItem>
+            <NFormItem v-if="isClaudePriceForm" :label="t('缓存写 1h', 'Cache write 1h')">
+              <NInputNumber
+                :value="form.cache_creation_1h_usd_per_million ?? null"
+                :min="0"
+                clearable
+                :placeholder="t('未配置', 'Not configured')"
+                @update:value="form.cache_creation_1h_usd_per_million = $event"
+              />
             </NFormItem>
           </div>
         </section>
@@ -2630,15 +2695,18 @@ onBeforeUnmount(() => {
               <NFormItem :label="t('缓存读', 'Cache read')">
                 <NInputNumber v-model:value="longContextForm.cache_read_usd_per_million" :min="0" />
               </NFormItem>
-              <NFormItem :label="t('缓存写', 'Cache write')">
+              <NFormItem :label="isClaudePriceForm ? t('缓存写 5m', 'Cache write 5m') : t('缓存写', 'Cache write')">
                 <NInputNumber v-model:value="longContextForm.cache_creation_usd_per_million" :min="0" />
+              </NFormItem>
+              <NFormItem v-if="isClaudePriceForm" :label="t('缓存写 1h', 'Cache write 1h')">
+                <NInputNumber v-model:value="longContextForm.cache_creation_1h_usd_per_million" :min="0" clearable :placeholder="t('未配置', 'Not configured')" />
               </NFormItem>
             </div>
           </template>
         </section>
 
-        <!-- Section 4: time pricing (DeepSeek channel token prices only) -->
-        <section v-if="deepSeekForm" class="price-section">
+        <!-- Section 4: time pricing (DeepSeek and Claude channel token prices) -->
+        <section v-if="timePricingForm" class="price-section">
           <header class="price-section-header">
             <span class="price-section-title">{{ t('峰谷期', 'Time pricing') }}</span>
             <NSwitch :value="timePricingEnabled" :disabled="isPriceSaving || timeRuleLoading" :loading="timeRuleLoading" @update:value="toggleTimePricing" />
@@ -2646,9 +2714,9 @@ onBeforeUnmount(() => {
           <template v-if="timePricingEnabled && timeRule">
             <details>
               <summary>{{ t('配置峰谷规则', 'Configure time pricing') }}</summary>
-              <PriceTimeRuleEditor v-model="timeRule" :disabled="isPriceSaving" />
+              <PriceTimeRuleEditor v-model="timeRule" :disabled="isPriceSaving" :claude="isClaudePriceForm" />
             </details>
-            <PriceRatesMatrix :rule="timeRule" :rates="form" :long-context="longContextEnabled ? longContextForm : null" />
+            <PriceRatesMatrix :rule="timeRule" :rates="form" :long-context="longContextEnabled ? longContextForm : null" :claude="isClaudePriceForm" />
           </template>
         </section>
 
@@ -2688,9 +2756,10 @@ onBeforeUnmount(() => {
                   :rule="version.time_pricing"
                   :billing-unit="version.billing_unit"
                   :request-usd="version.request_usd"
+                  :claude="isClaudePriceForm"
                   :priority-multiplier="version.priority_multiplier"
                   :show-fast="editingSupportsFast"
-                  :show-time-disabled="deepSeekForm"
+                  :show-time-disabled="timePricingForm"
                 />
               </li>
             </ol>

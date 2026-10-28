@@ -46,6 +46,8 @@ func TestCPAHelperPluginKeysSummary(t *testing.T) {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		case "GET /v0/management/plugins/cpa-helper-plugin/v1/capabilities":
+			_ = json.NewEncoder(w).Encode(map[string]any{"contract_version": "v1", "plugin_version": "0.1.4"})
 		case "GET /v0/management/plugins/cpa-helper-plugin/v1/policy":
 			policyReads++
 			if policyStatus != http.StatusOK {
@@ -612,8 +614,9 @@ func TestCPAHelperPluginPolicyAndDirectoryContracts(t *testing.T) {
 	} {
 		t.Run("status redacts caller scopes for "+role.name, func(t *testing.T) {
 			var result struct {
-				Capabilities map[string]any `json:"capabilities"`
-				Health       map[string]any `json:"health"`
+				Capabilities                       map[string]any `json:"capabilities"`
+				Health                             map[string]any `json:"health"`
+				ResponseModelVerificationSupported bool           `json:"response_model_verification_supported"`
 			}
 			requestJSON(t, handler, http.MethodGet, "/api/cpa-helper-plugin/status", nil, role.cookies, &result)
 			if _, exposed := result.Health["active"]; exposed {
@@ -624,6 +627,9 @@ func TestCPAHelperPluginPolicyAndDirectoryContracts(t *testing.T) {
 			}
 			if _, exposed := result.Capabilities["response_model_mismatch"]; exposed != (role.name == "super admin") {
 				t.Fatalf("response-model configuration permissions changed: %#v", result.Capabilities)
+			}
+			if !result.ResponseModelVerificationSupported {
+				t.Fatal("config redaction hid the legacy verifier capability")
 			}
 		})
 	}

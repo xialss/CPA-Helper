@@ -90,6 +90,7 @@ export interface CPAHelperPluginKey {
   enabled: boolean
   group_ids: string[]
   max_concurrency: number
+  claude_cache_ttl?: '' | '5m' | '1h'
   rule: CPAHelperPluginRule
   [key: string]: unknown
 }
@@ -136,10 +137,18 @@ export interface CPAHelperPluginKeyMetadata {
   key_preview: string
 }
 
+export interface CPAHelperPluginClaudeTTLFeature {
+  supported: boolean
+  status: 'configured' | 'disabled' | 'unavailable' | 'unsupported'
+  metadata_version?: 'v1'
+}
+
 export interface CPAHelperPluginStatus {
   loaded: boolean
   capabilities: Record<string, unknown>
   health: Record<string, unknown>
+  claude_cache_ttl: CPAHelperPluginClaudeTTLFeature
+  response_model_verification_supported: boolean
 }
 
 export interface CPAHelperResponseModelConfig {
@@ -332,6 +341,8 @@ export interface CollectorStatus {
   last_error: string | null
   remote_enabled: boolean | null
   records_collected: number
+  ttl_pending_records: number
+  ttl_pending_reason: string | null
 }
 
 export interface CodexKeeperPriorityRule {
@@ -580,7 +591,7 @@ export interface UsageOverviewResponse {
 export type ModelPriceBillingUnit = 'token' | 'request'
 
 export interface UsageTokenCostBreakdownItem {
-  kind: 'input' | 'cache_read' | 'cache_creation' | 'output'
+  kind: 'input' | 'cache_read' | 'cache_creation' | 'cache_creation_5m' | 'cache_creation_1h' | 'output'
   tokens: number
   usd_per_million: number
   subtotal_usd: number
@@ -629,6 +640,7 @@ export interface UsageRecordListItem {
   source: string | null
   source_label: string | null
   request_id: string | null
+  execution_id: string | null
   auth_index: string | null
   auth: string | null
   latency_ms: number | null
@@ -639,6 +651,14 @@ export interface UsageRecordListItem {
   cached_tokens: number
   cache_read_tokens: number
   cache_creation_tokens: number
+  cache_creation_ttl: '5m' | '1h' | 'mixed' | 'unknown' | null
+  cache_creation_5m_tokens: number | null
+  cache_creation_1h_tokens: number | null
+  cache_creation_ttl_source: 'upstream' | 'enforced_request' | 'unknown' | null
+  cache_creation_ttl_status: 'pending' | 'matched' | 'missing' | 'expired' | 'unsupported' | 'error' | 'conflict' | 'not_applicable' | 'legacy' | null
+  cache_creation_ttl_reason: string | null
+  cache_creation_policy_revision: number | null
+  cache_creation_observed_at: string | null
   reasoning_tokens: number
   total_tokens: number
   estimated_cost_usd: number
@@ -703,6 +723,7 @@ export interface ModelPriceLongContext {
   output_usd_per_million: number
   cache_read_usd_per_million: number
   cache_creation_usd_per_million: number
+  cache_creation_1h_usd_per_million: number | null
 }
 
 export type ModelPriceLongContextRateField = Exclude<keyof ModelPriceLongContext, 'threshold_input_tokens'>
@@ -712,7 +733,8 @@ export interface PriceTimeRule {
   peak_windows: { weekdays: number[]; start: string; end: string }[]
   offpeak_mode: 'multiplier' | 'explicit'
   offpeak_multiplier: number
-  offpeak_rates?: Pick<ModelPriceLongContext, 'input_usd_per_million' | 'output_usd_per_million' | 'cache_read_usd_per_million' | 'cache_creation_usd_per_million'>
+  offpeak_rates?: Pick<ModelPriceLongContext, 'input_usd_per_million' | 'output_usd_per_million' | 'cache_read_usd_per_million' | 'cache_creation_usd_per_million'> &
+    Partial<Pick<ModelPriceLongContext, 'cache_creation_1h_usd_per_million'>>
   long_context_multiplier: number
 }
 
@@ -729,6 +751,7 @@ export interface ModelPrice {
   output_usd_per_million: number
   cache_read_usd_per_million: number
   cache_creation_usd_per_million: number
+  cache_creation_1h_usd_per_million: number | null
   request_usd: number | null
   priority_multiplier: number | null
   long_context: ModelPriceLongContext | null
@@ -756,6 +779,7 @@ export interface ModelPricePayload {
   output_usd_per_million: number
   cache_read_usd_per_million: number
   cache_creation_usd_per_million: number
+  cache_creation_1h_usd_per_million?: number | null
   request_usd: number | null
   long_context: ModelPriceLongContext | null
   preserve_invalid_long_context?: boolean
@@ -776,6 +800,7 @@ export interface ModelPriceLibraryConflictLongContext {
   output_usd_per_million: number | null
   cache_read_usd_per_million: number | null
   cache_creation_usd_per_million: number | null
+  cache_creation_1h_usd_per_million: number | null
   non_finite_fields?: Partial<Record<ModelPriceLongContextRateField, 'NaN' | '+Inf' | '-Inf'>>
 }
 
@@ -830,6 +855,7 @@ export interface ModelPriceVersion {
   output_usd_per_million: number
   cache_read_usd_per_million: number
   cache_creation_usd_per_million: number
+  cache_creation_1h_usd_per_million: number | null
   request_usd: number | null
   billing_unit: ModelPriceBillingUnit
   priority_multiplier: number | null
@@ -977,6 +1003,7 @@ export interface AvailableModelPrice {
   output_usd_per_million: number
   cache_read_usd_per_million: number
   cache_creation_usd_per_million: number
+  cache_creation_1h_usd_per_million: number | null
   request_usd: number | null
   long_context: ModelPriceLongContext | null
   billing_unit: ModelPriceBillingUnit

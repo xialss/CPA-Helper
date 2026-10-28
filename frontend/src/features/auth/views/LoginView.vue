@@ -39,6 +39,7 @@ onMounted(async () => {
 })
 
 async function handleSubmit() {
+  if (isLoading.value) return
   if (setupRequired.value && !form.nickname.trim()) {
     message.error(t('用户昵称不能为空', 'User nickname is required'))
     return
@@ -110,7 +111,6 @@ async function handleSubmit() {
               type="password"
               show-password-on="mousedown"
               autocomplete="current-password"
-              @keyup.enter="handleSubmit"
             />
           </NFormItem>
           <NFormItem v-if="setupRequired" :label="t('用户昵称', 'User nickname')" path="nickname" required>

@@ -41,6 +41,8 @@ func TestCPAHelperPluginLabelsUseLocalDescriptions(t *testing.T) {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		case "GET /v0/management/plugins/cpa-helper-plugin/v1/capabilities":
+			_ = json.NewEncoder(w).Encode(map[string]any{"contract_version": "v1", "plugin_version": "0.1.4"})
 		case "GET /v0/management/plugins/cpa-helper-plugin/v1/policy":
 			pluginReads++
 			if !pluginAvailable {

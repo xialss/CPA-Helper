@@ -14,6 +14,8 @@ globalThis.document = { documentElement: { lang: 'zh-CN' } }
 const row = { api_key_hash: 'member-hash', description: 'Member', api_key: 'sk-member-secret-key', models: [], last_model: null, expires_at: null, expiration_enforced_at: null, expiration_sync_error: null }
 const keyPolicy = { id: 'member-scope', label: 'Member', enabled: true, group_ids: [], max_concurrency: 0, rule: {} }
 env.key = structuredClone(keyPolicy)
+env.status = { loaded: true, capabilities: {}, health: {}, response_model_verification_supported: false, claude_cache_ttl: { supported: false, status: 'unsupported' } }
+const statusResponse = (health = {}) => ({ ...env.status, health })
 const policyResponse = () => ({ policy_revision: env.revision, groups: env.groups, key: env.key })
 const apiError = (message, status = 503) => Response.json({ detail: { code: 'plugin_unavailable', message } }, { status })
 globalThis.fetch = async (url, init) => {
@@ -41,7 +43,8 @@ globalThis.fetch = async (url, init) => {
   if (path === '/api/account/model-request') return Response.json({ openai_base_url: 'http://example.invalid/v1' })
   if (path === '/api/cpa-helper-plugin/status') {
     if (env.deferStatusReads) return new Promise((resolve, reject) => env.statusReads.push({ resolve, reject }))
-    return Response.json({ loaded: true, capabilities: {}, health: {} })
+    if (env.failStatus) return apiError('插件状态不可用')
+    return Response.json(statusResponse())
   }
   if (path === '/api/cpa-helper-plugin/keys-summary') return Response.json({ keys: [{ api_key_hash: row.api_key_hash, enabled: env.key.enabled, ...env.summary, current_concurrency: 0, max_concurrency: env.key.max_concurrency }] })
   if (path === '/api/cpa-helper-plugin/directory') {
@@ -61,6 +64,7 @@ globalThis.fetch = async (url, init) => {
     assert.equal(payload.policy_revision, env.revision, 'Writes use the current revision')
     env.revision++
     env.key = { ...payload.key, label: row.description }
+    if (env.key.claude_cache_ttl === '') delete env.key.claude_cache_ttl
     return Response.json(policyResponse())
   }
   assert.fail(`Unexpected API call ${path}`)
@@ -205,7 +209,7 @@ try {
   const rejectedStatus = env.statusReads.at(-1)
   const replacementStatus = state.refresh()
   await settle()
-  env.statusReads.at(-1).resolve(Response.json({ loaded: true, capabilities: {}, health: { policy_revision: 2 } }))
+  env.statusReads.at(-1).resolve(Response.json(statusResponse({ policy_revision: 2 })))
   await replacementStatus
   rejectedStatus.reject(new Error('old plugin status failed'))
   await oldStatusFailure
@@ -221,14 +225,14 @@ try {
   env.statusReads.at(-1).reject(currentStatusError)
   await currentStatusFailure
   assert.equal(state.pluginStatusError.value, currentStatusError, 'Current status failures remain visible')
-  staleStatus.resolve(Response.json({ loaded: true, capabilities: {}, health: { policy_revision: 3 } }))
+  staleStatus.resolve(Response.json(statusResponse({ policy_revision: 3 })))
   await oldStatusSuccess
   assert.equal(state.pluginStatus.value, null, 'A late status success cannot overwrite the current failure')
   assert.equal(state.pluginStatusError.value, currentStatusError)
 
   const recoveredStatus = state.refresh()
   await settle()
-  env.statusReads.at(-1).resolve(Response.json({ loaded: true, capabilities: {}, health: { policy_revision: 4 } }))
+  env.statusReads.at(-1).resolve(Response.json(statusResponse({ policy_revision: 4 })))
   await recoveredStatus
   assert.equal(state.pluginStatusError.value, null, 'A current success clears the current warning')
   assert.equal(state.pluginStatus.value.health.policy_revision, 4)
@@ -464,19 +468,46 @@ try {
   const missingAllowedRef = `sha256:${'c'.repeat(64)}`
   const missingDeniedRef = `sha256:${'d'.repeat(64)}`
   env.directory = {
-    models: ['route-model'],
+    models: ['route-model', 'TEAM/public-alias'],
     credentials: [
       { ref: allowedRef, label: 'Codex primary · https://codex-a.invalid/v1 · sk-upa...1234', source: 'ai-providers', provider: 'codex', status: 'active', auth_index: '101' },
       { ref: deniedRef, label: 'Codex other · https://codex-b.invalid/v1 · sk-upb...5678', source: 'ai-providers', provider: 'codex', status: 'active', auth_index: '102' },
     ],
     credential_providers: [{ source: 'ai-providers', provider: 'codex', label: 'Codex' }],
   }
+  env.key = {
+    ...env.key,
+    rule: {
+      models: ['team/public-alias'],
+      denied_models: ['Team/public-alias'],
+      credential_ids: [allowedRef],
+      denied_credential_ids: [deniedRef],
+      credential_providers: [{ source: 'ai-providers', provider: 'codex' }],
+      denied_credential_providers: [],
+    },
+  }
+  await state.refreshPluginKeySummaries()
+  await state.editApiKey(row)
+  await settle()
+  const caseAllowedModels = select(host, '允许的模型')
+  const caseDeniedModels = select(host, '禁止的模型')
+  const equivalentAllowedOptions = caseAllowedModels.props.options.filter((option) => option.value.toLowerCase() === 'team/public-alias')
+  const equivalentDeniedOptions = caseDeniedModels.props.options.filter((option) => option.value.toLowerCase() === 'team/public-alias')
+  assert.deepEqual(equivalentAllowedOptions, [{ label: 'TEAM/public-alias', value: 'team/public-alias' }], 'A case-insensitive catalog match keeps the allowed rule spelling without a duplicate option')
+  assert.deepEqual(equivalentDeniedOptions, [{ label: 'TEAM/public-alias', value: 'Team/public-alias' }], 'A case-insensitive catalog match keeps the denied rule spelling without a duplicate option')
+  assert.ok(!ui(host, 'NAlert').some((alert) => alert.props.class === 'plugin-rule-missing'), 'Case-only model variants do not show the missing-directory warning')
+  updateValue(caseAllowedModels, ['team/public-alias', 'route-model'])
+  updateValue(caseDeniedModels, ['Team/public-alias'])
+  await state.saveEditedApiKey()
+  assert.deepEqual(env.policyWrites.at(-1).key.rule.models, ['team/public-alias', 'route-model'], 'Saving preserves the allowed model spelling')
+  assert.deepEqual(env.policyWrites.at(-1).key.rule.denied_models, ['Team/public-alias'], 'Saving preserves the denied model spelling')
+
   const references = {
     credential_ids: [allowedRef, missingAllowedRef], denied_credential_ids: [deniedRef, missingDeniedRef],
     credential_providers: [{ source: 'ai-providers', provider: 'codex' }],
     denied_credential_providers: [{ source: 'auth-files', provider: 'retired-file-provider' }],
   }
-  env.key = { ...env.key, enabled: true, group_ids: ['with-note', 'long-note'], rule: { ...env.key.rule, models: ['route-model'], ...references } }
+  env.key = { ...env.key, enabled: true, group_ids: ['with-note', 'long-note'], rule: { ...env.key.rule, models: ['route-model', 'retired-allowed-model'], denied_models: ['retired-denied-model'], ...references } }
   env.summary = { group_names: ['With note', 'Long note'], has_custom_rule: true }
   await state.refreshPluginKeySummaries()
   await state.editApiKey(row)
@@ -493,6 +524,10 @@ try {
   assert.equal(renderedLongNote.children, `Long note · ${longNote}`, 'The label renderer does not shorten a long note')
   const allowedCredentials = select(host, '允许的凭据')
   const deniedCredentials = select(host, '禁止的凭据')
+  const allowedModels = select(host, '允许的模型')
+  const deniedModels = select(host, '禁止的模型')
+  assert.match(allowedModels.props.options.find((option) => option.value === 'retired-allowed-model').label, /已选模型（当前目录缺失）/)
+  assert.match(deniedModels.props.options.find((option) => option.value === 'retired-denied-model').label, /已选模型（当前目录缺失）/)
   for (const credential of env.directory.credentials) {
     const option = allowedCredentials.props.options.find((value) => value.value === credential.ref)
     assert.equal(option.label, credential.label, 'Backend channel labels remain intact without appended auth indexes')
@@ -501,11 +536,15 @@ try {
   assert.match(allowedCredentials.props.options.find((option) => option.value === missingAllowedRef).label, /当前目录缺失/)
   assert.match(deniedCredentials.props.options.find((option) => option.value === missingDeniedRef).label, /当前目录缺失/)
   assert.match(select(host, '禁止的凭据类别').props.options.find((option) => option.value === 'auth-files/retired-file-provider').label, /当前目录缺失/)
+  assert.match(textContent(host), /部分已选模型、凭据或类别/)
   assert.match(textContent(host), /原引用仍会保留并保存/)
   setLanguage('en')
   await settle()
+  assert.match(select(host, 'Allowed models').props.options.find((option) => option.value === 'retired-allowed-model').label, /Selected model \(missing from directory\)/)
+  assert.match(select(host, 'Denied models').props.options.find((option) => option.value === 'retired-denied-model').label, /Selected model \(missing from directory\)/)
   assert.match(select(host, 'Allowed credentials').props.options.find((option) => option.value === missingAllowedRef).label, /Selected credential \(missing from directory\)/)
   assert.match(select(host, 'Denied credential categories').props.options.find((option) => option.value === 'auth-files/retired-file-provider').label, /Selected category \(missing from directory\)/)
+  assert.match(textContent(host), /Some selected models, credentials or categories are missing/)
   assert.match(textContent(host), /Their references will be kept when saving/)
   setLanguage('zh')
   await settle()
@@ -534,6 +573,10 @@ try {
   env.directory = { models: [], credentials: [], credential_providers: [] }
   await state.editApiKey(row)
   await settle()
+  assert.deepEqual(select(host, '允许的模型').props.value, env.key.rule.models)
+  assert.deepEqual(select(host, '禁止的模型').props.value, env.key.rule.denied_models)
+  assert.match(select(host, '允许的模型').props.options.find((option) => option.value === env.key.rule.models[0]).label, /已选模型（当前目录缺失）/)
+  assert.match(select(host, '禁止的模型').props.options.find((option) => option.value === 'retired-denied-model').label, /已选模型（当前目录缺失）/)
   assert.deepEqual(select(host, '允许的凭据').props.value, references.credential_ids)
   assert.deepEqual(select(host, '禁止的凭据').props.value, references.denied_credential_ids)
   for (const ref of [...references.credential_ids, ...references.denied_credential_ids]) assert.match(select(host, '允许的凭据').props.options.find((option) => option.value === ref).label, /当前目录缺失/, 'Every selected missing reference remains a labelled option')
@@ -545,9 +588,13 @@ try {
   await state.saveEditedApiKey()
   assert.equal(env.successes.length, successesBeforeMissingFailure)
   assert.equal(state.pluginKeyPolicyVisible.value, true, 'A failed save keeps the editor and reference warning visible')
+  assert.deepEqual(state.pluginKeyPolicyDraft.value.rule.models, ['keep-missing-references'])
+  assert.deepEqual(state.pluginKeyPolicyDraft.value.rule.denied_models, ['retired-denied-model'])
   for (const [field, value] of Object.entries(references)) assert.deepEqual(state.pluginKeyPolicyDraft.value.rule[field], value, 'A failed save preserves selected missing allowed and denied references')
   env.failPolicy = false
   await state.saveEditedApiKey()
+  assert.deepEqual(env.policyWrites.at(-1).key.rule.models, ['keep-missing-references'])
+  assert.deepEqual(env.policyWrites.at(-1).key.rule.denied_models, ['retired-denied-model'])
   for (const [field, value] of Object.entries(references)) assert.deepEqual(env.policyWrites.at(-1).key.rule[field], value)
   const writesBeforeDirectoryFailure = env.policyWrites.length
   env.failDirectory = true
@@ -560,6 +607,108 @@ try {
   await settle()
   for (const [field, value] of Object.entries(references)) assert.deepEqual(state.pluginKeyPolicyDraft.value.rule[field], value, 'Recovery reloads the original saved references')
   state.closePluginKeyPolicy()
+
+  const { normalizeCPAHelperPluginKey, getCPAHelperPluginStatus } = await server.ssrLoadModule('/src/features/plugin/api/cpaHelperPluginApi.ts')
+  for (const value of [null, false, 5, '2h', '5M']) {
+    assert.throws(() => normalizeCPAHelperPluginKey({ ...keyPolicy, claude_cache_ttl: value }), /TTL/, 'Invalid TTL types/values are never normalized into an inherited preference')
+  }
+  assert.equal(Object.hasOwn(normalizeCPAHelperPluginKey(keyPolicy), 'claude_cache_ttl'), false, 'An old Key remains absent rather than being defaulted to 5m')
+  await state.editApiKey(row)
+  await settle()
+  let ttlSelect = select(host, 'Claude 缓存 TTL')
+  assert.equal(ttlSelect.props.value, '')
+  assert.deepEqual(ttlSelect.props.options.map((option) => option.value), ['', '5m', '1h'])
+  assert.ok(ttlSelect.props.options.slice(1).every((option) => option.disabled), 'Unsupported Plugin cannot enable a new TTL preference')
+  assert.equal(Object.hasOwn(state.pluginKeyPolicyDraft.value, 'claude_cache_ttl'), false)
+  assert.equal(state.apiKeyEditDirty.value, false, 'Displaying inheritance does not dirty an old Key')
+  state.closePluginKeyPolicy()
+
+  env.status.claude_cache_ttl = { supported: true, status: 'configured', metadata_version: 'v1' }
+  for (const ttl of ['5m', '1h']) {
+    await state.editApiKey(row)
+    await settle()
+    ttlSelect = select(host, 'Claude 缓存 TTL')
+    assert.ok(ttlSelect.props.options.every((option) => !option.disabled))
+    if (ttl === '5m') {
+      setLanguage('en')
+      await settle()
+      assert.equal(select(host, 'Claude cache TTL').props.options[0].label, 'Inherit CPA')
+      assert.match(state.pluginKeyTTLHint.value, /upstream cache TTL is not confirmed/i, 'Configured is not presented as upstream confirmation')
+      assert.throws(() => normalizeCPAHelperPluginKey({ ...keyPolicy, claude_cache_ttl: null }), /Invalid API key cache TTL/)
+      setLanguage('zh')
+      await settle()
+      ttlSelect = select(host, 'Claude 缓存 TTL')
+    }
+    updateValue(ttlSelect, ttl)
+    if (ttl === '1h') {
+      env.failPolicy = true
+      const beforeFailedTTL = env.successes.length
+      await state.saveEditedApiKey()
+      assert.equal(state.pluginKeyPolicyDraft.value.claude_cache_ttl, '1h', 'Failed TTL save preserves the draft')
+      assert.equal(state.pluginKeyPolicyVisible.value, true)
+      assert.equal(env.successes.length, beforeFailedTTL, 'Failed TTL save never reports activation')
+      env.failPolicy = false
+    }
+    await state.saveEditedApiKey()
+    assert.equal(env.policyWrites.at(-1).key.claude_cache_ttl, ttl, 'The actual feature wrapper serializes the chosen TTL')
+    assert.equal(env.key.claude_cache_ttl, ttl)
+  }
+  for (const feature of [{ supported: true, status: 'disabled', metadata_version: 'v1' }, { supported: true, status: 'unavailable', metadata_version: 'v1' }, { supported: false, status: 'unsupported' }]) {
+    env.status.claude_cache_ttl = feature
+    await state.editApiKey(row)
+    await settle()
+    ttlSelect = select(host, 'Claude 缓存 TTL')
+    assert.equal(ttlSelect.props.value, '1h', 'Unavailable capability does not erase an existing preference')
+    assert.ok(ttlSelect.props.options.slice(1).every((option) => option.disabled))
+    state.pluginKeyPolicyDraft.value.max_concurrency++
+    await state.saveEditedApiKey()
+    assert.equal(env.policyWrites.at(-1).key.claude_cache_ttl, '1h', 'Unrelated policy edit preserves the loaded TTL')
+  }
+  await state.editApiKey(row)
+  await settle()
+  updateValue(select(host, 'Claude 缓存 TTL'), '')
+  await state.saveEditedApiKey()
+  assert.equal(env.policyWrites.at(-1).key.claude_cache_ttl, '', 'Clear is an explicit empty string on the wire, not a deleted Vue field')
+  assert.equal(Object.hasOwn(env.key, 'claude_cache_ttl'), false, 'Readback confirms the cleared effective preference')
+  await state.editApiKey(row)
+  assert.equal(state.pluginKeyPolicyDraft.value.claude_cache_ttl, undefined)
+  assert.equal(state.apiKeyEditDirty.value, false)
+  state.closePluginKeyPolicy()
+
+  env.failStatus = true
+  await state.editApiKey(row)
+  await settle()
+  assert.ok(state.pluginKeyTTLFeatureError.value, 'Feature lookup failures remain visible while other policy edits remain usable')
+  assert.equal(state.pluginKeyTTLConfigured.value, false)
+  assert.match(textContent(ui(host, 'NModal').find((node) => node.props.title === '编辑 API Key')), /插件状态不可用/)
+  assert.ok(select(host, 'Claude 缓存 TTL').props.options.slice(1).every((option) => option.disabled))
+  state.closePluginKeyPolicy()
+  env.failStatus = false
+
+  env.deferStatusReads = true
+  for (const failOld of [false, true]) {
+    const oldTTLLoad = state.editApiKey(row)
+    await settle()
+    const oldTTLStatus = env.statusReads.at(-1)
+    const currentTTLLoad = state.editApiKey(row)
+    await settle()
+    env.statusReads.at(-1).resolve(Response.json(statusResponse()))
+    await currentTTLLoad
+    if (failOld) oldTTLStatus.reject(new Error('stale TTL feature lookup failed'))
+    else oldTTLStatus.resolve(Response.json({ ...statusResponse(), claude_cache_ttl: { supported: true, status: 'configured', metadata_version: 'v1' } }))
+    await oldTTLLoad
+    assert.equal(state.pluginKeyTTLFeature.value.status, 'unsupported', 'Late capability completion cannot enable options in a replacement Key editor')
+    assert.equal(state.pluginKeyTTLFeatureError.value, null, 'Stale capability failure cannot overwrite the current editor state')
+    assert.equal(state.isPluginPolicyLoading.value, false)
+    state.closePluginKeyPolicy()
+  }
+  env.deferStatusReads = false
+  const validFeature = env.status.claude_cache_ttl
+  for (const feature of [{ supported: true, status: 'configured', metadata_version: 'v2' }, { supported: false, status: 'configured' }, { supported: true, status: 'unsupported', metadata_version: 'v1' }]) {
+    env.status.claude_cache_ttl = feature
+    await assert.rejects(getCPAHelperPluginStatus(), /TTL/, 'Malformed capability state is not treated as active')
+  }
+  env.status.claude_cache_ttl = validFeature
 
   const errorsBeforeUnmount = env.errors.length
   const beforeUnmount = state.loadAvailableModelsForTest()
@@ -593,7 +742,7 @@ try {
   const detachedStatusSnapshot = JSON.stringify(detachedState.pluginStatus.value)
   app.unmount()
   app = null
-  detachedStatus.resolve(Response.json({ loaded: true, capabilities: {}, health: { policy_revision: 99 } }))
+  detachedStatus.resolve(Response.json(statusResponse({ policy_revision: 99 })))
   await lateStatusSuccess
   assert.equal(JSON.stringify(detachedState.pluginStatus.value), detachedStatusSnapshot, 'Unmount suppresses a current late status success')
   assert.equal(detachedState.pluginStatusError.value, null)
