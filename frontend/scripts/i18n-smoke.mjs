@@ -176,6 +176,7 @@ try {
   installBrowserStubs({ browserLanguages: ['en-US'] })
 
   let {
+    errorText,
     localizedApiErrorMessage,
     localizedKeeperStatusDetail,
     localizedServerMessage,
@@ -196,6 +197,17 @@ try {
   assert.equal(localizedApiErrorMessage(null, null), 'Request failed')
   assert.equal(localizedServerMessage('渠道身份不完整'), 'Channel identity is incomplete')
   assert.equal(localizedApiErrorMessage('not_found', '峰谷时段模板不存在'), 'Time pricing template does not exist')
+  const claudePricingErrors = [
+    ['峰谷定价仅支持 DeepSeek 或 Claude 渠道 Token 价格', 'Time pricing only supports DeepSeek or Claude channel token prices'],
+    ['1 小时缓存价格仅支持 Claude 价格', '1-hour cache prices are only supported for Claude prices'],
+    ['请选择 DeepSeek 或 Claude 渠道 Token 价格', 'Select DeepSeek or Claude channel token prices'],
+  ]
+  for (const [input, expected] of claudePricingErrors) {
+    const translated = localizedApiErrorMessage('validation_error', input)
+    assert.equal(translated, expected)
+    assert.equal(errorText(new Error(translated), '保存价格失败', 'Failed to save price'), expected)
+    assert.doesNotMatch(translated, /\p{Script=Han}/u)
+  }
   assert.equal(
     localizedServerMessage('渠道名称不能包含控制字符或换行'),
     'Channel name cannot contain control characters or line breaks',
@@ -545,6 +557,9 @@ try {
 
   setLanguage('zh')
   assert.equal(localizedApiErrorMessage('validation_error', null), '请求参数无效')
+  for (const [input] of claudePricingErrors) {
+    assert.equal(errorText(new Error(localizedApiErrorMessage('validation_error', input))), input)
+  }
   for (const [code, input] of [...pluginBoundaryErrors, ...pluginOpaqueErrors]) assert.equal(localizedApiErrorMessage(code, input), input)
   assert.equal(
     localizedApiErrorMessage('usage_record_expired', null),

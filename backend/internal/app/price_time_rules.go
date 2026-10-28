@@ -19,10 +19,11 @@ type PricePeakWindow struct {
 	End      string `json:"end"`
 }
 type PriceOffpeakRates struct {
-	Input         float64 `json:"input_usd_per_million"`
-	Output        float64 `json:"output_usd_per_million"`
-	CacheRead     float64 `json:"cache_read_usd_per_million"`
-	CacheCreation float64 `json:"cache_creation_usd_per_million"`
+	Input           float64  `json:"input_usd_per_million"`
+	Output          float64  `json:"output_usd_per_million"`
+	CacheRead       float64  `json:"cache_read_usd_per_million"`
+	CacheCreation   float64  `json:"cache_creation_usd_per_million"`
+	CacheCreation1h *float64 `json:"cache_creation_1h_usd_per_million"`
 }
 
 // A rule is a snapshot, never a reference to the mutable administrator template.
@@ -129,7 +130,7 @@ func validatePriceTimeRule(r *PriceTimeRule) error {
 	if !finiteNonNegative(r.OffpeakMultiplier) {
 		return validationError("空闲倍率必须为非负有限数")
 	}
-	if v := r.OffpeakRates; v != nil && (!finiteNonNegative(v.Input) || !finiteNonNegative(v.Output) || !finiteNonNegative(v.CacheRead) || !finiteNonNegative(v.CacheCreation)) {
+	if v := r.OffpeakRates; v != nil && (!finiteNonNegative(v.Input) || !finiteNonNegative(v.Output) || !finiteNonNegative(v.CacheRead) || !finiteNonNegative(v.CacheCreation) || (v.CacheCreation1h != nil && !finiteNonNegative(*v.CacheCreation1h))) {
 		return validationError("空闲价格必须为非负有限数")
 	}
 	switch r.OffpeakMode {
@@ -152,18 +153,27 @@ func validateTimeRuleForPrice(p ModelPrice) error {
 		return nil
 	}
 	if !supportsPriceTimeRule(p) {
-		return validationError("峰谷定价仅支持 DeepSeek 渠道 Token 价格")
+		return validationError("峰谷定价仅支持 DeepSeek 或 Claude 渠道 Token 价格")
+	}
+	if p.TimePricing.OffpeakRates != nil && p.TimePricing.OffpeakRates.CacheCreation1h != nil && !modelPriceIsClaudeChannel(p) {
+		return validationError("1 小时缓存价格仅支持 Claude 价格")
 	}
 	return validatePriceTimeRule(p.TimePricing)
 }
 func supportsPriceTimeRule(p ModelPrice) bool {
+	if p.PriceScope != modelPriceScopeChannel || p.ChannelBrand == nil || p.ChannelKey == nil ||
+		strings.TrimSpace(*p.ChannelBrand) == "" || strings.TrimSpace(*p.ChannelKey) == "" ||
+		p.BillingUnit != modelBillingUnitToken {
+		return false
+	}
+	if modelPriceIsClaudeChannel(p) {
+		return true
+	}
 	name := strings.ToLower(normalizeModelPriceChannelModel(p.Model))
 	if i := strings.LastIndex(name, "/"); i >= 0 {
 		name = name[i+1:]
 	}
-	return p.PriceScope == modelPriceScopeChannel && p.ChannelBrand != nil && p.ChannelKey != nil &&
-		strings.TrimSpace(*p.ChannelBrand) != "" && strings.TrimSpace(*p.ChannelKey) != "" &&
-		strings.HasPrefix(name, "deepseek-") && p.BillingUnit == modelBillingUnitToken
+	return strings.HasPrefix(name, "deepseek-")
 }
 func priceTimeRuleJSON(rule *PriceTimeRule) any {
 	if rule == nil {
@@ -225,11 +235,18 @@ func priceForRequestTime(p *ModelPrice, at time.Time) *ModelPrice {
 		copy.OutputUSDPerMillion = r.OffpeakRates.Output
 		copy.CacheReadUSDPerMillion = r.OffpeakRates.CacheRead
 		copy.CacheCreationUSDPerMillion = r.OffpeakRates.CacheCreation
+		if modelPriceIsClaudeChannel(*p) {
+			copy.CacheCreation1hUSDPerMillion = r.OffpeakRates.CacheCreation1h
+		}
 	} else {
 		copy.InputUSDPerMillion *= r.OffpeakMultiplier
 		copy.OutputUSDPerMillion *= r.OffpeakMultiplier
 		copy.CacheReadUSDPerMillion *= r.OffpeakMultiplier
 		copy.CacheCreationUSDPerMillion *= r.OffpeakMultiplier
+		if modelPriceIsClaudeChannel(*p) && copy.CacheCreation1hUSDPerMillion != nil {
+			value := *copy.CacheCreation1hUSDPerMillion * r.OffpeakMultiplier
+			copy.CacheCreation1hUSDPerMillion = &value
+		}
 	}
 	if p.LongContext != nil {
 		tier := *p.LongContext
@@ -237,6 +254,10 @@ func priceForRequestTime(p *ModelPrice, at time.Time) *ModelPrice {
 		tier.OutputUSDPerMillion *= r.LongContextMultiplier
 		tier.CacheReadUSDPerMillion *= r.LongContextMultiplier
 		tier.CacheCreationUSDPerMillion *= r.LongContextMultiplier
+		if modelPriceIsClaudeChannel(*p) && tier.CacheCreation1hUSDPerMillion != nil {
+			value := *tier.CacheCreation1hUSDPerMillion * r.LongContextMultiplier
+			tier.CacheCreation1hUSDPerMillion = &value
+		}
 		copy.LongContext = &tier
 	}
 	return &copy
@@ -384,9 +405,9 @@ func (a *App) applyPriceTimeBatch(ctx context.Context, payload priceTimeBatchPay
 		p = effectivePriceFromVersions(p, versions, effective)
 		after := p
 		after.TimePricing = payload.Rule
-		// Disabling also requires a DeepSeek channel target.
+		// Disabling also requires a supported channel target.
 		if !supportsPriceTimeRule(after) {
-			return nil, validationError("请选择 DeepSeek 渠道 Token 价格")
+			return nil, validationError("请选择 DeepSeek 或 Claude 渠道 Token 价格")
 		}
 		if err := validateTimeRuleForPrice(after); err != nil {
 			return nil, err
@@ -423,8 +444,8 @@ func (a *App) applyPriceTimeBatch(ctx context.Context, payload priceTimeBatchPay
 	return map[string]any{"effective_at": dbTime(effective), "items": items, "applied": apply}, nil
 }
 
-func snapshotLongContextArgs(p ModelPrice) (threshold, input, output, read, write any) {
-	threshold, input, output, read, write = nullableLongContextThreshold(p.LongContext), nullableLongContextInput(p.LongContext), nullableLongContextOutput(p.LongContext), nullableLongContextCacheRead(p.LongContext), nullableLongContextCacheCreation(p.LongContext)
+func snapshotLongContextArgs(p ModelPrice) (threshold, input, output, read, write, write1h any) {
+	threshold, input, output, read, write, write1h = nullableLongContextThreshold(p.LongContext), nullableLongContextInput(p.LongContext), nullableLongContextOutput(p.LongContext), nullableLongContextCacheRead(p.LongContext), nullableLongContextCacheCreation(p.LongContext), nullableLongContextCacheCreation1h(p.LongContext)
 	if p.longContextInvalid && p.PreservedLongContext != nil {
 		v := p.PreservedLongContext
 		threshold = nullableInt64PtrArg(v.ThresholdInputTokens)
@@ -432,13 +453,14 @@ func snapshotLongContextArgs(p ModelPrice) (threshold, input, output, read, writ
 		output = nullableFloatArg(v.OutputUSDPerMillion)
 		read = nullableFloatArg(v.CacheReadUSDPerMillion)
 		write = nullableFloatArg(v.CacheCreationUSDPerMillion)
+		write1h = nullableFloatArg(v.CacheCreation1hUSDPerMillion)
 	}
 	return
 }
 
 func materializePriceSnapshot(ctx context.Context, tx *sql.Tx, p ModelPrice) error {
-	threshold, input, output, read, write := snapshotLongContextArgs(p)
-	_, err := tx.ExecContext(ctx, `UPDATE model_prices SET input_usd_per_million=?,output_usd_per_million=?,cache_read_usd_per_million=?,cache_creation_usd_per_million=?,request_usd=?,billing_unit=?,priority_multiplier=?,long_context_threshold_tokens=?,long_context_input_usd_per_million=?,long_context_output_usd_per_million=?,long_context_cache_read_usd_per_million=?,long_context_cache_creation_usd_per_million=?,time_pricing=? WHERE id=?`, p.InputUSDPerMillion, p.OutputUSDPerMillion, p.CacheReadUSDPerMillion, p.CacheCreationUSDPerMillion, nullableFloatArg(p.RequestUSD), p.BillingUnit, nullableFloatArg(p.PriorityMultiplier), threshold, input, output, read, write, priceTimeRuleJSON(p.TimePricing), p.ID)
+	threshold, input, output, read, write, write1h := snapshotLongContextArgs(p)
+	_, err := tx.ExecContext(ctx, `UPDATE model_prices SET input_usd_per_million=?,output_usd_per_million=?,cache_read_usd_per_million=?,cache_creation_usd_per_million=?,cache_creation_1h_usd_per_million=?,request_usd=?,billing_unit=?,priority_multiplier=?,long_context_threshold_tokens=?,long_context_input_usd_per_million=?,long_context_output_usd_per_million=?,long_context_cache_read_usd_per_million=?,long_context_cache_creation_usd_per_million=?,long_context_cache_creation_1h_usd_per_million=?,time_pricing=? WHERE id=?`, p.InputUSDPerMillion, p.OutputUSDPerMillion, p.CacheReadUSDPerMillion, p.CacheCreationUSDPerMillion, nullableFloatArg(p.CacheCreation1hUSDPerMillion), nullableFloatArg(p.RequestUSD), p.BillingUnit, nullableFloatArg(p.PriorityMultiplier), threshold, input, output, read, write, write1h, priceTimeRuleJSON(p.TimePricing), p.ID)
 	return err
 }
 
@@ -468,6 +490,7 @@ func effectivePriceFromVersions(p ModelPrice, versions modelPriceVersionIndex, a
 	p.OutputUSDPerMillion = selected.OutputUSDPerMillion
 	p.CacheReadUSDPerMillion = selected.CacheReadUSDPerMillion
 	p.CacheCreationUSDPerMillion = selected.CacheCreationUSDPerMillion
+	p.CacheCreation1hUSDPerMillion = selected.CacheCreation1hUSDPerMillion
 	p.LongContext = selected.LongContext
 	p.PriorityMultiplier = selected.PriorityMultiplier
 	p.RequestUSD = selected.RequestUSD

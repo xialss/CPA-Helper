@@ -6,7 +6,8 @@ import { createServer } from 'vite'
 const server = await createServer({
   root: fileURLToPath(new URL('..', import.meta.url)),
   logLevel: 'error',
-  server: { middlewareMode: true },
+  optimizeDeps: { noDiscovery: true, include: [] },
+  server: { middlewareMode: true, hmr: false, ws: false, watch: null },
 })
 
 function libraryPrice(id, provider, inputPrice, model = 'shared-model') {
@@ -23,6 +24,7 @@ function libraryPrice(id, provider, inputPrice, model = 'shared-model') {
     output_usd_per_million: inputPrice * 2,
     cache_read_usd_per_million: 0,
     cache_creation_usd_per_million: 0,
+    cache_creation_1h_usd_per_million: null,
     request_usd: null,
     priority_multiplier: null,
     long_context: null,
@@ -103,6 +105,7 @@ try {
     output_usd_per_million: 4,
     cache_read_usd_per_million: 0.2,
     cache_creation_usd_per_million: 0.4,
+    cache_creation_1h_usd_per_million: null,
   }
   const originalTemplate = structuredClone(template)
   const converted = multiplyModelPrice(template, 0.11)
@@ -115,8 +118,22 @@ try {
     output_usd_per_million: 0.44,
     cache_read_usd_per_million: 0.022,
     cache_creation_usd_per_million: 0.044,
+    cache_creation_1h_usd_per_million: null,
   })
   assert.deepEqual(template, originalTemplate, 'Conversion must not mutate the library snapshot')
+  const claudeTemplate = libraryPrice(11, 'anthropic', 0.2, 'claude-shared-model')
+  claudeTemplate.cache_creation_1h_usd_per_million = 0.4
+  claudeTemplate.long_context = {
+    threshold_input_tokens: 123456,
+    input_usd_per_million: 2,
+    output_usd_per_million: 4,
+    cache_read_usd_per_million: 0.2,
+    cache_creation_usd_per_million: 0.4,
+    cache_creation_1h_usd_per_million: 0.8,
+  }
+  const convertedClaude = multiplyModelPrice(claudeTemplate, 0.5)
+  assert.equal(convertedClaude.cache_creation_1h_usd_per_million, 0.2)
+  assert.equal(convertedClaude.long_context.cache_creation_1h_usd_per_million, 0.4)
   const large = multiplyModelPrice({ ...template, input_usd_per_million: 1e300 }, 0.11)
   assert.ok(Number.isFinite(large.input_usd_per_million), 'Rounding must preserve a finite large amount')
   assert.ok(Math.abs(large.input_usd_per_million / 1.1e299 - 1) < 1e-15)

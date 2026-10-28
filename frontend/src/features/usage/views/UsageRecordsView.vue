@@ -955,6 +955,57 @@ function formatOutputWithTps(row: Pick<UsageRecordListItem, 'latency_ms' | 'outp
   return outputTps === '-' ? output : `${output} (${outputTps} tps)`
 }
 
+function cacheCreationTTLLabel(record: UsageRecordListItem): string | null {
+  if (record.cost_breakdown.cache_creation_tokens <= 0) {
+    return null
+  }
+  switch (record.cache_creation_ttl) {
+    case '5m':
+      return t('5 分钟', '5 min')
+    case '1h':
+      return t('1 小时', '1 hour')
+    case 'mixed':
+      return t('混合', 'Mixed')
+    case 'unknown':
+    case null:
+      return t('未知', 'Unknown')
+  }
+}
+
+function cacheCreationTTLDetailLabel(record: UsageRecordListItem): string | null {
+  const ttl = cacheCreationTTLLabel(record)
+  if (record.cache_creation_ttl !== 'mixed' || ttl === null) {
+    return ttl
+  }
+  const buckets = [
+    record.cache_creation_5m_tokens === null
+      ? null
+      : `5m ${formatInteger(record.cache_creation_5m_tokens)}`,
+    record.cache_creation_1h_tokens === null
+      ? null
+      : `1h ${formatInteger(record.cache_creation_1h_tokens)}`,
+  ].filter((value): value is string => value !== null)
+  return buckets.length > 0 ? `${ttl} (${buckets.join(' / ')})` : ttl
+}
+
+function renderCacheCreationTokens(record: UsageRecordListItem) {
+  const ttl = cacheCreationTTLLabel(record)
+  return h('div', { class: 'usage-cache-creation-cell' }, [
+    h('span', formatInteger(record.cost_breakdown.cache_creation_tokens)),
+    ttl
+      ? h(
+          NTag,
+          {
+            size: 'small',
+            bordered: false,
+            type: record.cache_creation_ttl === 'unknown' || record.cache_creation_ttl === null ? 'default' : 'info',
+          },
+          { default: () => ttl },
+        )
+      : null,
+  ])
+}
+
 function renderOutputWithTps(row: Pick<UsageRecordListItem, 'latency_ms' | 'output_tokens'>) {
   const output = formatInteger(row.output_tokens)
   const outputTps = formatOutputTps(row)
@@ -1012,7 +1063,7 @@ function costBreakdownItemLabel(
       const includesCacheCreation =
         breakdown.cache_creation_tokens > 0 &&
         item.tokens === breakdown.normal_input_tokens + breakdown.cache_creation_tokens &&
-        !breakdown.items.some((candidate) => candidate.kind === 'cache_creation')
+        !breakdown.items.some((candidate) => candidate.kind.startsWith('cache_creation'))
       if (includesCacheCreation) {
         return t('输入（含缓存写）', 'Input (incl. cache write)')
       }
@@ -1022,6 +1073,10 @@ function costBreakdownItemLabel(
       return t('缓存读', 'Cache read')
     case 'cache_creation':
       return t('缓存写', 'Cache write')
+    case 'cache_creation_5m':
+      return t('缓存写 5m', 'Cache write 5m')
+    case 'cache_creation_1h':
+      return t('缓存写 1h', 'Cache write 1h')
     case 'output':
       return t('输出', 'Output')
     case 'request':
@@ -1186,6 +1241,7 @@ const detailRows = computed(() => {
   if (!record) {
     return []
   }
+  const cacheCreationTTL = cacheCreationTTLDetailLabel(record)
   const rows: { label: string; value: string; tooltip?: string | null }[] = [
     { label: t('时间', 'Time'), value: formatDateTime(record.timestamp) },
     { label: t('记录模型', 'Record model'), value: formatModelWithReasoning(record) },
@@ -1203,6 +1259,9 @@ const detailRows = computed(() => {
     { label: t('输入 Token', 'Input tokens'), value: formatInteger(record.cost_breakdown.normal_input_tokens) },
     { label: t('缓存读 Token', 'Cache read tokens'), value: formatInteger(record.cost_breakdown.cache_read_tokens) },
     { label: t('缓存写 Token', 'Cache write tokens'), value: formatInteger(record.cost_breakdown.cache_creation_tokens) },
+    ...(cacheCreationTTL === null
+      ? []
+      : [{ label: t('缓存写 TTL', 'Cache write TTL'), value: cacheCreationTTL }]),
     { label: t('输出 Token', 'Output tokens'), value: formatOutputWithTps(record) },
     { label: t('思考 Token', 'Reasoning tokens'), value: formatInteger(record.reasoning_tokens) },
     { label: t('总 Token', 'Total tokens'), value: formatInteger(record.total_tokens) },
@@ -1317,7 +1376,7 @@ const columns = computed<DataTableColumns<UsageRecordListItem>>(() => [
     title: t('缓存写', 'Cache write'),
     key: 'cache_creation_tokens',
     width: RECORDS_TABLE_COLUMN_WIDTHS.cacheCreationTokens,
-    render: (row) => formatInteger(row.cost_breakdown.cache_creation_tokens),
+    render: renderCacheCreationTokens,
   },
   {
     title: t('总 Token', 'Total tokens'),
@@ -1663,6 +1722,13 @@ onBeforeUnmount(() => {
   font-size: 11px;
   font-weight: 700;
   line-height: 20px;
+}
+
+:global(.records-table .usage-cache-creation-cell) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
 }
 
 :global(.usage-cost-trigger) {
