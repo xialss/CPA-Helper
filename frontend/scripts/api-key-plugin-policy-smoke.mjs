@@ -468,19 +468,46 @@ try {
   const missingAllowedRef = `sha256:${'c'.repeat(64)}`
   const missingDeniedRef = `sha256:${'d'.repeat(64)}`
   env.directory = {
-    models: ['route-model'],
+    models: ['route-model', 'TEAM/public-alias'],
     credentials: [
       { ref: allowedRef, label: 'Codex primary · https://codex-a.invalid/v1 · sk-upa...1234', source: 'ai-providers', provider: 'codex', status: 'active', auth_index: '101' },
       { ref: deniedRef, label: 'Codex other · https://codex-b.invalid/v1 · sk-upb...5678', source: 'ai-providers', provider: 'codex', status: 'active', auth_index: '102' },
     ],
     credential_providers: [{ source: 'ai-providers', provider: 'codex', label: 'Codex' }],
   }
+  env.key = {
+    ...env.key,
+    rule: {
+      models: ['team/public-alias'],
+      denied_models: ['Team/public-alias'],
+      credential_ids: [allowedRef],
+      denied_credential_ids: [deniedRef],
+      credential_providers: [{ source: 'ai-providers', provider: 'codex' }],
+      denied_credential_providers: [],
+    },
+  }
+  await state.refreshPluginKeySummaries()
+  await state.editApiKey(row)
+  await settle()
+  const caseAllowedModels = select(host, '允许的模型')
+  const caseDeniedModels = select(host, '禁止的模型')
+  const equivalentAllowedOptions = caseAllowedModels.props.options.filter((option) => option.value.toLowerCase() === 'team/public-alias')
+  const equivalentDeniedOptions = caseDeniedModels.props.options.filter((option) => option.value.toLowerCase() === 'team/public-alias')
+  assert.deepEqual(equivalentAllowedOptions, [{ label: 'TEAM/public-alias', value: 'team/public-alias' }], 'A case-insensitive catalog match keeps the allowed rule spelling without a duplicate option')
+  assert.deepEqual(equivalentDeniedOptions, [{ label: 'TEAM/public-alias', value: 'Team/public-alias' }], 'A case-insensitive catalog match keeps the denied rule spelling without a duplicate option')
+  assert.ok(!ui(host, 'NAlert').some((alert) => alert.props.class === 'plugin-rule-missing'), 'Case-only model variants do not show the missing-directory warning')
+  updateValue(caseAllowedModels, ['team/public-alias', 'route-model'])
+  updateValue(caseDeniedModels, ['Team/public-alias'])
+  await state.saveEditedApiKey()
+  assert.deepEqual(env.policyWrites.at(-1).key.rule.models, ['team/public-alias', 'route-model'], 'Saving preserves the allowed model spelling')
+  assert.deepEqual(env.policyWrites.at(-1).key.rule.denied_models, ['Team/public-alias'], 'Saving preserves the denied model spelling')
+
   const references = {
     credential_ids: [allowedRef, missingAllowedRef], denied_credential_ids: [deniedRef, missingDeniedRef],
     credential_providers: [{ source: 'ai-providers', provider: 'codex' }],
     denied_credential_providers: [{ source: 'auth-files', provider: 'retired-file-provider' }],
   }
-  env.key = { ...env.key, enabled: true, group_ids: ['with-note', 'long-note'], rule: { ...env.key.rule, models: ['route-model'], ...references } }
+  env.key = { ...env.key, enabled: true, group_ids: ['with-note', 'long-note'], rule: { ...env.key.rule, models: ['route-model', 'retired-allowed-model'], denied_models: ['retired-denied-model'], ...references } }
   env.summary = { group_names: ['With note', 'Long note'], has_custom_rule: true }
   await state.refreshPluginKeySummaries()
   await state.editApiKey(row)
@@ -497,6 +524,10 @@ try {
   assert.equal(renderedLongNote.children, `Long note · ${longNote}`, 'The label renderer does not shorten a long note')
   const allowedCredentials = select(host, '允许的凭据')
   const deniedCredentials = select(host, '禁止的凭据')
+  const allowedModels = select(host, '允许的模型')
+  const deniedModels = select(host, '禁止的模型')
+  assert.match(allowedModels.props.options.find((option) => option.value === 'retired-allowed-model').label, /已选模型（当前目录缺失）/)
+  assert.match(deniedModels.props.options.find((option) => option.value === 'retired-denied-model').label, /已选模型（当前目录缺失）/)
   for (const credential of env.directory.credentials) {
     const option = allowedCredentials.props.options.find((value) => value.value === credential.ref)
     assert.equal(option.label, credential.label, 'Backend channel labels remain intact without appended auth indexes')
@@ -505,11 +536,15 @@ try {
   assert.match(allowedCredentials.props.options.find((option) => option.value === missingAllowedRef).label, /当前目录缺失/)
   assert.match(deniedCredentials.props.options.find((option) => option.value === missingDeniedRef).label, /当前目录缺失/)
   assert.match(select(host, '禁止的凭据类别').props.options.find((option) => option.value === 'auth-files/retired-file-provider').label, /当前目录缺失/)
+  assert.match(textContent(host), /部分已选模型、凭据或类别/)
   assert.match(textContent(host), /原引用仍会保留并保存/)
   setLanguage('en')
   await settle()
+  assert.match(select(host, 'Allowed models').props.options.find((option) => option.value === 'retired-allowed-model').label, /Selected model \(missing from directory\)/)
+  assert.match(select(host, 'Denied models').props.options.find((option) => option.value === 'retired-denied-model').label, /Selected model \(missing from directory\)/)
   assert.match(select(host, 'Allowed credentials').props.options.find((option) => option.value === missingAllowedRef).label, /Selected credential \(missing from directory\)/)
   assert.match(select(host, 'Denied credential categories').props.options.find((option) => option.value === 'auth-files/retired-file-provider').label, /Selected category \(missing from directory\)/)
+  assert.match(textContent(host), /Some selected models, credentials or categories are missing/)
   assert.match(textContent(host), /Their references will be kept when saving/)
   setLanguage('zh')
   await settle()
@@ -538,6 +573,10 @@ try {
   env.directory = { models: [], credentials: [], credential_providers: [] }
   await state.editApiKey(row)
   await settle()
+  assert.deepEqual(select(host, '允许的模型').props.value, env.key.rule.models)
+  assert.deepEqual(select(host, '禁止的模型').props.value, env.key.rule.denied_models)
+  assert.match(select(host, '允许的模型').props.options.find((option) => option.value === env.key.rule.models[0]).label, /已选模型（当前目录缺失）/)
+  assert.match(select(host, '禁止的模型').props.options.find((option) => option.value === 'retired-denied-model').label, /已选模型（当前目录缺失）/)
   assert.deepEqual(select(host, '允许的凭据').props.value, references.credential_ids)
   assert.deepEqual(select(host, '禁止的凭据').props.value, references.denied_credential_ids)
   for (const ref of [...references.credential_ids, ...references.denied_credential_ids]) assert.match(select(host, '允许的凭据').props.options.find((option) => option.value === ref).label, /当前目录缺失/, 'Every selected missing reference remains a labelled option')
@@ -549,9 +588,13 @@ try {
   await state.saveEditedApiKey()
   assert.equal(env.successes.length, successesBeforeMissingFailure)
   assert.equal(state.pluginKeyPolicyVisible.value, true, 'A failed save keeps the editor and reference warning visible')
+  assert.deepEqual(state.pluginKeyPolicyDraft.value.rule.models, ['keep-missing-references'])
+  assert.deepEqual(state.pluginKeyPolicyDraft.value.rule.denied_models, ['retired-denied-model'])
   for (const [field, value] of Object.entries(references)) assert.deepEqual(state.pluginKeyPolicyDraft.value.rule[field], value, 'A failed save preserves selected missing allowed and denied references')
   env.failPolicy = false
   await state.saveEditedApiKey()
+  assert.deepEqual(env.policyWrites.at(-1).key.rule.models, ['keep-missing-references'])
+  assert.deepEqual(env.policyWrites.at(-1).key.rule.denied_models, ['retired-denied-model'])
   for (const [field, value] of Object.entries(references)) assert.deepEqual(env.policyWrites.at(-1).key.rule[field], value)
   const writesBeforeDirectoryFailure = env.policyWrites.length
   env.failDirectory = true
