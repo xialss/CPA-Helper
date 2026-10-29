@@ -49,6 +49,8 @@ type catalogHTTPFixture struct {
 	healthRevision      *uint64
 	healthStatus        string
 	stateResponse       []byte
+	catalogReads        int
+	onSecondCatalogRead func(*catalogHTTPFixture)
 	configReads         int
 	credentialReads     int
 	onSecondConfig      func(*catalogHTTPFixture)
@@ -57,10 +59,12 @@ type catalogHTTPFixture struct {
 	modelRelease        chan struct{}
 	version             string
 	cpaTarget           string
+	capabilities        map[string]json.RawMessage
 	registered          []pluginRegisteredCredentialModels
 	registeredReads     int
 	registeredResponse  []byte
 	onSecondRegistered  func(*catalogHTTPFixture)
+	onCatalogWrite      func(*catalogHTTPFixture)
 	downstream          []string
 	policy              map[string]json.RawMessage
 	needsSync           map[string]string
@@ -132,6 +136,11 @@ func newCatalogHTTPFixture(t *testing.T) (*catalogHTTPFixture, AppConfig) {
 		switch r.Method + " " + r.URL.Path {
 		case "GET /v0/management/plugins/cpa-helper-plugin/v1/capabilities":
 			payload = map[string]any{"contract_version": "v1", "plugin_version": fixture.version, "cpa_version": fixture.cpaTarget, "abi_version": 1, "schema_version": 7, "modules": []string{"model_list_filter"}, "model_list_filter_enabled": true}
+			if fixture.capabilities != nil {
+				caps := cloneRawObject(fixture.capabilities)
+				caps["plugin_version"], caps["cpa_version"] = mustRawString(fixture.version), mustRawString(fixture.cpaTarget)
+				payload = caps
+			}
 		case "GET /v0/management/plugins/cpa-helper-plugin/v1/directory":
 			payload = map[string]any{"credentials": []any{}}
 		case "GET /v8/management/config":
@@ -177,6 +186,10 @@ func newCatalogHTTPFixture(t *testing.T) (*catalogHTTPFixture, AppConfig) {
 			}
 			payload = map[string]any{"credentials": fixture.registered}
 		case "GET /v0/management/plugins/cpa-helper-plugin/v1/model-catalog":
+			fixture.catalogReads++
+			if fixture.catalogReads == 2 && fixture.onSecondCatalogRead != nil {
+				fixture.onSecondCatalogRead(fixture)
+			}
 			w.Header().Set("ETag", fmt.Sprintf("\"%d\"", fixture.revision))
 			if fixture.stateResponse != nil {
 				_, _ = w.Write(fixture.stateResponse)
@@ -206,6 +219,9 @@ func newCatalogHTTPFixture(t *testing.T) (*catalogHTTPFixture, AppConfig) {
 			fixture.revision++
 			fixture.catalog = append([]byte(nil), body...)
 			fixture.needsSync = map[string]string{}
+			if fixture.onCatalogWrite != nil {
+				fixture.onCatalogWrite(fixture)
+			}
 			revision := fixture.revision
 			if fixture.acceptedRevision != nil {
 				revision = *fixture.acceptedRevision

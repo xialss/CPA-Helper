@@ -239,6 +239,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceChannelColumns(t *testing.T) 
 		"request_usd",
 		"billing_unit",
 		"priority_multiplier",
+		"ultrafast_multiplier",
 		"price_scope",
 		"channel_auth_type",
 		"channel_brand",
@@ -303,7 +304,7 @@ func TestRequireSchemaShapeRejectsMissingModelPriceLibraryConflictsTable(t *test
 		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, cache_creation_ttl TEXT, cache_creation_5m_tokens TEXT, cache_creation_1h_tokens TEXT, service_tier TEXT)`,
 		codexKeeperAuthStateSchemaForStartupTest,
 		`CREATE TABLE model_prices (
-			request_usd TEXT, billing_unit TEXT, priority_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
+			request_usd TEXT, billing_unit TEXT, priority_multiplier TEXT, ultrafast_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
 			long_context_threshold_tokens TEXT, long_context_input_usd_per_million TEXT,
 			long_context_output_usd_per_million TEXT, long_context_cache_read_usd_per_million TEXT,
 			long_context_cache_creation_usd_per_million TEXT,
@@ -337,7 +338,7 @@ func TestRequireSchemaShapeRejectsMissingKeeperAuthIndex(t *testing.T) {
 		`CREATE TABLE usage_records (dedupe_key TEXT, ttft_ms TEXT, cache_creation_ttl TEXT, cache_creation_5m_tokens TEXT, cache_creation_1h_tokens TEXT, service_tier TEXT)`,
 		`CREATE TABLE codex_keeper_auth_states (auth_name TEXT)`,
 		`CREATE TABLE model_prices (
-			request_usd TEXT, billing_unit TEXT, priority_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
+			request_usd TEXT, billing_unit TEXT, priority_multiplier TEXT, ultrafast_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
 			long_context_threshold_tokens TEXT, long_context_input_usd_per_million TEXT,
 			long_context_output_usd_per_million TEXT, long_context_cache_read_usd_per_million TEXT,
 			long_context_cache_creation_usd_per_million TEXT,
@@ -442,6 +443,8 @@ func TestRequireSchemaShapeRejectsMissingNewModelPricingSchema(t *testing.T) {
 		{table: "model_price_channel_aliases", column: "created_at"},
 		{table: "model_price_channel_aliases", column: "updated_at"},
 		{table: "model_prices", column: "time_pricing"},
+		{table: "model_prices", column: "ultrafast_multiplier"},
+		{table: "model_price_library_conflicts", column: "ultrafast_multiplier"},
 		{table: "model_price_versions", column: "id", dropTable: true},
 		{table: "model_price_versions", column: "price_id"},
 		{table: "model_price_versions", column: "time_pricing"},
@@ -457,6 +460,7 @@ func TestRequireSchemaShapeRejectsMissingNewModelPricingSchema(t *testing.T) {
 		{table: "model_price_versions", column: "request_usd"},
 		{table: "model_price_versions", column: "billing_unit"},
 		{table: "model_price_versions", column: "priority_multiplier"},
+		{table: "model_price_versions", column: "ultrafast_multiplier"},
 		{table: "model_price_versions", column: "long_context_threshold_tokens"},
 		{table: "model_price_versions", column: "long_context_input_usd_per_million"},
 		{table: "model_price_versions", column: "long_context_output_usd_per_million"},
@@ -577,7 +581,7 @@ const codexKeeperAuthStateSchemaForStartupTest = `CREATE TABLE codex_keeper_auth
 const apiKeyExpirationSchemaForStartupTest = `CREATE TABLE user_api_keys (expires_at TEXT, expiration_enforced_at TEXT, expiration_sync_error TEXT)`
 
 const modelPriceSchemaForStartupTest = `CREATE TABLE model_prices (
-	request_usd TEXT, billing_unit TEXT, priority_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
+	request_usd TEXT, billing_unit TEXT, priority_multiplier TEXT, ultrafast_multiplier TEXT, price_scope TEXT, channel_auth_type TEXT, channel_brand TEXT, channel_key TEXT,
 	long_context_threshold_tokens TEXT, long_context_input_usd_per_million TEXT,
 	long_context_output_usd_per_million TEXT, long_context_cache_read_usd_per_million TEXT,
 	long_context_cache_creation_usd_per_million TEXT,
@@ -588,7 +592,7 @@ const modelPriceLibraryConflictSchemaForStartupTest = `CREATE TABLE model_price_
 	original_id TEXT, selected_price_id TEXT, conflict_reason TEXT, provider TEXT, model TEXT,
 	input_usd_per_million TEXT, output_usd_per_million TEXT,
 	cache_read_usd_per_million TEXT, cache_creation_usd_per_million TEXT,
-	request_usd TEXT, billing_unit TEXT, priority_multiplier TEXT, long_context_threshold_tokens TEXT,
+	request_usd TEXT, billing_unit TEXT, priority_multiplier TEXT, ultrafast_multiplier TEXT, long_context_threshold_tokens TEXT,
 	long_context_input_usd_per_million TEXT, long_context_output_usd_per_million TEXT,
 	long_context_cache_read_usd_per_million TEXT, long_context_cache_creation_usd_per_million TEXT,
 	cache_creation_1h_usd_per_million TEXT, long_context_cache_creation_1h_usd_per_million TEXT,

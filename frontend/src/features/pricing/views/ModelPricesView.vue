@@ -209,6 +209,7 @@ const visiblePriceVersions = computed(() => {
   return showAllVersions.value ? newestFirst : newestFirst.slice(0, collapsedVersionCount)
 })
 const editingSupportsFast = computed(() => supportsPriorityMultiplier(prices.value.find(price => price.id === editingId.value) ?? null))
+const editingSupportsUltrafast = computed(() => supportsUltrafastMultiplier(prices.value.find(price => price.id === editingId.value) ?? null))
 function isClaudePriceEntry(price: Pick<ModelPrice, 'price_scope' | 'channel_brand' | 'provider'> | null | undefined): boolean {
   if (!price) return false
   if (price.price_scope === 'channel') return price.channel_brand === 'claude'
@@ -268,6 +269,9 @@ watch(aliasModalOpen, (open) => {
 const channelAliases = ref<ModelPriceChannelAlias[]>([])
 const priorityEditingPrice = ref<ModelPrice | null>(null)
 const priorityMultiplier = ref<number | null>(null)
+const ultrafastMultiplier = ref<number | null>(null)
+const priorityMultiplierEdited = ref(false)
+const ultrafastMultiplierEdited = ref(false)
 const priorityCorrectLatest = ref(false)
 const priorityLatestVersion = ref<ModelPriceVersion | null>(null)
 const priorityVersionsLoading = ref(false)
@@ -1411,11 +1415,19 @@ function supportsPriorityMultiplier(price: ModelPrice | null): boolean {
   return ['openai', 'codex'].includes(price.provider.trim().toLowerCase())
 }
 
+function supportsUltrafastMultiplier(price: ModelPrice | null): boolean {
+  return supportsPriorityMultiplier(price) && !!price &&
+    ['gpt-6.1-sol', 'gpt-6-astra'].includes(normalizeModelComparisonKey(price.model).toLowerCase())
+}
+
 function openPriorityMultiplierEditor(price: ModelPrice) {
   if (isPrioritySaving.value) return
   priorityVersionRequest += 1
   priorityEditingPrice.value = price
   priorityMultiplier.value = price.priority_multiplier
+  ultrafastMultiplier.value = price.ultrafast_multiplier ?? null
+  priorityMultiplierEdited.value = false
+  ultrafastMultiplierEdited.value = false
   priorityCorrectLatest.value = false
   priorityLatestVersion.value = null
   priorityVersionsError.value = ''
@@ -1445,19 +1457,35 @@ async function savePriorityMultiplier() {
   if (isPrioritySaving.value || (priorityCorrectLatest.value && (priorityVersionsLoading.value || priorityVersionsError.value))) return
   const price = priorityEditingPrice.value
   const multiplier = priorityMultiplier.value
-  if (!price || multiplier === null || !Number.isFinite(multiplier) || multiplier <= 0) {
+  const ultra = ultrafastMultiplier.value
+  if (!price) return
+  if (multiplier !== null && (!Number.isFinite(multiplier) || multiplier <= 0)) {
     message.error(t('Fast 倍率必须大于 0', 'Fast multiplier must be greater than 0'))
+    return
+  }
+  const supportsUltra = supportsUltrafastMultiplier(price)
+  if (supportsUltra && ultra !== null && (!Number.isFinite(ultra) || ultra <= 0)) {
+    message.error(t('ultrafast 倍率必须大于 0', 'ultrafast multiplier must be greater than 0'))
+    return
+  }
+  // Untouched inputs must not overwrite the other tier in a scheduled version.
+  const values = {
+    ...(multiplier !== null && (!supportsUltra || priorityMultiplierEdited.value) ? { priority_multiplier: multiplier } : {}),
+    ...(supportsUltra && ultra !== null && ultrafastMultiplierEdited.value ? { ultrafast_multiplier: ultra } : {}),
+  }
+  if (!Object.keys(values).length) {
+    message.error(t('请至少填写或修改一档倍率', 'Enter or change at least one multiplier'))
     return
   }
   isPrioritySaving.value = true
   try {
     const correct = price.price_scope === 'channel' && priorityCorrectLatest.value
-    await updateModelPricePriorityMultiplier(price.id, { priority_multiplier: multiplier, ...(correct ? { correct_latest_version: true } : {}) })
+    await updateModelPricePriorityMultiplier(price.id, { ...values, ...(correct ? { correct_latest_version: true } : {}) })
     priorityModalOpen.value = false
-    message.success(t('Fast 倍率已更新', 'Fast multiplier updated'))
+    message.success(supportsUltra ? t('Fast / ultrafast 倍率已更新', 'Fast / ultrafast multipliers updated') : t('Fast 倍率已更新', 'Fast multiplier updated'))
     await refresh()
   } catch (error) {
-    message.error(errorText(error, '保存 Fast 倍率失败', 'Failed to save Fast multiplier'))
+    message.error(errorText(error, '保存倍率失败', 'Failed to save multipliers'))
   } finally {
     isPrioritySaving.value = false
   }
@@ -1885,19 +1913,13 @@ function renderPriorityMultiplier(row: PriceTableRow) {
   if (!supportsPriorityMultiplier(row.price)) {
     return h('span', { class: 'price-muted' }, '-')
   }
-  const multiplier = row.price?.priority_multiplier
-  if (typeof multiplier !== 'number') {
-    return h(
-      NTag,
-      { size: 'small', type: 'warning', bordered: false },
-      { default: () => t('未配置', 'Unconfigured') },
-    )
-  }
-  return h(
+  const labels: [string, number | null | undefined][] = [['Fast', row.price?.priority_multiplier]]
+  if (supportsUltrafastMultiplier(row.price)) labels.push(['ultrafast', row.price?.ultrafast_multiplier])
+  return h('div', {}, labels.map(([label, multiplier]) => h(
     NTag,
     { size: 'small', type: 'warning', bordered: false },
-    { default: () => 'Fast x' + formatMultiplier(multiplier) },
-  )
+    { default: () => typeof multiplier === 'number' ? `${label} x${formatMultiplier(multiplier)}` : `${label}: ${t('未配置', 'Unconfigured')}` },
+  )))
 }
 
 function formatThreshold(value: number): string {
@@ -2758,7 +2780,9 @@ onBeforeUnmount(() => {
                   :request-usd="version.request_usd"
                   :claude="isClaudePriceForm"
                   :priority-multiplier="version.priority_multiplier"
+                  :ultrafast-multiplier="version.ultrafast_multiplier"
                   :show-fast="editingSupportsFast"
+                  :show-ultrafast="editingSupportsUltrafast"
                   :show-time-disabled="timePricingForm"
                 />
               </li>
@@ -2823,8 +2847,19 @@ onBeforeUnmount(() => {
     >
       <NForm label-placement="top">
         <NFormItem :label="t('Fast 倍率', 'Fast multiplier')">
-          <NInputNumber v-model:value="priorityMultiplier" :min="0" :disabled="isPrioritySaving" />
+          <!-- Numeric updates omit same-value input, so retain native editing intent too. -->
+          <div class="tier-multiplier-input" @input.capture="priorityMultiplierEdited = true">
+            <NInputNumber v-model:value="priorityMultiplier" :min="0" :disabled="isPrioritySaving" @update:value="priorityMultiplierEdited = true" />
+          </div>
         </NFormItem>
+        <template v-if="supportsUltrafastMultiplier(priorityEditingPrice)">
+          <NFormItem :label="t('ultrafast 倍率', 'ultrafast multiplier')">
+            <div class="tier-multiplier-input" @input.capture="ultrafastMultiplierEdited = true">
+              <NInputNumber v-model:value="ultrafastMultiplier" :min="0" :disabled="isPrioritySaving" @update:value="ultrafastMultiplierEdited = true" />
+            </div>
+          </NFormItem>
+          <p class="price-save-hint">{{ t('分别设置两档倍率；留空或未修改的档位保留原值。ultrafast 未配置时按基础价格估算。', 'Configure each tier independently. Empty or unchanged tiers keep their existing values. Unconfigured ultrafast uses a base price estimate.') }}</p>
+        </template>
         <template v-if="priorityEditingPrice?.price_scope === 'channel'">
           <p v-if="priorityVersionsLoading" class="price-save-hint">{{ t('加载价格版本…', 'Loading price versions…') }}</p>
           <NAlert v-if="priorityVersionsError" type="error" :show-icon="false">{{ priorityVersionsError }}</NAlert>
@@ -2842,12 +2877,13 @@ onBeforeUnmount(() => {
               {{ formatDateTime(priorityLatestVersion.effective_at) }}
               <strong v-if="Date.parse(priorityLatestVersion.effective_at) > Date.now()">{{ t('（待生效）', ' (scheduled)') }}</strong>
               <div>{{ t('该版本当前 Fast 倍率：', 'Current Fast multiplier of this version:') }} {{ priorityLatestVersion.priority_multiplier === null ? t('默认', 'Default') : `${formatMultiplier(priorityLatestVersion.priority_multiplier)}x` }}</div>
+              <div v-if="supportsUltrafastMultiplier(priorityEditingPrice)">{{ t('该版本当前 ultrafast 倍率：', 'Current ultrafast multiplier of this version:') }} {{ priorityLatestVersion.ultrafast_multiplier == null ? t('未配置', 'Unconfigured') : `${formatMultiplier(priorityLatestVersion.ultrafast_multiplier)}x` }}</div>
             </template>
             <template v-else>{{ t('尚无历史版本，将从保存时刻新增版本。', 'No price history exists yet; a new version will start at save time.') }}</template>
           </NAlert>
           <p class="price-save-hint">
             {{ priorityCorrectLatest
-              ? t('将原地修正最新一条价格版本的 Fast 倍率并保留其生效时间；该时刻之后的请求在历史统计中按修正价重算，已结算扣费不会改写。', 'Overwrites the Fast multiplier of the latest price version in place and keeps its effective time. Requests since that moment are recalculated in history; settled charges are not rewritten.')
+              ? t('将原地修正最新一条价格版本的已修改倍率并保留其生效时间；该时刻之后的请求在历史统计中按修正价重算，已结算扣费不会改写。', 'Overwrites the changed multipliers of the latest price version in place and keeps its effective time. Requests since that moment are recalculated in history; settled charges are not rewritten.')
               : t('保存后新增一条价格版本，从现在起生效。', 'Saving appends a new price version effective from now.') }}
           </p>
         </template>
@@ -3096,6 +3132,10 @@ onBeforeUnmount(() => {
 
 .price-table :deep(.price-muted) {
   color: var(--cpa-text-muted);
+}
+
+.tier-multiplier-input {
+  width: 100%;
 }
 
 .price-save-hint {

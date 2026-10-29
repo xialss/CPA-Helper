@@ -22,7 +22,7 @@ func configureAuthoritativeCatalogFixture(f *catalogHTTPFixture, version string)
 		// Some runtime Host entries are not in credentials inventory/config.
 		{Ref: catalogFixtureRef("runtime-only-no-models"), AuthIndex: "Runtime-empty", Provider: "codex", Models: []string{}},
 	}
-	return map[string]json.RawMessage{"contract_version": mustRawString("v1"), "plugin_version": mustRawString(version), "cpa_version": mustRawString("v8.0.45")}
+	return map[string]json.RawMessage{"contract_version": mustRawString("v1"), "plugin_version": mustRawString(version), "cpa_version": mustRawString("v8.0.45"), "abi_version": mustRawNumber(1), "schema_version": mustRawNumber(7)}
 }
 
 func TestPluginAuthoritativeCatalogUsesFullHostRegistry(t *testing.T) {

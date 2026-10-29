@@ -4,6 +4,12 @@ type MessagePair = readonly [zh: string, en: string]
 type ServerMessagePattern = readonly [RegExp, (match: RegExpMatchArray) => string]
 
 const exactServerMessages: MessagePair[] = [
+  ['ultrafast 倍率仅支持 OpenAI 兼容或 Codex 渠道的 gpt-6.1-sol 和 gpt-6-astra', 'ultrafast multipliers only support gpt-6.1-sol and gpt-6-astra on OpenAI-compatible or Codex channels'],
+  ['ultrafast 倍率必须是大于 0 的有限数值', 'The ultrafast multiplier must be a finite number greater than 0'],
+  ['ultrafast 倍率会产生无法安全计价的金额', 'The ultrafast multiplier produces an amount that cannot be priced safely'],
+  ['Fast 倍率必须是大于 0 的有限数值', 'The Fast multiplier must be a finite number greater than 0'],
+  ['Fast 倍率会产生无法安全计价的金额', 'The Fast multiplier produces an amount that cannot be priced safely'],
+  ['Fast 倍率仅支持 OpenAI 兼容或 Codex 渠道', 'Fast multipliers only support OpenAI-compatible or Codex channels'],
   ['Claude 缓存 TTL 只能配置在 API 密钥上', 'Claude cache TTL can only be configured on an API key'],
   ['Claude 缓存 TTL 必须为继承 CPA、5m 或 1h', 'Claude cache TTL must be Inherit CPA, 5m or 1h'],
   ['Claude 缓存 TTL 尚未完成插件配置校验', 'Claude cache TTL plugin configuration has not been verified'],

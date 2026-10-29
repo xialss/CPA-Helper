@@ -46,27 +46,12 @@ func (a *App) loadModelPriceVersions(ctx context.Context) (modelPriceVersionInde
 }
 
 func loadModelPriceVersionsWithQueryer(ctx context.Context, q modelPriceQueryer) (modelPriceVersionIndex, error) {
-	rows, err := q.QueryContext(ctx, `SELECT price_id, provider, model, channel_auth_type, channel_brand, channel_key,
+	rows, err := queryPriceRowsWithLegacyProjection(ctx, q, "model_price_versions", `price_id, provider, model, channel_auth_type, channel_brand, channel_key,
       input_usd_per_million, output_usd_per_million, cache_read_usd_per_million, cache_creation_usd_per_million, cache_creation_1h_usd_per_million,
-      request_usd, billing_unit, priority_multiplier, long_context_threshold_tokens,
+      request_usd, billing_unit, priority_multiplier, ultrafast_multiplier, long_context_threshold_tokens,
       long_context_input_usd_per_million, long_context_output_usd_per_million,
 	  long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million, long_context_cache_creation_1h_usd_per_million,
-		 effective_at, baseline, time_pricing FROM model_price_versions ORDER BY effective_at ASC, id ASC`)
-	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "no such table") && strings.Contains(strings.ToLower(err.Error()), "model_price_versions") {
-			return modelPriceVersionIndex{}, nil
-		}
-		if isMissingPriceSchemaColumnError(err) {
-			rows, err = q.QueryContext(ctx, `SELECT price_id, provider, model, channel_auth_type, channel_brand, channel_key,
-		      input_usd_per_million, output_usd_per_million, cache_read_usd_per_million, cache_creation_usd_per_million,
-		      NULL AS cache_creation_1h_usd_per_million,
-		      request_usd, billing_unit, priority_multiplier, long_context_threshold_tokens,
-		      long_context_input_usd_per_million, long_context_output_usd_per_million,
-		      long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
-		      NULL AS long_context_cache_creation_1h_usd_per_million,
-			 effective_at, baseline, time_pricing FROM model_price_versions ORDER BY effective_at ASC, id ASC`)
-		}
-	}
+		 effective_at, baseline, time_pricing`, " ORDER BY effective_at ASC, id ASC")
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "no such table") && strings.Contains(strings.ToLower(err.Error()), "model_price_versions") {
 			return modelPriceVersionIndex{}, nil
@@ -79,7 +64,7 @@ func loadModelPriceVersionsWithQueryer(ctx context.Context, q modelPriceQueryer)
 		var p ModelPrice
 		var priceID sql.NullInt64
 		var auth, brand, key sql.NullString
-		var req, pri sql.NullFloat64
+		var req, pri, ultra sql.NullFloat64
 		var cacheCreation1h sql.NullFloat64
 		var threshold sql.NullInt64
 		var li, lo, lcr, lcc sql.NullFloat64
@@ -87,7 +72,7 @@ func loadModelPriceVersionsWithQueryer(ctx context.Context, q modelPriceQueryer)
 		var effective string
 		var baseline int
 		var rule sql.NullString
-		if err := rows.Scan(&priceID, &p.Provider, &p.Model, &auth, &brand, &key, &p.InputUSDPerMillion, &p.OutputUSDPerMillion, &p.CacheReadUSDPerMillion, &p.CacheCreationUSDPerMillion, &cacheCreation1h, &req, &p.BillingUnit, &pri, &threshold, &li, &lo, &lcr, &lcc, &longContextCacheCreation1h, &effective, &baseline, &rule); err != nil {
+		if err := rows.Scan(&priceID, &p.Provider, &p.Model, &auth, &brand, &key, &p.InputUSDPerMillion, &p.OutputUSDPerMillion, &p.CacheReadUSDPerMillion, &p.CacheCreationUSDPerMillion, &cacheCreation1h, &req, &p.BillingUnit, &pri, &ultra, &threshold, &li, &lo, &lcr, &lcc, &longContextCacheCreation1h, &effective, &baseline, &rule); err != nil {
 			return nil, err
 		}
 		p.TimePricing, err = parsePriceTimeRule(rule)
@@ -116,6 +101,7 @@ func loadModelPriceVersionsWithQueryer(ctx context.Context, q modelPriceQueryer)
 		if pri.Valid {
 			p.PriorityMultiplier = &pri.Float64
 		}
+		p.UltrafastMultiplier = nullableFloat(ultra)
 		longContextConfigured := threshold.Valid || li.Valid || lo.Valid || lcr.Valid || lcc.Valid || longContextCacheCreation1h.Valid
 		if longContextConfigured {
 			candidate := &ModelPriceLongContext{ThresholdInputTokens: threshold.Int64, InputUSDPerMillion: li.Float64, OutputUSDPerMillion: lo.Float64, CacheReadUSDPerMillion: lcr.Float64, CacheCreationUSDPerMillion: lcc.Float64, CacheCreation1hUSDPerMillion: nullableFloat(longContextCacheCreation1h)}
@@ -182,47 +168,43 @@ func (a *App) appendModelPriceVersion(ctx context.Context, tx *sql.Tx, price Mod
 		return err
 	}
 	threshold, input, output, read, write, write1h := snapshotLongContextArgs(price)
-	_, err := tx.ExecContext(ctx, `INSERT INTO model_price_versions (
+	columns := strings.Split(`
       price_id, provider, model, channel_auth_type, channel_brand, channel_key,
       input_usd_per_million, output_usd_per_million, cache_read_usd_per_million, cache_creation_usd_per_million, cache_creation_1h_usd_per_million,
-      request_usd, billing_unit, priority_multiplier, long_context_threshold_tokens,
+      request_usd, billing_unit, priority_multiplier, ultrafast_multiplier, long_context_threshold_tokens,
       long_context_input_usd_per_million, long_context_output_usd_per_million,
       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million, long_context_cache_creation_1h_usd_per_million,
-      effective_at, baseline, time_pricing) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		func() any {
-			if price.ID > 0 {
-				return price.ID
-			}
-			return nil
-		}(), price.Provider, price.Model, nullableStringArg(price.ChannelAuthType), nullableStringArg(price.ChannelBrand), nullableStringArg(price.ChannelKey),
+      effective_at, baseline, time_pricing`, ",")
+	var priceID any
+	if price.ID > 0 {
+		priceID = price.ID
+	}
+	args := []any{priceID, price.Provider, price.Model, nullableStringArg(price.ChannelAuthType), nullableStringArg(price.ChannelBrand), nullableStringArg(price.ChannelKey),
 		price.InputUSDPerMillion, price.OutputUSDPerMillion, price.CacheReadUSDPerMillion, price.CacheCreationUSDPerMillion, nullableFloatArg(price.CacheCreation1hUSDPerMillion),
-		nullableFloatArg(price.RequestUSD), price.BillingUnit, nullableFloatArg(price.PriorityMultiplier), threshold, input, output, read, write, write1h, dbTime(effectiveAt), baseline, priceTimeRuleJSON(price.TimePricing))
-	if isMissingPriceSchemaColumnError(err) {
-		legacyThreshold, legacyInput, legacyOutput, legacyRead, legacyWrite := snapshotLongContextArgsLegacy(price)
-		_, err = tx.ExecContext(ctx, `INSERT INTO model_price_versions (
-      price_id, provider, model, channel_auth_type, channel_brand, channel_key,
-      input_usd_per_million, output_usd_per_million, cache_read_usd_per_million, cache_creation_usd_per_million,
-      request_usd, billing_unit, priority_multiplier, long_context_threshold_tokens,
-      long_context_input_usd_per_million, long_context_output_usd_per_million,
-      long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million,
-      effective_at, baseline, time_pricing) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			func() any {
-				if price.ID > 0 {
-					return price.ID
-				}
-				return nil
-			}(), price.Provider, price.Model, nullableStringArg(price.ChannelAuthType), nullableStringArg(price.ChannelBrand), nullableStringArg(price.ChannelKey),
-			price.InputUSDPerMillion, price.OutputUSDPerMillion, price.CacheReadUSDPerMillion, price.CacheCreationUSDPerMillion,
-			nullableFloatArg(price.RequestUSD), price.BillingUnit, nullableFloatArg(price.PriorityMultiplier), legacyThreshold, legacyInput, legacyOutput, legacyRead, legacyWrite, dbTime(effectiveAt), baseline, priceTimeRuleJSON(price.TimePricing))
+		nullableFloatArg(price.RequestUSD), price.BillingUnit, nullableFloatArg(price.PriorityMultiplier), nullableFloatArg(price.UltrafastMultiplier), threshold, input, output, read, write, write1h, dbTime(effectiveAt), baseline, priceTimeRuleJSON(price.TimePricing)}
+	insert := func() error {
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(args)), ",")
+		_, err := tx.ExecContext(ctx, "INSERT INTO model_price_versions ("+strings.Join(columns, ",")+") VALUES ("+placeholders+")", args...)
+		return err
+	}
+	err := insert()
+	if isMissingPriceSchemaColumnError(err) && price.UltrafastMultiplier == nil {
+		// Only omit columns absent from a pre-migration schema. In particular,
+		// a missing ultrafast column must not drop existing 1h cache rates.
+		present, schemaErr := priceSchemaColumns(ctx, tx, "model_price_versions")
+		if schemaErr != nil {
+			return schemaErr
+		}
+		for i := len(columns) - 1; i >= 0; i-- {
+			column := strings.TrimSpace(columns[i])
+			if !present[column] && (column == "ultrafast_multiplier" || column == "cache_creation_1h_usd_per_million" || column == "long_context_cache_creation_1h_usd_per_million") {
+				columns = append(columns[:i], columns[i+1:]...)
+				args = append(args[:i], args[i+1:]...)
+			}
+		}
+		err = insert()
 	}
 	return err
-}
-
-func snapshotLongContextArgsLegacy(price ModelPrice) (any, any, any, any, any) {
-	if price.LongContext == nil {
-		return nil, nil, nil, nil, nil
-	}
-	return price.LongContext.ThresholdInputTokens, price.LongContext.InputUSDPerMillion, price.LongContext.OutputUSDPerMillion, price.LongContext.CacheReadUSDPerMillion, price.LongContext.CacheCreationUSDPerMillion
 }
 
 // correctLatestModelPriceVersion overwrites the price columns of the newest
@@ -252,12 +234,12 @@ func (a *App) correctLatestModelPriceVersion(ctx context.Context, tx *sql.Tx, pr
 	threshold, input, output, read, write, write1h := snapshotLongContextArgs(price)
 	result, err := tx.ExecContext(ctx, `UPDATE model_price_versions SET price_id = COALESCE(price_id, ?),
       provider = ?, input_usd_per_million = ?, output_usd_per_million = ?, cache_read_usd_per_million = ?, cache_creation_usd_per_million = ?, cache_creation_1h_usd_per_million = ?,
-      request_usd = ?, billing_unit = ?, priority_multiplier = ?, long_context_threshold_tokens = ?,
+      request_usd = ?, billing_unit = ?, priority_multiplier = ?, ultrafast_multiplier = ?, long_context_threshold_tokens = ?,
       long_context_input_usd_per_million = ?, long_context_output_usd_per_million = ?,
       long_context_cache_read_usd_per_million = ?, long_context_cache_creation_usd_per_million = ?, long_context_cache_creation_1h_usd_per_million = ?, time_pricing = ?
       WHERE id = ?`,
 		price.ID, price.Provider, price.InputUSDPerMillion, price.OutputUSDPerMillion, price.CacheReadUSDPerMillion, price.CacheCreationUSDPerMillion, nullableFloatArg(price.CacheCreation1hUSDPerMillion),
-		nullableFloatArg(price.RequestUSD), price.BillingUnit, nullableFloatArg(price.PriorityMultiplier), threshold,
+		nullableFloatArg(price.RequestUSD), price.BillingUnit, nullableFloatArg(price.PriorityMultiplier), nullableFloatArg(price.UltrafastMultiplier), threshold,
 		input, output, read, write, write1h,
 		priceTimeRuleJSON(price.TimePricing), latestID)
 	if err != nil {
@@ -283,6 +265,7 @@ type ModelPriceVersion struct {
 	RequestUSD                   *float64                              `json:"request_usd"`
 	BillingUnit                  string                                `json:"billing_unit"`
 	PriorityMultiplier           *float64                              `json:"priority_multiplier"`
+	UltrafastMultiplier          *float64                              `json:"ultrafast_multiplier"`
 	LongContext                  *ModelPriceLongContext                `json:"long_context"`
 	PreservedLongContext         *ModelPriceLibraryConflictLongContext `json:"preserved_long_context"`
 }
@@ -303,6 +286,9 @@ func modelPriceVersionsForAPI(versions []ModelPriceVersion) []map[string]any {
 func modelPriceVersionForAPI(version ModelPriceVersion) ModelPriceVersion {
 	if version.PriorityMultiplier != nil && (math.IsNaN(*version.PriorityMultiplier) || math.IsInf(*version.PriorityMultiplier, 0)) {
 		version.PriorityMultiplier = nil
+	}
+	if version.UltrafastMultiplier != nil && (math.IsNaN(*version.UltrafastMultiplier) || math.IsInf(*version.UltrafastMultiplier, 0)) {
+		version.UltrafastMultiplier = nil
 	}
 	if version.LongContext != nil && !validLongContextPrice(version.LongContext) {
 		version.LongContext = nil
@@ -325,7 +311,7 @@ func (a *App) listModelPriceVersionsForPrice(ctx context.Context, id int) ([]Mod
 	rows, err := a.db.QueryContext(ctx, `SELECT id, effective_at, baseline,
       input_usd_per_million, output_usd_per_million, cache_read_usd_per_million, cache_creation_usd_per_million,
       cache_creation_1h_usd_per_million,
-      request_usd, billing_unit, priority_multiplier, long_context_threshold_tokens,
+      request_usd, billing_unit, priority_multiplier, ultrafast_multiplier, long_context_threshold_tokens,
       long_context_input_usd_per_million, long_context_output_usd_per_million,
       long_context_cache_read_usd_per_million, long_context_cache_creation_usd_per_million, long_context_cache_creation_1h_usd_per_million, time_pricing
       FROM model_price_versions
@@ -341,11 +327,11 @@ func (a *App) listModelPriceVersionsForPrice(ctx context.Context, id int) ([]Mod
 		var v ModelPriceVersion
 		var effective string
 		var baseline int
-		var req, pri, li, lo, lcr, lcc, cacheCreation1h, longContextCacheCreation1h sql.NullFloat64
+		var req, pri, ultra, li, lo, lcr, lcc, cacheCreation1h, longContextCacheCreation1h sql.NullFloat64
 		var threshold sql.NullInt64
 		var rule sql.NullString
 		if err := rows.Scan(&v.ID, &effective, &baseline, &v.InputUSDPerMillion, &v.OutputUSDPerMillion, &v.CacheReadUSDPerMillion, &v.CacheCreationUSDPerMillion,
-			&cacheCreation1h, &req, &v.BillingUnit, &pri, &threshold, &li, &lo, &lcr, &lcc, &longContextCacheCreation1h, &rule); err != nil {
+			&cacheCreation1h, &req, &v.BillingUnit, &pri, &ultra, &threshold, &li, &lo, &lcr, &lcc, &longContextCacheCreation1h, &rule); err != nil {
 			return nil, err
 		}
 		v.TimePricing, err = parsePriceTimeRule(rule)
@@ -365,6 +351,7 @@ func (a *App) listModelPriceVersionsForPrice(ctx context.Context, id int) ([]Mod
 		if pri.Valid {
 			v.PriorityMultiplier = &pri.Float64
 		}
+		v.UltrafastMultiplier = nullableFloat(ultra)
 		longContextConfigured := threshold.Valid || li.Valid || lo.Valid || lcr.Valid || lcc.Valid || longContextCacheCreation1h.Valid
 		if longContextConfigured {
 			candidate := &ModelPriceLongContext{ThresholdInputTokens: threshold.Int64, InputUSDPerMillion: li.Float64, OutputUSDPerMillion: lo.Float64, CacheReadUSDPerMillion: lcr.Float64, CacheCreationUSDPerMillion: lcc.Float64, CacheCreation1hUSDPerMillion: nullableFloat(longContextCacheCreation1h)}

@@ -7,7 +7,7 @@ import type {
   PriceTimeRule,
 } from '@/shared/types/api'
 import { useI18n } from '@/shared/i18n'
-import { formatInteger, formatPreservedLongContextPrice, formatPriceValue } from '@/shared/utils/format'
+import { formatInteger, formatMultiplier, formatPreservedLongContextPrice, formatPriceValue } from '@/shared/utils/format'
 
 type Rates = Pick<ModelPriceLongContext, 'input_usd_per_million' | 'output_usd_per_million' | 'cache_read_usd_per_million' | 'cache_creation_usd_per_million'> &
   Partial<Pick<ModelPriceLongContext, 'cache_creation_1h_usd_per_million'>>
@@ -24,7 +24,9 @@ const props = withDefaults(defineProps<{
   requestUsd?: number | null | undefined
   claude?: boolean | undefined
   priorityMultiplier?: number | null | undefined
+  ultrafastMultiplier?: number | null | undefined
   showFast?: boolean | undefined
+  showUltrafast?: boolean | undefined
   showTimeDisabled?: boolean | undefined
 }>(), {
   longContext: null,
@@ -34,7 +36,9 @@ const props = withDefaults(defineProps<{
   requestUsd: null,
   claude: false,
   priorityMultiplier: null,
+  ultrafastMultiplier: null,
   showFast: false,
+  showUltrafast: false,
   showTimeDisabled: false,
 })
 
@@ -141,8 +145,9 @@ const ruleSummary = computed(() => {
   ]
 })
 
-const fastLabel = computed(() => props.priorityMultiplier === null ? t('默认', 'Default') : `${props.priorityMultiplier}x`)
-const hasMeta = computed(() => props.showFast || !!props.rule || props.showTimeDisabled)
+const fastLabel = computed(() => props.priorityMultiplier === null ? t('默认', 'Default') : `${formatMultiplier(props.priorityMultiplier)}x`)
+const ultrafastLabel = computed(() => props.ultrafastMultiplier === null ? t('未配置', 'Unconfigured') : `${formatMultiplier(props.ultrafastMultiplier)}x`)
+const hasMeta = computed(() => props.showFast || props.showUltrafast || !!props.rule || props.showTimeDisabled)
 </script>
 
 <template>
@@ -177,6 +182,7 @@ const hasMeta = computed(() => props.showFast || !!props.rule || props.showTimeD
     </div>
     <div v-if="hasMeta" class="rates-meta">
       <span v-if="showFast">Fast: {{ fastLabel }}</span>
+      <span v-if="showUltrafast">ultrafast: {{ ultrafastLabel }}</span>
       <template v-if="rule">
         <span v-for="line in ruleSummary" :key="line">{{ line }}</span>
       </template>

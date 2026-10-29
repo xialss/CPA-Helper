@@ -800,12 +800,21 @@ function normalizedServiceTier(record: Pick<UsageRecordListItem, 'service_tier'>
   return record.service_tier?.trim() ?? ''
 }
 
-function isFastRecord(record: Pick<UsageRecordListItem, 'provider' | 'service_tier'>): boolean {
-  return isFastPricingProvider(record) && normalizedServiceTier(record).toLowerCase() === 'priority'
+function appliedTierMultiplier(record: Pick<UsageRecordListItem, 'cost_breakdown'>): number | null {
+  const multiplier = record.cost_breakdown.tier_multiplier
+  return typeof multiplier === 'number' && Number.isFinite(multiplier) && multiplier > 0 ? multiplier : null
+}
+
+function isFastRecord(record: Pick<UsageRecordListItem, 'provider' | 'service_tier' | 'cost_breakdown'>): boolean {
+  const tier = normalizedServiceTier(record).toLowerCase()
+  return tier === 'ultrafast'
+    ? record.cost_breakdown.ultrafast_eligible === true || appliedTierMultiplier(record) !== null
+    : isFastPricingProvider(record) && tier === 'priority'
 }
 
 function serviceTierLabel(record: Pick<UsageRecordListItem, 'provider' | 'service_tier'>): string {
   const tier = normalizedServiceTier(record)
+  if (tier.toLowerCase() === 'ultrafast') return 'ultrafast'
   if (!isFastPricingProvider(record)) {
     return tier || t('未上报', 'Unreported')
   }
@@ -859,7 +868,7 @@ function renderModelWithPricingMarkers(row: UsageRecordListItem) {
   }
 
   if (fast) {
-    const fastLabel = t('Fast 模式', 'Fast mode')
+    const fastLabel = normalizedServiceTier(row).toLowerCase() === 'ultrafast' ? t('ultrafast 模式', 'ultrafast mode') : t('Fast 模式', 'Fast mode')
     markers.push(
       h(
         NTooltip,
@@ -889,23 +898,28 @@ function renderModelWithPricingMarkers(row: UsageRecordListItem) {
 }
 
 function tierPricingNote(row: UsageRecordListItem): string | null {
-  if (!isFastPricingProvider(row)) {
+  const tier = normalizedServiceTier(row).toLowerCase()
+  if (!isFastPricingProvider(row) && tier !== 'ultrafast') {
     return null
   }
-  const tier = normalizedServiceTier(row).toLowerCase()
-  if (tier === 'priority') {
+  if (tier === 'priority' || tier === 'ultrafast') {
+    const mode = tier === 'ultrafast' ? 'ultrafast' : 'Fast'
+    const multiplier = appliedTierMultiplier(row)
+    if (tier === 'ultrafast' && row.cost_breakdown.ultrafast_eligible !== true && multiplier === null) {
+      return t('ultrafast：未应用倍率', 'ultrafast: multiplier not applied')
+    }
     if (
       row.failed &&
       row.cost_breakdown.billing_unit === 'request' &&
       row.cost_breakdown.total_usd === 0
     ) {
-      return t('Fast 请求失败：费用为 0', 'Fast request failed: cost is $0')
+      return t(`${mode} 请求失败：费用为 0`, `${mode} request failed: cost is $0`)
     }
-    const multiplier = row.cost_breakdown.tier_multiplier
-    if (typeof multiplier === 'number' && Number.isFinite(multiplier) && multiplier > 0) {
-      return 'Fast x' + formatMultiplier(multiplier)
+    if (row.cost_breakdown.unpriced) return t(`${mode}：未定价`, `${mode}: unpriced`)
+    if (multiplier !== null) {
+      return mode + ' x' + formatMultiplier(multiplier)
     }
-    return t('Fast：未配置倍率，按基础价格估算', 'Fast: multiplier unconfigured; base price estimate')
+    return t(`${mode}：未配置倍率，按基础价格估算`, `${mode}: multiplier unconfigured; base price estimate`)
   }
   if (tier === '') {
     return t('未上报：未应用 Fast 倍率', 'Unreported: Fast multiplier not applied')
