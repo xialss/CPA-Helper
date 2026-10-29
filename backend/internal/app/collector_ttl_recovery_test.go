@@ -14,14 +14,13 @@ func TestCollectorTTLUnlimitedOutcomeSurvivesReceiptFailure(t *testing.T) {
 	for _, markerFailure := range []bool{false, true} {
 		t.Run(fmt.Sprintf("marker failure %t", markerFailure), func(t *testing.T) {
 			a, owner, pricing := newCollectorTTLApp(t)
-			f, cfg := newCollectorTTLFixture(t)
+			_, cfg := newCollectorTTLFixture(t)
 			ctx, now := context.Background(), time.Date(2026, 10, 28, 10, 0, 0, 0, appTimeLocation)
 			if _, err := a.updateUserQuota(ctx, owner, userQuotaPayload{}); err != nil {
 				t.Fatal(err)
 			}
 			id := collectorTTLID(90)
 			raw := collectorTTLMessage(t, id, now, nil)
-			f.facts[id] = collectorTTLFact(id, "1h", now)
 			if err := a.persistCollectorUsageBatch(ctx, cfg.Collector, []string{raw}, now); err != nil {
 				t.Fatal(err)
 			}
@@ -55,7 +54,7 @@ func TestCollectorTTLUnlimitedOutcomeSurvivesReceiptFailure(t *testing.T) {
 			if _, err := a.updateUserQuota(ctx, owner, userQuotaPayload{LifetimeQuotaUSD: &quota}); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := a.processCollectorUsageInbox(ctx, cfg, pricing, now.Add(2*time.Second)); err != nil {
+			if _, err := a.processCollectorUsageInboxWithPricing(ctx, AppConfig{}, nil, now.Add(2*time.Second)); err != nil {
 				t.Fatal(err)
 			}
 			if got := collectorTTLCount(t, a, `SELECT COUNT(*) FROM user_quota_charges`); got != 0 {
@@ -173,15 +172,15 @@ func TestCollectorTTLProtectedSourcesRetainIdentityAndAliases(t *testing.T) {
 
 func TestCollectorTTLPendingRestartAndDeletedOwner(t *testing.T) {
 	a, owner, pricing := newCollectorTTLApp(t)
-	f, cfg := newCollectorTTLFixture(t)
+	_, cfg := newCollectorTTLFixture(t)
 	ctx, now := context.Background(), time.Date(2026, 10, 28, 10, 0, 0, 0, appTimeLocation)
 	id := collectorTTLID(110)
 	raw := collectorTTLMessage(t, id, now, nil)
 	if err := a.persistCollectorUsageBatch(ctx, cfg.Collector, []string{raw}, now); err != nil {
 		t.Fatal(err)
 	}
-	if count, err := a.processCollectorUsageInbox(ctx, cfg, pricing, now); err != nil || count != 0 {
-		t.Fatalf("initial pending = %d/%v", count, err)
+	if _, err := a.db.Exec(`UPDATE usage_collector_inbox SET state = 'pending', next_attempt_at = ?, deadline_at = ?`, dbTime(now.Add(time.Hour)), dbTime(now.Add(5*time.Minute))); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := a.db.Exec(`DELETE FROM user_api_keys WHERE user_id = ?`, owner); err != nil {
 		t.Fatal(err)
@@ -201,15 +200,12 @@ func TestCollectorTTLPendingRestartAndDeletedOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer restarted.Close()
-	f.mu.Lock()
-	f.facts[id] = collectorTTLFact(id, "1h", now.Add(time.Second))
-	f.mu.Unlock()
 	if count, err := restarted.processCollectorUsageInbox(ctx, cfg, pricing, now.Add(10*time.Second)); err != nil || count != 1 {
 		t.Fatalf("pending restart = %d/%v", count, err)
 	}
 	record := collectorTTLRecord(t, restarted, raw)
-	if *record.CacheCreationMetadata.Source != "enforced_request" || *record.CacheCreationTTL != "1h" {
-		t.Fatalf("restart lost attribution: %#v", record.CacheCreationMetadata)
+	if record.CacheCreationTokens != 1000000 {
+		t.Fatalf("restart lost the original cache creation total: %#v", record)
 	}
 	if got := collectorTTLCount(t, restarted, `SELECT COUNT(*) FROM user_quota_charges WHERE user_id = ?`, replacement); got != 0 {
 		t.Fatal("deleted owner's usage charged a reused username/key")

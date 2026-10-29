@@ -79,7 +79,7 @@ func TestClaudeCacheTTLLegacyPriceReadsPreserveExistingAttributes(t *testing.T) 
 	}
 }
 
-func TestClaudeCacheTTLTimePricingQuotaAndHistoricalCosts(t *testing.T) {
+func TestClaudeCacheCreationSingleRateTimePricingQuotaAndHistoricalCosts(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	ctx := context.Background()
 	a, err := NewWithOptions(ctx, NewOptions{Migrate: true, StartBackground: false})
@@ -111,17 +111,17 @@ func TestClaudeCacheTTLTimePricingQuotaAndHistoricalCosts(t *testing.T) {
 		want        float64
 		unpriced    bool
 	}{
-		{name: "multiplier-peak-1h", mode: "multiplier", ttl: "1h", want: 8},
-		{name: "multiplier-offpeak-1h", mode: "multiplier", offpeak: true, ttl: "1h", want: 4},
-		{name: "explicit-peak-1h", mode: "explicit", ttl: "1h", want: 8},
-		{name: "explicit-offpeak-1h", mode: "explicit", offpeak: true, ttl: "1h", want: 3},
+		{name: "multiplier-peak-1h", mode: "multiplier", ttl: "1h", want: 2},
+		{name: "multiplier-offpeak-1h", mode: "multiplier", offpeak: true, ttl: "1h", want: 1},
+		{name: "explicit-peak-1h", mode: "explicit", ttl: "1h", want: 2},
+		{name: "explicit-offpeak-1h", mode: "explicit", offpeak: true, ttl: "1h", want: 1},
 		{name: "explicit-offpeak-5m", mode: "explicit", offpeak: true, ttl: "5m", want: 1},
-		{name: "explicit-offpeak-mixed", mode: "explicit", offpeak: true, ttl: "mixed", want: 2.2},
-		{name: "explicit-offpeak-unset-1h", mode: "explicit", offpeak: true, ttl: "1h", missing1h: true, unpriced: true},
-		{name: "explicit-offpeak-free-1h", mode: "explicit", offpeak: true, ttl: "1h", zero1h: true},
-		{name: "long-peak-1h", mode: "multiplier", long: true, ttl: "1h", want: 19},
-		{name: "long-multiplier-offpeak-1h", mode: "multiplier", offpeak: true, long: true, ttl: "1h", want: 4.75},
-		{name: "long-explicit-offpeak-1h", mode: "explicit", offpeak: true, long: true, ttl: "1h", want: 4.75},
+		{name: "explicit-offpeak-mixed", mode: "explicit", offpeak: true, ttl: "mixed", want: 1},
+		{name: "explicit-offpeak-unset-1h", mode: "explicit", offpeak: true, ttl: "1h", missing1h: true, want: 1},
+		{name: "explicit-offpeak-free-1h", mode: "explicit", offpeak: true, ttl: "1h", zero1h: true, want: 1},
+		{name: "long-peak-1h", mode: "multiplier", long: true, ttl: "1h", want: 7},
+		{name: "long-multiplier-offpeak-1h", mode: "multiplier", offpeak: true, long: true, ttl: "1h", want: 1.75},
+		{name: "long-explicit-offpeak-1h", mode: "explicit", offpeak: true, long: true, ttl: "1h", want: 1.75},
 		{name: "legacy-unknown", mode: "multiplier", ttl: "unknown", want: 2},
 		{name: "non-claude-separate-write", ttl: "1h", nonClaude: true, want: 2},
 		{name: "non-claude-included-write", ttl: "1h", nonClaude: true, genericZero: true, want: 1},
@@ -163,8 +163,8 @@ func TestClaudeCacheTTLTimePricingQuotaAndHistoricalCosts(t *testing.T) {
 				if price.Model != model {
 					continue
 				}
-				// Exercise persisted version snapshots, including the time rule's
-				// nullable off-peak 1h rate, in the monetary paths below.
+				// Exercise persisted historical columns alongside the active
+				// single cache-write rate in every monetary path below.
 				tx, err := a.db.BeginTx(ctx, nil)
 				if err != nil {
 					t.Fatal(err)
@@ -308,7 +308,7 @@ func assertClaudeTTLHistoricalCosts(t *testing.T, a *App, pricing modelPriceBill
 	}
 }
 
-func TestClaudeCacheTTLScalarCorrectionsAndRollbackRepairHistoricalCosts(t *testing.T) {
+func TestRetiredClaudeCacheTTLScalarChangesDoNotChangeCostsOrReplayQuota(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	ctx := context.Background()
 	a, err := NewWithOptions(ctx, NewOptions{Migrate: true, StartBackground: false})
@@ -360,10 +360,10 @@ func TestClaudeCacheTTLScalarCorrectionsAndRollbackRepairHistoricalCosts(t *test
 		cost     float64
 		unpriced int
 	}{
-		{"ttl only", "cache_creation_ttl = '1h'", 8, 0},
-		{"mixed", "cache_creation_ttl = 'mixed', cache_creation_5m_tokens = 400000, cache_creation_1h_tokens = 600000", 5.6, 0},
-		{"5m bucket only invalidates", "cache_creation_5m_tokens = 500000", 0, 1},
-		{"1h bucket only repairs", "cache_creation_1h_tokens = 500000", 5, 0},
+		{"ttl only", "cache_creation_ttl = '1h'", 2, 0},
+		{"mixed", "cache_creation_ttl = 'mixed', cache_creation_5m_tokens = 400000, cache_creation_1h_tokens = 600000", 2, 0},
+		{"5m bucket only", "cache_creation_5m_tokens = 500000", 2, 0},
+		{"1h bucket only", "cache_creation_1h_tokens = 500000", 2, 0},
 		{"null TTL keeps legacy price", "cache_creation_ttl = NULL", 2, 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -415,7 +415,7 @@ func TestClaudeCacheTTLScalarCorrectionsAndRollbackRepairHistoricalCosts(t *test
 	if _, err := a.db.ExecContext(ctx, `UPDATE usage_records SET cache_creation_ttl = '1h' WHERE id = ?`, record.ID); err != nil {
 		t.Fatal(err)
 	}
-	assertClaudeTTLHistoricalCosts(t, a, pricing, start, end, map[string]float64{model: 8}, 0)
+	assertClaudeTTLHistoricalCosts(t, a, pricing, start, end, map[string]float64{model: 2}, 0)
 	state, err := loadUsageAnalyticsState(ctx, a.db)
 	if err != nil || state.hourlyNeedsRebuild {
 		t.Fatalf("1h baseline was not current before rollback: %#v, err=%v", state, err)
@@ -444,5 +444,125 @@ func TestClaudeCacheTTLScalarCorrectionsAndRollbackRepairHistoricalCosts(t *test
 	}
 	if legacyCost != 2 {
 		t.Fatalf("rolled-back hourly cost = %g, want generic cache price 2", legacyCost)
+	}
+}
+
+func TestRetiredClaudeCacheTTLMigrationRebuildsCachedCostsAndPreservesSettledQuota(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+	prepareMigrationTestDatabase(t, dataDir, 202610290001)
+	ctx := context.Background()
+	a, err := NewWithOptions(ctx, NewOptions{Migrate: false, StartBackground: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	userID := seedQuotaTestUser(t, a, "retired-cache-upgrade")
+	apiKey, model := "sk-retired-cache-upgrade", "claude-retired-cache-upgrade"
+	seedQuotaTestAPIKey(t, a, userID, apiKey)
+	quota := 20.0
+	if _, err := a.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &quota}); err != nil {
+		t.Fatal(err)
+	}
+	seedQuotaTestNativePrice(t, a, "claude", "retired-cache-upgrade-auth", model, 0)
+	if _, err := a.db.ExecContext(ctx, `UPDATE model_prices SET cache_creation_usd_per_million=2,cache_creation_1h_usd_per_million=8 WHERE model=?`, model); err != nil {
+		t.Fatal(err)
+	}
+	pricing := quotaTestBillingPriceIndex(t, a)
+	raw := []byte(`{"api_key":"sk-retired-cache-upgrade","provider":"claude","model":"claude-retired-cache-upgrade","auth":"api_key","auth_index":"retired-cache-upgrade-auth","timestamp":"2026-10-26T10:00:00+08:00","request_id":"retired-cache-upgrade","tokens":{"cache_creation_tokens":1000000,"cache_creation_ttl":"1h"}}`)
+	record, created, err := a.saveUsageMessage(ctx, raw, pricing)
+	if err != nil || !created {
+		t.Fatalf("seed old usage: created=%t err=%v", created, err)
+	}
+	// Represent a charge and a complete hourly cache produced by v0.9.0.
+	if _, err := a.db.ExecContext(ctx, `UPDATE usage_records SET cache_creation_ttl='1h' WHERE id=?`, record.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.ExecContext(ctx, `UPDATE user_quota_charges SET amount_usd=8 WHERE usage_record_id=?`, record.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.ExecContext(ctx, `UPDATE users SET quota_lifetime_usd=12 WHERE id=?`, userID); err != nil {
+		t.Fatal(err)
+	}
+	// The direct historical correction above queues a fact repair. Settle that
+	// repair before seeding a current old-code cache, so the first read does not
+	// correctly rebuild it for an unrelated pending fact.
+	if err := a.ensureUsageAnalyticsFacts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.rebuildUsageAnalyticsHourly(ctx, pricing); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.ExecContext(ctx, `UPDATE usage_analytics_hourly SET estimated_cost_usd=8`); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := a.usageAnalyticsFactsPending(ctx); err != nil || pending {
+		t.Fatalf("old complete cache has pending fact repairs: pending=%t err=%v", pending, err)
+	}
+	before, err := loadUsageAnalyticsState(ctx, a.db)
+	if err != nil || before.hourlyNeedsRebuild {
+		t.Fatalf("old cached baseline: %#v / %v", before, err)
+	}
+	start := time.Date(2026, 10, 26, 0, 0, 0, 0, appTimeLocation)
+	end := start.AddDate(0, 0, 1)
+	filters := UsageFilters{Start: &start, End: &end}
+	collector := newUsageAnalyticsCollector(filters, pricing.Prices, pricing.MatchContext, nil, usageAnalyticsCollectorOptions{Summary: true})
+	if err := a.collectUsageAnalytics(ctx, filters, pricing, collector, ""); err != nil {
+		t.Fatal(err)
+	}
+	if collector.summary.estimated != 8 {
+		t.Fatalf("old hourly cache was not represented: %#v", collector.summary)
+	}
+	var previousRaw, previousTTL string
+	var previousTokens int
+	if err := a.db.QueryRowContext(ctx, `SELECT raw_json,cache_creation_ttl,cache_creation_tokens FROM usage_records WHERE id=?`, record.ID).Scan(&previousRaw, &previousTTL, &previousTokens); err != nil {
+		t.Fatal(err)
+	}
+	if previousRaw == "" || previousTTL != "1h" || previousTokens != 1000000 {
+		t.Fatalf("historical usage baseline = %q / %q / %d", previousRaw, previousTTL, previousTokens)
+	}
+	goose.SetBaseFS(backendMigrations.FS)
+	if err := goose.UpToContext(ctx, a.db, ".", backendMigrations.LatestVersion); err != nil {
+		t.Fatal(err)
+	}
+	after, err := loadUsageAnalyticsState(ctx, a.db)
+	if err != nil || after.pricingVersion != before.pricingVersion+1 || after.factsVersion != before.factsVersion || !after.hourlyNeedsRebuild {
+		t.Fatalf("retirement cache invalidation: before=%#v after=%#v err=%v", before, after, err)
+	}
+	var persistedRaw, persistedTTL string
+	var persistedTokens int
+	if err := a.db.QueryRowContext(ctx, `SELECT raw_json,cache_creation_ttl,cache_creation_tokens FROM usage_records WHERE id=?`, record.ID).Scan(&persistedRaw, &persistedTTL, &persistedTokens); err != nil {
+		t.Fatal(err)
+	}
+	if persistedRaw != previousRaw || persistedTTL != previousTTL || persistedTokens != previousTokens {
+		t.Fatalf("migration changed historical usage: %q / %q / %d", persistedRaw, persistedTTL, persistedTokens)
+	}
+	assertClaudeTTLHistoricalCosts(t, a, pricing, start, end, map[string]float64{model: 2}, 0)
+	if err := goose.UpToContext(ctx, a.db, ".", backendMigrations.LatestVersion); err != nil {
+		t.Fatal(err)
+	}
+	repeated, err := loadUsageAnalyticsState(ctx, a.db)
+	if err != nil || repeated.pricingVersion != after.pricingVersion || repeated.hourlyNeedsRebuild {
+		t.Fatalf("repeat upgrade invalidated a current cache: %#v / %v", repeated, err)
+	}
+	var amount float64
+	var charges int
+	if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*),SUM(amount_usd) FROM user_quota_charges`).Scan(&charges, &amount); err != nil {
+		t.Fatal(err)
+	}
+	user, err := a.getUser(ctx, userID)
+	if err != nil || charges != 1 || amount != 8 || user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != 12 {
+		t.Fatalf("upgrade replayed historical quota: charges=%d amount=%g user=%#v err=%v", charges, amount, user, err)
+	}
+	if err := goose.DownToContext(ctx, a.db, ".", 202610290001); err != nil {
+		t.Fatal(err)
+	}
+	downgraded, err := loadUsageAnalyticsState(ctx, a.db)
+	if err != nil || downgraded.pricingVersion != repeated.pricingVersion+1 || !downgraded.hourlyNeedsRebuild {
+		t.Fatalf("downgrade did not invalidate only the cache: %#v / %v", downgraded, err)
+	}
+	var retiredRate float64
+	if err := a.db.QueryRowContext(ctx, `SELECT cache_creation_1h_usd_per_million FROM model_prices WHERE model=?`, model).Scan(&retiredRate); err != nil || retiredRate != 8 {
+		t.Fatalf("downgrade removed historical price storage: %g / %v", retiredRate, err)
 	}
 }

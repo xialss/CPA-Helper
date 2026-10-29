@@ -363,9 +363,6 @@ func normalizePluginPolicy(policy map[string]json.RawMessage) error {
 		return err
 	}
 	for _, group := range groups {
-		if _, exists := group["claude_cache_ttl"]; exists {
-			return validationError("Claude 缓存 TTL 只能配置在 API 密钥上")
-		}
 		if err := normalizePluginPolicyRule(group); err != nil {
 			return err
 		}
@@ -376,15 +373,6 @@ func normalizePluginPolicy(policy map[string]json.RawMessage) error {
 }
 
 func normalizePluginPolicyKey(key map[string]json.RawMessage) error {
-	if raw, exists := key["claude_cache_ttl"]; exists {
-		var ttl string
-		if rawJSONNull(raw) || json.Unmarshal(raw, &ttl) != nil || (ttl != "" && ttl != "5m" && ttl != "1h") {
-			return validationError("Claude 缓存 TTL 必须为继承 CPA、5m 或 1h")
-		}
-		if ttl == "" {
-			delete(key, "claude_cache_ttl")
-		}
-	}
 	if raw, ok := key["enabled"]; !ok || rawJSONNull(raw) {
 		key["enabled"] = mustRawBool(true)
 	}
@@ -767,6 +755,8 @@ func (a *App) pluginKeyPolicy(ctx context.Context, user *AuthUser, localHash str
 	for _, item := range keys {
 		if rawString(item["id"]) == scope {
 			groups, _ := rawObjectArray(policy, "groups")
+			item = cloneRawObject(item)
+			delete(item, "claude_cache_ttl")
 			result := map[string]json.RawMessage{"policy_revision": policy["policy_revision"], "key": mustRaw(item), "groups": mustRaw(groups)}
 			return result, nil
 		}
@@ -842,15 +832,6 @@ func (a *App) putCPAHelperPluginPolicy(ctx context.Context, cfg AppConfig, curre
 	if err := normalizePluginPolicy(policy); err != nil {
 		return nil, err
 	}
-	if pluginPolicyEnablesTTL(current, policy) {
-		feature, err := a.pluginClaudeTTLFeature(ctx, cfg)
-		if err != nil {
-			return nil, err
-		}
-		if !feature.Supported || feature.Status != "configured" {
-			return nil, appError("plugin_claude_ttl_unavailable", http.StatusServiceUnavailable, "Claude 缓存 TTL 尚未完成插件配置校验")
-		}
-	}
 	delete(policy, pluginKeyMetadataField)
 	if err := a.projectLocalPluginKeyLabels(ctx, policy); err != nil {
 		return nil, err
@@ -889,9 +870,6 @@ func (a *App) putCPAHelperPluginPolicy(ctx context.Context, cfg AppConfig, curre
 	}
 	if rawUint(latest["policy_revision"]) != acceptedRevision {
 		return nil, appError("plugin_sync_failed", http.StatusServiceUnavailable, "插件策略保存后未生效")
-	}
-	if !pluginPolicyTTLMatches(policy, latest) {
-		return nil, appError("plugin_sync_failed", http.StatusServiceUnavailable, "插件 API 密钥缓存 TTL 保存后未生效")
 	}
 	return latest, nil
 }
@@ -1731,6 +1709,9 @@ func (a *App) handleCPAHelperPlugin(w http.ResponseWriter, r *http.Request) erro
 			if rawString(request.Key["id"]) != pluginCallerScope(*key.APIKey) {
 				return forbiddenError("插件 API 密钥身份映射不匹配")
 			}
+			if _, exists := request.Key["claude_cache_ttl"]; exists {
+				return validationError("Claude 缓存 TTL 配置已移除")
+			}
 			current, _, err := a.cpaHelperPluginPolicy(r.Context(), cfg)
 			if err != nil {
 				return err
@@ -1803,17 +1784,9 @@ func (a *App) handleCPAHelperPlugin(w http.ResponseWriter, r *http.Request) erro
 		// Live activity is available through the authorized account/admin
 		// summary endpoints, without exposing caller-scope identities.
 		delete(healthObject, "active")
-		feature, err := a.pluginClaudeTTLFeatureFromState(r.Context(), cfg, capabilities, healthObject)
-		if err != nil {
-			return err
-		}
-		if _, exists := capabilities["claude_cache_ttl"]; exists {
-			capabilities["claude_cache_ttl"] = mustRaw(feature)
-		}
-		if _, exists := healthObject["claude_cache_ttl"]; exists {
-			healthObject["claude_cache_ttl"] = mustRaw(feature)
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"loaded": true, "capabilities": capabilities, "health": healthObject, "claude_cache_ttl": feature, "response_model_verification_supported": responseVerificationSupported})
+		delete(capabilities, "claude_cache_ttl")
+		delete(healthObject, "claude_cache_ttl")
+		writeJSON(w, http.StatusOK, map[string]any{"loaded": true, "capabilities": capabilities, "health": healthObject, "response_model_verification_supported": responseVerificationSupported})
 		return nil
 	case "/policy":
 		if !user.IsSuperAdmin {

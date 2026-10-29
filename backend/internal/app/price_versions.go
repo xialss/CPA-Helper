@@ -95,6 +95,7 @@ func loadModelPriceVersionsWithQueryer(ctx context.Context, q modelPriceQueryer)
 			p.RequestUSD = &req.Float64
 		}
 		p.CacheCreation1hUSDPerMillion = nullableFloat(cacheCreation1h)
+		p.retiredLongContextCacheCreation1h = nullableFloat(longContextCacheCreation1h)
 		// Keep legacy non-finite values in the billing index. The shared cost
 		// calculator uses them to fail closed for Fast requests; JSON projections
 		// are sanitized separately at the API boundary.
@@ -102,7 +103,7 @@ func loadModelPriceVersionsWithQueryer(ctx context.Context, q modelPriceQueryer)
 			p.PriorityMultiplier = &pri.Float64
 		}
 		p.UltrafastMultiplier = nullableFloat(ultra)
-		longContextConfigured := threshold.Valid || li.Valid || lo.Valid || lcr.Valid || lcc.Valid || longContextCacheCreation1h.Valid
+		longContextConfigured := threshold.Valid || li.Valid || lo.Valid || lcr.Valid || lcc.Valid
 		if longContextConfigured {
 			candidate := &ModelPriceLongContext{ThresholdInputTokens: threshold.Int64, InputUSDPerMillion: li.Float64, OutputUSDPerMillion: lo.Float64, CacheReadUSDPerMillion: lcr.Float64, CacheCreationUSDPerMillion: lcc.Float64, CacheCreation1hUSDPerMillion: nullableFloat(longContextCacheCreation1h)}
 			p.LongContext = candidate
@@ -261,7 +262,7 @@ type ModelPriceVersion struct {
 	OutputUSDPerMillion          float64                               `json:"output_usd_per_million"`
 	CacheReadUSDPerMillion       float64                               `json:"cache_read_usd_per_million"`
 	CacheCreationUSDPerMillion   float64                               `json:"cache_creation_usd_per_million"`
-	CacheCreation1hUSDPerMillion *float64                              `json:"cache_creation_1h_usd_per_million"`
+	CacheCreation1hUSDPerMillion *float64                              `json:"-"`
 	RequestUSD                   *float64                              `json:"request_usd"`
 	BillingUnit                  string                                `json:"billing_unit"`
 	PriorityMultiplier           *float64                              `json:"priority_multiplier"`
@@ -352,7 +353,7 @@ func (a *App) listModelPriceVersionsForPrice(ctx context.Context, id int) ([]Mod
 			v.PriorityMultiplier = &pri.Float64
 		}
 		v.UltrafastMultiplier = nullableFloat(ultra)
-		longContextConfigured := threshold.Valid || li.Valid || lo.Valid || lcr.Valid || lcc.Valid || longContextCacheCreation1h.Valid
+		longContextConfigured := threshold.Valid || li.Valid || lo.Valid || lcr.Valid || lcc.Valid
 		if longContextConfigured {
 			candidate := &ModelPriceLongContext{ThresholdInputTokens: threshold.Int64, InputUSDPerMillion: li.Float64, OutputUSDPerMillion: lo.Float64, CacheReadUSDPerMillion: lcr.Float64, CacheCreationUSDPerMillion: lcc.Float64, CacheCreation1hUSDPerMillion: nullableFloat(longContextCacheCreation1h)}
 			if threshold.Valid && li.Valid && lo.Valid && lcr.Valid && lcc.Valid && validLongContextPrice(candidate) {
@@ -373,34 +374,7 @@ func (a *App) listModelPriceVersionsForPrice(ctx context.Context, id int) ([]Mod
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if !modelPriceSupportsClaudeCacheTTL(price) {
-		for index := range versions {
-			stripNonClaudeVersionCacheTTL(&versions[index])
-		}
-	}
 	return versions, nil
-}
-
-func stripNonClaudeVersionCacheTTL(version *ModelPriceVersion) {
-	if version == nil {
-		return
-	}
-	version.CacheCreation1hUSDPerMillion = nil
-	if version.LongContext != nil {
-		longContext := *version.LongContext
-		longContext.CacheCreation1hUSDPerMillion = nil
-		version.LongContext = &longContext
-	}
-	version.PreservedLongContext = stripNonClaudeLongContextAudit(version.PreservedLongContext)
-	if version.TimePricing != nil {
-		rule := *version.TimePricing
-		if rule.OffpeakRates != nil {
-			rates := *rule.OffpeakRates
-			rates.CacheCreation1h = nil
-			rule.OffpeakRates = &rates
-		}
-		version.TimePricing = &rule
-	}
 }
 
 func resolveVersionedPrice(record UsageRecord, price *ModelPrice, versions modelPriceVersionIndex) *ModelPrice {

@@ -33,16 +33,15 @@ type AvailableModelSource struct {
 }
 
 type AvailableModelPrice struct {
-	Provider                     string                 `json:"provider"`
-	Model                        string                 `json:"model"`
-	InputUSDPerMillion           float64                `json:"input_usd_per_million"`
-	OutputUSDPerMillion          float64                `json:"output_usd_per_million"`
-	CacheReadUSDPerMillion       float64                `json:"cache_read_usd_per_million"`
-	CacheCreationUSDPerMillion   float64                `json:"cache_creation_usd_per_million"`
-	CacheCreation1hUSDPerMillion *float64               `json:"cache_creation_1h_usd_per_million"`
-	RequestUSD                   *float64               `json:"request_usd"`
-	LongContext                  *ModelPriceLongContext `json:"long_context"`
-	BillingUnit                  string                 `json:"billing_unit"`
+	Provider                   string                 `json:"provider"`
+	Model                      string                 `json:"model"`
+	InputUSDPerMillion         float64                `json:"input_usd_per_million"`
+	OutputUSDPerMillion        float64                `json:"output_usd_per_million"`
+	CacheReadUSDPerMillion     float64                `json:"cache_read_usd_per_million"`
+	CacheCreationUSDPerMillion float64                `json:"cache_creation_usd_per_million"`
+	RequestUSD                 *float64               `json:"request_usd"`
+	LongContext                *ModelPriceLongContext `json:"long_context"`
+	BillingUnit                string                 `json:"billing_unit"`
 }
 
 type AvailableModelItem struct {
@@ -228,27 +227,17 @@ func availableModelPriceFromPrice(price *ModelPrice) *AvailableModelPrice {
 		return nil
 	}
 	apiPrice := modelPriceForAPI(*price)
-	cacheCreation1h := apiPrice.CacheCreation1hUSDPerMillion
 	longContext := apiPrice.LongContext
-	if !modelPriceSupportsClaudeCacheTTL(apiPrice) {
-		cacheCreation1h = nil
-		if longContext != nil {
-			longContextCopy := *longContext
-			longContextCopy.CacheCreation1hUSDPerMillion = nil
-			longContext = &longContextCopy
-		}
-	}
 	return &AvailableModelPrice{
-		Provider:                     apiPrice.Provider,
-		Model:                        apiPrice.Model,
-		InputUSDPerMillion:           apiPrice.InputUSDPerMillion,
-		OutputUSDPerMillion:          apiPrice.OutputUSDPerMillion,
-		CacheReadUSDPerMillion:       apiPrice.CacheReadUSDPerMillion,
-		CacheCreationUSDPerMillion:   apiPrice.CacheCreationUSDPerMillion,
-		CacheCreation1hUSDPerMillion: cacheCreation1h,
-		RequestUSD:                   apiPrice.RequestUSD,
-		LongContext:                  longContext,
-		BillingUnit:                  apiPrice.BillingUnit,
+		Provider:                   apiPrice.Provider,
+		Model:                      apiPrice.Model,
+		InputUSDPerMillion:         apiPrice.InputUSDPerMillion,
+		OutputUSDPerMillion:        apiPrice.OutputUSDPerMillion,
+		CacheReadUSDPerMillion:     apiPrice.CacheReadUSDPerMillion,
+		CacheCreationUSDPerMillion: apiPrice.CacheCreationUSDPerMillion,
+		RequestUSD:                 apiPrice.RequestUSD,
+		LongContext:                longContext,
+		BillingUnit:                apiPrice.BillingUnit,
 	}
 }
 

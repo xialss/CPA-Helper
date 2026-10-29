@@ -14,8 +14,8 @@ globalThis.document = { documentElement: { lang: 'zh-CN' } }
 const row = { api_key_hash: 'member-hash', description: 'Member', api_key: 'sk-member-secret-key', models: [], last_model: null, expires_at: null, expiration_enforced_at: null, expiration_sync_error: null }
 const keyPolicy = { id: 'member-scope', label: 'Member', enabled: true, group_ids: [], max_concurrency: 0, rule: {} }
 env.key = structuredClone(keyPolicy)
-env.status = { loaded: true, capabilities: {}, health: {}, response_model_verification_supported: false, claude_cache_ttl: { supported: false, status: 'unsupported' } }
-const statusResponse = (health = {}) => ({ ...env.status, health })
+env.status = { loaded: true, capabilities: {}, health: {}, response_model_verification_supported: false }
+const statusResponse = (health = env.status.health) => ({ ...env.status, health })
 const policyResponse = () => ({ policy_revision: env.revision, groups: env.groups, key: env.key })
 const apiError = (message, status = 503) => Response.json({ detail: { code: 'plugin_unavailable', message } }, { status })
 globalThis.fetch = async (url, init) => {
@@ -64,7 +64,6 @@ globalThis.fetch = async (url, init) => {
     assert.equal(payload.policy_revision, env.revision, 'Writes use the current revision')
     env.revision++
     env.key = { ...payload.key, label: row.description }
-    if (env.key.claude_cache_ttl === '') delete env.key.claude_cache_ttl
     return Response.json(policyResponse())
   }
   assert.fail(`Unexpected API call ${path}`)
@@ -609,106 +608,30 @@ try {
   state.closePluginKeyPolicy()
 
   const { normalizeCPAHelperPluginKey, getCPAHelperPluginStatus } = await server.ssrLoadModule('/src/features/plugin/api/cpaHelperPluginApi.ts')
-  for (const value of [null, false, 5, '2h', '5M']) {
-    assert.throws(() => normalizeCPAHelperPluginKey({ ...keyPolicy, claude_cache_ttl: value }), /TTL/, 'Invalid TTL types/values are never normalized into an inherited preference')
-  }
-  assert.equal(Object.hasOwn(normalizeCPAHelperPluginKey(keyPolicy), 'claude_cache_ttl'), false, 'An old Key remains absent rather than being defaulted to 5m')
-  await state.editApiKey(row)
-  await settle()
-  let ttlSelect = select(host, 'Claude 缓存 TTL')
-  assert.equal(ttlSelect.props.value, '')
-  assert.deepEqual(ttlSelect.props.options.map((option) => option.value), ['', '5m', '1h'])
-  assert.ok(ttlSelect.props.options.slice(1).every((option) => option.disabled), 'Unsupported Plugin cannot enable a new TTL preference')
-  assert.equal(Object.hasOwn(state.pluginKeyPolicyDraft.value, 'claude_cache_ttl'), false)
-  assert.equal(state.apiKeyEditDirty.value, false, 'Displaying inheritance does not dirty an old Key')
-  state.closePluginKeyPolicy()
-
-  env.status.claude_cache_ttl = { supported: true, status: 'configured', metadata_version: 'v1' }
-  for (const ttl of ['5m', '1h']) {
-    await state.editApiKey(row)
-    await settle()
-    ttlSelect = select(host, 'Claude 缓存 TTL')
-    assert.ok(ttlSelect.props.options.every((option) => !option.disabled))
-    if (ttl === '5m') {
-      setLanguage('en')
-      await settle()
-      assert.equal(select(host, 'Claude cache TTL').props.options[0].label, 'Inherit CPA')
-      assert.match(state.pluginKeyTTLHint.value, /upstream cache TTL is not confirmed/i, 'Configured is not presented as upstream confirmation')
-      assert.throws(() => normalizeCPAHelperPluginKey({ ...keyPolicy, claude_cache_ttl: null }), /Invalid API key cache TTL/)
-      setLanguage('zh')
-      await settle()
-      ttlSelect = select(host, 'Claude 缓存 TTL')
-    }
-    updateValue(ttlSelect, ttl)
-    if (ttl === '1h') {
-      env.failPolicy = true
-      const beforeFailedTTL = env.successes.length
-      await state.saveEditedApiKey()
-      assert.equal(state.pluginKeyPolicyDraft.value.claude_cache_ttl, '1h', 'Failed TTL save preserves the draft')
-      assert.equal(state.pluginKeyPolicyVisible.value, true)
-      assert.equal(env.successes.length, beforeFailedTTL, 'Failed TTL save never reports activation')
-      env.failPolicy = false
-    }
-    await state.saveEditedApiKey()
-    assert.equal(env.policyWrites.at(-1).key.claude_cache_ttl, ttl, 'The actual feature wrapper serializes the chosen TTL')
-    assert.equal(env.key.claude_cache_ttl, ttl)
-  }
-  for (const feature of [{ supported: true, status: 'disabled', metadata_version: 'v1' }, { supported: true, status: 'unavailable', metadata_version: 'v1' }, { supported: false, status: 'unsupported' }]) {
-    env.status.claude_cache_ttl = feature
-    await state.editApiKey(row)
-    await settle()
-    ttlSelect = select(host, 'Claude 缓存 TTL')
-    assert.equal(ttlSelect.props.value, '1h', 'Unavailable capability does not erase an existing preference')
-    assert.ok(ttlSelect.props.options.slice(1).every((option) => option.disabled))
-    state.pluginKeyPolicyDraft.value.max_concurrency++
-    await state.saveEditedApiKey()
-    assert.equal(env.policyWrites.at(-1).key.claude_cache_ttl, '1h', 'Unrelated policy edit preserves the loaded TTL')
-  }
-  await state.editApiKey(row)
-  await settle()
-  updateValue(select(host, 'Claude 缓存 TTL'), '')
-  await state.saveEditedApiKey()
-  assert.equal(env.policyWrites.at(-1).key.claude_cache_ttl, '', 'Clear is an explicit empty string on the wire, not a deleted Vue field')
-  assert.equal(Object.hasOwn(env.key, 'claude_cache_ttl'), false, 'Readback confirms the cleared effective preference')
-  await state.editApiKey(row)
-  assert.equal(state.pluginKeyPolicyDraft.value.claude_cache_ttl, undefined)
-  assert.equal(state.apiKeyEditDirty.value, false)
-  state.closePluginKeyPolicy()
-
-  env.failStatus = true
-  await state.editApiKey(row)
-  await settle()
-  assert.ok(state.pluginKeyTTLFeatureError.value, 'Feature lookup failures remain visible while other policy edits remain usable')
-  assert.equal(state.pluginKeyTTLConfigured.value, false)
-  assert.match(textContent(ui(host, 'NModal').find((node) => node.props.title === '编辑 API Key')), /插件状态不可用/)
-  assert.ok(select(host, 'Claude 缓存 TTL').props.options.slice(1).every((option) => option.disabled))
-  state.closePluginKeyPolicy()
-  env.failStatus = false
-
+  assert.equal(Object.hasOwn(normalizeCPAHelperPluginKey(keyPolicy), 'claude_cache_ttl'), false)
+  assert.deepEqual(await getCPAHelperPluginStatus(), env.status, 'The status contract works without the retired TTL feature')
+  const statusReadsBeforeEdit = env.statusReads.length
   env.deferStatusReads = true
-  for (const failOld of [false, true]) {
-    const oldTTLLoad = state.editApiKey(row)
+  await state.editApiKey(row)
+  await settle()
+  assert.equal(env.statusReads.length, statusReadsBeforeEdit, 'Key editing does not wait for a retired feature status lookup')
+  assert.equal(state.apiKeyEditDirty.value, false)
+  for (const language of ['zh', 'en']) {
+    setLanguage(language)
     await settle()
-    const oldTTLStatus = env.statusReads.at(-1)
-    const currentTTLLoad = state.editApiKey(row)
-    await settle()
-    env.statusReads.at(-1).resolve(Response.json(statusResponse()))
-    await currentTTLLoad
-    if (failOld) oldTTLStatus.reject(new Error('stale TTL feature lookup failed'))
-    else oldTTLStatus.resolve(Response.json({ ...statusResponse(), claude_cache_ttl: { supported: true, status: 'configured', metadata_version: 'v1' } }))
-    await oldTTLLoad
-    assert.equal(state.pluginKeyTTLFeature.value.status, 'unsupported', 'Late capability completion cannot enable options in a replacement Key editor')
-    assert.equal(state.pluginKeyTTLFeatureError.value, null, 'Stale capability failure cannot overwrite the current editor state')
-    assert.equal(state.isPluginPolicyLoading.value, false)
-    state.closePluginKeyPolicy()
+    assert.ok(!ui(host, 'NFormItem').some((node) => /TTL/.test(node.props.label ?? '')), 'No TTL preference remains in either language')
   }
+  setLanguage('zh')
+  state.pluginKeyPolicyDraft.value.max_concurrency++
+  await state.saveEditedApiKey()
+  assert.equal(Object.hasOwn(env.policyWrites.at(-1).key, 'claude_cache_ttl'), false, 'Normal policy saves never create a TTL field')
   env.deferStatusReads = false
-  const validFeature = env.status.claude_cache_ttl
-  for (const feature of [{ supported: true, status: 'configured', metadata_version: 'v2' }, { supported: false, status: 'configured' }, { supported: true, status: 'unsupported', metadata_version: 'v1' }]) {
-    env.status.claude_cache_ttl = feature
-    await assert.rejects(getCPAHelperPluginStatus(), /TTL/, 'Malformed capability state is not treated as active')
+  const validStatus = env.status
+  for (const invalid of [{ loaded: 1 }, { capabilities: null }, { health: [] }, { response_model_verification_supported: 'false' }]) {
+    env.status = { ...validStatus, ...invalid }
+    await assert.rejects(getCPAHelperPluginStatus(), /插件能力响应格式无效/, 'Other capability validation remains strict')
   }
-  env.status.claude_cache_ttl = validFeature
+  env.status = validStatus
 
   const errorsBeforeUnmount = env.errors.length
   const beforeUnmount = state.loadAvailableModelsForTest()

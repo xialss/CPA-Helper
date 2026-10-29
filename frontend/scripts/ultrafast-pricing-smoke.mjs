@@ -142,7 +142,7 @@ const price = {
   id: 1, provider: 'openai', model: 'gpt-6.1-sol', price_scope: 'library',
   channel_brand: null, channel_key: null, channel_auth_type: null, billing_unit: 'token',
   input_usd_per_million: 2, output_usd_per_million: 4, cache_read_usd_per_million: 0, cache_creation_usd_per_million: 0,
-  cache_creation_1h_usd_per_million: null, request_usd: null, long_context: null, preserved_long_context: null,
+  request_usd: null, long_context: null, preserved_long_context: null,
   time_pricing: null, priority_multiplier: 2, ultrafast_multiplier: 3,
   source: 'manual', auto_synced: false, updated_at: '2026-10-29T00:00:00Z',
 }

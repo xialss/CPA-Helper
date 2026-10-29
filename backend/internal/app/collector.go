@@ -130,7 +130,7 @@ func (r *CollectorRunner) loop(ctx context.Context) {
 			}
 			unpersisted = nil
 		}
-		// Deadline resolution and successful-quota receipt completion remain
+		// Successful-quota receipt completion remains
 		// available after restart even when remote pricing selectors are offline.
 		if _, err := r.app.processCollectorUsageInboxWithPricing(ctx, cfg, nil, time.Now()); err != nil {
 			r.setCollectorError(fmt.Errorf("recover persisted usage batch: %w", err), durationSeconds(collector.RetryIntervalSeconds))
