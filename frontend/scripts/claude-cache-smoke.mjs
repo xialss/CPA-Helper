@@ -9,8 +9,8 @@ import { createServer, transformWithEsbuild } from 'vite'
 import { createRenderer, h, nextTick, reactive } from 'vue'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
-const env = { errors: [], models: [], renderTable: true }
-globalThis.__claudeCacheTTLSmoke = env
+const env = { errors: [], models: [], writes: [], renderTable: true }
+globalThis.__claudeCacheSmoke = env
 globalThis.localStorage = { getItem: () => 'zh', setItem() {} }
 globalThis.document = { documentElement: { lang: 'zh-CN', clientWidth: 1280 } }
 globalThis.window = {
@@ -18,13 +18,19 @@ globalThis.window = {
   matchMedia: () => ({ matches: true, addEventListener() {}, removeEventListener() {} }),
 }
 globalThis.getComputedStyle = () => ({ getPropertyValue: () => '' })
-globalThis.fetch = async (url) => {
-  const path = new URL(url, 'http://claude-ttl-smoke.invalid').pathname
+globalThis.fetch = async (url, init = {}) => {
+  const path = new URL(url, 'http://claude-cache-smoke.invalid').pathname
   let result
   if (path === '/api/account/models') result = {
     has_api_keys: true, api_key_count: 1, queryable_api_key_count: 1,
     model_list_filter_status: 'enabled', models: env.models, errors: [],
   }
+  else if (path === '/api/model-prices/1' && init.method === 'PUT') {
+    const payload = JSON.parse(init.body)
+    env.writes.push(payload)
+    result = { id: 1, ...payload }
+  }
+  else if (path === '/api/model-prices/1/versions') result = []
   else if (path === '/api/model-prices/catalog') result = { models: [], channels: [], errors: [] }
   else if (['/api/model-prices', '/api/model-prices/library-conflicts', '/api/model-prices/channel-aliases'].includes(path)) result = []
   else assert.fail(`Unexpected API request ${path}`)
@@ -35,6 +41,7 @@ const views = {
   models: 'src/features/models/views/AvailableModelsView.vue',
   prices: 'src/features/pricing/views/ModelPricesView.vue',
   editor: 'src/features/pricing/components/PriceTimeRuleEditor.vue',
+  matrix: 'src/features/pricing/components/PriceRatesMatrix.vue',
 }
 const passiveUI = ['NAlert', 'NButton', 'NCheckbox', 'NEmpty', 'NForm', 'NFormItem', 'NIcon', 'NInput', 'NInputNumber', 'NPagination', 'NPopover', 'NRadioButton', 'NRadioGroup', 'NSelect', 'NSpace', 'NSpin', 'NSwitch', 'NTag', 'NTooltip']
 const icons = ['Cpu', 'KeyRound', 'RefreshCw', 'ShieldCheck', 'Database', 'Layers3', 'Pencil', 'RotateCcw', 'Search', 'Server', 'Zap']
@@ -46,16 +53,18 @@ const server = await createServer({
   optimizeDeps: { noDiscovery: true, include: [] },
   server: { middlewareMode: true, hmr: false, ws: false, watch: null },
   plugins: [{
-    name: 'claude-cache-ttl-smoke', enforce: 'pre',
+    name: 'claude-cache-smoke', enforce: 'pre',
     async resolveId(id, importer) {
-      for (const name of Object.keys(views)) if (id === `/__claude-ttl-${name}.ts`) return `\0claude-ttl:${name}`
-      if (['naive-ui', 'vue-router', 'lucide-vue-next'].includes(id)) return `\0claude-ttl:${id}`
-      if (['DeepSeekTemplateModal.vue', 'PriceRatesMatrix.vue', 'ModelListNotice.vue'].some(name => id.endsWith(`/${name}`))) return '\0claude-ttl:passive'
-      const source = views[importer?.replace('\0claude-ttl:', '')]
+      for (const name of Object.keys(views)) if (id === `/__claude-cache-${name}.ts`) return `\0claude-cache:${name}`
+      if (['naive-ui', 'vue-router', 'lucide-vue-next'].includes(id)) return `\0claude-cache:${id}`
+      if (id.endsWith('/PriceRatesMatrix.vue')) return '\0claude-cache:matrix'
+      if (id.endsWith('/PriceTimeRuleEditor.vue')) return '\0claude-cache:editor'
+      if (['DeepSeekTemplateModal.vue', 'ModelListNotice.vue'].some(name => id.endsWith(`/${name}`))) return '\0claude-cache:passive'
+      const source = views[importer?.replace('\0claude-cache:', '')]
       if (source && id.startsWith('.')) return this.resolve(resolve(dirname(`${root}/${source}`), id), undefined, { skipSelf: true })
     },
     async load(id) {
-      const name = id.replace('\0claude-ttl:', '')
+      const name = id.replace('\0claude-cache:', '')
       if (views[name]) {
         const filename = `${root}/${views[name]}`
         const { descriptor, errors } = parse(await readFile(filename, 'utf8'), { filename })
@@ -74,11 +83,11 @@ const server = await createServer({
         };
         export const NDataTable = {
           props: { columns: Array, data: Array },
-          setup(props) { return () => globalThis.__claudeCacheTTLSmoke.renderTable
+          setup(props) { return () => globalThis.__claudeCacheSmoke.renderTable
             ? h('table', props.data.map(row => h('tr', { 'data-model': row.id }, props.columns.map(column => h('td', { 'data-column': column.key }, column.render ? column.render(row) : row[column.key])))))
             : null; }
         };
-        export const useMessage = () => ({ error: value => globalThis.__claudeCacheTTLSmoke.errors.push(value) });
+        export const useMessage = () => ({ error: value => globalThis.__claudeCacheSmoke.errors.push(value), success() {} });
         export const useDialog = () => ({});`
       if (name === 'vue-router') return 'export const useRouter = () => ({ push() {} })'
       if (name === 'lucide-vue-next') return icons.map(component => `export const ${component} = { render: () => null };`).join('\n')
@@ -112,7 +121,7 @@ const updateValue = (node, value) => {
 }
 let app
 const mount = async (name) => {
-  const { default: component } = await server.ssrLoadModule(`/__claude-ttl-${name}.ts`)
+  const { default: component } = await server.ssrLoadModule(`/__claude-cache-${name}.ts`)
   let state
   const host = { children: [] }
   app = renderer.createApp({ ...component, setup(props, context) { state = component.setup(props, context); return state } })
@@ -120,13 +129,13 @@ const mount = async (name) => {
   await settle()
   return { state, host }
 }
-function availableModel(id, provider, oneHour = 6) {
+function availableModel(id, provider, cacheWrite = 3.75) {
   return {
     id, name: id, owner: provider, metadata: {}, sources: [],
     price: {
       provider, model: id, billing_unit: 'token', request_usd: null, long_context: null,
       input_usd_per_million: 3, output_usd_per_million: 15, cache_read_usd_per_million: 0.3,
-      cache_creation_usd_per_million: 3.75, cache_creation_1h_usd_per_million: oneHour,
+      cache_creation_usd_per_million: cacheWrite,
     },
   }
 }
@@ -138,8 +147,8 @@ function quoteCell(host, id) {
 try {
   const { setLanguage } = await server.ssrLoadModule('/src/shared/i18n/index.ts')
   env.models = [
-    availableModel('claude-pair', 'anthropic'), availableModel('claude-unconfigured', 'Claude', null),
-    availableModel('claude-free', 'claude', 0), availableModel('claude-looking-name', 'openai', 99),
+    availableModel('claude-priced', 'anthropic'), availableModel('claude-provider', 'Claude'),
+    availableModel('claude-free', 'claude', 0), availableModel('claude-looking-name', 'openai'),
     { ...availableModel('request-price', 'claude'), price: { ...availableModel('request-price', 'claude').price, billing_unit: 'request', request_usd: 0.04 } },
     { ...availableModel('no-price', 'claude'), price: null },
   ]
@@ -147,12 +156,12 @@ try {
   for (const language of ['zh', 'en']) {
     setLanguage(language)
     await settle()
-    const pair = quoteCell(models.host, 'claude-pair')
-    assert.equal(textContent(pair), '5m3.751h6', 'Claude quotes contain only the two TTL-labelled write rates')
-    assert.equal(descendants(pair).filter(node => node.type === 'small').length, 2)
-    assert.equal(textContent(quoteCell(models.host, 'claude-unconfigured')), `5m3.751h${language === 'zh' ? '未配置' : 'Not configured'}`)
-    assert.equal(textContent(quoteCell(models.host, 'claude-free')), '5m3.751h0', 'Explicit zero remains a configured quote')
-    assert.equal(textContent(quoteCell(models.host, 'claude-looking-name')), '3.75', 'Provider identity, not the model name or stray 1h data, controls Claude rates')
+    const quote = quoteCell(models.host, 'claude-priced')
+    assert.equal(textContent(quote), '3.75', 'Claude displays one normal cache write rate')
+    assert.equal(descendants(quote).filter(node => node.type === 'small').length, 0)
+    assert.equal(textContent(quoteCell(models.host, 'claude-provider')), '3.75')
+    assert.equal(textContent(quoteCell(models.host, 'claude-free')), '0', 'Explicit zero remains a configured quote')
+    assert.equal(textContent(quoteCell(models.host, 'claude-looking-name')), '3.75')
     assert.equal(textContent(quoteCell(models.host, 'request-price')), '-')
     assert.equal(textContent(quoteCell(models.host, 'no-price')), '-')
   }
@@ -163,12 +172,11 @@ try {
     id: 1, provider: 'anthropic', model: 'opaque-model', price_scope: 'library',
     channel_brand: null, channel_key: null, channel_auth_type: null, billing_unit: 'token',
     input_usd_per_million: 3, output_usd_per_million: 15, cache_read_usd_per_million: 0.3,
-    cache_creation_usd_per_million: 3.75, cache_creation_1h_usd_per_million: 6,
+    cache_creation_usd_per_million: 3.75,
     long_context: null, request_usd: null, time_pricing: null,
     preserved_long_context: {
       threshold_input_tokens: null, input_usd_per_million: null, output_usd_per_million: 30,
       cache_read_usd_per_million: null, cache_creation_usd_per_million: 7.5,
-      cache_creation_1h_usd_per_million: 12,
     },
   }
   const edit = async (overrides = {}) => {
@@ -181,53 +189,76 @@ try {
     const prefix = language === 'zh' ? '缓存写' : 'Cache write'
     let alert = await edit()
     assert.ok(alert, 'The actual editing modal shows preserved long-context fields')
-    assert.ok(textContent(alert).includes(`${prefix} 5m 7.5 · ${prefix} 1h 12`))
-    assert.ok(!textContent(alert).includes(`${prefix} 7.5`), 'Claude has no third generic write label')
-    alert = await edit({ preserved_long_context: { ...price.preserved_long_context, cache_creation_1h_usd_per_million: null } })
-    assert.ok(textContent(alert).includes(`${prefix} 1h ${language === 'zh' ? '未设置' : 'Not set'}`))
-    alert = await edit({ preserved_long_context: { ...price.preserved_long_context, cache_creation_1h_usd_per_million: 0 } })
-    assert.ok(textContent(alert).includes(`${prefix} 1h 0`))
+    assert.ok(textContent(alert).includes(`${prefix} 7.5`))
+    assert.ok(!/\b(?:5m|1h|TTL)\b/.test(textContent(prices.host)), 'Claude price forms have no TTL labels')
+    assert.equal(ui(prices.host, 'NFormItem').filter(node => node.props.label === prefix).length, 1)
     alert = await edit({ provider: 'openai' })
     assert.ok(textContent(alert).includes(`${prefix} 7.5`))
-    assert.ok(!textContent(alert).includes(`${prefix} 1h`), 'Non-Claude summaries keep one generic write rate')
+    assert.ok(!textContent(alert).includes(`${prefix} 1h`), 'Non-Claude summaries also keep one generic write rate')
+  }
+  const longContext = {
+    threshold_input_tokens: 200000, input_usd_per_million: 6, output_usd_per_million: 30,
+    cache_read_usd_per_million: 0.6, cache_creation_usd_per_million: 7.5,
+  }
+  const rule = {
+    timezone: 'Asia/Shanghai', peak_windows: [{ weekdays: [1], start: '09:00', end: '12:00' }],
+    offpeak_mode: 'explicit', offpeak_multiplier: 0.5, long_context_multiplier: 0.5,
+    offpeak_rates: { input_usd_per_million: 1, output_usd_per_million: 2, cache_read_usd_per_million: 0.1, cache_creation_usd_per_million: 1.25 },
+  }
+  await edit({ price_scope: 'channel', channel_brand: 'claude', channel_auth_type: 'apikey', channel_key: 'claude-channel', preserved_long_context: null, long_context: longContext, time_pricing: rule })
+  await prices.state.savePrice()
+  assert.equal(env.writes.length, 1)
+  assert.equal(env.writes[0].cache_creation_usd_per_million, 3.75)
+  assert.deepEqual(env.writes[0].long_context, longContext)
+  assert.deepEqual(env.writes[0].time_pricing, rule)
+  assert.ok(!/cache_creation_(?:1h|5m|ttl)/.test(JSON.stringify(env.writes[0])), 'The real price editor saves only the single cache write rate at every level')
+  app.unmount()
+  const { default: matrix } = await server.ssrLoadModule('/__claude-cache-matrix.ts')
+  const matrixHost = { children: [] }
+  app = renderer.createApp({ setup: () => () => h(matrix, { rates: price, longContext, rule, preservedLongContext: price.preserved_long_context }) })
+  app.mount(matrixHost)
+  for (const language of ['zh', 'en']) {
+    setLanguage(language)
+    await settle()
+    const header = descendants(matrixHost).find(node => node.type === 'thead')
+    assert.deepEqual(descendants(header).filter(node => node.type === 'th').map(textContent), language === 'zh'
+      ? ['USD / 1M', '输入', '输出', '缓存读', '缓存写']
+      : ['USD / 1M', 'Input', 'Output', 'Cache read', 'Cache write'])
+    const body = descendants(matrixHost).find(node => node.type === 'tbody')
+    assert.deepEqual(descendants(body).filter(node => node.type === 'tr').map(row => descendants(row).filter(node => node.type === 'td').map(textContent)), [
+      ['3', '15', '0.3', '3.75'], ['1', '2', '0.1', '1.25'], ['6', '30', '0.6', '7.5'], ['3', '15', '0.3', '3.75'],
+    ])
+    assert.ok(!/\b(?:5m|1h|TTL)\b/.test(textContent(matrixHost)), 'Saved/version previews use four normal rate columns')
   }
   app.unmount()
-  const { default: editor } = await server.ssrLoadModule('/__claude-ttl-editor.ts')
+  const { default: editor } = await server.ssrLoadModule('/__claude-cache-editor.ts')
   const editorProps = reactive({
-    claude: true,
-    modelValue: {
-      timezone: 'Asia/Shanghai', peak_windows: [{ weekdays: [1], start: '09:00', end: '12:00' }],
-      offpeak_mode: 'explicit', offpeak_multiplier: 0.5, long_context_multiplier: 1,
-      offpeak_rates: { input_usd_per_million: 1, output_usd_per_million: 2, cache_read_usd_per_million: 0.1, cache_creation_usd_per_million: 1.25, cache_creation_1h_usd_per_million: 2 },
-    },
+    modelValue: structuredClone(rule),
   })
   const host = { children: [] }
   app = renderer.createApp({ setup: () => () => h(editor, { ...editorProps, 'onUpdate:modelValue': value => { editorProps.modelValue = value } }) })
   app.mount(host)
   await settle()
-  const oneHourInput = () => {
-    const field = ui(host, 'NFormItem').find(node => node.props.label.startsWith('Off-peak cache write 1h'))
+  const cacheWriteInput = () => {
+    const field = ui(host, 'NFormItem').find(node => node.props.label.startsWith('Off-peak cache write'))
     assert.ok(field)
     return ui(field, 'NInputNumber')[0]
   }
-  assert.equal(oneHourInput().props.value, 2)
-  updateValue(oneHourInput(), null)
-  await settle()
-  assert.equal(editorProps.modelValue.offpeak_rates.cache_creation_1h_usd_per_million, null)
-  assert.equal(oneHourInput().props.value, null, 'Clearing the real input emits and renders null, never an implicit free rate')
-  assert.equal(JSON.parse(JSON.stringify(editorProps.modelValue)).offpeak_rates.cache_creation_1h_usd_per_million, null)
-  updateValue(oneHourInput(), 0)
-  await settle()
-  assert.equal(editorProps.modelValue.offpeak_rates.cache_creation_1h_usd_per_million, 0)
-  assert.equal(oneHourInput().props.value, 0)
-  assert.equal(editorProps.modelValue.offpeak_rates.cache_creation_usd_per_million, 1.25)
-  editorProps.claude = false
-  await settle()
   assert.equal(ui(host, 'NFormItem').filter(node => node.props.label.startsWith('Off-peak cache write')).length, 1)
+  assert.equal(cacheWriteInput().props.value, 1.25)
+  updateValue(cacheWriteInput(), 2)
+  await settle()
+  assert.equal(editorProps.modelValue.offpeak_rates.cache_creation_usd_per_million, 2)
+  assert.equal(cacheWriteInput().props.value, 2)
+  updateValue(cacheWriteInput(), 0)
+  await settle()
+  assert.equal(editorProps.modelValue.offpeak_rates.cache_creation_usd_per_million, 0)
+  assert.equal(cacheWriteInput().props.value, 0)
+  assert.ok(!/cache_creation_(?:1h|5m|ttl)/.test(JSON.stringify(editorProps.modelValue)))
   assert.equal(env.errors.length, 0)
-  globalThis.console.log('Claude cache TTL SFC smoke tests passed')
+  globalThis.console.log('Claude cache SFC smoke tests passed: single-rate quotes, forms, payloads, preserved tiers and matrix previews')
 } finally {
   app?.unmount()
   await server.close()
-  delete globalThis.__claudeCacheTTLSmoke
+  delete globalThis.__claudeCacheSmoke
 }

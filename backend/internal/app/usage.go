@@ -69,14 +69,14 @@ type UsageRecord struct {
 	CachedTokens          int
 	CacheReadTokens       int
 	CacheCreationTokens   int
-	CacheCreationTTL      *string
-	CacheCreation5mTokens *int
-	CacheCreation1hTokens *int
+	CacheCreationTTL      *string `json:"-"` // Retired storage fields, never API or billing inputs.
+	CacheCreation5mTokens *int    `json:"-"`
+	CacheCreation1hTokens *int    `json:"-"`
 	ReasoningTokens       int
 	TotalTokens           int
 	DedupeKey             string
 	RawJSON               string
-	CacheCreationMetadata usageCacheCreationMetadata
+	CacheCreationMetadata json.RawMessage `json:"-"`
 	resolvedAuth          *string
 	authResolved          bool
 	analyticsSourceKey    *string
@@ -1086,13 +1086,10 @@ func scanUsageRecord(scanner usageRecordScanner) (UsageRecord, error) {
 	record.CacheCreationTTL = nullableString(cacheCreationTTL)
 	record.CacheCreation5mTokens = nullableInt(cacheCreation5mTokens)
 	record.CacheCreation1hTokens = nullableInt(cacheCreation1hTokens)
-	metadata, err := decodeUsageCacheCreationMetadata(cacheCreationMetadata.String)
-	if err != nil {
-		return UsageRecord{}, fmt.Errorf("read usage %d: %w", record.ID, err)
-	}
-	record.CacheCreationMetadata = metadata
+	// Retired TTL evidence is retained in storage, but never interpreted while
+	// reading a request. Its old shape must not prevent the request appearing.
 	record.analyticsSourceKey = nullableString(sourceKey)
-	if record.analyticsSourceKey != nil && !validUsageCallerScope(*record.analyticsSourceKey) {
+	if record.analyticsSourceKey != nil && !validUsageSourceKey(*record.analyticsSourceKey) {
 		return UsageRecord{}, fmt.Errorf("read usage %d: stored source identity is malformed", record.ID)
 	}
 	return record, nil
@@ -1128,73 +1125,6 @@ func nullableUsageIntArg(value *int) any {
 		return nil
 	}
 	return *value
-}
-
-func usageRecordCacheCreationTTL(record UsageRecord) *string {
-	if record.CacheCreationTokens <= 0 {
-		return nil
-	}
-	if record.CacheCreationTTL != nil {
-		normalized := strings.TrimSpace(*record.CacheCreationTTL)
-		switch normalized {
-		case "5m", "1h", "mixed", "unknown":
-			return &normalized
-		}
-	}
-	unknown := "unknown"
-	return &unknown
-}
-
-func normalizedCacheCreationTTL(value any, cacheCreationTokens int) (*string, *int, *int) {
-	if cacheCreationTokens <= 0 {
-		return nil, nil, nil
-	}
-	var ttl string
-	if tokens, ok := value.(map[string]any); ok {
-		if usage, ok := tokens["tokens"].(map[string]any); ok {
-			if raw, ok := usage["cache_creation_ttl"].(string); ok {
-				ttl = strings.TrimSpace(raw)
-			}
-		}
-	}
-	switch ttl {
-	case "5m", "1h", "unknown":
-		return &ttl, nil, nil
-	case "mixed":
-		five := canonicalUsageTokenAtPath(value, "tokens", "cache_creation_5m_tokens")
-		oneHour := canonicalUsageTokenAtPath(value, "tokens", "cache_creation_1h_tokens")
-		return &ttl, five, oneHour
-	default:
-		unknown := "unknown"
-		return &unknown, nil, nil
-	}
-}
-
-func canonicalUsageTokenAtPath(value any, path ...string) *int {
-	current := value
-	for _, key := range path {
-		object, ok := current.(map[string]any)
-		if !ok {
-			return nil
-		}
-		current, ok = object[key]
-		if !ok {
-			return nil
-		}
-	}
-	number, ok := current.(json.Number)
-	if !ok {
-		return nil
-	}
-	rat, ok := new(big.Rat).SetString(number.String())
-	if !ok || rat.Sign() < 0 || !rat.IsInt() {
-		return nil
-	}
-	tokens, ok := usageTokenInt(number)
-	if !ok {
-		return nil
-	}
-	return &tokens
 }
 
 func resolveProjectedUsageRecordAuth(rawAuth, storedAuth *string) *string {
@@ -1257,47 +1187,37 @@ func listItemFromRecordWithBreakdown(record UsageRecord, users map[string]userIn
 	authIndex = redactedAuthIndex(authIndex, redaction)
 	auth := usageRecordAuth(record)
 	source := usageAnalyticsRecordSource(record)
-	cacheMetadata := usageCacheCreationMetadataForRecord(record)
 	return map[string]any{
-		"id":                             record.ID,
-		"timestamp":                      usageAPITime(record.Timestamp),
-		"api_key_description":            record.APIKeyDescription,
-		"user_id":                        userID,
-		"user_label":                     userLabel,
-		"provider":                       record.Provider,
-		"model":                          record.Model,
-		"response_model":                 record.ResponseModel,
-		"request_alias":                  record.RequestAlias,
-		"service_tier":                   record.ServiceTier,
-		"reasoning_effort":               record.ReasoningEffort,
-		"endpoint":                       record.Endpoint,
-		"source":                         redactedUsageSource(source, auth, redaction),
-		"source_label":                   (*string)(nil),
-		"request_id":                     record.RequestID,
-		"auth_index":                     authIndex,
-		"auth":                           auth,
-		"latency_ms":                     record.LatencyMS,
-		"ttft_ms":                        record.TTFTMS,
-		"failed":                         record.Failed,
-		"input_tokens":                   record.InputTokens,
-		"output_tokens":                  record.OutputTokens,
-		"cached_tokens":                  record.CachedTokens,
-		"cache_read_tokens":              record.CacheReadTokens,
-		"cache_creation_tokens":          record.CacheCreationTokens,
-		"cache_creation_ttl":             usageRecordCacheCreationTTL(record),
-		"cache_creation_5m_tokens":       record.CacheCreation5mTokens,
-		"cache_creation_1h_tokens":       record.CacheCreation1hTokens,
-		"execution_id":                   cacheMetadata.ExecutionID,
-		"cache_creation_ttl_source":      cacheMetadata.Source,
-		"cache_creation_ttl_status":      cacheMetadata.Status,
-		"cache_creation_ttl_reason":      cacheMetadata.Reason,
-		"cache_creation_policy_revision": cacheMetadata.PolicyRevision,
-		"cache_creation_observed_at":     usageAPITimePtr(cacheMetadata.ObservedAt),
-		"reasoning_tokens":               record.ReasoningTokens,
-		"total_tokens":                   record.TotalTokens,
-		"estimated_cost_usd":             costBreakdown.TotalUSD,
-		"unpriced":                       costBreakdown.Unpriced,
-		"cost_breakdown":                 costBreakdown,
+		"id":                    record.ID,
+		"timestamp":             usageAPITime(record.Timestamp),
+		"api_key_description":   record.APIKeyDescription,
+		"user_id":               userID,
+		"user_label":            userLabel,
+		"provider":              record.Provider,
+		"model":                 record.Model,
+		"response_model":        record.ResponseModel,
+		"request_alias":         record.RequestAlias,
+		"service_tier":          record.ServiceTier,
+		"reasoning_effort":      record.ReasoningEffort,
+		"endpoint":              record.Endpoint,
+		"source":                redactedUsageSource(source, auth, redaction),
+		"source_label":          (*string)(nil),
+		"request_id":            record.RequestID,
+		"auth_index":            authIndex,
+		"auth":                  auth,
+		"latency_ms":            record.LatencyMS,
+		"ttft_ms":               record.TTFTMS,
+		"failed":                record.Failed,
+		"input_tokens":          record.InputTokens,
+		"output_tokens":         record.OutputTokens,
+		"cached_tokens":         record.CachedTokens,
+		"cache_read_tokens":     record.CacheReadTokens,
+		"cache_creation_tokens": record.CacheCreationTokens,
+		"reasoning_tokens":      record.ReasoningTokens,
+		"total_tokens":          record.TotalTokens,
+		"estimated_cost_usd":    costBreakdown.TotalUSD,
+		"unpriced":              costBreakdown.Unpriced,
+		"cost_breakdown":        costBreakdown,
 	}
 }
 
@@ -1954,10 +1874,11 @@ func (a *App) saveNormalizedUsage(ctx context.Context, normalized normalizedUsag
 			return UsageRecord{}, false, err
 		}
 	}
-	metadataJSON, err := encodeUsageCacheCreationMetadata(normalized.CacheCreationMetadata)
-	if err != nil {
-		return UsageRecord{}, false, err
-	}
+	// Legacy receipts can contain TTL attribution. It is no longer a billing
+	// input and is not copied into newly saved requests.
+	normalized.CacheCreationTTL, normalized.CacheCreation5mTokens, normalized.CacheCreation1hTokens = nil, nil, nil
+	normalized.CacheCreationMetadata = nil
+	metadataJSON := ""
 	now := dbTime(time.Now())
 	responseModel, requestAlias := usageResponseModelFields(normalized.RawJSON)
 	var origin *string
@@ -2086,15 +2007,15 @@ type normalizedUsage struct {
 	CachedTokens          int
 	CacheReadTokens       int
 	CacheCreationTokens   int
-	CacheCreationTTL      *string
-	CacheCreation5mTokens *int
-	CacheCreation1hTokens *int
+	CacheCreationTTL      *string `json:",omitempty"` // Legacy inbox fields, never new billing inputs.
+	CacheCreation5mTokens *int    `json:",omitempty"`
+	CacheCreation1hTokens *int    `json:",omitempty"`
 	ReasoningTokens       int
 	TotalTokens           int
 	DedupeKey             string
 	RawJSON               string
-	ExecutionID           *string
-	CacheCreationMetadata usageCacheCreationMetadata
+	ExecutionID           *string         `json:",omitempty"`
+	CacheCreationMetadata json.RawMessage `json:",omitempty"`
 	inputFromBreakdown    bool
 	breakdownUncached     int
 	breakdownUncachedOK   bool
@@ -2144,7 +2065,6 @@ func normalizeUsage(raw []byte) (normalizedUsage, error) {
 		[]string{"token_breakdown", "input", "cache_write_tokens"},
 		"cache_creation_tokens", "cache_creation_input_tokens",
 	)
-	cacheCreationTTL, cacheCreation5mTokens, cacheCreation1hTokens := normalizedCacheCreationTTL(parsed, cacheCreation)
 	reasoning, _ := usageTokenValue(parsed,
 		[]string{"tokens", "reasoning_tokens"},
 		[]string{"token_breakdown", "output", "reasoning_tokens"},
@@ -2180,9 +2100,6 @@ func normalizeUsage(raw []byte) (normalizedUsage, error) {
 		CachedTokens:          cached,
 		CacheReadTokens:       cacheRead,
 		CacheCreationTokens:   cacheCreation,
-		CacheCreationTTL:      cacheCreationTTL,
-		CacheCreation5mTokens: cacheCreation5mTokens,
-		CacheCreation1hTokens: cacheCreation1hTokens,
 		ReasoningTokens:       reasoning,
 		TotalTokens:           total,
 		DedupeKey:             "raw:" + hex.EncodeToString(sum[:]),
@@ -2195,12 +2112,6 @@ func normalizeUsage(raw []byte) (normalizedUsage, error) {
 		breakdownCacheWrite:   breakdownCacheWrite,
 		breakdownCacheWriteOK: breakdownCacheWriteOK,
 	}
-	if object, ok := parsed.(map[string]any); ok {
-		if execution, ok := object["execution_id"].(string); ok && validUsageExecutionID(execution) {
-			normalized.ExecutionID = &execution
-		}
-	}
-	normalized.CacheCreationMetadata = initialUsageCacheCreationMetadata(normalized)
 	return normalized, nil
 }
 

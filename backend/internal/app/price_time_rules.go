@@ -23,7 +23,7 @@ type PriceOffpeakRates struct {
 	Output          float64  `json:"output_usd_per_million"`
 	CacheRead       float64  `json:"cache_read_usd_per_million"`
 	CacheCreation   float64  `json:"cache_creation_usd_per_million"`
-	CacheCreation1h *float64 `json:"cache_creation_1h_usd_per_million"`
+	CacheCreation1h *float64 `json:"-"`
 }
 
 // A rule is a snapshot, never a reference to the mutable administrator template.
@@ -69,6 +69,35 @@ func (r *PriceTimeRule) UnmarshalJSON(data []byte) error {
 		}
 	}
 	*r = PriceTimeRule(value)
+	return nil
+}
+
+// Historical rules remain readable; only new API submissions reject the
+// retired dimension so clients cannot mistake an ignored rate for a saved one.
+func rejectRetiredTimeRuleCachePrice(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	var fields struct {
+		OffpeakRates json.RawMessage `json:"offpeak_rates"`
+	}
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return validationError("请求体不是有效 JSON")
+	}
+	return rejectRetiredCachePriceField(fields.OffpeakRates)
+}
+
+func decodePriceTimeRulePayload(r *http.Request, rule *PriceTimeRule) error {
+	var data json.RawMessage
+	if err := decodeJSON(r, &data); err != nil {
+		return err
+	}
+	if err := rejectRetiredTimeRuleCachePrice(data); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, rule); err != nil {
+		return validationError("请求体不是有效 JSON")
+	}
 	return nil
 }
 
@@ -130,7 +159,7 @@ func validatePriceTimeRule(r *PriceTimeRule) error {
 	if !finiteNonNegative(r.OffpeakMultiplier) {
 		return validationError("空闲倍率必须为非负有限数")
 	}
-	if v := r.OffpeakRates; v != nil && (!finiteNonNegative(v.Input) || !finiteNonNegative(v.Output) || !finiteNonNegative(v.CacheRead) || !finiteNonNegative(v.CacheCreation) || (v.CacheCreation1h != nil && !finiteNonNegative(*v.CacheCreation1h))) {
+	if v := r.OffpeakRates; v != nil && (!finiteNonNegative(v.Input) || !finiteNonNegative(v.Output) || !finiteNonNegative(v.CacheRead) || !finiteNonNegative(v.CacheCreation)) {
 		return validationError("空闲价格必须为非负有限数")
 	}
 	switch r.OffpeakMode {
@@ -154,9 +183,6 @@ func validateTimeRuleForPrice(p ModelPrice) error {
 	}
 	if !supportsPriceTimeRule(p) {
 		return validationError("峰谷定价仅支持 DeepSeek 或 Claude 渠道 Token 价格")
-	}
-	if p.TimePricing.OffpeakRates != nil && p.TimePricing.OffpeakRates.CacheCreation1h != nil && !modelPriceIsClaudeChannel(p) {
-		return validationError("1 小时缓存价格仅支持 Claude 价格")
 	}
 	return validatePriceTimeRule(p.TimePricing)
 }
@@ -235,18 +261,11 @@ func priceForRequestTime(p *ModelPrice, at time.Time) *ModelPrice {
 		copy.OutputUSDPerMillion = r.OffpeakRates.Output
 		copy.CacheReadUSDPerMillion = r.OffpeakRates.CacheRead
 		copy.CacheCreationUSDPerMillion = r.OffpeakRates.CacheCreation
-		if modelPriceIsClaudeChannel(*p) {
-			copy.CacheCreation1hUSDPerMillion = r.OffpeakRates.CacheCreation1h
-		}
 	} else {
 		copy.InputUSDPerMillion *= r.OffpeakMultiplier
 		copy.OutputUSDPerMillion *= r.OffpeakMultiplier
 		copy.CacheReadUSDPerMillion *= r.OffpeakMultiplier
 		copy.CacheCreationUSDPerMillion *= r.OffpeakMultiplier
-		if modelPriceIsClaudeChannel(*p) && copy.CacheCreation1hUSDPerMillion != nil {
-			value := *copy.CacheCreation1hUSDPerMillion * r.OffpeakMultiplier
-			copy.CacheCreation1hUSDPerMillion = &value
-		}
 	}
 	if p.LongContext != nil {
 		tier := *p.LongContext
@@ -254,10 +273,6 @@ func priceForRequestTime(p *ModelPrice, at time.Time) *ModelPrice {
 		tier.OutputUSDPerMillion *= r.LongContextMultiplier
 		tier.CacheReadUSDPerMillion *= r.LongContextMultiplier
 		tier.CacheCreationUSDPerMillion *= r.LongContextMultiplier
-		if modelPriceIsClaudeChannel(*p) && tier.CacheCreation1hUSDPerMillion != nil {
-			value := *tier.CacheCreation1hUSDPerMillion * r.LongContextMultiplier
-			tier.CacheCreation1hUSDPerMillion = &value
-		}
 		copy.LongContext = &tier
 	}
 	return &copy
@@ -285,7 +300,7 @@ func (a *App) handleDeepSeekTimeTemplate(w http.ResponseWriter, r *http.Request,
 			return nil
 		case http.MethodPut:
 			var rule PriceTimeRule
-			if err := decodeJSON(r, &rule); err != nil {
+			if err := decodePriceTimeRulePayload(r, &rule); err != nil {
 				return err
 			}
 			if err := validatePriceTimeRule(&rule); err != nil {
@@ -318,7 +333,7 @@ func (a *App) handleDeepSeekTimeTemplate(w http.ResponseWriter, r *http.Request,
 		return err
 	}
 	var payload priceTimeBatchPayload
-	if err := decodeJSON(r, &payload); err != nil {
+	if err := decodeModelPricingPayload(r, &payload); err != nil {
 		return err
 	}
 	result, err := a.applyPriceTimeBatch(r.Context(), payload, path == "deepseek-template/apply")
@@ -347,6 +362,9 @@ func (p *priceTimeBatchPayload) UnmarshalJSON(data []byte) error {
 	}
 	if _, ok := fields["rule"]; !ok {
 		return validationError("请明确提供峰谷规则；null 表示关闭")
+	}
+	if err := rejectRetiredTimeRuleCachePrice(fields["rule"]); err != nil {
+		return err
 	}
 	*p = priceTimeBatchPayload(value)
 	return nil
@@ -455,6 +473,9 @@ func snapshotLongContextArgs(p ModelPrice) (threshold, input, output, read, writ
 		write = nullableFloatArg(v.CacheCreationUSDPerMillion)
 		write1h = nullableFloatArg(v.CacheCreation1hUSDPerMillion)
 	}
+	if write1h == nil {
+		write1h = nullableFloatArg(p.retiredLongContextCacheCreation1h)
+	}
 	return
 }
 
@@ -491,6 +512,7 @@ func effectivePriceFromVersions(p ModelPrice, versions modelPriceVersionIndex, a
 	p.CacheReadUSDPerMillion = selected.CacheReadUSDPerMillion
 	p.CacheCreationUSDPerMillion = selected.CacheCreationUSDPerMillion
 	p.CacheCreation1hUSDPerMillion = selected.CacheCreation1hUSDPerMillion
+	p.retiredLongContextCacheCreation1h = selected.retiredLongContextCacheCreation1h
 	p.LongContext = selected.LongContext
 	p.PriorityMultiplier = selected.PriorityMultiplier
 	p.UltrafastMultiplier = selected.UltrafastMultiplier

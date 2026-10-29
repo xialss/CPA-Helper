@@ -18,7 +18,7 @@ const env = {
   settings: { cliaproxy_url: 'http://cpa.invalid', model_request_url: 'http://cpa.invalid', management_key: '', management_key_set: true, collector_enabled: true, queue_name: 'usage', batch_size: 100, poll_interval_seconds: 2, retry_interval_seconds: 10 },
   responseConfig: { enabled: false, stream_enabled: true, responses_only_stream: true, max_buffer_bytes: 2097152, max_total_buffer_bytes: 8388608, action: 'reject', unknown_action: 'pass', case_sensitive: false, ignore_thinking_suffix: true, ignored_models: ['ignored-model'], accepted_models: { 'request-model': ['response-model'] } },
   policy: { contract_version: 'v1', plugin_version: '0.1.5', policy_revision: 1, generated_at: '', groups: [{ id: 'existing', name: 'Existing', note: '', rule: {} }], keys: [], future_policy_field: { preserve: true } },
-  status: { loaded: true, capabilities: {}, health: {}, response_model_verification_supported: true, claude_cache_ttl: { supported: false, status: 'unsupported' } },
+  status: { loaded: true, capabilities: {}, health: {}, response_model_verification_supported: true },
 }
 const originalGlobals = new Map(['fetch', 'localStorage', 'document', 'crypto'].map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))
 globalThis.__pluginFormsSmoke = env
@@ -50,7 +50,7 @@ globalThis.fetch = async (url, init) => {
   } else {
     env.reads.push(path)
     if (path === '/api/settings') snapshot = env.settings
-    else if (path === '/api/collector/status') snapshot = { enabled: env.settings.collector_enabled, running: false, records_collected: 0, ttl_pending_records: 3 }
+    else if (path === '/api/collector/status') snapshot = { enabled: env.settings.collector_enabled, running: false, records_collected: 0 }
     else if (path === responsePath) snapshot = env.responseConfig
     else if (path === '/api/cpa-helper-plugin/policy') snapshot = env.policy
     else if (path === directoryPath) snapshot = { models: [], credentials: [], credential_providers: [] }
@@ -281,7 +281,7 @@ try {
   assert.equal(state.responseModelConfigError.value, null)
   env.deferredReads.delete(responsePath)
 
-  env.status = { ...env.status, response_model_verification_supported: false, capabilities: { modules: ['model_rules', 'claude_cache_ttl'] }, claude_cache_ttl: { supported: true, status: 'configured', metadata_version: 'v1' } }
+  env.status = { ...env.status, response_model_verification_supported: false, capabilities: { modules: ['model_rules'] } }
   const beforeRemovedReads = readCount(responsePath)
   const beforeRemovedWrites = writeCount(responsePath)
   const removedVerifier = await mount('settings')
@@ -289,8 +289,8 @@ try {
   assert.equal(removedVerifier.state.responseModelLoaded.value, false)
   assert.equal(readCount(responsePath), beforeRemovedReads, 'Plugin without verification capability never receives the removed GET')
   assert.ok(!textContent(removedVerifier.host).includes('响应核验'), 'Removed verification has no settings entry')
-  assert.ok(ui(removedVerifier.host, 'NDescriptionsItem').some((node) => node.props.label === 'TTL 归属或入账处理中' && textContent(node) === '3'), 'Pending attribution/accounting count is visible during recovery')
-  assert.match(textContent(removedVerifier.host), /正在处理 TTL 归属或入账/)
+  assert.ok(!textContent(removedVerifier.host).includes('TTL'), 'Settings have no retired TTL status or pending display')
+  assert.ok(!ui(removedVerifier.host, 'NDescriptionsItem').some((node) => /TTL/.test(node.props.label ?? '')))
   await removedVerifier.state.saveResponseModelConfig()
   assert.equal(writeCount(responsePath), beforeRemovedWrites, 'No removed verifier save is sent')
   removedVerifier.state.settingsForm.batch_size = 300

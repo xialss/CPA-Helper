@@ -427,7 +427,8 @@ func TestRunMigrationsBackfillsFirstChannelPriceHourlyCosts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.pricingVersion != before.pricingVersion+1 || !after.hourlyNeedsRebuild {
+	// First-price backfill and TTL retirement each invalidate stored estimates.
+	if after.pricingVersion != before.pricingVersion+2 || !after.hourlyNeedsRebuild {
 		t.Fatalf("upgrade did not invalidate the old pricing cache: before=%#v after=%#v", before, after)
 	}
 	assertSummary(1, 0)

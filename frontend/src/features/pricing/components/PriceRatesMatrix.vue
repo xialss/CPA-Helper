@@ -9,8 +9,7 @@ import type {
 import { useI18n } from '@/shared/i18n'
 import { formatInteger, formatMultiplier, formatPreservedLongContextPrice, formatPriceValue } from '@/shared/utils/format'
 
-type Rates = Pick<ModelPriceLongContext, 'input_usd_per_million' | 'output_usd_per_million' | 'cache_read_usd_per_million' | 'cache_creation_usd_per_million'> &
-  Partial<Pick<ModelPriceLongContext, 'cache_creation_1h_usd_per_million'>>
+type Rates = Pick<ModelPriceLongContext, 'input_usd_per_million' | 'output_usd_per_million' | 'cache_read_usd_per_million' | 'cache_creation_usd_per_million'>
 type RateField = keyof Rates
 
 // One compact matrix for a price snapshot: base / off-peak / long-context rows
@@ -22,7 +21,6 @@ const props = withDefaults(defineProps<{
   rule?: PriceTimeRule | null | undefined
   billingUnit?: ModelPriceBillingUnit | undefined
   requestUsd?: number | null | undefined
-  claude?: boolean | undefined
   priorityMultiplier?: number | null | undefined
   ultrafastMultiplier?: number | null | undefined
   showFast?: boolean | undefined
@@ -34,7 +32,6 @@ const props = withDefaults(defineProps<{
   rule: null,
   billingUnit: 'token',
   requestUsd: null,
-  claude: false,
   priorityMultiplier: null,
   ultrafastMultiplier: null,
   showFast: false,
@@ -48,14 +45,12 @@ const fields = computed<readonly RateField[]>(() => [
   'output_usd_per_million',
   'cache_read_usd_per_million',
   'cache_creation_usd_per_million',
-  ...(props.claude ? ['cache_creation_1h_usd_per_million' as const] : []),
 ])
 const columnNames = computed(() => [
   t('输入', 'Input'),
   t('输出', 'Output'),
   t('缓存读', 'Cache read'),
-  props.claude ? t('缓存写 5m', 'Cache write 5m') : t('缓存写', 'Cache write'),
-  ...(props.claude ? [t('缓存写 1h', 'Cache write 1h')] : []),
+  t('缓存写', 'Cache write'),
 ])
 const dayNames = computed(() => [t('日', 'Sun'), t('一', 'Mon'), t('二', 'Tue'), t('三', 'Wed'), t('四', 'Thu'), t('五', 'Fri'), t('六', 'Sat')])
 
@@ -69,9 +64,6 @@ function scaled(base: Rates, multiplier: number): Rates {
     output_usd_per_million: base.output_usd_per_million * multiplier,
     cache_read_usd_per_million: base.cache_read_usd_per_million * multiplier,
     cache_creation_usd_per_million: base.cache_creation_usd_per_million * multiplier,
-    ...(base.cache_creation_1h_usd_per_million === undefined
-      ? {}
-      : { cache_creation_1h_usd_per_million: base.cache_creation_1h_usd_per_million === null ? null : base.cache_creation_1h_usd_per_million * multiplier }),
   }
 }
 
@@ -82,7 +74,6 @@ function offpeakRates(base: Rates, rule: PriceTimeRule): Rates {
       output_usd_per_million: rule.offpeak_rates?.output_usd_per_million ?? 0,
       cache_read_usd_per_million: rule.offpeak_rates?.cache_read_usd_per_million ?? 0,
       cache_creation_usd_per_million: rule.offpeak_rates?.cache_creation_usd_per_million ?? 0,
-      ...(props.claude ? { cache_creation_1h_usd_per_million: rule.offpeak_rates?.cache_creation_1h_usd_per_million ?? null } : {}),
     }
   }
   return scaled(base, rule.offpeak_multiplier)
@@ -177,8 +168,7 @@ const hasMeta = computed(() => props.showFast || props.showUltrafast || !!props.
       <span>{{ t('输入', 'Input') }}: {{ formatPreservedLongContextPrice(preservedLongContext, 'input_usd_per_million') }}</span>
       <span>{{ t('输出', 'Output') }}: {{ formatPreservedLongContextPrice(preservedLongContext, 'output_usd_per_million') }}</span>
       <span>{{ t('缓存读', 'Cache read') }}: {{ formatPreservedLongContextPrice(preservedLongContext, 'cache_read_usd_per_million') }}</span>
-      <span>{{ claude ? t('缓存写 5m', 'Cache write 5m') : t('缓存写', 'Cache write') }}: {{ formatPreservedLongContextPrice(preservedLongContext, 'cache_creation_usd_per_million') }}</span>
-      <span v-if="claude">{{ t('缓存写 1h', 'Cache write 1h') }}: {{ formatPreservedLongContextPrice(preservedLongContext, 'cache_creation_1h_usd_per_million') }}</span>
+      <span>{{ t('缓存写', 'Cache write') }}: {{ formatPreservedLongContextPrice(preservedLongContext, 'cache_creation_usd_per_million') }}</span>
     </div>
     <div v-if="hasMeta" class="rates-meta">
       <span v-if="showFast">Fast: {{ fastLabel }}</span>

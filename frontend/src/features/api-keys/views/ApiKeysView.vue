@@ -72,7 +72,6 @@ import type {
   CPAHelperPluginKey,
   CPAHelperPluginKeySummary,
   CPAHelperPluginStatus,
-  CPAHelperPluginClaudeTTLFeature,
 } from '@/shared/types/api'
 import { useI18n } from '@/shared/i18n'
 import { copyToClipboard } from '@/shared/utils/clipboard'
@@ -100,21 +99,6 @@ const pluginLinkedRuleOptions = computed(() => pluginKeyPolicyGroupOptions.value
   value: group.id,
 })))
 const pluginKeyPolicyDraft = ref<CPAHelperPluginKey | null>(null)
-const pluginKeyTTLFeature = ref<CPAHelperPluginClaudeTTLFeature | null>(null)
-const pluginKeyTTLFeatureError = ref<unknown>(null)
-const pluginKeyTTLConfigured = computed(() => pluginKeyTTLFeature.value?.supported === true && pluginKeyTTLFeature.value.status === 'configured')
-const pluginKeyTTLOptions = computed(() => [
-  { label: t('继承 CPA', 'Inherit CPA'), value: '' },
-  { label: '5m', value: '5m', disabled: !pluginKeyTTLConfigured.value },
-  { label: '1h', value: '1h', disabled: !pluginKeyTTLConfigured.value },
-])
-const pluginKeyTTLHint = computed(() => {
-  if (pluginKeyTTLFeatureError.value) return errorText(pluginKeyTTLFeatureError.value, '无法确认 Claude 缓存 TTL 能力', 'Could not verify Claude cache TTL support')
-  if (pluginKeyTTLConfigured.value) return t('仅用于 Claude 请求，统一已有缓存断点的 TTL。部署配置已校验；不代表上游已确认缓存 TTL。', 'Applies to Claude requests and unifies the TTL of existing cache breakpoints. Deployment configuration is verified; upstream cache TTL is not confirmed.')
-  if (pluginKeyTTLFeature.value?.status === 'disabled') return t('Claude 缓存 TTL 尚未启用。可保留当前设置或选择继承 CPA。', 'Claude cache TTL is disabled. Keep the current setting or choose Inherit CPA.')
-  if (pluginKeyTTLFeature.value?.status === 'unavailable') return t('Claude 缓存 TTL 配置不可用，请管理员检查部署。可选择继承 CPA。', 'Claude cache TTL configuration is unavailable. Ask an administrator to check deployment, or choose Inherit CPA.')
-  return t('当前插件不支持 Claude 缓存 TTL 设置。缺省继续继承 CPA。', 'The current plugin does not support Claude cache TTL settings. The default continues to inherit CPA.')
-})
 const pluginKeyPolicyError = ref<unknown>(null)
 const editedApiKeyDescription = ref('')
 const savedApiKeyDescription = ref('')
@@ -745,8 +729,6 @@ async function editApiKey(row: UserApiKeySummary) {
   editedApiKeyExpiresAt.value = row.expires_at ? new Date(row.expires_at).getTime() : null
   savedApiKeyExpiresAt.value = editedApiKeyExpiresAt.value
   pluginKeyPolicyDraft.value = null
-  pluginKeyTTLFeature.value = null
-  pluginKeyTTLFeatureError.value = null
   pluginKeyPolicyGroups.value = []
   pluginKeyPolicyGroupOptions.value = []
   pluginKeyPolicySnapshot.value = ''
@@ -756,13 +738,9 @@ async function editApiKey(row: UserApiKeySummary) {
   pluginKeyPolicyVisible.value = true
   isPluginPolicyLoading.value = true
   try {
-    const [policy, choices, featureResult] = await Promise.all([
+    const [policy, choices] = await Promise.all([
       getCPAHelperPluginKeyPolicy(row.api_key_hash),
       getCPAHelperPluginDirectory(row.api_key_hash),
-      getCPAHelperPluginStatus().then(
-        (value) => ({ value, error: null }),
-        (error: unknown) => ({ value: null, error }),
-      ),
     ])
     if (generation !== pluginKeyPolicyLoadGeneration) return
     pluginKeyPolicyRevision.value = policy.policy_revision
@@ -771,8 +749,6 @@ async function editApiKey(row: UserApiKeySummary) {
     pluginKeyPolicyGroupOptions.value = policy.groups
     pluginKeyPolicyDraft.value = JSON.parse(JSON.stringify(normalizedKey)) as CPAHelperPluginKey
     pluginDirectory.value = choices
-    pluginKeyTTLFeature.value = featureResult.value?.claude_cache_ttl ?? null
-    pluginKeyTTLFeatureError.value = featureResult.error
     pluginKeyPolicySnapshot.value = JSON.stringify(pluginKeyPolicyDraft.value)
   } catch (error) {
     if (generation === pluginKeyPolicyLoadGeneration) pluginKeyPolicyError.value = error
@@ -1263,12 +1239,6 @@ onBeforeUnmount(() => {
             </div>
           </NFormItem>
           <NFormItem :label="t('单 Key 并发上限', 'Per-key concurrency limit')"><NInputNumber v-model:value="pluginKeyPolicyDraft.max_concurrency" :min="0" :precision="0" :disabled="isPluginPolicySaving" /></NFormItem>
-          <NFormItem :label="t('Claude 缓存 TTL', 'Claude cache TTL')">
-            <div class="plugin-key-ttl-field">
-              <NSelect :value="pluginKeyPolicyDraft.claude_cache_ttl ?? ''" :options="pluginKeyTTLOptions" :disabled="isPluginPolicySaving" @update:value="(value: '' | '5m' | '1h') => { if (pluginKeyPolicyDraft) pluginKeyPolicyDraft.claude_cache_ttl = value }" />
-              <span class="plugin-key-enabled-hint" :role="pluginKeyTTLFeatureError ? 'alert' : undefined">{{ pluginKeyTTLHint }}</span>
-            </div>
-          </NFormItem>
           <NFormItem :label="t('关联全局规则', 'Linked global rules')"><NSelect v-model:value="pluginKeyPolicyGroups" multiple filterable :options="pluginLinkedRuleOptions" :render-label="renderLinkedRuleOptionLabel" :disabled="isPluginPolicySaving" /></NFormItem>
         </div>
         <PluginRuleFields :key="pluginKeyPolicyHash ?? ''" v-model="pluginKeyPolicyDraft.rule" :models="pluginDirectory?.models ?? []" :credentials="pluginDirectory?.credentials ?? []" :credential-providers="pluginDirectory?.credential_providers ?? []" :disabled="isPluginPolicySaving" />
@@ -1696,7 +1666,6 @@ onBeforeUnmount(() => {
 .api-key-expiration-presets { display: flex; flex-wrap: wrap; gap: 4px; }
 .api-key-expiration-presets :deep(.api-key-expiration-preset) { border: 1px solid var(--cpa-border); border-radius: 6px; font-weight: 400; }
 .plugin-key-enabled-field { display: grid; gap: 8px; }
-.plugin-key-ttl-field { display: grid; gap: 8px; width: 100%; }
 .plugin-key-enabled-hint { color: var(--cpa-text-muted); font-size: 12px; }
 
 :global(.n-base-select-option .plugin-linked-rule-option-label) {

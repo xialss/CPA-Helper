@@ -5,553 +5,482 @@ import (
 	"database/sql"
 	"encoding/json"
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	backendMigrations "cpa-helper/backend/migrations"
-	"github.com/pressly/goose/v3"
 )
 
-func TestClaudeCacheTTLCostUsesTTLPriceAndValidatesMixedBuckets(t *testing.T) {
+func TestClaudeCacheCreationIgnoresRetiredTTLAndBuckets(t *testing.T) {
+	provider, model, brand := "claude", "claude-cache-write", "claude"
 	price := ModelPrice{
-		Provider:                     "anthropic",
-		Model:                        "claude-ttl-test",
-		PriceScope:                   modelPriceScopeLibrary,
-		InputUSDPerMillion:           0,
-		OutputUSDPerMillion:          0,
-		CacheCreationUSDPerMillion:   2,
-		CacheCreation1hUSDPerMillion: claudeTTLFloatPtr(6),
-		BillingUnit:                  modelBillingUnitToken,
+		Provider: provider, Model: model, PriceScope: modelPriceScopeChannel, ChannelBrand: &brand,
+		InputUSDPerMillion: 2, OutputUSDPerMillion: 4, CacheReadUSDPerMillion: 0.5,
+		CacheCreationUSDPerMillion: 3, CacheCreation1hUSDPerMillion: claudeTTLFloatPtr(80),
+		BillingUnit: modelBillingUnitToken,
 	}
-	makeRecord := func(ttl string) UsageRecord {
-		model := price.Model
-		provider := "claude"
-		return UsageRecord{
-			Provider:            &provider,
-			Model:               &model,
-			CacheCreationTokens: 10,
-			CacheCreationTTL:    &ttl,
+	for _, ttl := range []string{"5m", "1h", "mixed", "unknown", ""} {
+		for _, oneHour := range []*float64{nil, claudeTTLFloatPtr(0), claudeTTLFloatPtr(80), claudeTTLFloatPtr(math.Inf(1))} {
+			current := price
+			current.CacheCreation1hUSDPerMillion = oneHour
+			record := UsageRecord{
+				Provider: &provider, Model: &model, InputTokens: 1000000, OutputTokens: 1000000,
+				CacheReadTokens: 1000000, CacheCreationTokens: 1000000, CacheCreationTTL: &ttl,
+				// Even incomplete or contradictory historical buckets are inert.
+				CacheCreation5mTokens: claudeTTLIntPtr(-1), CacheCreation1hTokens: claudeTTLIntPtr(600000),
+				CacheCreationMetadata: json.RawMessage(`{"status":"enforced","ttl_source":"key_policy"}`),
+			}
+			got := calculateRecordCostForMatch(record, &current, priceMatchStatusMatched, nil, true)
+			if got.Unpriced || got.TotalUSD != 9.5 || got.NormalInputTokens != 1000000 || got.ContextInputTokens != 3000000 || len(got.Items) != 4 {
+				t.Fatalf("TTL %q, retired rate %v: cost = %#v, want four ordinary token items totaling 9.5", ttl, oneHour, got)
+			}
+			item, ok := got.Items[2].(usageTokenCostBreakdownItem)
+			if !ok || item.Kind != usageCostKindCacheCreation || item.Tokens != 1000000 || item.USDPerMillion != 3 || item.SubtotalUSD != 3 {
+				t.Fatalf("TTL %q: cache-write item = %#v", ttl, got.Items[2])
+			}
 		}
 	}
-	tests := []struct {
-		name         string
-		record       UsageRecord
-		missing1h    bool
-		wantKind     string
-		wantTotal    float64
-		wantUnpriced bool
-	}{
-		{name: "5m", record: makeRecord("5m"), wantKind: usageCostKindCacheCreation5m, wantTotal: 0.00002},
-		{name: "1h", record: makeRecord("1h"), wantKind: usageCostKindCacheCreation1h, wantTotal: 0.00006},
-		{name: "unknown keeps legacy rate", record: makeRecord("unknown"), wantKind: usageCostKindCacheCreation, wantTotal: 0.00002},
-		{name: "missing 1h price", record: makeRecord("1h"), missing1h: true, wantUnpriced: true},
-		{name: "mixed missing 5m bucket", record: func() UsageRecord { r := makeRecord("mixed"); r.CacheCreation1hTokens = claudeTTLIntPtr(10); return r }(), wantUnpriced: true},
-		{name: "mixed missing 1h bucket", record: func() UsageRecord { r := makeRecord("mixed"); r.CacheCreation5mTokens = claudeTTLIntPtr(10); return r }(), wantUnpriced: true},
-		{name: "mixed bucket sum mismatch", record: func() UsageRecord {
-			r := makeRecord("mixed")
-			r.CacheCreation5mTokens = claudeTTLIntPtr(4)
-			r.CacheCreation1hTokens = claudeTTLIntPtr(5)
-			return r
-		}(), wantUnpriced: true},
-		{name: "mixed negative bucket", record: func() UsageRecord {
-			r := makeRecord("mixed")
-			r.CacheCreation5mTokens = claudeTTLIntPtr(-1)
-			r.CacheCreation1hTokens = claudeTTLIntPtr(11)
-			return r
-		}(), wantUnpriced: true},
-		{name: "mixed exact buckets", record: func() UsageRecord {
-			r := makeRecord("mixed")
-			r.CacheCreation5mTokens = claudeTTLIntPtr(5)
-			r.CacheCreation1hTokens = claudeTTLIntPtr(5)
-			return r
-		}(), wantTotal: 0.00004},
+	price.CacheCreationUSDPerMillion = 0
+	ttl := "1h"
+	got := calculateRecordCostForMatch(UsageRecord{Provider: &provider, Model: &model, CacheCreationTokens: 1000000, CacheCreationTTL: &ttl}, &price, priceMatchStatusMatched, nil, true)
+	if got.Unpriced || got.TotalUSD != 0 || len(got.Items) != 1 {
+		t.Fatalf("zero Claude cache-write rate = %#v, want a priced zero item", got)
 	}
-	for _, test := range tests {
+}
+
+func TestRetiredCacheTTLDoesNotChangeGenericTokenSemantics(t *testing.T) {
+	provider, model, ttl := "openai", "gpt-cache-write", "1h"
+	price := ModelPrice{
+		Provider: provider, Model: model, PriceScope: modelPriceScopeLibrary, BillingUnit: modelBillingUnitToken,
+		InputUSDPerMillion: 1, CacheCreationUSDPerMillion: 2, CacheCreation1hUSDPerMillion: claudeTTLFloatPtr(88),
+	}
+	record := UsageRecord{Provider: &provider, Model: &model, InputTokens: 10, CacheCreationTokens: 4, CacheCreationTTL: &ttl}
+	got := calculateRecordCostForMatch(record, &price, priceMatchStatusMatched, nil, true)
+	if got.Unpriced || got.TotalUSD != 0.000014 || got.NormalInputTokens != 6 {
+		t.Fatalf("generic cache-write cost = %#v, want ordinary included-input semantics", got)
+	}
+	price.CacheCreationUSDPerMillion = 0
+	got = calculateRecordCostForMatch(record, &price, priceMatchStatusMatched, nil, true)
+	if got.Unpriced || got.TotalUSD != 0.00001 || len(got.Items) != 1 {
+		t.Fatalf("generic unset cache-write cost = %#v, want original input fallback", got)
+	}
+}
+
+func TestRetiredCachePricesDoNotBlockActiveValidationOrTierMultipliers(t *testing.T) {
+	for _, retired := range []float64{-1, math.Inf(1), math.MaxFloat64} {
+		payload := modelPricePayload{
+			Provider: "openai", Model: "gpt-6.1-sol", BillingUnit: modelBillingUnitToken,
+			InputUSDPerMillion: 2, CacheCreationUSDPerMillion: 3, CacheCreation1hUSDPerMillion: &retired,
+			LongContext: &modelPriceLongContextPayload{
+				ThresholdInputTokens: claudeTTLInt64Ptr(100), InputUSDPerMillion: claudeTTLFloatPtr(4),
+				OutputUSDPerMillion: claudeTTLFloatPtr(0), CacheReadUSDPerMillion: claudeTTLFloatPtr(0),
+				CacheCreationUSDPerMillion: claudeTTLFloatPtr(6), CacheCreation1hUSDPerMillion: &retired,
+			},
+		}
+		validated, err := validatePricePayload(payload)
+		if err != nil {
+			t.Fatalf("retired rate %v rejected active payload: %v", retired, err)
+		}
+		price := modelPriceFromPayload(validated, claudeTTLFloatPtr(2))
+		price.UltrafastMultiplier = claudeTTLFloatPtr(3)
+		if err := validatePriorityMultiplierForPrice(price); err != nil {
+			t.Fatalf("retired rate %v rejected tier multiplier: %v", retired, err)
+		}
+		provider, model := "openai", price.Model
+		for _, tier := range []struct {
+			name string
+			want float64
+		}{{serviceTierPriority, 14}, {serviceTierUltrafast, 21}} {
+			record := UsageRecord{Provider: &provider, Model: &model, InputTokens: 1500000, CacheCreationTokens: 500000, ServiceTier: &tier.name}
+			got := calculateRecordCostForMatch(record, &price, priceMatchStatusMatched, nil, true)
+			if got.Unpriced || !got.LongContextApplied || got.TotalUSD != tier.want {
+				t.Fatalf("retired rate %v / %s: cost = %#v, want %g", retired, tier.name, got, tier.want)
+			}
+		}
+		payload.InputUSDPerMillion = -1
+		if _, err := validatePricePayload(payload); err == nil {
+			t.Fatal("negative active input price was accepted")
+		}
+	}
+}
+
+func TestRetiredCacheTTLFieldsAreAbsentFromAllPriceProjections(t *testing.T) {
+	retired := math.Inf(1)
+	audit := &ModelPriceLibraryConflictLongContext{
+		InputUSDPerMillion: claudeTTLFloatPtr(math.Inf(1)), CacheCreation1hUSDPerMillion: &retired,
+		NonFiniteFields: map[string]string{"input_usd_per_million": "+Inf", "cache_creation_1h_usd_per_million": "+Inf"},
+	}
+	for _, provider := range []string{"anthropic", "openai"} {
+		price := ModelPrice{
+			Provider: provider, Model: "model", BillingUnit: modelBillingUnitToken, CacheCreation1hUSDPerMillion: &retired,
+			LongContext:          &ModelPriceLongContext{ThresholdInputTokens: 100, InputUSDPerMillion: 1, CacheCreation1hUSDPerMillion: &retired},
+			PreservedLongContext: audit, TimePricing: &PriceTimeRule{OffpeakRates: &PriceOffpeakRates{CacheCreation1h: &retired}},
+		}
+		version := ModelPriceVersion{CacheCreation1hUSDPerMillion: &retired, LongContext: price.LongContext, PreservedLongContext: audit, TimePricing: price.TimePricing}
+		catalog := ModelPriceCatalogResponse{Models: []ModelPriceCatalogItem{{Price: &price, TemplatePrice: &price}}}
+		for _, projection := range []any{
+			modelPriceForAPI(price), availableModelPriceFromPrice(&price), modelPriceCatalogForAPI(catalog),
+			modelPriceLibraryConflictsForAPI([]ModelPriceLibraryConflict{{Price: price, ArchivedLongContext: audit}}),
+			modelPriceVersionsForAPI([]ModelPriceVersion{version}),
+		} {
+			encoded, err := json.Marshal(projection)
+			if err != nil {
+				t.Fatalf("marshal %T: %v", projection, err)
+			}
+			if strings.Contains(string(encoded), "cache_creation_1h") || strings.Contains(string(encoded), "cache_creation_5m") {
+				t.Fatalf("%T exposed retired cache price: %s", projection, encoded)
+			}
+		}
+	}
+	if audit.NonFiniteFields["cache_creation_1h_usd_per_million"] != "+Inf" || audit.NonFiniteFields["input_usd_per_million"] != "+Inf" || audit.CacheCreation1hUSDPerMillion != &retired {
+		t.Fatal("API projection mutated historical audit values")
+	}
+}
+
+func TestRetiredCacheTimePricingJSONIgnoresOldFieldAndValidatesActiveRates(t *testing.T) {
+	const legacy = `{"timezone":"UTC","peak_windows":[{"weekdays":[1],"start":"09:00","end":"17:00"}],"offpeak_mode":"explicit","offpeak_multiplier":0.5,"offpeak_rates":{"input_usd_per_million":2,"output_usd_per_million":4,"cache_read_usd_per_million":0.5,"cache_creation_usd_per_million":3,"cache_creation_1h_usd_per_million":"retired invalid value"},"long_context_multiplier":0.25}`
+	rule, err := parsePriceTimeRule(sql.NullString{String: legacy, Valid: true})
+	if err != nil || rule == nil || rule.OffpeakRates.CacheCreation != 3 {
+		t.Fatalf("read old time pricing JSON: %#v / %v", rule, err)
+	}
+	encoded, err := json.Marshal(rule)
+	if err != nil || strings.Contains(string(encoded), "cache_creation_1h") {
+		t.Fatalf("time price projection = %s / %v", encoded, err)
+	}
+	for _, invalid := range []string{
+		strings.Replace(legacy, `"cache_creation_usd_per_million":3`, `"cache_creation_usd_per_million":-1`, 1),
+		strings.Replace(legacy, `"cache_read_usd_per_million":0.5,`, "", 1),
+	} {
+		if _, err := parsePriceTimeRule(sql.NullString{String: invalid, Valid: true}); err == nil {
+			t.Fatal("invalid active time price was accepted")
+		}
+	}
+	for _, body := range []string{
+		`{"provider":"openai","model":"gpt-6.1-sol","cache_creation_1h_usd_per_million":null}`,
+		`{"provider":"openai","model":"gpt-6.1-sol","long_context":{"cache_creation_1h_usd_per_million":8}}`,
+		`{"provider":"claude","model":"claude-test","time_pricing":` + legacy + `}`,
+	} {
+		var payload modelPricePayload
+		request := httptest.NewRequest("PUT", "/api/model-prices/1", strings.NewReader(body))
+		if err := decodeModelPricingPayload(request, &payload); err == nil {
+			t.Fatalf("new price request accepted retired cache rate: %s", body)
+		}
+	}
+	var batch priceTimeBatchPayload
+	if err := json.Unmarshal([]byte(`{"price_ids":[1],"rule":`+legacy+`}`), &batch); err == nil {
+		t.Fatal("batch API accepted a retired off-peak cache rate")
+	}
+	request := httptest.NewRequest("PUT", "/api/model-prices/deepseek-template", strings.NewReader(legacy))
+	if err := decodePriceTimeRulePayload(request, &PriceTimeRule{}); err == nil {
+		t.Fatal("template API accepted a retired off-peak cache rate")
+	}
+}
+
+func TestRetiredCachePriceHTTPRejectsPreciselyWithoutMutations(t *testing.T) {
+	a, ctx := newUltrafastTestApp(t), context.Background()
+	handler := a.Routes()
+	cookies := requestJSONForPricingTest(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{"username": "admin", "password": "test-password", "nickname": "Admin"}, nil, nil)
+	library, err := a.createPrice(ctx, modelPricePayload{Provider: "openai", Model: "gpt-retired-http", InputUSDPerMillion: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := "deepseek-retired-http"
+	id := seedCorrectionTestChannelPrice(t, a, model, 2)
+	if _, err := a.updatePrice(ctx, id, correctionTestPayload(model, 3, false)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := func() any {
+		t.Helper()
+		prices, err := listPricesWithQueryer(ctx, a.db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		versions, err := a.listModelPriceVersionsForPrice(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var template string
+		if err := a.db.QueryRowContext(ctx, `SELECT rule FROM model_price_time_templates WHERE name='deepseek'`).Scan(&template); err != nil {
+			t.Fatal(err)
+		}
+		state, err := loadUsageAnalyticsState(ctx, a.db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return struct {
+			Prices   []ModelPrice
+			Versions []ModelPriceVersion
+			Template string
+			State    usageAnalyticsState
+		}{prices, versions, template, state}
+	}
+	before := snapshot()
+	const retiredRule = `{"timezone":"UTC","peak_windows":[{"weekdays":[1],"start":"09:00","end":"17:00"}],"offpeak_mode":"explicit","offpeak_rates":{"input_usd_per_million":2,"output_usd_per_million":4,"cache_read_usd_per_million":0.5,"cache_creation_usd_per_million":3,"cache_creation_1h_usd_per_million":8},"long_context_multiplier":0.25}`
+	libraryBody := func() map[string]any {
+		return map[string]any{"provider": "openai", "model": library.Model, "input_usd_per_million": 99, "cache_creation_1h_usd_per_million": 8}
+	}
+	channelBody := func(correct bool) map[string]any {
+		return map[string]any{
+			"provider": "codex", "model": model, "price_scope": "channel", "channel_auth_type": "oauth",
+			"channel_brand": "codex", "channel_key": "oauth_pool", "billing_unit": "token",
+			"input_usd_per_million": 99, "correct_latest_version": correct, "time_pricing": json.RawMessage(retiredRule),
+		}
+	}
+	longContext := map[string]any{
+		"threshold_input_tokens": 1000, "input_usd_per_million": 4, "output_usd_per_million": 0,
+		"cache_read_usd_per_million": 0, "cache_creation_usd_per_million": 6, "cache_creation_1h_usd_per_million": 8,
+	}
+	createLongContext := map[string]any{"provider": "openai", "model": "new-retired-http", "input_usd_per_million": 99, "long_context": longContext}
+	editLongContext := map[string]any{"provider": "openai", "model": library.Model, "input_usd_per_million": 99, "long_context": longContext}
+	for _, test := range []struct {
+		name, method, path string
+		body               any
+	}{
+		{"create base", http.MethodPost, "/api/model-prices", map[string]any{"provider": "openai", "model": "new-retired-base-http", "input_usd_per_million": 99, "cache_creation_1h_usd_per_million": 8}},
+		{"create long context", http.MethodPost, "/api/model-prices", createLongContext},
+		{"update base", http.MethodPut, "/api/model-prices/" + strconv.Itoa(library.ID), libraryBody()},
+		{"update long context", http.MethodPut, "/api/model-prices/" + strconv.Itoa(library.ID), editLongContext},
+		{"append channel version", http.MethodPut, "/api/model-prices/" + strconv.Itoa(id), channelBody(false)},
+		{"correct channel version", http.MethodPut, "/api/model-prices/" + strconv.Itoa(id), channelBody(true)},
+		{"batch preview", http.MethodPost, "/api/model-prices/deepseek-template/preview", map[string]any{"price_ids": []int{id}, "rule": json.RawMessage(retiredRule)}},
+		{"batch apply", http.MethodPost, "/api/model-prices/deepseek-template/apply", map[string]any{"price_ids": []int{id}, "rule": json.RawMessage(retiredRule)}},
+		{"template edit", http.MethodPut, "/api/model-prices/deepseek-template", json.RawMessage(retiredRule)},
+	} {
 		t.Run(test.name, func(t *testing.T) {
-			currentPrice := price
-			if test.missing1h {
-				currentPrice.CacheCreation1hUSDPerMillion = nil
+			body, err := json.Marshal(test.body)
+			if err != nil {
+				t.Fatal(err)
 			}
-			breakdown := calculateRecordCostForMatch(test.record, &currentPrice, priceMatchStatusMatched, nil, true)
-			if breakdown.Unpriced != test.wantUnpriced {
-				t.Fatalf("unpriced = %t, want %t; breakdown=%#v", breakdown.Unpriced, test.wantUnpriced, breakdown)
+			request := httptest.NewRequest(test.method, test.path, strings.NewReader(string(body)))
+			request.Header.Set("Content-Type", "application/json")
+			for _, cookie := range cookies {
+				request.AddCookie(cookie)
 			}
-			if test.wantUnpriced {
-				if breakdown.TotalUSD != 0 || len(breakdown.Items) != 0 {
-					t.Fatalf("invalid TTL cost = %v with items %#v, want zero and no items", breakdown.TotalUSD, breakdown.Items)
-				}
-				return
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			var response struct {
+				Detail struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"detail"`
 			}
-			if breakdown.TotalUSD != test.wantTotal {
-				t.Fatalf("total USD = %v, want %v", breakdown.TotalUSD, test.wantTotal)
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode error response: %v / %s", err, recorder.Body.String())
 			}
-			if test.wantKind == "" {
-				if len(breakdown.Items) != 2 {
-					t.Fatalf("mixed cost items = %#v, want two buckets", breakdown.Items)
-				}
-				for i, wantKind := range []string{usageCostKindCacheCreation5m, usageCostKindCacheCreation1h} {
-					item, ok := breakdown.Items[i].(usageTokenCostBreakdownItem)
-					if !ok || item.Kind != wantKind {
-						t.Fatalf("mixed item %d = %#v, want %q", i, breakdown.Items[i], wantKind)
-					}
-				}
-				return
+			if recorder.Code != http.StatusUnprocessableEntity || response.Detail.Code != "validation_error" || response.Detail.Message != "TTL 缓存价格已移除，请使用统一缓存写入价格" {
+				t.Fatalf("%s %s returned %d: %s", test.method, test.path, recorder.Code, recorder.Body.String())
 			}
-			if len(breakdown.Items) != 1 {
-				t.Fatalf("cost items = %#v, want one cache-write item", breakdown.Items)
-			}
-			item, ok := breakdown.Items[0].(usageTokenCostBreakdownItem)
-			if !ok || item.Kind != test.wantKind {
-				t.Fatalf("cache-write item = %#v, want kind %q", breakdown.Items[0], test.wantKind)
+			if after := snapshot(); !reflect.DeepEqual(before, after) {
+				t.Fatalf("rejected request changed prices, versions, template, or pricing cache: before=%#v after=%#v", before, after)
 			}
 		})
 	}
-
-	zeroPrice := ModelPrice{
-		Provider: "claude", Model: price.Model, PriceScope: modelPriceScopeLibrary,
-		CacheCreationUSDPerMillion: 2, CacheCreation1hUSDPerMillion: claudeTTLFloatPtr(0),
-		BillingUnit: modelBillingUnitToken,
-	}
-	zero := calculateRecordCostForMatch(makeRecord("1h"), &zeroPrice, priceMatchStatusMatched, nil, true)
-	if zero.Unpriced || zero.TotalUSD != 0 || len(zero.Items) != 1 {
-		t.Fatalf("explicit zero 1h price = %#v, want priced zero with item", zero)
-	}
-	zeroItem, ok := zero.Items[0].(usageTokenCostBreakdownItem)
-	if !ok || zeroItem.Kind != usageCostKindCacheCreation1h || zeroItem.SubtotalUSD != 0 {
-		t.Fatalf("explicit zero 1h item = %#v", zero.Items[0])
-	}
-
-	noCache := makeRecord("1h")
-	noCache.CacheCreationTokens = 0
-	noCache.CacheCreationTTL = nil
-	if result := calculateRecordCostForMatch(noCache, &zeroPrice, priceMatchStatusMatched, nil, true); result.Unpriced || result.TotalUSD != 0 {
-		t.Fatalf("no-cache record cost = %#v, want no charge", result)
-	}
 }
 
-func TestClaudeCacheTTLIsRejectedForNonClaudeAndGenericPriceIsUnchanged(t *testing.T) {
-	rate1h := 88.0
+func TestRetiredCachePriceStorageSurvivesEditsAndVersionReads(t *testing.T) {
+	a, ctx := newUltrafastTestApp(t), context.Background()
+	seedQuotaTestNativePrice(t, a, "claude", "retired-cache-auth", "claude-retired-cache", 1)
+	if _, err := a.db.ExecContext(ctx, `UPDATE model_prices SET cache_creation_usd_per_million=2, cache_creation_1h_usd_per_million=?, long_context_cache_creation_1h_usd_per_million=?`, math.Inf(1), math.Inf(1)); err != nil {
+		t.Fatal(err)
+	}
+	prices, err := listPricesWithQueryer(ctx, a.db)
+	if err != nil || len(prices) != 1 {
+		t.Fatalf("load existing price: %#v / %v", prices, err)
+	}
+	price := prices[0]
+	if price.LongContext != nil || price.longContextInvalid || price.PreservedLongContext != nil {
+		t.Fatalf("retired-only long-context column configured an active tier: %#v", price)
+	}
 	payload := modelPricePayload{
-		Provider: "openai", Model: "gpt-ttl-isolation", PriceScope: modelPriceScopeLibrary,
-		BillingUnit: modelBillingUnitToken, InputUSDPerMillion: 1, OutputUSDPerMillion: 1,
-		CacheCreationUSDPerMillion: 2, CacheCreation1hUSDPerMillion: &rate1h,
+		Provider: price.Provider, Model: price.Model, PriceScope: price.PriceScope, ChannelAuthType: price.ChannelAuthType,
+		ChannelBrand: price.ChannelBrand, ChannelKey: price.ChannelKey, BillingUnit: modelBillingUnitToken,
+		InputUSDPerMillion: 3, CacheCreationUSDPerMillion: 4,
 	}
-	if _, err := validatePricePayload(payload); err == nil {
-		t.Fatal("non-Claude 1h cache price was accepted")
-	}
-	payload.CacheCreation1hUSDPerMillion = nil
-	payload.LongContext = &modelPriceLongContextPayload{
-		ThresholdInputTokens: claudeTTLInt64Ptr(1000), InputUSDPerMillion: claudeTTLFloatPtr(1),
-		OutputUSDPerMillion: claudeTTLFloatPtr(1), CacheReadUSDPerMillion: claudeTTLFloatPtr(0),
-		CacheCreationUSDPerMillion: claudeTTLFloatPtr(2), CacheCreation1hUSDPerMillion: &rate1h,
-	}
-	if _, err := validatePricePayload(payload); err == nil {
-		t.Fatal("non-Claude long-context 1h cache price was accepted")
-	}
-
-	provider, model, ttl := "openai", "gpt-ttl-isolation", "1h"
-	price := ModelPrice{
-		Provider: provider, Model: model, PriceScope: modelPriceScopeLibrary,
-		InputUSDPerMillion: 1, CacheCreationUSDPerMillion: 2,
-		CacheCreation1hUSDPerMillion: &rate1h, BillingUnit: modelBillingUnitToken,
-	}
-	record := UsageRecord{
-		Provider: &provider, Model: &model, InputTokens: 10, CacheCreationTokens: 4,
-		CacheCreationTTL: &ttl, TotalTokens: 10,
-	}
-	breakdown := calculateRecordCostForMatch(record, &price, priceMatchStatusMatched, nil, true)
-	if breakdown.Unpriced || breakdown.TotalUSD != 0.000014 {
-		t.Fatalf("non-Claude generic cache-write cost = %#v, want 0.000014 priced", breakdown)
-	}
-	var cacheWriteItems int
-	for _, raw := range breakdown.Items {
-		item, ok := raw.(usageTokenCostBreakdownItem)
-		if ok && strings.HasPrefix(item.Kind, "cache_creation") {
-			cacheWriteItems++
-			if item.Kind != usageCostKindCacheCreation || item.USDPerMillion != 2 {
-				t.Fatalf("non-Claude cache-write item = %#v, want generic rate 2", item)
-			}
-		}
-	}
-	if cacheWriteItems != 1 {
-		t.Fatalf("non-Claude cache-write item count = %d, want one generic item: %#v", cacheWriteItems, breakdown.Items)
-	}
-}
-
-func TestClaudeCacheTTLPriceProjectionAndVersionRoundTrip(t *testing.T) {
-	base1h, long1h, multiplier := 0.0, 9.5, 1.75
-	nonClaudeAPI := modelPriceForAPI(ModelPrice{
-		Provider: "openai", Model: "gpt-ttl-api", PriceScope: modelPriceScopeLibrary,
-		CacheCreation1hUSDPerMillion: &base1h,
-		LongContext:                  &ModelPriceLongContext{ThresholdInputTokens: 1000, InputUSDPerMillion: 1, OutputUSDPerMillion: 1, CacheReadUSDPerMillion: 1, CacheCreationUSDPerMillion: 1, CacheCreation1hUSDPerMillion: &long1h},
-		PreservedLongContext:         &ModelPriceLibraryConflictLongContext{CacheCreation1hUSDPerMillion: &long1h, NonFiniteFields: map[string]string{"cache_creation_1h_usd_per_million": "NaN", "input_usd_per_million": "NaN"}},
-	})
-	if nonClaudeAPI.CacheCreation1hUSDPerMillion != nil || nonClaudeAPI.LongContext.CacheCreation1hUSDPerMillion != nil || nonClaudeAPI.PreservedLongContext.CacheCreation1hUSDPerMillion != nil {
-		t.Fatalf("non-Claude model-price API projection exposed 1h price: %#v", nonClaudeAPI)
-	}
-	if _, exists := nonClaudeAPI.PreservedLongContext.NonFiniteFields["cache_creation_1h_usd_per_million"]; exists {
-		t.Fatalf("non-Claude preserved audit exposed 1h field: %#v", nonClaudeAPI.PreservedLongContext.NonFiniteFields)
-	}
-	nonClaudeProjection := availableModelPriceFromPrice(&ModelPrice{
-		Provider: "openai", Model: "gpt-ttl-projection", PriceScope: modelPriceScopeLibrary,
-		CacheCreation1hUSDPerMillion: &base1h,
-		LongContext:                  &ModelPriceLongContext{ThresholdInputTokens: 1000, InputUSDPerMillion: 1, OutputUSDPerMillion: 1, CacheCreation1hUSDPerMillion: &long1h},
-	})
-	if nonClaudeProjection.CacheCreation1hUSDPerMillion != nil || nonClaudeProjection.LongContext.CacheCreation1hUSDPerMillion != nil {
-		t.Fatalf("non-Claude available-model projection exposed 1h price: %#v", nonClaudeProjection)
-	}
-	claudeProjection := availableModelPriceFromPrice(&ModelPrice{
-		Provider: "anthropic", Model: "claude-ttl-projection", PriceScope: modelPriceScopeLibrary,
-		CacheCreation1hUSDPerMillion: &base1h,
-		LongContext:                  &ModelPriceLongContext{ThresholdInputTokens: 1000, InputUSDPerMillion: 1, OutputUSDPerMillion: 1, CacheCreation1hUSDPerMillion: &long1h},
-	})
-	if claudeProjection.CacheCreation1hUSDPerMillion == nil || *claudeProjection.CacheCreation1hUSDPerMillion != 0 || claudeProjection.LongContext.CacheCreation1hUSDPerMillion == nil || *claudeProjection.LongContext.CacheCreation1hUSDPerMillion != long1h {
-		t.Fatalf("Claude available-model projection lost explicit 1h prices: %#v", claudeProjection)
-	}
-
-	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
-	ctx := context.Background()
-	a, err := NewWithOptions(ctx, NewOptions{Migrate: true, StartBackground: false})
+	updated, err := a.updatePrice(ctx, price.ID, payload)
 	if err != nil {
+		t.Fatalf("ordinary edit with hidden old rates: %v", err)
+	}
+	var base, long float64
+	if err := a.db.QueryRowContext(ctx, `SELECT cache_creation_1h_usd_per_million,long_context_cache_creation_1h_usd_per_million FROM model_prices WHERE id=?`, price.ID).Scan(&base, &long); err != nil {
 		t.Fatal(err)
 	}
-	defer a.Close()
-	provider, model, brand, key, auth := "anthropic", "claude-ttl-version", "claude", "account.json", modelPriceChannelAuthTypeAPIKey
-	price := ModelPrice{
-		Provider: provider, Model: model, PriceScope: modelPriceScopeChannel,
-		ChannelAuthType: &auth, ChannelBrand: &brand, ChannelKey: &key,
-		InputUSDPerMillion: 1, OutputUSDPerMillion: 2, CacheReadUSDPerMillion: 0.5,
-		CacheCreationUSDPerMillion: 3, CacheCreation1hUSDPerMillion: &base1h,
-		PriorityMultiplier: &multiplier, BillingUnit: modelBillingUnitToken,
-		LongContext: &ModelPriceLongContext{
-			ThresholdInputTokens: 200000, InputUSDPerMillion: 4, OutputUSDPerMillion: 5,
-			CacheReadUSDPerMillion: 0.6, CacheCreationUSDPerMillion: 7,
-			CacheCreation1hUSDPerMillion: &long1h,
-		},
-	}
-	tx, err := a.db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := a.appendModelPriceVersion(ctx, tx, price, time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC), true); err != nil {
-		_ = tx.Rollback()
-		t.Fatalf("append Claude price version: %v", err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if !math.IsInf(base, 1) || !math.IsInf(long, 1) || updated.CacheCreationUSDPerMillion != 4 {
+		t.Fatalf("active edit lost old storage or active rate: %g / %g / %#v", base, long, updated)
 	}
 	versions, err := a.loadModelPriceVersions(ctx)
 	if err != nil {
-		t.Fatalf("load Claude price versions: %v", err)
+		t.Fatal(err)
 	}
-	history := versions[channelModelPriceKey(auth, brand, key, model)]
-	if history == nil || len(history.all) != 1 {
-		t.Fatalf("Claude version history = %#v, want one version", history)
+	history := versions[channelModelPriceKey(modelPriceChannelAuthType(updated), *updated.ChannelBrand, *updated.ChannelKey, updated.Model)]
+	if history == nil || len(history.all) == 0 {
+		t.Fatal("normal edit did not retain the channel version history")
 	}
-	loaded := history.all[0].Price
-	if loaded.CacheCreation1hUSDPerMillion == nil || *loaded.CacheCreation1hUSDPerMillion != 0 || loaded.LongContext == nil || loaded.LongContext.CacheCreation1hUSDPerMillion == nil || *loaded.LongContext.CacheCreation1hUSDPerMillion != long1h || loaded.PriorityMultiplier == nil || *loaded.PriorityMultiplier != multiplier {
-		t.Fatalf("Claude 1h/long-context/multiplier round-trip = %#v", loaded)
-	}
-	ttl := "1h"
-	usage := UsageRecord{
-		Provider: &provider, Model: &model, InputTokens: 200001,
-		CacheCreationTokens: 10, CacheCreationTTL: &ttl,
-	}
-	brandValue := aiProviderBrandClaude
-	longContextCost := calculateRecordCostForMatch(usage, &loaded, priceMatchStatusMatched, &brandValue, true)
-	if longContextCost.Unpriced || !longContextCost.LongContextApplied {
-		t.Fatalf("long-context Claude 1h calculation = %#v, want priced long-context tier", longContextCost)
-	}
-	var longContextCacheWrite *usageTokenCostBreakdownItem
-	for _, raw := range longContextCost.Items {
-		item, ok := raw.(usageTokenCostBreakdownItem)
-		if ok && item.Kind == usageCostKindCacheCreation1h {
-			longContextCacheWrite = &item
-			break
+	for _, version := range history.all {
+		if version.Price.LongContext != nil || version.Price.longContextInvalid {
+			t.Fatalf("retired-only version column configured an active tier: %#v", version.Price)
 		}
 	}
-	if longContextCacheWrite == nil || longContextCacheWrite.USDPerMillion != long1h || longContextCacheWrite.SubtotalUSD != 0.000095 {
-		t.Fatalf("long-context 1h cache-write cost item = %#v, want %g/0.000095", longContextCacheWrite, long1h)
+	listed, err := a.listModelPriceVersionsForPrice(ctx, price.ID)
+	if err != nil || len(listed) == 0 {
+		t.Fatalf("list old/new versions: %#v / %v", listed, err)
 	}
-
-	large := math.MaxFloat64 / 10
-	if priorityMultiplierProducesRoundableCost(ModelPrice{
-		Provider: "openai", Model: "gpt-ttl-multiplier", BillingUnit: modelBillingUnitToken,
-		CacheCreation1hUSDPerMillion: &large,
-	}, 2) {
-		t.Fatal("multiplier safety check ignored the 1h cache rate")
+	encoded, err := json.Marshal(modelPriceVersionsForAPI(listed))
+	if err != nil || strings.Contains(string(encoded), "cache_creation_1h") {
+		t.Fatalf("version API = %s / %v", encoded, err)
 	}
-	if priorityMultiplierProducesRoundableCost(ModelPrice{
-		Provider: "openai", Model: "gpt-ttl-multiplier", BillingUnit: modelBillingUnitToken,
-		LongContext: &ModelPriceLongContext{ThresholdInputTokens: 1000, InputUSDPerMillion: 0, OutputUSDPerMillion: 0, CacheReadUSDPerMillion: 0, CacheCreationUSDPerMillion: 0, CacheCreation1hUSDPerMillion: &large},
-	}, 2) {
-		t.Fatal("multiplier safety check ignored long-context 1h cache rate")
+	record := UsageRecord{Provider: &updated.Provider, Model: &updated.Model, Timestamp: time.Now(), CacheCreationTokens: 1000000, CacheCreationTTL: claudeTTLStringPtr("1h")}
+	got := calculateRecordCostForMatch(record, &updated, priceMatchStatusMatched, nil, true)
+	if got.Unpriced || got.TotalUSD != 4 {
+		t.Fatalf("edited legacy price cost = %#v, want ordinary cache-write price 4", got)
 	}
 }
 
-func TestNonClaudeCacheTTLFieldsStayHiddenFromAPIProjections(t *testing.T) {
-	oneHour := 1.0
-	price := modelPriceForAPI(ModelPrice{
-		Provider:                     "openai",
-		Model:                        "gpt-ttl-hidden",
-		CacheCreation1hUSDPerMillion: &oneHour,
-		TimePricing: &PriceTimeRule{OffpeakRates: &PriceOffpeakRates{
-			CacheCreation1h: &oneHour,
-		}},
-	})
-	if price.CacheCreation1hUSDPerMillion != nil || price.TimePricing == nil || price.TimePricing.OffpeakRates == nil || price.TimePricing.OffpeakRates.CacheCreation1h != nil {
-		t.Fatalf("non-Claude price projection leaked 1h cache fields: %#v", price)
-	}
-
-	archived := &ModelPriceLibraryConflictLongContext{
-		CacheCreation1hUSDPerMillion: &oneHour,
-		NonFiniteFields:              map[string]string{"cache_creation_1h_usd_per_million": "+Inf", "input_usd_per_million": "+Inf"},
-	}
-	conflicts := modelPriceLibraryConflictsForAPI([]ModelPriceLibraryConflict{
-		{Price: ModelPrice{Provider: "openai", Model: "gpt-ttl-hidden"}, ArchivedLongContext: archived},
-	})
-	if conflicts[0].ArchivedLongContext == nil || conflicts[0].ArchivedLongContext.CacheCreation1hUSDPerMillion != nil {
-		t.Fatalf("non-Claude conflict projection leaked 1h cache field: %#v", conflicts[0])
-	}
-	if _, exists := conflicts[0].ArchivedLongContext.NonFiniteFields["cache_creation_1h_usd_per_million"]; exists {
-		t.Fatal("non-Claude conflict projection leaked 1h audit field")
-	}
-
-	version := ModelPriceVersion{
-		CacheCreation1hUSDPerMillion: &oneHour,
-		LongContext:                  &ModelPriceLongContext{CacheCreation1hUSDPerMillion: &oneHour},
-		PreservedLongContext:         archived,
-		TimePricing:                  &PriceTimeRule{OffpeakRates: &PriceOffpeakRates{CacheCreation1h: &oneHour}},
-	}
-	stripNonClaudeVersionCacheTTL(&version)
-	if version.CacheCreation1hUSDPerMillion != nil || version.LongContext.CacheCreation1hUSDPerMillion != nil || version.PreservedLongContext.CacheCreation1hUSDPerMillion != nil || version.TimePricing.OffpeakRates.CacheCreation1h != nil {
-		t.Fatalf("non-Claude version projection leaked 1h cache fields: %#v", version)
-	}
-	if _, exists := version.PreservedLongContext.NonFiniteFields["cache_creation_1h_usd_per_million"]; exists {
-		t.Fatal("non-Claude version projection leaked 1h audit field")
-	}
-	version.PreservedLongContext.NonFiniteFields["input_usd_per_million"] = "changed projection"
-	if archived.CacheCreation1hUSDPerMillion != &oneHour || archived.NonFiniteFields["input_usd_per_million"] != "+Inf" || archived.NonFiniteFields["cache_creation_1h_usd_per_million"] != "+Inf" {
-		t.Fatalf("API projection mutated shared audit values: %#v", archived)
-	}
-}
-
-func TestClaudeCacheTTLUsagePersistsToFactsAndAPIProjection(t *testing.T) {
-	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
-	ctx := context.Background()
-	a, err := NewWithOptions(ctx, NewOptions{Migrate: true, StartBackground: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer a.Close()
-	raw := []byte(`{"provider":"claude","model":"claude-usage-ttl","timestamp":"2026-10-27T12:00:00Z","api_key":"usage-test-key","tokens":{"input_tokens":100,"output_tokens":7,"cache_creation_tokens":10,"cache_creation_ttl":"mixed","cache_creation_5m_tokens":4,"cache_creation_1h_tokens":6,"total_tokens":117}}`)
-	record, created, err := a.saveUsageMessage(ctx, raw, modelPriceBillingIndex{})
-	if err != nil || !created {
-		t.Fatalf("saveUsageMessage created=%t err=%v", created, err)
-	}
-	stored, err := a.getUsageRecord(ctx, record.ID)
-	if err != nil {
-		t.Fatalf("getUsageRecord: %v", err)
-	}
-	if stored.CacheCreationTTL == nil || *stored.CacheCreationTTL != "mixed" || stored.CacheCreation5mTokens == nil || *stored.CacheCreation5mTokens != 4 || stored.CacheCreation1hTokens == nil || *stored.CacheCreation1hTokens != 6 {
-		t.Fatalf("stored usage TTL buckets = %#v", stored)
-	}
-	var factTTL sql.NullString
-	var fact5m, fact1h sql.NullInt64
-	if err := a.db.QueryRowContext(ctx, `SELECT cache_creation_ttl, cache_creation_5m_tokens, cache_creation_1h_tokens FROM usage_analytics_facts WHERE usage_record_id = ?`, stored.ID).Scan(&factTTL, &fact5m, &fact1h); err != nil {
-		t.Fatalf("query usage facts TTL: %v", err)
-	}
-	if !factTTL.Valid || factTTL.String != "mixed" || !fact5m.Valid || fact5m.Int64 != 4 || !fact1h.Valid || fact1h.Int64 != 6 {
-		t.Fatalf("usage facts TTL = %v/%v/%v, want mixed/4/6", factTTL, fact5m, fact1h)
-	}
-	projected := listItemFromRecordWithBreakdown(stored, nil, usageRedactionOptions{}, usageCostBreakdown{BillingUnit: modelBillingUnitToken, CacheCreationTokens: 10})
-	encoded, err := json.Marshal(projected)
-	if err != nil {
-		t.Fatalf("marshal usage API projection: %v", err)
-	}
-	var api map[string]any
-	if err := json.Unmarshal(encoded, &api); err != nil {
-		t.Fatalf("decode usage API projection: %v", err)
-	}
-	if api["cache_creation_ttl"] != "mixed" || api["cache_creation_5m_tokens"] != float64(4) || api["cache_creation_1h_tokens"] != float64(6) {
-		t.Fatalf("usage API TTL projection = %#v", api)
-	}
-	if got := usageRecordCacheCreationTTL(UsageRecord{CacheCreationTokens: 5}); got == nil || *got != "unknown" {
-		t.Fatalf("legacy aggregate-only TTL projection = %v, want unknown", got)
-	}
-	if got := usageRecordCacheCreationTTL(UsageRecord{}); got != nil {
-		t.Fatalf("no-cache TTL projection = %v, want null", got)
-	}
-
-	invalid, err := normalizeUsage([]byte(`{"provider":"claude","tokens":{"cache_creation_tokens":10,"cache_creation_ttl":"mixed","cache_creation_5m_tokens":-1,"cache_creation_1h_tokens":11}}`))
-	if err != nil {
-		t.Fatalf("normalize invalid canonical bucket: %v", err)
-	}
-	if invalid.CacheCreationTTL == nil || *invalid.CacheCreationTTL != "mixed" || invalid.CacheCreation5mTokens != nil || invalid.CacheCreation1hTokens == nil || *invalid.CacheCreation1hTokens != 11 {
-		t.Fatalf("invalid canonical buckets were not kept non-billable: %#v", invalid)
-	}
-}
-
-func TestClaudeCacheTTLMigrationBackfillsOnlyCanonicalRawUsage(t *testing.T) {
-	dataDir := t.TempDir()
-	dbPath := prepareMigrationTestDatabase(t, dataDir, 202610190001)
-	db, err := sql.Open("sqlite", sqliteDSN(dbPath, false))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	ctx := context.Background()
-	const timestamp = "2026-10-27T12:00:00Z"
-	maxInt := int(^uint(0) >> 1)
-	overflow := strconv.FormatUint(uint64(maxInt)+1, 10)
-	records := []struct {
-		id         int
-		provider   string
-		model      string
-		cacheWrite int
-		raw        string
-	}{
-		{41, "claude", "claude-migration-mixed", 10, `{"tokens":{"cache_creation_tokens":10,"cache_creation_ttl":"mixed","cache_creation_5m_tokens":4,"cache_creation_1h_tokens":6}}`},
-		{42, "claude", "claude-migration-legacy", 10, `{"cache_ttl_setting":"1h","tokens":{"cache_creation_tokens":10}}`},
-		{43, "claude", "claude-migration-empty", 7, ""},
-		{44, "claude", "claude-migration-malformed", 7, "{"},
-		{45, "claude", "claude-migration-integral-numbers", 10, `{"tokens":{"cache_creation_ttl":" mixed ","cache_creation_5m_tokens":4.0,"cache_creation_1h_tokens":6e0}}`},
-		{46, "claude", "claude-migration-fractional", 10, `{"tokens":{"cache_creation_ttl":"mixed","cache_creation_5m_tokens":4.5,"cache_creation_1h_tokens":6}}`},
-		{47, "claude", "claude-migration-overflow", 10, `{"tokens":{"cache_creation_ttl":"mixed","cache_creation_5m_tokens":` + overflow + `,"cache_creation_1h_tokens":0}}`},
-		{48, "claude", "claude-migration-max-int", maxInt, `{"tokens":{"cache_creation_ttl":"mixed","cache_creation_5m_tokens":` + strconv.Itoa(maxInt) + `,"cache_creation_1h_tokens":0}}`},
-		{49, "claude", "claude-migration-negative", 10, `{"tokens":{"cache_creation_ttl":"mixed","cache_creation_5m_tokens":-1,"cache_creation_1h_tokens":11}}`},
-		{50, "claude", "claude-migration-nonnumeric", 10, `{"tokens":{"cache_creation_ttl":"mixed","cache_creation_5m_tokens":"4","cache_creation_1h_tokens":true}}`},
-		{51, "claude", "claude-migration-no-cache", 0, `{"tokens":{"cache_creation_ttl":"mixed","cache_creation_5m_tokens":4,"cache_creation_1h_tokens":6}}`},
-		{52, "claude", "claude-migration-single-ttl", 10, `{"tokens":{"cache_creation_ttl":"1h","cache_creation_5m_tokens":4,"cache_creation_1h_tokens":6}}`},
-		{53, "claude", "claude-migration-unknown-ttl", 10, `{"tokens":{"cache_creation_ttl":"unrecognized","cache_creation_5m_tokens":4,"cache_creation_1h_tokens":6}}`},
-	}
-	for _, record := range records {
-		if _, err := db.ExecContext(ctx, `INSERT INTO usage_records (id, created_at, timestamp, provider, model, cache_creation_tokens, dedupe_key, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, record.id, timestamp, timestamp, record.provider, record.model, record.cacheWrite, "ttl-migration-"+record.model, record.raw); err != nil {
-			t.Fatalf("seed usage record %d: %v", record.id, err)
-		}
-		if _, err := db.ExecContext(ctx, `INSERT INTO usage_analytics_facts (usage_record_id, timestamp, provider, model, cache_creation_tokens) VALUES (?, ?, ?, ?, ?)`, record.id, timestamp, record.provider, record.model, record.cacheWrite); err != nil {
-			t.Fatalf("seed usage fact %d: %v", record.id, err)
-		}
-	}
-	for _, model := range []struct {
-		provider string
-		model    string
-		cache    float64
-	}{
-		{"anthropic", "claude-ttl-migration-price", 2},
-		{"openai", "gpt-legacy-cache-price", 5},
-	} {
-		if _, err := db.ExecContext(ctx, `INSERT INTO model_prices (provider, model, cache_creation_usd_per_million, updated_at) VALUES (?, ?, ?, ?)`, model.provider, model.model, model.cache, timestamp); err != nil {
-			t.Fatalf("seed existing cache price %s: %v", model.model, err)
-		}
-	}
-	if _, err := db.ExecContext(ctx, `UPDATE usage_analytics_state SET facts_version = 7, hourly_needs_rebuild = 0 WHERE id = 1`); err != nil {
-		t.Fatalf("seed analytics state: %v", err)
-	}
-	goose.SetBaseFS(backendMigrations.FS)
-	if err := goose.SetDialect("sqlite3"); err != nil {
-		t.Fatal(err)
-	}
-	if err := goose.UpToContext(ctx, db, ".", 202610270001); err != nil {
-		t.Fatalf("upgrade usage database with Claude TTL migration: %v", err)
-	}
+func TestRetiredCacheLongContextStorageSurvivesFastAndTimeSnapshots(t *testing.T) {
+	a, ctx := newUltrafastTestApp(t), context.Background()
 	for _, test := range []struct {
-		id      int
-		wantTTL string
-		want5m  sql.NullInt64
-		want1h  sql.NullInt64
+		name       string
+		columns    string
+		configured bool
+		invalid    bool
 	}{
-		{41, "mixed", sql.NullInt64{Int64: 4, Valid: true}, sql.NullInt64{Int64: 6, Valid: true}},
-		{42, "", sql.NullInt64{}, sql.NullInt64{}},
-		{43, "", sql.NullInt64{}, sql.NullInt64{}},
-		{44, "", sql.NullInt64{}, sql.NullInt64{}},
-		{45, "mixed", sql.NullInt64{Int64: 4, Valid: true}, sql.NullInt64{Int64: 6, Valid: true}},
-		{46, "mixed", sql.NullInt64{}, sql.NullInt64{Int64: 6, Valid: true}},
-		{47, "mixed", sql.NullInt64{}, sql.NullInt64{Int64: 0, Valid: true}},
-		{48, "mixed", sql.NullInt64{Int64: int64(maxInt), Valid: true}, sql.NullInt64{Int64: 0, Valid: true}},
-		{49, "mixed", sql.NullInt64{}, sql.NullInt64{Int64: 11, Valid: true}},
-		{50, "mixed", sql.NullInt64{}, sql.NullInt64{}},
-		{51, "", sql.NullInt64{}, sql.NullInt64{}},
-		{52, "1h", sql.NullInt64{}, sql.NullInt64{}},
-		{53, "", sql.NullInt64{}, sql.NullInt64{}},
+		{name: "no-active-tier"},
+		{name: "complete-tier", columns: ",long_context_threshold_tokens=100,long_context_input_usd_per_million=4,long_context_output_usd_per_million=0,long_context_cache_read_usd_per_million=0,long_context_cache_creation_usd_per_million=6", configured: true},
+		{name: "partial-tier", columns: ",long_context_threshold_tokens=100,long_context_input_usd_per_million=4", configured: true, invalid: true},
 	} {
-		var ttl sql.NullString
-		var five, oneHour sql.NullInt64
-		if err := db.QueryRowContext(ctx, `SELECT cache_creation_ttl, cache_creation_5m_tokens, cache_creation_1h_tokens FROM usage_records WHERE id = ?`, test.id).Scan(&ttl, &five, &oneHour); err != nil {
-			t.Fatalf("query migrated usage %d: %v", test.id, err)
-		}
-		if ttl.Valid != (test.wantTTL != "") || (ttl.Valid && ttl.String != test.wantTTL) || five != test.want5m || oneHour != test.want1h {
-			t.Errorf("migrated usage %d = %v/%v/%v, want %q/%v/%v", test.id, ttl, five, oneHour, test.wantTTL, test.want5m, test.want1h)
-		}
-		var factTTL sql.NullString
-		var fact5m, fact1h sql.NullInt64
-		if err := db.QueryRowContext(ctx, `SELECT cache_creation_ttl, cache_creation_5m_tokens, cache_creation_1h_tokens FROM usage_analytics_facts WHERE usage_record_id = ?`, test.id).Scan(&factTTL, &fact5m, &fact1h); err != nil {
-			t.Fatalf("query migrated usage fact %d: %v", test.id, err)
-		}
-		if factTTL != ttl || fact5m != five || fact1h != oneHour {
-			t.Errorf("migrated usage fact %d = %v/%v/%v, want record projection %v/%v/%v", test.id, factTTL, fact5m, fact1h, ttl, five, oneHour)
-		}
-		var raw string
-		var aggregate int
-		if err := db.QueryRowContext(ctx, `SELECT raw_json, cache_creation_tokens FROM usage_records WHERE id = ?`, test.id).Scan(&raw, &aggregate); err != nil {
-			t.Fatal(err)
-		}
-		var payload any
-		decoder := json.NewDecoder(strings.NewReader(raw))
-		decoder.UseNumber()
-		if err := decoder.Decode(&payload); err == nil {
-			_, live5m, live1h := normalizedCacheCreationTTL(payload, aggregate)
-			if five != sqlNullIntForClaudeTTLTest(live5m) || oneHour != sqlNullIntForClaudeTTLTest(live1h) {
-				t.Errorf("migration/live bucket mismatch for %d: migration %v/%v, live %v/%v", test.id, five, oneHour, live5m, live1h)
+		t.Run(test.name, func(t *testing.T) {
+			model := "deepseek-retired-snapshot-" + test.name
+			id := seedCorrectionTestChannelPrice(t, a, model, 2)
+			if _, err := a.db.ExecContext(ctx, `UPDATE model_prices SET cache_creation_usd_per_million=3,cache_creation_1h_usd_per_million=?,long_context_cache_creation_1h_usd_per_million=?`+test.columns+` WHERE id=?`, math.Inf(1), math.Inf(1), id); err != nil {
+				t.Fatal(err)
 			}
-		}
-	}
-	var factsVersion int
-	var hourlyNeedsRebuild bool
-	if err := db.QueryRowContext(ctx, `SELECT facts_version, hourly_needs_rebuild FROM usage_analytics_state WHERE id = 1`).Scan(&factsVersion, &hourlyNeedsRebuild); err != nil {
-		t.Fatalf("query migrated analytics state: %v", err)
-	}
-	if factsVersion != 8 || !hourlyNeedsRebuild {
-		t.Fatalf("migrated analytics state = version %d rebuild %t, want 8/true", factsVersion, hourlyNeedsRebuild)
-	}
-	for _, test := range []struct {
-		provider string
-		model    string
-		cache    float64
-	}{
-		{"anthropic", "claude-ttl-migration-price", 2},
-		{"openai", "gpt-legacy-cache-price", 5},
-	} {
-		var cache, oneHour sql.NullFloat64
-		if err := db.QueryRowContext(ctx, `SELECT cache_creation_usd_per_million, cache_creation_1h_usd_per_million FROM model_prices WHERE provider = ? AND model = ?`, test.provider, test.model).Scan(&cache, &oneHour); err != nil {
-			t.Fatalf("query migrated model price %s: %v", test.model, err)
-		}
-		if !cache.Valid || cache.Float64 != test.cache || oneHour.Valid {
-			t.Errorf("migrated model price %s = %v/%v, want unchanged generic/5m %v and unconfigured 1h", test.model, cache, oneHour, test.cache)
-		}
-	}
-	if err := goose.DownToContext(ctx, db, ".", 202610190001); err != nil {
-		t.Fatalf("roll back Claude TTL migration: %v", err)
-	}
-	var trigger string
-	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'usage_analytics_pending_facts_update'`).Scan(&trigger); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(trigger, "cache_creation_ttl") || strings.Contains(trigger, "cache_creation_5m_tokens") || strings.Contains(trigger, "cache_creation_1h_tokens") {
-		t.Fatal("rollback retained TTL references in the pending-fact trigger")
+			check := func() ModelPrice {
+				t.Helper()
+				price, err := getPriceWithQuerier(ctx, a.db, id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if (price.LongContext != nil) != test.configured || price.longContextInvalid != test.invalid || (price.PreservedLongContext != nil) != test.invalid {
+					t.Fatalf("retired storage changed active tier: %#v", price)
+				}
+				if price.CacheCreation1hUSDPerMillion == nil || !math.IsInf(*price.CacheCreation1hUSDPerMillion, 1) || price.retiredLongContextCacheCreation1h == nil || !math.IsInf(*price.retiredLongContextCacheCreation1h, 1) {
+					t.Fatalf("snapshot lost historical cache rates: %#v", price)
+				}
+				var base, long float64
+				if err := a.db.QueryRowContext(ctx, `SELECT cache_creation_1h_usd_per_million,long_context_cache_creation_1h_usd_per_million FROM model_prices WHERE id=?`, id).Scan(&base, &long); err != nil || !math.IsInf(base, 1) || !math.IsInf(long, 1) {
+					t.Fatalf("persisted historical rates = %g / %g, err=%v", base, long, err)
+				}
+				return price
+			}
+			price := check()
+			if test.invalid {
+				payload := correctionTestPayload(model, 3, false)
+				preserve := true
+				payload.PreserveInvalidLongContext = &preserve
+				if _, err := a.updatePrice(ctx, id, payload); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := a.updatePriorityMultiplier(ctx, id, priorityMultiplierPayload{PriorityMultiplier: claudeTTLFloatPtr(2)}); err != nil {
+				t.Fatal(err)
+			}
+			check()
+			if _, err := a.applyPriceTimeBatch(ctx, priceTimeBatchPayload{PriceIDs: []int{id}, Rule: testTimeRule()}, true); err != nil {
+				t.Fatal(err)
+			}
+			versions, err := a.loadModelPriceVersions(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			selected := effectivePriceFromVersions(price, versions, time.Now())
+			tx, err := a.db.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := materializePriceSnapshot(ctx, tx, selected); err != nil {
+				_ = tx.Rollback()
+				t.Fatal(err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			check()
+			payload := correctionTestPayload(model, 5, true)
+			if test.invalid {
+				preserve := true
+				payload.PreserveInvalidLongContext = &preserve
+			} else {
+				payload.LongContext = longContextPayloadFromPrice(selected.LongContext)
+			}
+			if _, err := a.updatePrice(ctx, id, payload); err != nil {
+				t.Fatal(err)
+			}
+			check()
+			rows, err := a.db.QueryContext(ctx, `SELECT cache_creation_1h_usd_per_million,long_context_cache_creation_1h_usd_per_million FROM model_price_versions WHERE price_id=?`, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			count := 0
+			for rows.Next() {
+				var base, long float64
+				if err := rows.Scan(&base, &long); err != nil || !math.IsInf(base, 1) || !math.IsInf(long, 1) {
+					t.Fatalf("version snapshot lost historical rate: %g / %g, err=%v", base, long, err)
+				}
+				count++
+			}
+			if err := rows.Err(); err != nil || count < 2 {
+				t.Fatalf("version snapshots: count=%d err=%v", count, err)
+			}
+		})
 	}
 }
 
-func sqlNullIntForClaudeTTLTest(value *int) sql.NullInt64 {
-	if value == nil {
-		return sql.NullInt64{}
+func TestRetiredCachePriceSyncAndConflictCopiesIgnoreHiddenValues(t *testing.T) {
+	a, ctx := newUltrafastTestApp(t), context.Background()
+	if _, err := a.db.ExecContext(ctx, `INSERT INTO model_prices(provider,model,input_usd_per_million,cache_creation_1h_usd_per_million,long_context_cache_creation_1h_usd_per_million,source,updated_at) VALUES('openai','gpt-5.5',2,?,?,'litellm',CURRENT_TIMESTAMP)`, math.Inf(1), math.Inf(1)); err != nil {
+		t.Fatal(err)
 	}
-	return sql.NullInt64{Int64: int64(*value), Valid: true}
+	raw := map[string]any{"gpt-5.5": map[string]any{"litellm_provider": "openai", "input_cost_per_token": 0.000003}}
+	if _, err := a.syncLiteLLMPricesSelected(ctx, "fixture", raw, []string{"gpt-5.5"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.syncLiteLLMPrices(ctx, "fixture", raw); err != nil {
+		t.Fatal(err)
+	}
+	prices, err := a.listPrices(ctx)
+	if err != nil || len(prices) != 1 {
+		t.Fatalf("synced prices: %#v / %v", prices, err)
+	}
+	price := prices[0]
+	if price.PriorityMultiplier == nil || *price.PriorityMultiplier != 2.5 || price.LongContext != nil || price.longContextInvalid || price.CacheCreation1hUSDPerMillion == nil || !math.IsInf(*price.CacheCreation1hUSDPerMillion, 1) {
+		t.Fatalf("retired rates affected Fast initialization or existing storage: %#v", price)
+	}
+	if _, err := a.db.ExecContext(ctx, `INSERT INTO model_price_library_conflicts(original_id,selected_price_id,conflict_reason,provider,model,input_usd_per_million,cache_creation_1h_usd_per_million,long_context_cache_creation_1h_usd_per_million,priority_multiplier,updated_at) VALUES(900001,?,'case_insensitive_library_identity','OpenAI','gpt-5.5',7,?,?,2.5,CURRENT_TIMESTAMP)`, price.ID, math.Inf(1), math.Inf(1)); err != nil {
+		t.Fatal(err)
+	}
+	conflicts, err := a.listModelPriceLibraryConflicts(ctx)
+	if err != nil || len(conflicts) != 1 || conflicts[0].Price.LongContext != nil || conflicts[0].ArchivedLongContext != nil {
+		t.Fatalf("retired-only conflict configured a tier: %#v / %v", conflicts, err)
+	}
+	replaced, err := a.replaceActiveModelPriceLibraryConflict(ctx, 900001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replaced.InputUSDPerMillion != 7 || replaced.CacheCreation1hUSDPerMillion == nil || !math.IsInf(*replaced.CacheCreation1hUSDPerMillion, 1) {
+		t.Fatalf("replacement lost active price or historical values: %#v", replaced)
+	}
+	promoted, err := a.promoteModelPriceLibraryConflict(ctx, 900001, modelPriceLibraryConflictPromotePayload{Provider: "codex", Model: "gpt-5.5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promoted.InputUSDPerMillion != 3 || promoted.LongContext != nil || promoted.CacheCreation1hUSDPerMillion == nil || !math.IsInf(*promoted.CacheCreation1hUSDPerMillion, 1) {
+		t.Fatalf("promotion lost active price or historical values: %#v", promoted)
+	}
 }
 
 func claudeTTLFloatPtr(value float64) *float64 { return &value }
 func claudeTTLIntPtr(value int) *int           { return &value }
 func claudeTTLInt64Ptr(value int64) *int64     { return &value }
+func claudeTTLStringPtr(value string) *string  { return &value }

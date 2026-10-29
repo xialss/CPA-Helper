@@ -267,7 +267,7 @@ func usageSourceAPIKeyHashWithIdentity(source, sourceKey *string) string {
 	if hash := usageSourceAPIKeyHash(source); hash != "" {
 		return hash
 	}
-	if sourceKey != nil && validUsageCallerScope(*sourceKey) {
+	if sourceKey != nil && validUsageSourceKey(*sourceKey) {
 		if maskedKey := usageSourceKey(source); maskedKey != nil && *maskedKey == *sourceKey {
 			// Legacy callers may already have supplied a mask. Its digest is a
 			// grouping identity, never proof of the original credential.

@@ -3,7 +3,7 @@ import { computed } from 'vue'
 import { NButton, NInput, NInputNumber, NSelect, NFormItem } from 'naive-ui'
 import type { PriceTimeRule } from '@/shared/types/api'
 import { useI18n } from '@/shared/i18n'
-const props = withDefaults(defineProps<{ modelValue: PriceTimeRule; disabled?: boolean; claude?: boolean }>(), { disabled: false, claude: false })
+const props = withDefaults(defineProps<{ modelValue: PriceTimeRule; disabled?: boolean }>(), { disabled: false })
 const emit = defineEmits<{ 'update:modelValue': [PriceTimeRule] }>()
 const { t } = useI18n()
 const rule = computed(() => props.modelValue)
@@ -20,17 +20,14 @@ const weekly = computed(() => days.value.map(day => {
   }
   return { ...day, intervals: intervals.sort() }
 }))
-type OffpeakRateKey = 'input_usd_per_million' | 'output_usd_per_million' | 'cache_read_usd_per_million' | 'cache_creation_usd_per_million' | 'cache_creation_1h_usd_per_million'
-const baseRateKeys = [
+type OffpeakRateKey = 'input_usd_per_million' | 'output_usd_per_million' | 'cache_read_usd_per_million' | 'cache_creation_usd_per_million'
+const rates = [
   'input_usd_per_million',
   'output_usd_per_million',
   'cache_read_usd_per_million',
   'cache_creation_usd_per_million',
 ] as const satisfies readonly OffpeakRateKey[]
-const rates = computed<OffpeakRateKey[]>(() => props.claude
-  ? [...baseRateKeys, 'cache_creation_1h_usd_per_million']
-  : [...baseRateKeys])
-const rateNames = computed(() => [t('空闲输入', 'Off-peak input'), t('空闲输出', 'Off-peak output'), t('空闲缓存读', 'Off-peak cache read'), props.claude ? t('空闲缓存写 5m', 'Off-peak cache write 5m') : t('空闲缓存写', 'Off-peak cache write'), ...(props.claude ? [t('空闲缓存写 1h', 'Off-peak cache write 1h')] : [])])
+const rateNames = computed(() => [t('空闲输入', 'Off-peak input'), t('空闲输出', 'Off-peak output'), t('空闲缓存读', 'Off-peak cache read'), t('空闲缓存写', 'Off-peak cache write')])
 function setRate(key: OffpeakRateKey, value: number | null) {
   change({
     offpeak_rates: {
@@ -39,7 +36,7 @@ function setRate(key: OffpeakRateKey, value: number | null) {
       cache_read_usd_per_million: 0,
       cache_creation_usd_per_million: 0,
       ...rule.value.offpeak_rates,
-      [key]: key === 'cache_creation_1h_usd_per_million' ? value : (value ?? 0),
+      [key]: value ?? 0,
     },
   })
 }
@@ -64,7 +61,7 @@ function setMode(mode: PriceTimeRule['offpeak_mode']) {
       <NSelect :value="rule.offpeak_mode" :options="[{ label: t('统一倍率', 'Uniform multiplier'), value: 'multiplier' }, { label: t('独立价格', 'Explicit rates'), value: 'explicit' }]" @update:value="setMode" />
     </NFormItem>
     <NFormItem v-if="rule.offpeak_mode === 'multiplier'" :label="t('空闲倍率', 'Off-peak multiplier')"><NInputNumber :value="rule.offpeak_multiplier" :min="0" @update:value="change({ offpeak_multiplier: $event ?? 0 })" /></NFormItem>
-    <template v-else><NFormItem v-for="(key, index) in rates" :key="key" :label="rateNames[index] + ' (USD / 1M)'"><NInputNumber :value="key === 'cache_creation_1h_usd_per_million' ? (rule.offpeak_rates?.[key] ?? null) : (rule.offpeak_rates?.[key] ?? 0)" :min="0" :clearable="key === 'cache_creation_1h_usd_per_million'" :placeholder="key === 'cache_creation_1h_usd_per_million' ? t('未配置', 'Not configured') : ''" @update:value="setRate(key, $event)" /></NFormItem></template>
+    <template v-else><NFormItem v-for="(key, index) in rates" :key="key" :label="rateNames[index] + ' (USD / 1M)'"><NInputNumber :value="rule.offpeak_rates?.[key] ?? 0" :min="0" @update:value="setRate(key, $event)" /></NFormItem></template>
     <NFormItem :label="t('长上下文空闲倍率', 'Long-context off-peak multiplier')"><NInputNumber :value="rule.long_context_multiplier" :min="0" @update:value="change({ long_context_multiplier: $event ?? 0 })" /></NFormItem>
     <p>{{ t('长上下文直接乘此倍率，基础空闲优惠不再叠加；Fast 倍率最后应用。', 'Long-context rates use this multiplier only; Fast is applied last.') }}</p>
     <details open>

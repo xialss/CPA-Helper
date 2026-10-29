@@ -328,10 +328,6 @@ Use the System Settings page to configure:
 - **Enable local collector**: when enabled, CPA-Helper reads events from the usage queue and writes them to the local database.
 - **Batch size, polling interval and retry interval**: control local collector throughput and failure retry behavior.
 
-### Claude Cache TTL
-
-A compatible CPA-Helper Plugin provides per-key Inherit CPA / 5m / 1h settings. Request details distinguish upstream facts from enforced request policy; token counts still come from CPA's original queue. Enabling this requires capability detection and validated Plugin deployment configuration. See the [configuration, billing and rollback guide](docs/claude-cache-ttl.md) (Chinese).
-
 ### User Balances
 
 - Existing users and newly created users are unlimited by default.

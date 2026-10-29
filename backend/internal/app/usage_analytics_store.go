@@ -31,73 +31,6 @@ func (a *App) upsertUsageAnalyticsFactWithColumns(ctx context.Context, executor 
 	if err := persistUsageRecordAnalyticsMetadata(ctx, executor, record); err != nil {
 		return err
 	}
-	if !columns["cache_creation_ttl"] || !columns["cache_creation_5m_tokens"] || !columns["cache_creation_1h_tokens"] {
-		return a.upsertUsageAnalyticsFactLegacy(ctx, executor, record)
-	}
-	metadataColumn, metadataPlaceholder, metadataUpdate := "", "", ""
-	arguments := []any{record.ID, dbTime(record.Timestamp), nullableStringArg(record.UsageUsername), nullableStringArg(record.APIKeyDescription), nullableStringArg(record.Provider), nullableStringArg(record.Model),
-		nullableStringArg(record.ServiceTier), nullableStringArg(record.Endpoint), nullableStringArg(sourceKey), nullableStringArg(auth), nullableStringArg(authIndex), nullableStringArg(sourceAccount), nullableFloatArg(record.TTFTMS),
-		record.Failed, record.InputTokens, record.OutputTokens, record.CachedTokens, record.CacheReadTokens, record.CacheCreationTokens, record.ReasoningTokens, record.TotalTokens,
-		nullableStringArg(record.CacheCreationTTL), nullableUsageIntArg(record.CacheCreation5mTokens), nullableUsageIntArg(record.CacheCreation1hTokens)}
-	if columns["cache_creation_metadata"] {
-		encoded, err := encodeUsageCacheCreationMetadata(usageCacheCreationMetadataForRecord(record))
-		if err != nil {
-			return err
-		}
-		metadataColumn, metadataPlaceholder, metadataUpdate = ", cache_creation_metadata", ", ?", ", cache_creation_metadata = excluded.cache_creation_metadata"
-		arguments = append(arguments, encoded)
-	}
-	if _, err := executor.ExecContext(ctx, `
-		INSERT INTO usage_analytics_facts (
-			usage_record_id, timestamp, usage_username, api_key_description, provider, model,
-			service_tier, endpoint, source_key, auth, auth_index, source_account, ttft_ms,
-			failed, input_tokens, output_tokens, cached_tokens, cache_read_tokens,
-			cache_creation_tokens, reasoning_tokens, total_tokens, cache_creation_ttl,
-			cache_creation_5m_tokens, cache_creation_1h_tokens`+metadataColumn+`
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`+metadataPlaceholder+`)
-		ON CONFLICT(usage_record_id) DO UPDATE SET
-			timestamp = excluded.timestamp,
-			usage_username = excluded.usage_username,
-			api_key_description = excluded.api_key_description,
-			provider = excluded.provider,
-			model = excluded.model,
-			service_tier = excluded.service_tier,
-			endpoint = excluded.endpoint,
-			source_key = COALESCE(excluded.source_key, usage_analytics_facts.source_key),
-			auth = COALESCE(excluded.auth, usage_analytics_facts.auth),
-			auth_index = COALESCE(excluded.auth_index, usage_analytics_facts.auth_index),
-			source_account = COALESCE(excluded.source_account, usage_analytics_facts.source_account),
-			ttft_ms = excluded.ttft_ms,
-			failed = excluded.failed,
-			input_tokens = excluded.input_tokens,
-			output_tokens = excluded.output_tokens,
-			cached_tokens = excluded.cached_tokens,
-			cache_read_tokens = excluded.cache_read_tokens,
-			cache_creation_tokens = excluded.cache_creation_tokens,
-			cache_creation_ttl = excluded.cache_creation_ttl,
-			cache_creation_5m_tokens = excluded.cache_creation_5m_tokens,
-			cache_creation_1h_tokens = excluded.cache_creation_1h_tokens,
-			reasoning_tokens = excluded.reasoning_tokens,
-			total_tokens = excluded.total_tokens`+metadataUpdate, arguments...); err != nil {
-		return err
-	}
-	if sourceKey != nil {
-		if err := upsertUsageSourceCatalog(ctx, executor, *sourceKey, source, auth, sourceAccount, authIndex, authConflict); err != nil {
-			return err
-		}
-	}
-	if _, err := executor.ExecContext(ctx, `DELETE FROM usage_analytics_pending_facts WHERE usage_record_id = ?`, record.ID); err != nil {
-		return err
-	}
-	return markUsageAnalyticsFactUpserted(ctx, executor, record.ID)
-}
-
-func (a *App) upsertUsageAnalyticsFactLegacy(ctx context.Context, executor usageAnalyticsExecutor, record UsageRecord) error {
-	source := usageAnalyticsRecordSource(record)
-	authIndex := usageAnalyticsRecordAuthIndex(record)
-	sourceKey := usageAnalyticsRecordSourceKey(record)
-	sourceAccount := usageAnalyticsRecordSourceAccount(record, source)
-	auth, authConflict := usageSourceCatalogAuth(record)
 	if _, err := executor.ExecContext(ctx, `
 		INSERT INTO usage_analytics_facts (
 			usage_record_id, timestamp, usage_username, api_key_description, provider, model,
@@ -213,7 +146,7 @@ func usageSourceCatalogAuth(record UsageRecord) (*string, bool) {
 	if rawAuth != nil {
 		return rawAuth, storedAuth != nil && usageAuthTypeKey(storedAuth) != usageAuthTypeKey(rawAuth)
 	}
-	if strings.TrimSpace(record.RawJSON) == "" && record.analyticsSourceKey != nil && validUsageCallerScope(*record.analyticsSourceKey) && record.CacheCreationMetadata.Version == "v1" {
+	if strings.TrimSpace(record.RawJSON) == "" && record.analyticsSourceKey != nil && validUsageSourceKey(*record.analyticsSourceKey) {
 		// New inbox records retain the normalized authentication beside their
 		// pre-mask digest. Raw retention must not invalidate that frozen fact.
 		return storedAuth, false

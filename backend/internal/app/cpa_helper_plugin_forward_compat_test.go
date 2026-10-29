@@ -90,7 +90,7 @@ func TestPluginStableManagementContractValidation(t *testing.T) {
 	}
 }
 
-func TestPluginStableContractPolicyTTLAndRemovedVerifier(t *testing.T) {
+func TestPluginStableContractPolicyPreservesUnmanagedFieldsAndRemovedVerifier(t *testing.T) {
 	for _, version := range []string{"0.1.11", "0.1.42"} {
 		t.Run(version, func(t *testing.T) {
 			f, cfg := newPluginTTLHTTPFixture(t)
@@ -107,24 +107,37 @@ func TestPluginStableContractPolicyTTLAndRemovedVerifier(t *testing.T) {
 			if err := a.upsertUserAPIKey(context.Background(), owner, hashAPIKey(key), key, "Modern contract"); err != nil {
 				t.Fatal(err)
 			}
+			f.policy["keys"] = mustRaw([]any{map[string]any{"id": pluginCallerScope(key), "enabled": true, "claude_cache_ttl": "1h", "future_remote": 99}})
 			path := "/api/cpa-helper-plugin/policy/key/" + hashAPIKey(key)
 			var policy struct {
 				Revision uint64                     `json:"policy_revision"`
 				Key      map[string]json.RawMessage `json:"key"`
 			}
 			modelMonitorRequest(t, handler, http.MethodGet, path, nil, admin, 200, &policy)
-			policy.Key["claude_cache_ttl"], policy.Key["future"] = mustRawString("1h"), mustRawNumber(42)
+			if _, exists := policy.Key["claude_cache_ttl"]; exists {
+				t.Fatal("Key response still exposes the retired TTL control")
+			}
+			policy.Key["future"] = mustRawNumber(42)
 			modelMonitorRequest(t, handler, http.MethodPut, path, map[string]any{"policy_revision": policy.Revision, "key": policy.Key}, admin, 200, nil)
 			policy.Key = nil
 			modelMonitorRequest(t, handler, http.MethodGet, path, nil, admin, 200, &policy)
-			if policy.Revision != 8 || rawString(policy.Key["claude_cache_ttl"]) != "1h" || rawUint(policy.Key["future"]) != 42 || f.writeCount != 1 {
+			remoteKeys, err := rawObjectArray(f.policy, "keys")
+			if err != nil || len(remoteKeys) != 1 || rawString(remoteKeys[0]["claude_cache_ttl"]) != "1h" || rawUint(remoteKeys[0]["future_remote"]) != 99 {
+				t.Fatalf("Key edit lost unmanaged remote fields: %#v/%v", remoteKeys, err)
+			}
+			if policy.Revision != 8 || rawUint(policy.Key["future"]) != 42 || f.writeCount != 1 {
 				t.Fatalf("modern policy CAS/readback lost intended fields: %#v, writes=%d", policy, f.writeCount)
+			}
+			policy.Key["claude_cache_ttl"] = mustRawString("5m")
+			modelMonitorRequest(t, handler, http.MethodPut, path, map[string]any{"policy_revision": policy.Revision, "key": policy.Key}, admin, 422, nil)
+			delete(policy.Key, "claude_cache_ttl")
+			if f.writeCount != 1 {
+				t.Fatal("retired Key control reached a remote write")
 			}
 			var status map[string]json.RawMessage
 			modelMonitorRequest(t, handler, http.MethodGet, "/api/cpa-helper-plugin/status", nil, admin, 200, &status)
-			var feature cpaHelperPluginClaudeTTLFeature
-			if json.Unmarshal(status["claude_cache_ttl"], &feature) != nil || !feature.Supported || feature.Status != "configured" || feature.MetadataVersion != "v1" {
-				t.Fatalf("modern TTL status is wrong: %s", status["claude_cache_ttl"])
+			if _, exists := status["claude_cache_ttl"]; exists {
+				t.Fatal("retired TTL status is still public")
 			}
 			if strings.Contains(string(mustRaw(status)), "private/") || string(status["response_model_verification_supported"]) != "false" {
 				t.Fatalf("modern status exposed secrets or resurrected verification: %s", mustRaw(status))
@@ -132,7 +145,7 @@ func TestPluginStableContractPolicyTTLAndRemovedVerifier(t *testing.T) {
 			modelMonitorRequest(t, handler, http.MethodGet, "/api/cpa-helper-plugin/response-model", nil, admin, 503, nil)
 			modelMonitorRequest(t, handler, http.MethodPut, "/api/cpa-helper-plugin/response-model", map[string]any{"enabled": true}, admin, 503, nil)
 			for _, request := range f.requests {
-				if strings.Contains(request, "response-model/validate") || strings.Contains(request, "response_model_mismatch") {
+				if strings.Contains(request, "response-model/validate") || strings.Contains(request, "response_model_mismatch") || strings.Contains(request, "/claude-ttl/") {
 					t.Fatalf("removed verifier reached upstream: %s", request)
 				}
 			}
@@ -144,59 +157,6 @@ func TestPluginStableContractPolicyTTLAndRemovedVerifier(t *testing.T) {
 				t.Fatal("foreign Key ownership check reached management IO")
 			}
 		})
-	}
-}
-
-func TestPluginStableContractTTLFeatureProbe(t *testing.T) {
-	for _, version := range []string{"0.1.11", "0.1.42"} {
-		for _, test := range []struct {
-			name, status string
-			edit         func(*pluginTTLHTTPFixture)
-			supported    bool
-			fails        bool
-		}{
-			{"configured", "configured", nil, true, false},
-			{"disabled keeps metadata protocol", "disabled", func(f *pluginTTLHTTPFixture) {
-				f.health["claude_cache_ttl"] = mustRaw(map[string]any{"status": "disabled", "ttl_source": "enforced_request", "metadata_retention_hours": 24, "configuration_validation": "pinned_file_requires_reload"})
-			}, true, false},
-			{"unavailable keeps metadata protocol", "unavailable", func(f *pluginTTLHTTPFixture) { f.healthStatus = http.StatusServiceUnavailable }, true, false},
-			{"TTL absent", "unsupported", func(f *pluginTTLHTTPFixture) { f.caps = pluginStableCapabilitiesFixture(version, "v8.0.45", false) }, false, false},
-			{"TTL field without module", "", func(f *pluginTTLHTTPFixture) {
-				f.caps["modules"] = pluginStableCapabilitiesFixture(version, "v8.0.45", false)["modules"]
-			}, false, true},
-			{"TTL module without field", "", func(f *pluginTTLHTTPFixture) {
-				f.caps["policy_fields"] = pluginStableCapabilitiesFixture(version, "v8.0.45", false)["policy_fields"]
-			}, false, true},
-			{"unknown metadata protocol", "", func(f *pluginTTLHTTPFixture) {
-				f.requirements = strings.Replace(f.requirements, `"metadata_version":"v1"`, `"metadata_version":"v2"`, 1)
-			}, false, true},
-		} {
-			t.Run(version+"/"+test.name, func(t *testing.T) {
-				f, cfg := newPluginTTLHTTPFixture(t)
-				f.caps = pluginStableCapabilitiesFixture(version, "v8.0.45", true)
-				if test.edit != nil {
-					test.edit(f)
-				}
-				feature, err := (&App{}).pluginClaudeTTLFeature(context.Background(), cfg)
-				if test.fails {
-					var problem *AppError
-					if !errors.As(err, &problem) || problem.Code != "plugin_incompatible" {
-						t.Fatalf("unknown TTL contract accepted: %#v, %v", feature, err)
-					}
-					return
-				}
-				if err != nil || feature.Supported != test.supported || feature.Status != test.status || (test.supported && feature.MetadataVersion != "v1") {
-					t.Fatalf("wrong TTL protocol/health projection: %#v, %v", feature, err)
-				}
-				if test.status == "unsupported" {
-					for _, request := range f.requests {
-						if strings.Contains(request, "/claude-ttl/") || strings.HasSuffix(request, "/health") {
-							t.Fatalf("missing TTL capability reached feature IO: %s", request)
-						}
-					}
-				}
-			})
-		}
 	}
 }
 

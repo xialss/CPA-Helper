@@ -969,116 +969,8 @@ function formatOutputWithTps(row: Pick<UsageRecordListItem, 'latency_ms' | 'outp
   return outputTps === '-' ? output : `${output} (${outputTps} tps)`
 }
 
-function cacheCreationTTLLabel(record: UsageRecordListItem): string | null {
-  if (record.cost_breakdown.cache_creation_tokens <= 0) {
-    return null
-  }
-  switch (record.cache_creation_ttl) {
-    case '5m':
-      return t('5 分钟', '5 min')
-    case '1h':
-      return t('1 小时', '1 hour')
-    case 'mixed':
-      return t('混合', 'Mixed')
-    case 'unknown':
-    case null:
-      return t('未知', 'Unknown')
-  }
-}
-
-function cacheCreationTTLDetailLabel(record: UsageRecordListItem): string | null {
-  const ttl = cacheCreationTTLLabel(record)
-  if (record.cache_creation_ttl !== 'mixed' || ttl === null) {
-    return ttl
-  }
-  const buckets = [
-    record.cache_creation_5m_tokens === null
-      ? null
-      : `5m ${formatInteger(record.cache_creation_5m_tokens)}`,
-    record.cache_creation_1h_tokens === null
-      ? null
-      : `1h ${formatInteger(record.cache_creation_1h_tokens)}`,
-  ].filter((value): value is string => value !== null)
-  return buckets.length > 0 ? `${ttl} (${buckets.join(' / ')})` : ttl
-}
-
-function cacheCreationTTLSourceLabel(record: UsageRecordListItem): string {
-  switch (record.cache_creation_ttl_source) {
-    case 'upstream':
-      return t('上游用量', 'Upstream usage')
-    case 'enforced_request':
-      return t('执行策略归属（非上游观测）', 'Execution policy attribution (not observed upstream)')
-    case 'unknown':
-      return t('未知', 'Unknown')
-    default:
-      return t('未记录', 'Not recorded')
-  }
-}
-
-function cacheCreationTTLStatusLabel(record: UsageRecordListItem): string {
-  switch (record.cache_creation_ttl_status) {
-    case 'pending': return t('等待归属', 'Awaiting attribution')
-    case 'matched': return t('已关联', 'Matched')
-    case 'missing': return t('未取得执行归属', 'Execution attribution not found')
-    case 'expired': return t('归属已过期', 'Attribution expired')
-    case 'unsupported': return t('不支持归属查询', 'Attribution lookup unsupported')
-    case 'error': return t('归属查询失败', 'Attribution lookup failed')
-    case 'conflict': return t('归属冲突，保留原计费依据', 'Attribution conflict; original billing basis retained')
-    case 'not_applicable': return t('不适用', 'Not applicable')
-    case 'legacy': return t('历史记录', 'Legacy record')
-    default: return t('未记录', 'Not recorded')
-  }
-}
-
-function cacheCreationTTLReasonLabel(record: UsageRecordListItem): string | null {
-  switch (record.cache_creation_ttl_reason) {
-    case null:
-    case undefined: return null
-    case 'metadata_pending': return t('等待补充执行归属', 'Waiting for supplemental execution attribution')
-    case 'metadata_missing': return t('等待窗口内未取得执行归属', 'Execution attribution was not found within the waiting window')
-    case 'metadata_unavailable': return t('归属服务暂不可用', 'The attribution service is temporarily unavailable')
-    case 'metadata_expired': return t('已超出归属数据保留期', 'The attribution retention window has expired')
-    case 'metadata_unsupported':
-    case 'metadata_feature_incompatible': return t('当前插件未提供可用的 TTL 归属能力', 'The current plugin does not provide compatible TTL attribution')
-    case 'unsupported_metadata_version': return t('归属数据版本不受支持', 'The attribution data version is unsupported')
-    case 'unsupported_metadata_source': return t('归属数据来源不受支持', 'The attribution data source is unsupported')
-    case 'invalid_metadata_response':
-    case 'invalid_metadata_record':
-    case 'invalid_metadata_partition': return t('归属数据校验失败，未用于计费', 'Attribution data failed validation and was not used for billing')
-    case 'execution_id_missing': return t('原请求缺少有效执行 ID', 'The original request has no valid execution ID')
-    case 'caller_scope_missing': return t('无法确认请求所属 API Key', 'The request API key could not be verified')
-    case 'caller_scope_mismatch':
-    case 'execution_scope_conflict': return t('执行归属与请求身份不匹配', 'Execution attribution does not match the request identity')
-    case 'collector_origin_changed': return t('采集源已变更，未关联其他来源的数据', 'The collection source changed; data from another source was not matched')
-    case 'metadata_matched': return t('已按同一请求的执行策略确定 TTL', 'TTL was attributed using the execution policy for this request')
-    case 'upstream_reported':
-    case 'historical_upstream': return t('采用上游报告的 TTL', 'The upstream-reported TTL applies')
-    case 'upstream_policy_conflict': return t('上游 TTL 与执行策略不一致，按上游事实计价', 'Upstream TTL differs from the execution policy; upstream facts determine pricing')
-    case 'invalid_upstream_buckets': return t('上游混合 TTL 分桶无效，费用未定价', 'Upstream mixed TTL buckets are invalid; the cost is unpriced')
-    case 'non_claude': return t('此请求不适用 Claude TTL 归属', 'Claude TTL attribution does not apply to this request')
-    case 'count_tokens': return t('Token 计数请求不应用缓存 TTL 归属', 'Cache TTL attribution does not apply to token-count requests')
-    case 'no_cache_creation': return t('此请求没有缓存写入', 'This request has no cache writes')
-    case 'legacy_no_metadata': return t('历史记录没有执行归属', 'The legacy record has no execution attribution')
-    default: return t('归属说明不可用，请以已记录的计费依据为准。', 'Attribution details are unavailable; the recorded billing basis applies.')
-  }
-}
-
 function renderCacheCreationTokens(record: UsageRecordListItem) {
-  const ttl = cacheCreationTTLLabel(record)
-  return h('div', { class: 'usage-cache-creation-cell', title: ttl ? cacheCreationTTLSourceLabel(record) : undefined }, [
-    h('span', formatInteger(record.cost_breakdown.cache_creation_tokens)),
-    ttl
-      ? h(
-          NTag,
-          {
-            size: 'small',
-            bordered: false,
-            type: record.cache_creation_ttl === 'unknown' || record.cache_creation_ttl === null ? 'default' : 'info',
-          },
-          { default: () => ttl },
-        )
-      : null,
-  ])
+  return formatInteger(record.cost_breakdown.cache_creation_tokens)
 }
 
 function renderOutputWithTps(row: Pick<UsageRecordListItem, 'latency_ms' | 'output_tokens'>) {
@@ -1148,10 +1040,6 @@ function costBreakdownItemLabel(
       return t('缓存读', 'Cache read')
     case 'cache_creation':
       return t('缓存写', 'Cache write')
-    case 'cache_creation_5m':
-      return t('缓存写 5m', 'Cache write 5m')
-    case 'cache_creation_1h':
-      return t('缓存写 1h', 'Cache write 1h')
     case 'output':
       return t('输出', 'Output')
     case 'request':
@@ -1316,8 +1204,6 @@ const detailRows = computed(() => {
   if (!record) {
     return []
   }
-  const cacheCreationTTL = cacheCreationTTLDetailLabel(record)
-  const cacheCreationTTLReason = cacheCreationTTLReasonLabel(record)
   const rows: { label: string; value: string; tooltip?: string | null }[] = [
     { label: t('时间', 'Time'), value: formatDateTime(record.timestamp) },
     { label: t('记录模型', 'Record model'), value: formatModelWithReasoning(record) },
@@ -1329,23 +1215,12 @@ const detailRows = computed(() => {
     { label: t('API KEY 描述', 'API key description'), value: apiKeyDescriptionLabel(record.api_key_description) },
     { label: t('认证类型', 'Auth type'), value: textOrDash(record.auth) },
     { label: t('请求 ID', 'Request ID'), value: textOrDash(record.request_id) },
-    ...(record.execution_id ? [{ label: t('执行 ID', 'Execution ID'), value: record.execution_id }] : []),
     { label: t('结果', 'Result'), value: record.failed ? t('失败', 'Failed') : t('成功', 'Success') },
     { label: t('首字耗时', 'TTFT'), value: formatPositiveLatency(record.ttft_ms) },
     { label: t('总耗时', 'Latency'), value: formatLatency(record.latency_ms) },
     { label: t('输入 Token', 'Input tokens'), value: formatInteger(record.cost_breakdown.normal_input_tokens) },
     { label: t('缓存读 Token', 'Cache read tokens'), value: formatInteger(record.cost_breakdown.cache_read_tokens) },
     { label: t('缓存写 Token', 'Cache write tokens'), value: formatInteger(record.cost_breakdown.cache_creation_tokens) },
-    ...(cacheCreationTTL === null
-      ? []
-      : [
-          { label: t('缓存写 TTL', 'Cache write TTL'), value: cacheCreationTTL },
-          { label: t('TTL 来源', 'TTL source'), value: cacheCreationTTLSourceLabel(record) },
-          { label: t('TTL 归属状态', 'TTL attribution status'), value: cacheCreationTTLStatusLabel(record) },
-          ...(cacheCreationTTLReason === null ? [] : [{ label: t('TTL 归属说明', 'TTL attribution details'), value: cacheCreationTTLReason }]),
-          ...(record.cache_creation_policy_revision == null ? [] : [{ label: t('执行策略版本', 'Execution policy revision'), value: formatInteger(record.cache_creation_policy_revision) }]),
-          ...(record.cache_creation_observed_at ? [{ label: t('TTL 归属记录时间', 'TTL attribution recorded at'), value: formatDateTime(record.cache_creation_observed_at) }] : []),
-        ]),
     { label: t('输出 Token', 'Output tokens'), value: formatOutputWithTps(record) },
     { label: t('思考 Token', 'Reasoning tokens'), value: formatInteger(record.reasoning_tokens) },
     { label: t('总 Token', 'Total tokens'), value: formatInteger(record.total_tokens) },
@@ -1806,13 +1681,6 @@ onBeforeUnmount(() => {
   font-size: 11px;
   font-weight: 700;
   line-height: 20px;
-}
-
-:global(.records-table .usage-cache-creation-cell) {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px;
 }
 
 :global(.usage-cost-trigger) {

@@ -202,6 +202,7 @@ try {
   assert.equal(localizedApiErrorMessage('not_found', '峰谷时段模板不存在'), 'Time pricing template does not exist')
   const claudePricingErrors = [
     ['峰谷定价仅支持 DeepSeek 或 Claude 渠道 Token 价格', 'Time pricing only supports DeepSeek or Claude channel token prices'],
+    ['TTL 缓存价格已移除，请使用统一缓存写入价格', 'TTL cache prices have been removed. Use the unified cache write price.'],
     ['1 小时缓存价格仅支持 Claude 价格', '1-hour cache prices are only supported for Claude prices'],
     ['请选择 DeepSeek 或 Claude 渠道 Token 价格', 'Select DeepSeek or Claude channel token prices'],
   ]
@@ -226,10 +227,7 @@ try {
     'Plugin policy was saved but did not take effect',
   )
   const pluginBoundaryErrors = [
-    ['validation_error', 'Claude 缓存 TTL 只能配置在 API 密钥上', 'Claude cache TTL can only be configured on an API key'],
-    ['validation_error', 'Claude 缓存 TTL 必须为继承 CPA、5m 或 1h', 'Claude cache TTL must be Inherit CPA, 5m or 1h'],
-    ['plugin_claude_ttl_unavailable', 'Claude 缓存 TTL 尚未完成插件配置校验', 'Claude cache TTL plugin configuration has not been verified'],
-    ['plugin_sync_failed', '插件 API 密钥缓存 TTL 保存后未生效', 'The plugin API key cache TTL was saved but did not take effect'],
+    ['validation_error', 'Claude 缓存 TTL 配置已移除', 'Claude cache TTL settings have been removed'],
     ['plugin_feature_unsupported', '当前 CPA Helper Plugin 不支持响应模型核验', 'The current CPA Helper Plugin does not support response model verification'],
     ['model_catalog_out_of_sync', '同步期间 CPA 凭据模型注册已变化，请刷新后重试', 'CPA credential model registration changed during synchronization. Refresh and try again.'],
     ['model_catalog_sync_failed', 'CPA 注册凭据与元数据不一致，请重新同步', 'CPA registered credentials do not match the metadata. Sync again.'],

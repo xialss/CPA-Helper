@@ -76,12 +76,6 @@ const remoteStatusText = computed(() => {
 
 const collectorEnabledText = computed(() => (collectorStatus.value?.enabled ? t('开启', 'On') : t('关闭', 'Off')))
 const collectorRunningText = computed(() => (collectorStatus.value?.running ? t('运行中', 'Running') : t('空闲', 'Idle')))
-const pendingTTLText = computed(() => {
-  if ((collectorStatus.value?.ttl_pending_records ?? 0) <= 0) return ''
-  if (collectorStatus.value?.ttl_pending_reason === 'metadata_unavailable') return t('TTL 归属服务暂不可用；相关请求仍在处理归属或入账。', 'The TTL attribution service is temporarily unavailable; attribution or accounting is still in progress for these requests.')
-  if (collectorStatus.value?.ttl_pending_reason === 'collector_origin_changed') return t('采集源已切换；仍有请求正在处理归属或入账。', 'The collection source changed; attribution or accounting is still in progress for some requests.')
-  return t('正在处理 TTL 归属或入账。', 'TTL attribution or accounting is in progress.')
-})
 const isManagementKeySet = ref(false)
 const responseModelConfigLoading = ref(false)
 const responseModelConfigSaving = ref(false)
@@ -392,9 +386,6 @@ onBeforeUnmount(() => {
             <NDescriptionsItem :label="t('累计写入', 'Records written')">
               {{ formatInteger(collectorStatus?.records_collected ?? 0) }}
             </NDescriptionsItem>
-            <NDescriptionsItem :label="t('TTL 归属或入账处理中', 'TTL attribution or accounting in progress')">
-              {{ formatInteger(collectorStatus?.ttl_pending_records ?? 0) }}
-            </NDescriptionsItem>
             <NDescriptionsItem :label="t('最后轮询', 'Last poll')">
               {{ formatDateTime(collectorStatus?.last_poll_at ?? null) }}
             </NDescriptionsItem>
@@ -402,7 +393,6 @@ onBeforeUnmount(() => {
               {{ formatDateTime(collectorStatus?.last_success_at ?? null) }}
             </NDescriptionsItem>
           </NDescriptions>
-          <p v-if="pendingTTLText" class="form-help" role="status">{{ pendingTTLText }}</p>
           <NAlert
             v-if="collectorStatus?.last_error"
             type="warning"
