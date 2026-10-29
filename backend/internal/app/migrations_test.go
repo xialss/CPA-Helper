@@ -173,6 +173,11 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 			t.Fatalf("ai_radar_state.%s was not created", column)
 		}
 	}
+	for _, column := range []string{"image_studio_enabled", "ai_radar_enabled", "revision", "updated_at"} {
+		if !testColumnExists(t, app.db, "feature_center_settings", column) {
+			t.Fatalf("feature_center_settings.%s was not created", column)
+		}
+	}
 	if testTableExists(t, app.db, "user_card_shop_favorites") {
 		t.Fatal("user_card_shop_favorites should not exist")
 	}
@@ -349,12 +354,8 @@ func TestRunMigrationsUpgradesFromImmediatePreviousHead(t *testing.T) {
 func TestRunMigrationsBackfillsFirstChannelPriceHourlyCosts(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
-	prepareMigrationTestDatabase(t, dataDir, 202609080001)
+	a := newLegacyMigrationTestApp(t, dataDir, 202609080001)
 	ctx := context.Background()
-	a, err := NewWithOptions(ctx, NewOptions{Migrate: false, StartBackground: false})
-	if err != nil {
-		t.Fatal(err)
-	}
 	defer a.Close()
 
 	start := time.Now().In(appTimeLocation).Truncate(time.Hour).Add(-4 * time.Hour)
@@ -1818,13 +1819,9 @@ func TestRunMigrationsRetentionMetadataPreservesExistingPendingFact(t *testing.T
 func TestMigrateRecoversPreexistingPendingFactFrom202607310003(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
-	prepareMigrationTestDatabase(t, dataDir, 202607310003)
+	legacyApp := newLegacyMigrationTestApp(t, dataDir, 202607310003)
 
 	ctx := context.Background()
-	legacyApp, err := NewWithOptions(ctx, NewOptions{Migrate: false, StartBackground: false})
-	if err != nil {
-		t.Fatalf("open 202607310003 database: %v", err)
-	}
 	now := dbTime(time.Now().In(appTimeLocation))
 	initialProvider := "legacy-provider"
 	correctedProvider := "corrected-provider"
@@ -2526,6 +2523,21 @@ func TestRunMigrationsRepairsRetainedNestedMetadataWithoutSource(t *testing.T) {
 	if factSourceKey.Valid || factAccount != "no-source@example.com" || factAuth != "api_key" || factAuthIndex != "no-source-auth-index" {
 		t.Fatalf("retained nested metadata fact = %#v/%q/%q/%q", factSourceKey, factAccount, factAuth, factAuthIndex)
 	}
+}
+
+// Legacy fixture setup exercises migration/data helpers without starting an
+// application against a schema which intentionally predates its required state.
+func newLegacyMigrationTestApp(t *testing.T, dataDir string, version int64) *App {
+	t.Helper()
+	dbPath := prepareMigrationTestDatabase(t, dataDir, version)
+	db, err := sql.Open("sqlite", sqliteDSN(dbPath, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	app := &App{db: db}
+	t.Cleanup(app.Close)
+	return app
 }
 
 func prepareMigrationTestDatabase(t *testing.T, dataDir string, version int64) string {

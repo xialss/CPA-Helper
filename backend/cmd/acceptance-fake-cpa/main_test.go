@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -26,6 +28,72 @@ func TestV8ConfigReturnsRootConfiguration(t *testing.T) {
 			t.Fatalf("native v8 config is missing the root %q object: %v", field, err)
 		}
 	}
+}
+
+func TestV8ProviderFamilyWritePreservesRawAndLegacyViews(t *testing.T) {
+	fixture := newFakeCPA()
+	call := func(method, path, body string, status int) []byte {
+		t.Helper()
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer acceptance-management-key")
+		response := httptest.NewRecorder()
+		fixture.ServeHTTP(response, request)
+		if response.Code != status {
+			t.Fatalf("%s %s = %d: %s", method, path, response.Code, response.Body.String())
+		}
+		return response.Body.Bytes()
+	}
+	initial := fixture.v8Config()["api-keys"].(map[string]any)
+	for _, kind := range providerKinds {
+		for _, group := range objectList(initial[kind.Provider]) {
+			if group["keys"] == nil {
+				t.Fatalf("%s keys must be a non-null array", kind.Provider)
+			}
+			if kind.Provider != "openai-compatibility" {
+				for _, key := range objectList(group["keys"]) {
+					if _, exists := key["base-url"]; exists {
+						t.Fatal("native base-url duplicated into key")
+					}
+				}
+			}
+		}
+	}
+	call(http.MethodPut, "/v8/management/config/api-keys/codex", `[{"name":"external","base-url":"https://synthetic.example/v1","request-retry":4,"disable-cooling":true,"keys":[{"api-key":"synthetic-one","request-retry":null,"request-scoped-errors":[],"future":{"n":9007199254740993123}},{"api-key":"synthetic-two","request-retry":0,"disable-cooling":false}]}]`, http.StatusOK)
+	var groups []map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(call(http.MethodGet, "/v8/management/config/api-keys/codex", "", http.StatusOK)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&groups); err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || len(groups[0]["keys"].([]any)) != 2 {
+		t.Fatalf("group shape changed: %#v", groups)
+	}
+	keys := groups[0]["keys"].([]any)
+	first := keys[0].(map[string]any)
+	if value, exists := first["request-retry"]; !exists || value != nil {
+		t.Fatal("explicit null override was lost")
+	}
+	if first["future"].(map[string]any)["n"] != json.Number("9007199254740993123") || len(first["request-scoped-errors"].([]any)) != 0 {
+		t.Fatalf("opaque value or empty override changed: %#v", first)
+	}
+	var legacy []map[string]any
+	decoder = json.NewDecoder(bytes.NewReader(call(http.MethodGet, "/v0/management/codex-api-key", "", http.StatusOK)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&legacy); err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy) != 2 || legacy[0]["request-retry"] != json.Number("4") || legacy[1]["request-retry"] != json.Number("0") || legacy[1]["disable-cooling"] != false {
+		t.Fatalf("legacy inherited view = %#v", legacy)
+	}
+	call(http.MethodGet, "/v8/management/credentials", "", http.StatusOK)
+	call(http.MethodPut, "/v0/management/codex-api-key", `[{"api-key":"synthetic-legacy","base-url":"https://legacy.example","models":[]}]`, http.StatusOK)
+	if body := call(http.MethodGet, "/v8/management/config/api-keys/codex", "", http.StatusOK); !bytes.Contains(body, []byte("synthetic-legacy")) || bytes.Contains(body, []byte("synthetic-one")) {
+		t.Fatalf("legacy write did not refresh v8 view: %s", body)
+	}
+	call(http.MethodPut, "/v8/management/config/api-keys/codex", `[]`, http.StatusOK)
+	call(http.MethodPut, "/v8/management/config/api-keys/codex", `[{"keys":[{"api-key":"x","base-url":"https://invalid.example"}]}]`, http.StatusBadRequest)
+	call(http.MethodPut, "/v8/management/config/api-keys/codex", `null`, http.StatusBadRequest)
+	call(http.MethodPut, "/v8/management/config/api-keys/unknown", `[]`, http.StatusNotFound)
 }
 
 func TestValidateLoopbackListenAddress(t *testing.T) {

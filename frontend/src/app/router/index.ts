@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 import { getMe } from '@/features/auth/api/authApi'
 import { setCurrentUser } from '@/features/auth/state/currentUser'
+import { verifyFeatureState } from '@/features/feature-center/state/useFeatureState'
 import type { AuthUser } from '@/shared/types/api'
 
 function homePath(user: AuthUser): string {
@@ -122,12 +123,14 @@ export const router = createRouter({
         {
           path: 'account/image-studio',
           name: 'account-image-studio',
-          component: () => import('@/features/image-studio/views/ImageStudioView.vue'),
+          component: () => import('@/features/feature-center/views/FeatureRouteView.vue'),
+          meta: { feature: 'image_studio' },
         },
         {
           path: 'account/ai-radar',
           name: 'account-ai-radar',
-          component: () => import('@/features/ai-radar/views/AiRadarView.vue'),
+          component: () => import('@/features/feature-center/views/FeatureRouteView.vue'),
+          meta: { feature: 'ai_radar' },
         },
         {
           path: 'account/settings',
@@ -200,6 +203,10 @@ router.beforeEach(async (to) => {
     }
     if (to.meta.requiresAdmin && !user.is_admin) {
       return { path: '/account/usage' }
+    }
+    if (to.meta.feature) {
+      // Feature failures stay in the feature gate; they are not auth failures.
+      await verifyFeatureState().catch(() => { /* The route displays the shared pause state. */ })
     }
     return true
   } catch {

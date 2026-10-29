@@ -98,9 +98,9 @@ async function download(id: string): Promise<void> {
   } catch (error) { action.error(error) }
 }
 
-function retry(id: string): void {
+async function retry(id: string): Promise<void> {
   const action = beginAction()
-  try { studio.retry(id) } catch (error) { action.error(error) }
+  try { await studio.retry(id) } catch (error) { action.error(error) }
 }
 
 async function retrySave(id: string): Promise<void> {

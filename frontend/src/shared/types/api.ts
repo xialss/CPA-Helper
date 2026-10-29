@@ -1,5 +1,11 @@
 export type ThemePreference = 'system' | 'light' | 'dark'
 
+export interface FeatureCenterSnapshot {
+  revision: number
+  image_studio_enabled: boolean
+  ai_radar_enabled: boolean
+}
+
 export interface AuthUser {
   id: number
   username: string
@@ -211,8 +217,22 @@ export interface AIProviderKeyEntry {
 export interface AIProviderCloak {
   mode?: string | null
   strict_mode?: boolean | null
-  sensitive_words: string[]
+  sensitive_words?: string[] | null
   cache_user_id?: boolean | null
+}
+
+export interface AIProviderRequestErrorRule {
+  source_hash?: string
+  status?: number | null
+  match?: string[] | null
+  match_regex?: string[] | null
+  action?: string | null
+}
+
+export interface AIProviderRuntimePolicy {
+  disable_cooling?: boolean | null
+  request_retry?: number | null
+  request_scoped_errors?: AIProviderRequestErrorRule[] | null
 }
 
 export interface AIProviderRecentRequestBucket {
@@ -226,6 +246,7 @@ export interface AIProviderItem {
   brand_label: string
   index: number
   identity_hash: string
+  source_hash?: string | null
   api_key?: string
   api_key_hash?: string | null
   api_key_masked?: string | null
@@ -244,6 +265,13 @@ export interface AIProviderItem {
   headers: AIProviderHeader[]
   excluded_models: string[]
   disable_cooling?: boolean | null
+  request_retry?: number | null
+  request_scoped_errors?: AIProviderRequestErrorRule[] | null
+  runtime_policy_effective?: AIProviderRuntimePolicy | null
+  alpha_search?: boolean | null
+  disable_codex_cloaking?: boolean | null
+  support_prompt_cache_key?: boolean | null
+  fingerprint_profile?: string | null
   websockets?: boolean | null
   rebuild_mid_system_message?: boolean | null
   experimental_cch_signing?: boolean | null
@@ -257,7 +285,7 @@ export interface AIProviderItem {
   metadata?: Record<string, unknown>
 }
 
-export type AIProviderPayload = Omit<AIProviderItem, 'channel_key' | 'local_alias'>
+export type AIProviderPayload = Omit<AIProviderItem, 'channel_key' | 'local_alias' | 'runtime_policy_effective'>
 
 export interface AIProviderUsage {
   provider?: string
@@ -298,6 +326,7 @@ export interface AIProvidersResponse {
 /** Non-secret optimistic-concurrency reference used when reordering a provider list. */
 export interface AIProviderOrderItem {
   index: number
+  source_hash?: string | null
   identity_hash?: string | null
   api_key_hash?: string | null
   name?: string | null

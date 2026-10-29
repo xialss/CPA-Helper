@@ -35,6 +35,7 @@ const server = await createServer({
     name: 'image-studio-smoke',
     enforce: 'pre',
     resolveId(id, importer) {
+      if (/\/features\/feature-center\/state\/useFeatureState(?:\.ts)?$/.test(id.replaceAll('\\', '/'))) return '\0studio-ui:features'
       if (id === 'naive-ui' || id === 'lucide-vue-next' || id === 'vue-router') return `\0studio-ui:${id}`
       if (/\/shared\/composables\/useThemePreference(?:\.ts)?$/.test(id.replaceAll('\\', '/'))) return '\0studio-ui:theme'
       const parent = importer?.startsWith(virtualPrefix) ? importer.slice(virtualPrefix.length) : importer
@@ -50,6 +51,14 @@ const server = await createServer({
       if (importer?.startsWith(virtualPrefix) && id.startsWith('.')) return this.resolve(id, parent, { skipSelf: true })
     },
     async load(id) {
+      if (id === '\0studio-ui:features') return `
+        import { ref } from 'vue';
+        const imageStudio = ref('enabled'); const aiRadar = ref('enabled');
+        const snapshot = { revision: 1, image_studio_enabled: true, ai_radar_enabled: true };
+        export const setFeatureSession = () => {};
+        export const verifyFeatureState = async () => snapshot;
+        export const useFeatureState = () => ({ imageStudio, aiRadar, state: ref({ verified: true, snapshot }), verify: verifyFeatureState });
+      `
       if (id.startsWith(virtualPrefix)) {
         const filename = `${id.slice(virtualPrefix.length, -3)}.vue`
         const { descriptor, errors } = parse(await readFile(filename, 'utf8'), { filename })
@@ -1203,6 +1212,7 @@ try {
         assert.equal(button.attrs['aria-pressed'], true)
       }
       form.emit('submit', { preventDefault() {} })
+      await new Promise((resolve) => setImmediate(resolve))
       assert.equal(calls.length, 1)
       assert.equal(calls[0].body.model, saved.model)
       const content = calls[0].body.messages[0].content
@@ -1343,6 +1353,7 @@ try {
     }
     studio.connection.value = { ...connection }
     const initial = studio.loadModels()
+    await new Promise((resolve) => setImmediate(resolve))
     calls[0].resolve(modelsResponse([...modelNames, modelNames[0]]))
     await initial
     assert.deepEqual(studio.visibleModels.value, modelNames.slice(0, 3))
@@ -1353,11 +1364,13 @@ try {
     assert.equal(studio.draft.value.model, 'gpt-image-1', 'Collapsing candidates preserves the selected model')
 
     const oldLoad = studio.loadModels()
+    await new Promise((resolve) => setImmediate(resolve))
     studio.connection.value.baseUrl = 'https://different.example.invalid/custom/'
     assert.equal(calls[1].options.signal.aborted, true)
     assert.deepEqual(studio.models.value, [])
     assert.equal(studio.modelsLoaded.value, false)
     const replacement = studio.loadModels()
+    await new Promise((resolve) => setImmediate(resolve))
     calls[1].resolve(modelsResponse(['nai-stale-success']))
     await oldLoad
     assert.equal(studio.modelsLoading.value, true, 'Old finally cannot clear the new loading state')
@@ -1367,9 +1380,11 @@ try {
     assert.equal(calls[2].url, 'https://different.example.invalid/custom/v1/models')
 
     const oldFailure = studio.loadModels()
+    await new Promise((resolve) => setImmediate(resolve))
     studio.connection.value.apiKey = 'changed-fixture-key'
     assert.deepEqual(studio.models.value, [])
     const newKeyLoad = studio.loadModels()
+    await new Promise((resolve) => setImmediate(resolve))
     calls[4].resolve(modelsResponse(['NAI-new-key']))
     await newKeyLoad
     calls[3].reject(new Error('late old-connection failure'))
@@ -1378,6 +1393,7 @@ try {
     assert.equal(studio.modelProblem.value, null)
     assert.equal(calls[4].options.headers.Authorization, 'Bearer changed-fixture-key')
     const failed = studio.loadModels()
+    await new Promise((resolve) => setImmediate(resolve))
     calls[5].resolve(new Response('{"error":{"message":"fixture failure"}}', { status: 503 }))
     await failed
     assert.equal(studio.modelProblem.value.kind, 'http')
@@ -1448,6 +1464,7 @@ try {
       const generateButton = uiControl('NButton', (item) => item.text === '开始生成')
       assert.equal(generateButton.props.attrType, 'submit')
       form.emit('submit', { preventDefault() {} })
+      await new Promise((resolve) => setImmediate(resolve))
       assert.equal(calls.length, 5, 'The actual form dispatches all 5 before any response')
       const firstBatch = studio.batchIds.value[0]
       await nextTick()
@@ -1457,6 +1474,7 @@ try {
       inputControl('studio-request-model').emit('update:value', 'NAI-Test-Model')
       inputControl('studio-image-count').emit('update:value', 3)
       form.emit('submit', { preventDefault() {} })
+      await new Promise((resolve) => setImmediate(resolve))
       assert.equal(calls.length, 8, 'A second form submission starts all 3 while 5 are still in flight')
       assert.equal(studio.activeCount.value, 8)
       await nextTick()
@@ -1635,6 +1653,7 @@ try {
         assert.equal(inputControl('studio-negative-preset-name'), undefined)
         assert.ok(![...bridge.controls].some((item) => item.name === 'NButton' && item.text === '删除预设' && parentProp(item, 'kind') === 'negative'))
         form.emit('submit', { preventDefault() {} })
+        await new Promise((resolve) => setImmediate(resolve))
         assert.equal(calls.length, index + 1)
         assert.ok(calls[index].messages[0].content.endsWith(`negative_prompt:${text}}`), `${name} is serialized verbatim`)
         const task = studio.tasks.value.find((item) => item.batchId === studio.batchIds.value[0])
@@ -2286,6 +2305,7 @@ try {
       assert.equal(studio.modelsLoaded.value, false)
       assert.deepEqual(studio.models.value, [])
       await switchOwner(303)
+      await until(() => !studio.presetsSaving.value, 'restored account presets synchronized')
       assert.equal(studio.presets.value[0].text, updatedText)
       assert.equal(studio.activeCount.value, 0)
     } finally {

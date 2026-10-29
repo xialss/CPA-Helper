@@ -450,12 +450,8 @@ func TestRetiredClaudeCacheTTLScalarChangesDoNotChangeCostsOrReplayQuota(t *test
 func TestRetiredClaudeCacheTTLMigrationRebuildsCachedCostsAndPreservesSettledQuota(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
-	prepareMigrationTestDatabase(t, dataDir, 202610290001)
+	a := newLegacyMigrationTestApp(t, dataDir, 202610290001)
 	ctx := context.Background()
-	a, err := NewWithOptions(ctx, NewOptions{Migrate: false, StartBackground: false})
-	if err != nil {
-		t.Fatal(err)
-	}
 	defer a.Close()
 	userID := seedQuotaTestUser(t, a, "retired-cache-upgrade")
 	apiKey, model := "sk-retired-cache-upgrade", "claude-retired-cache-upgrade"

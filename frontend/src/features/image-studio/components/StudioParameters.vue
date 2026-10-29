@@ -28,6 +28,7 @@ const {
   modelsLoading, modelsLoaded, modelProblem, models,
 } = studio
 const submitProblem = ref<StudioProblem | null>(null)
+const checkingSubmission = ref(false)
 const tagMarketVisible = ref(false)
 const pickerVersion = ref(0)
 const modelOptions = computed(() => visibleModels.value.map((model) => ({ label: model, value: model })))
@@ -164,21 +165,27 @@ watch(connection, () => {
   pickerVersion.value++
 }, { deep: true, flush: 'sync' })
 watch(ownerId, () => {
+  checkingSubmission.value = false
   submitProblem.value = null
   tagMarketVisible.value = false
   selectedCharacterId.value = null
 }, { flush: 'sync' })
+
+watch(studio.availability, () => { checkingSubmission.value = false }, { flush: 'sync' })
 
 function renderModelLabel(option: SelectOption | SelectGroupOption) {
   const text = String(option.label ?? option.value ?? '')
   return h('span', { title: text }, text)
 }
 
-function submit(): void {
+async function submit(): Promise<void> {
+  if (checkingSubmission.value) return
+  const action = beginAction()
+  checkingSubmission.value = true
   submitProblem.value = null
-  try { emit('submitted', studio.submit()) } catch (error) {
-    submitProblem.value = toStudioProblem(error, connection.value.apiKey)
-  }
+  try { const batch = await studio.submit(); if (action.current()) emit('submitted', batch) } catch (error) {
+    if (action.current()) submitProblem.value = toStudioProblem(error, connection.value.apiKey)
+  } finally { if (action.current()) checkingSubmission.value = false }
 }
 
 async function saveSettings(): Promise<void> {
@@ -338,7 +345,7 @@ async function saveSettings(): Promise<void> {
       <label for="studio-image-count" class="field-heading">{{ t('生成张数', 'Images') }}</label>
       <div class="generate-controls">
         <NInputNumber v-model:value="draft.count" :step="1" :min="1" :input-props="{ id: 'studio-image-count', 'aria-label': t('生成张数', 'Image count') }" />
-        <NButton type="primary" attr-type="submit" size="large" :disabled="ownerId === null || localLoading">
+        <NButton type="primary" attr-type="submit" size="large" :loading="checkingSubmission" :disabled="ownerId === null || localLoading || checkingSubmission || studio.availability.value !== 'enabled'">
           <template #icon><NIcon :component="Sparkles" /></template>{{ t('开始生成', 'Generate') }}
         </NButton>
       </div>

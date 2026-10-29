@@ -9,7 +9,7 @@ import type {
   StudioGalleryPreferences,
   TextPreset,
 } from '../types'
-import { ImageStudioError } from '../utils/studioErrors'
+import { cancelledError, ImageStudioError } from '../utils/studioErrors'
 
 const databaseName = 'cpa-helper-image-studio'
 const databaseVersion = 1
@@ -89,15 +89,26 @@ export class ImageStudioStorage implements GenerationPersistence {
     return opening
   }
 
-  private async transaction<T>(stores: string[], mode: IDBTransactionMode, work: (transaction: IDBTransaction) => () => T): Promise<T> {
+  private async transaction<T>(stores: string[], mode: IDBTransactionMode, work: (transaction: IDBTransaction) => () => T, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) throw cancelledError()
     const db = await this.database()
+    if (signal?.aborted) throw cancelledError()
     return new Promise<T>((resolve, reject) => {
       const transaction = db.transaction(stores, mode)
+      const cancel = () => {
+        try { transaction.abort() } catch (error) {
+          // A transaction whose commit already sealed cannot be rolled back.
+          // Its result is still rejected by the runner's owner/feature epoch.
+          if (!(error instanceof DOMException) || error.name !== 'InvalidStateError') throw error
+        }
+      }
+      const cleanup = () => signal?.removeEventListener('abort', cancel)
+      signal?.addEventListener('abort', cancel, { once: true })
       let result: () => T
       // Request success is not commit success; publish writes only on complete.
-      transaction.oncomplete = () => resolve(result())
-      transaction.onabort = () => reject(transactionError(transaction.error))
-      transaction.onerror = () => reject(transactionError(transaction.error))
+      transaction.oncomplete = () => { cleanup(); resolve(result()) }
+      transaction.onabort = () => { cleanup(); reject(signal?.aborted ? cancelledError() : transactionError(transaction.error)) }
+      transaction.onerror = () => { cleanup(); reject(transactionError(transaction.error)) }
       try {
         result = work(transaction)
       } catch (error) {
@@ -195,14 +206,14 @@ export class ImageStudioStorage implements GenerationPersistence {
     })
   }
 
-  saveTask(ownerId: number, task: StoredGenerationTask, image?: Blob): Promise<void> {
+  saveTask(ownerId: number, task: StoredGenerationTask, image?: Blob, signal?: AbortSignal): Promise<void> {
     requireOwner(ownerId)
     if (task.ownerId !== ownerId) throw new ImageStudioError('storage', '记录不属于当前账号', 'This record does not belong to the current account')
     return this.transaction(['tasks', 'images'], 'readwrite', (transaction) => {
       transaction.objectStore('tasks').put(task)
       if (image) transaction.objectStore('images').put({ ownerId, id: task.id, blob: image })
       return () => undefined
-    })
+    }, signal)
   }
 
   listHistory(ownerId: number, cursor: HistoryCursor | null = null, pageSize = 24): Promise<HistoryPage> {

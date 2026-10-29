@@ -8,16 +8,17 @@ import { useImageStudio } from './useImageStudio'
 
 // Dialog callbacks and delayed UI feedback must belong to the same account and mounted view.
 export function useStudioFeedback() {
-  const { ownerId, connection } = useImageStudio()
+  const { ownerId, connection, availability } = useImageStudio()
   const message = useMessage()
   let version = 0
   watch(ownerId, () => { version++ }, { flush: 'sync' })
+  watch(availability, () => { version++ }, { flush: 'sync' })
   onScopeDispose(() => { version++ })
 
   return function beginAction() {
     const captured = version
     const secret = connection.value.apiKey
-    const current = () => captured === version && ownerId.value !== null
+    const current = () => captured === version && ownerId.value !== null && availability.value === 'enabled'
     return {
       current,
       success(zh: string, en: string) {

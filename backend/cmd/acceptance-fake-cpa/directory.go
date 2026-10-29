@@ -166,35 +166,7 @@ func (s *fakeCPA) fillAuthIndexes(previous []fixtureCredential) {
 func (s *fakeCPA) v8Config() map[string]any {
 	providers := map[string]any{}
 	for _, kind := range providerKinds {
-		groups := []map[string]any{}
-		for _, entry := range s.providers[kind.ConfigKey] {
-			group := copyObject(entry)
-			delete(group, "api-key")
-			delete(group, "auth-index")
-			if kind.Provider == "openai-compatibility" {
-				delete(group, "api-key-entries")
-				keys := []map[string]any{}
-				for _, raw := range objectList(entry["api-key-entries"]) {
-					key := copyObject(raw)
-					key["auth_index"] = key["auth-index"]
-					delete(key, "auth-index")
-					keys = append(keys, key)
-				}
-				group["keys"] = keys
-				if len(keys) == 0 {
-					group["keys"] = nil
-					group["auth_index"] = entry["auth-index"]
-				}
-			} else {
-				key := copyObject(entry)
-				key["auth_index"] = key["auth-index"]
-				key["disabled"] = providerDisabled(entry, entry)
-				delete(key, "auth-index")
-				group["keys"] = []map[string]any{key}
-			}
-			groups = append(groups, group)
-		}
-		providers[kind.Provider] = groups
+		providers[kind.Provider] = s.v8ProviderGroups(kind.ConfigKey, kind.Provider)
 	}
 	return map[string]any{
 		"api-keys": providers,

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { NAlert, NButton, NEmpty, NIcon, NSpin, NTooltip, useMessage } from 'naive-ui'
 import { ExternalLink, RefreshCw } from 'lucide-vue-next'
 
@@ -18,6 +18,7 @@ import {
   radarAutoRefreshIntervalMs,
 } from '@/features/ai-radar/utils/radarSchedule'
 import { useCurrentUser } from '@/features/auth/state/currentUser'
+import { useFeatureState } from '@/features/feature-center/state/useFeatureState'
 import { isApiRequestError } from '@/shared/api/apiClient'
 import { useI18n } from '@/shared/i18n'
 import type { AIRadarHistoryResponse, AIRadarResponse } from '@/shared/types/api'
@@ -26,6 +27,7 @@ import { formatDateTime } from '@/shared/utils/format'
 const message = useMessage()
 const { serverText, t } = useI18n()
 const { currentUser } = useCurrentUser()
+const { aiRadar: availability, verify } = useFeatureState()
 
 const live = ref<AIRadarResponse | null>(null)
 const liveLoading = ref(false)
@@ -49,6 +51,9 @@ let lastSourceRevision: string | null = null
 let isMounted = false
 let forceRefreshInFlight = false
 let autoRefreshQueued = false
+let lifecycle = 0
+let liveController: AbortController | null = null
+let historyController: AbortController | null = null
 
 const isAdmin = computed(() => currentUser.value?.is_admin === true)
 
@@ -79,11 +84,19 @@ function describeError(error: unknown, fallback: string): string {
  * slower earlier response can never overwrite a newer one.
  */
 async function requestLive(force: boolean): Promise<AIRadarResponse | null> {
+  if (availability.value !== 'enabled') return null
+  const epoch = lifecycle
   const generation = ++liveGeneration
+  liveController?.abort()
+  const controller = new AbortController()
+  liveController = controller
+  const owns = () => epoch === lifecycle && generation === liveGeneration && availability.value === 'enabled'
   liveLoading.value = true
   try {
-    const response = force ? await refreshAIRadar() : await getAIRadar()
-    if (generation !== liveGeneration) return null
+    await verify('ai_radar')
+    if (!owns()) return null
+    const response = force ? await refreshAIRadar(controller.signal) : await getAIRadar(controller.signal)
+    if (!owns()) return null
     live.value = response
     liveError.value = null
     // An explicit force refresh reloads history unconditionally; a timed read
@@ -91,12 +104,12 @@ async function requestLive(force: boolean): Promise<AIRadarResponse | null> {
     syncHistoryWithRevision(response.source_updated_at, !force)
     return response
   } catch (error) {
-    if (generation !== liveGeneration) return null
+    if (!owns()) return null
     liveError.value = describeError(error, t('加载 AI 雷达失败', 'Failed to load the AI radar'))
     return null
   } finally {
     // The newest request is always the one that clears the spinner.
-    if (generation === liveGeneration) liveLoading.value = false
+    if (owns()) { liveLoading.value = false; liveController = null }
   }
 }
 
@@ -119,15 +132,16 @@ function syncHistoryWithRevision(sourceUpdatedAt: string | null, reload: boolean
 /** Re-arms from the clock each time, so a slept or throttled tab self-corrects. */
 function scheduleAutoRefresh() {
   window.clearTimeout(autoRefreshTimer)
-  if (!isMounted) return
+  if (!isMounted || availability.value !== 'enabled') return
   autoRefreshTimer = window.setTimeout(() => {
     autoRefreshTimer = undefined
-    if (!isMounted) return
+    if (!isMounted || availability.value !== 'enabled') return
     void runAutoRefresh()
   }, msUntilNextBoundary(Date.now(), autoRefreshIntervalMs))
 }
 
 async function runAutoRefresh() {
+  if (availability.value !== 'enabled') return
   if (forceRefreshInFlight || refreshing.value) {
     autoRefreshQueued = true
     return
@@ -138,18 +152,24 @@ async function runAutoRefresh() {
 }
 
 async function loadHistory() {
+  if (availability.value !== 'enabled') return
+  const epoch = lifecycle
   const generation = ++historyGeneration
+  historyController?.abort()
+  const controller = new AbortController()
+  historyController = controller
+  const owns = () => epoch === lifecycle && generation === historyGeneration && availability.value === 'enabled'
   historyLoading.value = true
   try {
-    const response = await getAIRadarHistory(historyWindow.value)
-    if (generation !== historyGeneration) return
+    const response = await getAIRadarHistory(historyWindow.value, controller.signal)
+    if (!owns()) return
     history.value = response
   } catch (error) {
-    if (generation !== historyGeneration) return
+    if (!owns()) return
     history.value = null
     message.error(describeError(error, t('加载历史数据失败', 'Failed to load history')))
   } finally {
-    if (generation === historyGeneration) historyLoading.value = false
+    if (owns()) { historyLoading.value = false; historyController = null }
   }
 }
 
@@ -165,7 +185,8 @@ function handleWindowChange(value: RadarHistoryWindow) {
  * rows without upstream changing its revision.
  */
 async function forceRefresh() {
-  if (refreshing.value) return
+  if (refreshing.value || availability.value !== 'enabled') return
+  const epoch = lifecycle
   refreshing.value = true
   forceRefreshInFlight = true
   try {
@@ -176,30 +197,50 @@ async function forceRefresh() {
     }
     await loadHistory()
   } finally {
-    forceRefreshInFlight = false
-    refreshing.value = false
-    if (isMounted && autoRefreshQueued) {
-      autoRefreshQueued = false
-      void runAutoRefresh()
+    if (epoch === lifecycle) {
+      forceRefreshInFlight = false
+      refreshing.value = false
+      if (isMounted && autoRefreshQueued) {
+        autoRefreshQueued = false
+        void runAutoRefresh()
+      }
     }
   }
 }
 
 onMounted(() => {
   isMounted = true
+  if (availability.value !== 'enabled') return
   void loadLive()
   void loadHistory()
   scheduleAutoRefresh()
 })
 
-onBeforeUnmount(() => {
-  isMounted = false
+function deactivate(): void {
+  lifecycle++
   autoRefreshQueued = false
   forceRefreshInFlight = false
   liveGeneration += 1
   historyGeneration += 1
+  liveController?.abort()
+  historyController?.abort()
+  liveController = null
+  historyController = null
+  liveLoading.value = false
+  historyLoading.value = false
+  refreshing.value = false
   window.clearTimeout(autoRefreshTimer)
   autoRefreshTimer = undefined
+}
+
+watch(availability, (next) => {
+  if (next !== 'enabled') { deactivate(); return }
+  if (isMounted) { loadLive(); void loadHistory(); scheduleAutoRefresh() }
+}, { flush: 'sync' })
+
+onBeforeUnmount(() => {
+  isMounted = false
+  deactivate()
 })
 </script>
 

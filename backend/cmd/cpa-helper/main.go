@@ -272,8 +272,9 @@ func serve(ctx context.Context, options backendApp.NewOptions) error {
 	defer app.Close()
 
 	if err := httpserver.Run(ctx, httpserver.Config{
-		Addr:    addr,
-		Handler: app.Routes(),
+		Addr:       addr,
+		Handler:    app.Routes(),
+		OnShutdown: app.StopFeatureCenterEvents,
 	}); err != nil {
 		return fmt.Errorf("server failed: %w", err)
 	}

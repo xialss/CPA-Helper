@@ -141,8 +141,26 @@ func TestNewWithOptionsDoesNotStartAIRadarSamplingWithoutBackgroundServices(t *t
 		t.Fatal(err)
 	}
 	defer app.Close()
-	if app.aiRadarSampling != nil {
-		t.Fatal("AI radar sampling started while background services were disabled")
+	assertNotStarted := func() {
+		t.Helper()
+		if app.aiRadarSampling != nil {
+			app.aiRadarSampling.mu.Lock()
+			started := app.aiRadarSampling.cancel != nil || app.aiRadarSampling.done != nil
+			app.aiRadarSampling.mu.Unlock()
+			if started {
+				t.Fatal("AI radar sampling started while background services were disabled")
+			}
+		}
+	}
+	assertNotStarted()
+	upstream := &aiRadarTestUpstream{liveBody: aiRadarLivePayloadJSON(t, time.Now().Format(time.RFC3339))}
+	app.aiRadarHTTPClient = upstream.client
+	app.startFeatureCenterBackground()
+	featureCenterTestUpdate(t, app, true, false)
+	featureCenterTestUpdate(t, app, true, true)
+	assertNotStarted()
+	if upstream.liveRequestCount() != 0 || upstream.historyRequestCount() != 0 || aiRadarHistoryRowCount(t, app) != 0 {
+		t.Fatal("background-disabled startup or re-enable fetched upstream data or sampled history")
 	}
 }
 
@@ -480,6 +498,10 @@ func TestRequireSchemaShapeRejectsMissingNewModelPricingSchema(t *testing.T) {
 		{table: "ai_radar_points", column: "created_at"},
 		{table: "ai_radar_state", column: "backfill_completed_at", dropTable: true},
 		{table: "ai_radar_state", column: "updated_at"},
+		{table: "feature_center_settings", column: "image_studio_enabled", dropTable: true},
+		{table: "feature_center_settings", column: "ai_radar_enabled"},
+		{table: "feature_center_settings", column: "revision"},
+		{table: "feature_center_settings", column: "updated_at"},
 		{table: "usage_records", column: "cache_creation_metadata"},
 		{table: "usage_records", column: "source_key"},
 		{table: "usage_analytics_facts", column: "cache_creation_metadata"},

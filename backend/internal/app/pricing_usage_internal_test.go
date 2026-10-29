@@ -805,6 +805,8 @@ func TestBillingPriceIndexUsesCachedSelectorsWithoutChannelPrices(t *testing.T) 
 		managementCalls++
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
+		case "/v8/management/config":
+			http.NotFound(w, r)
 		case "/v0/management/gemini-api-key":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
 				"auth-index": sharedAuthIndex,
@@ -847,8 +849,9 @@ func TestBillingPriceIndexUsesCachedSelectorsWithoutChannelPrices(t *testing.T) 
 	if err := app.refreshModelPriceSelectorsIfStale(ctx, cfg); err != nil {
 		t.Fatalf("refresh selectors failed: %v", err)
 	}
-	if managementCalls != len(aiProviderBrandConfigs) {
-		t.Fatalf("management calls after refresh = %d, want %d", managementCalls, len(aiProviderBrandConfigs))
+	wantRefreshCalls := 1 + len(aiProviderBrandConfigs) // v8 capability probe followed by the legacy lists.
+	if managementCalls != wantRefreshCalls {
+		t.Fatalf("management calls after refresh = %d, want %d", managementCalls, wantRefreshCalls)
 	}
 
 	pricing, err := app.billingPriceIndex(ctx)
@@ -861,8 +864,8 @@ func TestBillingPriceIndexUsesCachedSelectorsWithoutChannelPrices(t *testing.T) 
 	if _, err := app.billingPriceIndex(ctx); err != nil {
 		t.Fatalf("second billingPriceIndex failed: %v", err)
 	}
-	if managementCalls != len(aiProviderBrandConfigs) {
-		t.Fatalf("management calls after billing indexes = %d, want cached %d", managementCalls, len(aiProviderBrandConfigs))
+	if managementCalls != wantRefreshCalls {
+		t.Fatalf("management calls after billing indexes = %d, want cached %d", managementCalls, wantRefreshCalls)
 	}
 
 	googleProvider := "google"

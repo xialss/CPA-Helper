@@ -159,6 +159,7 @@ async function imageDimensions(blob: Blob, signal: AbortSignal): Promise<{ width
 }
 
 async function readImage(reference: string, signal: AbortSignal): Promise<GeneratedImage> {
+  if (signal.aborted) throw cancelledError()
   let blob: Blob
   if (reference.startsWith('data:')) blob = imageDataUrlToBlob(reference)
   else {
@@ -173,7 +174,9 @@ async function readImage(reference: string, signal: AbortSignal): Promise<Genera
     }
   }
   try {
+    if (signal.aborted) throw cancelledError()
     const png = await readPngMetadata(blob)
+    if (signal.aborted) throw cancelledError()
     const size = await imageDimensions(blob, signal)
     if (!size.width || !size.height) throw new Error('Empty image')
     return {
@@ -236,6 +239,7 @@ export async function generateImage(request: GenerationRequest, apiKey: string, 
       body: JSON.stringify({ model: request.model, messages: [{ role: 'user', content: request.content }], stream: false }),
     })
     const payload = await readPayload(response)
+    if (requestSignal.aborted) throw cancelledError()
     const reference = extractImageReference(imageContent(payload))
     const image = await readImage(reference, requestSignal)
     for (const [key, value] of Object.entries(image.metadata.parameters)) {
