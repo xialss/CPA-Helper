@@ -43,6 +43,8 @@ import {
 
 import { getMe, isAuthUser, logout } from '@/features/auth/api/authApi'
 import { useCurrentUser } from '@/features/auth/state/currentUser'
+import FeatureStatusNotice from '@/features/feature-center/components/FeatureStatusNotice.vue'
+import { useFeatureState } from '@/features/feature-center/state/useFeatureState'
 import { useThemePreference } from '@/shared/composables/useThemePreference'
 import { useI18n } from '@/shared/i18n'
 import { logoUrl } from '@/shared/utils/assets'
@@ -58,6 +60,7 @@ const navigationTarget = ref<string | null>(null)
 const isRouteTransitioning = ref(false)
 const studioScrollModeHeld = ref(false)
 const { currentUser, setCurrentUser } = useCurrentUser()
+const { imageStudio, aiRadar, state: featureState } = useFeatureState()
 const hasLoadedUser = ref(currentUser.value !== null)
 const { isDark, preference, setThemePreference, toggleTheme } = useThemePreference()
 const { language, t, toggleLanguage } = useI18n()
@@ -150,8 +153,8 @@ const accountInspectionMenuItems = computed<MenuOption[]>(() => [
 ])
 
 const featureMenuItems = computed<MenuOption[]>(() => [
-  { label: t('生图广场', 'Image Studio'), key: '/account/image-studio', icon: renderIcon(Images) },
-  { label: t('AI 雷达', 'AI Radar'), key: '/account/ai-radar', icon: renderIcon(Radar) },
+  ...(imageStudio.value === 'enabled' ? [{ label: t('生图广场', 'Image Studio'), key: '/account/image-studio', icon: renderIcon(Images) }] : []),
+  ...(aiRadar.value === 'enabled' ? [{ label: t('AI 雷达', 'AI Radar'), key: '/account/ai-radar', icon: renderIcon(Radar) }] : []),
 ])
 
 const accountMenuItems = computed<MenuOption[]>(() => [
@@ -210,7 +213,7 @@ const menuOptions = computed<MenuOption[]>(() => {
       children: accountInspectionMenuItems.value,
     })
   }
-  groups.push({
+  if (featureMenuItems.value.length) groups.push({
     type: 'group',
     label: t('功能中心', 'Feature Center'),
     key: 'feature-group',
@@ -457,6 +460,7 @@ const logoutAriaLabel = computed(() => t('退出登录', 'Sign out'))
         }"
       >
         <div v-if="isMenuNavigationPending" class="route-progress" aria-hidden="true" />
+        <FeatureStatusNotice v-if="!featureState.verified && !route.meta.feature" class="feature-status-notice" />
         <RouterView v-slot="{ Component: RouteComponent, route: activeRoute }">
           <Transition
             name="route-fade"

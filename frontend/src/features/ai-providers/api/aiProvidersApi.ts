@@ -18,6 +18,9 @@ function providerSelectorQuery(provider: AIProviderItem): string {
   if (provider.identity_hash) {
     query.set('identity_hash', provider.identity_hash)
   }
+  if (provider.source_hash) {
+    query.set('source_hash', provider.source_hash)
+  }
   if (provider.api_key_hash) {
     query.set('api_key_hash', provider.api_key_hash)
   }

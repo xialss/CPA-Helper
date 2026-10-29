@@ -342,6 +342,27 @@ try {
     ['validation_error', 'CPA 上游类型不受支持: 私有类型（C）', 'Unsupported CPA upstream provider type: 私有类型（C）'],
   ]
   for (const [code, input, expected] of pluginOpaqueErrors) assert.equal(localizedApiErrorMessage(code, input), expected)
+  const providerPolicyErrors = [
+    ['validation_error', '请求错误规则需要正整数状态码', 'Request error rules require a positive integer status code'],
+    ['validation_error', '请求错误规则动作无效', 'Request error rule action is invalid'],
+    ['validation_error', '请求错误规则至少需要一个匹配条件', 'Request error rules require at least one match condition'],
+    ['validation_error', '请求错误规则匹配条件不能为空', 'Request error rule text conditions cannot be empty'],
+    ['validation_error', '请求错误规则正则条件不能为空', 'Request error rule regex conditions cannot be empty'],
+    ['validation_error', '请求错误规则包含无效的 Go 正则表达式', 'Request error rule contains an invalid Go regular expression'],
+    ['validation_error', 'Claude 请求指纹配置无效', 'Claude request fingerprint configuration is invalid'],
+    ['validation_error', 'Claude Cloak 模式无效', 'Claude Cloak mode is invalid'],
+    ['conflict', '请求错误规则来源已变化，请刷新后重试', 'A request error rule source changed. Refresh and try again.'],
+    ['conflict', '此配置来自包含多把 Key 的 CPA 分组，修改地址会影响其他 Key；请先在 CPA 中调整分组', 'This configuration belongs to a CPA group with multiple keys. Changing its URL would affect the other keys; adjust the group in CPA first.'],
+    ['conflict', '此排序会拆开 CPA 中的多 Key 分组；请保持同一分组连续，或先在 CPA 中调整分组', 'This order would split a CPA group containing multiple keys. Keep the group together or adjust it in CPA first.'],
+    ['conflict', 'AI provider 列表已变化，请刷新后重试', 'The AI provider list changed. Refresh and try again.'],
+    ['conflict', 'CPA 配置已被其他工具修改，请刷新后重试', 'The CPA configuration was changed by another tool. Refresh and try again.'],
+    ['validation_error', '读取 CPA v8 配置失败：HTTP 502', 'Failed to read CPA v8 configuration: HTTP 502'],
+    ['validation_error', '写入 Claude provider 失败：HTTP 502', 'Failed to write Claude provider: HTTP 502'],
+    ['validation_error', 'Gemini v8 分组缺少有效 keys 列表', 'Gemini v8 group is missing a valid keys list'],
+    ['provider_config_committed_refresh_required', 'AI provider 配置已提交，但部分配置未生效或无法核验，请刷新后检查 CPA 兼容性', 'The AI provider configuration was submitted, but some settings did not take effect or could not be verified. Refresh and check CPA compatibility.'],
+  ]
+  for (const [code, input, expected] of providerPolicyErrors) assert.equal(localizedApiErrorMessage(code, input), expected)
+  setLanguage('en')
   assert.equal(
     localizedApiErrorMessage('plugin_auth_failed', 'CPA Helper Plugin 管理端认证失败，请检查管理密钥'),
     'CPA Helper Plugin management authentication failed. Check the management key.',
@@ -689,6 +710,29 @@ try {
         },
       )
     }
+  }
+  for (const language of ['en', 'zh']) {
+    setLanguage(language)
+    for (const [code, input, expected] of providerPolicyErrors) {
+      globalThis.fetch = async () => Response.json({ detail: { code, message: input } }, { status: 409 })
+      await assert.rejects(() => apiClient.put('/ai-providers', {}), error => {
+        const rendered = browserCase.i18n.errorText(error, '保存 AI provider 失败', 'Failed to save AI provider')
+        assert.equal(rendered, language === 'zh' ? input : expected)
+        if (language === 'en') assert.doesNotMatch(rendered, /\p{Script=Han}/u)
+        return true
+      })
+    }
+  }
+  setLanguage('en')
+  for (const [code, expected] of [
+    ['provider_config_committed_refresh_required', 'The AI provider configuration was submitted, but some settings did not take effect or could not be verified. Refresh and check CPA compatibility.'],
+    ['provider_order_committed_refresh_required', 'The AI provider order was written remotely. Refresh the list before continuing.'],
+  ]) {
+    globalThis.fetch = async () => Response.json({ detail: { code } }, { status: 409 })
+    await assert.rejects(() => apiClient.put('/ai-providers', {}), error => {
+      assert.equal(browserCase.i18n.errorText(error, 'Failed to save AI provider'), expected)
+      return true
+    })
   }
   setLanguage('en')
 

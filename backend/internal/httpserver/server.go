@@ -15,6 +15,7 @@ type Config struct {
 	Addr            string
 	Handler         http.Handler
 	ShutdownTimeout time.Duration
+	OnShutdown      func()
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -30,6 +31,9 @@ func Run(ctx context.Context, cfg Config) error {
 		Addr:              addr,
 		Handler:           cfg.Handler,
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if cfg.OnShutdown != nil {
+		server.RegisterOnShutdown(cfg.OnShutdown)
 	}
 
 	errCh := make(chan error, 1)

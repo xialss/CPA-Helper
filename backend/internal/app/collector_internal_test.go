@@ -72,6 +72,10 @@ func (server *collectorProtocolTestServer) handle(conn net.Conn) {
 			return
 		}
 		server.record("http:" + request.URL.Path)
+		if request.URL.Path == "/v8/management/config" {
+			_, _ = fmt.Fprint(conn, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			return
+		}
 		body := "[]"
 		_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 		return
@@ -226,6 +230,7 @@ func TestLoadCollectorBatchUsesDerivedHTTPManagementURLForRespQueue(t *testing.T
 		t.Fatalf("messages = %#v, want empty queue", messages)
 	}
 	want := []string{
+		"http:/v8/management/config",
 		"http:/v0/management/gemini-api-key",
 		"http:/v0/management/codex-api-key",
 		"http:/v0/management/claude-api-key",
@@ -415,6 +420,10 @@ func TestLoadCollectorBatchStopsBeforeQueueWhenExpiredSelectorRefreshFails(t *te
 	providerRequestsFail := false
 	queueRequests := 0
 	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v8/management/config" {
+			http.NotFound(w, r)
+			return
+		}
 		mu.Lock()
 		failProviders := providerRequestsFail
 		if r.URL.Path == "/v0/management/usage-queue" {
@@ -487,6 +496,10 @@ func TestLoadCollectorBatchUsesUnexpiredSelectorsAfterProactiveRefreshFails(t *t
 	providerRequestsFail := false
 	queueRequests := 0
 	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v8/management/config" {
+			http.NotFound(w, r)
+			return
+		}
 		mu.Lock()
 		failProviders := providerRequestsFail
 		if r.URL.Path == "/v0/management/usage-queue" {
@@ -620,6 +633,8 @@ func TestLoadCollectorBatchLoadsSelectorsBeforeConsumingQueue(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
+		case "/v8/management/config":
+			http.NotFound(w, r)
 		case "/v0/management/gemini-api-key", "/v0/management/codex-api-key", "/v0/management/claude-api-key", "/v0/management/openai-compatibility", "/v0/management/vertex-api-key", "/v0/management/xai-api-key":
 			_ = json.NewEncoder(w).Encode([]map[string]any{})
 		case "/v0/management/usage-queue":
@@ -668,6 +683,7 @@ func TestLoadCollectorBatchLoadsSelectorsBeforeConsumingQueue(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	want := []string{
+		"/v8/management/config",
 		"/v0/management/gemini-api-key",
 		"/v0/management/codex-api-key",
 		"/v0/management/claude-api-key",

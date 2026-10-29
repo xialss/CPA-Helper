@@ -240,7 +240,7 @@ func (runner *aiRadarSamplingRunner) Start(parent context.Context) {
 	if parent == nil {
 		parent = context.Background()
 	}
-	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	ctx, cancel := context.WithCancel(parent)
 	runner.cancel = cancel
 	runner.done = make(chan struct{})
 	go runner.loop(ctx, runner.done, runner.interval)
@@ -255,7 +255,7 @@ func (runner *aiRadarSamplingRunner) loop(ctx context.Context, done chan<- struc
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := runner.RunOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			if err := runner.RunOnce(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, context.Canceled) {
 				log.Printf("ai radar scheduled sampling failed: %v", err)
 			}
 		}
@@ -285,6 +285,11 @@ func (runner *aiRadarSamplingRunner) RunOnce(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx, done, err := runner.app.beginAIRadarOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
 	client, err := runner.app.aiRadarClient(aiRadarHTTPTimeout)
 	if err != nil {
 		return err
@@ -682,11 +687,25 @@ func (a *App) handleAIRadarRefresh(w http.ResponseWriter, r *http.Request) error
 }
 
 func (a *App) serveAIRadar(w http.ResponseWriter, r *http.Request, force bool) error {
+	parent := r.Context()
+	if !force {
+		// Shared ordinary fetches survive one viewer disconnecting, but remain
+		// owned by the feature epoch and bounded by the live-fetch timeout.
+		parent = context.WithoutCancel(parent)
+	}
+	ctx, done, err := a.beginAIRadarOperation(parent)
+	if err != nil {
+		return err
+	}
+	defer done()
 	now := time.Now()
 	a.aiRadarMu.Lock()
 	snapshot := a.aiRadarSnapshot
 	if aiRadarServeCached(snapshot, now, force, aiRadarCacheTTL, aiRadarFailureTTL) {
 		a.aiRadarMu.Unlock()
+		if err := a.checkAIRadarOperation(ctx); err != nil {
+			return err
+		}
 		writeJSON(w, http.StatusOK, aiRadarCachedResponse(snapshot))
 		return nil
 	}
@@ -714,6 +733,11 @@ func (a *App) serveAIRadar(w http.ResponseWriter, r *http.Request, force bool) e
 		case <-flight.done:
 		case <-r.Context().Done():
 			return r.Context().Err()
+		case <-ctx.Done():
+			return a.checkAIRadarOperation(ctx)
+		}
+		if err := a.checkAIRadarOperation(ctx); err != nil {
+			return err
 		}
 		a.aiRadarMu.Lock()
 		current := a.aiRadarSnapshot
@@ -721,31 +745,35 @@ func (a *App) serveAIRadar(w http.ResponseWriter, r *http.Request, force bool) e
 		writeJSON(w, http.StatusOK, aiRadarCachedResponse(current))
 		return nil
 	}
+	defer func() {
+		if !force {
+			aiRadarLiveFlights.CompareAndDelete(a, flight)
+		}
+		close(flight.done)
+	}()
 
 	client, err := a.aiRadarClient(aiRadarHTTPTimeout)
 	if err != nil {
 		flight.err = err
-		if !force {
-			aiRadarLiveFlights.Delete(a)
-		}
-		close(flight.done)
 		return err
 	}
 	defer client.CloseIdleConnections()
 
-	fetchContext := r.Context()
-	var cancel context.CancelFunc
-	if !force {
-		fetchContext, cancel = context.WithTimeout(context.Background(), aiRadarHTTPTimeout)
-		defer cancel()
-	}
+	fetchContext, cancel := context.WithTimeout(ctx, aiRadarHTTPTimeout)
+	defer cancel()
 	result, fetchErr := fetchAIRadarLive(fetchContext, client)
+	if err := a.checkAIRadarOperation(ctx); err != nil {
+		return err
+	}
 	// A live revision must not become visible before its history sample. Both
 	// cache hits and flight followers may immediately reload history on seeing
 	// that revision. Keep sampling best effort, and independent of the first
 	// viewer disconnecting when this is a shared ordinary fetch.
 	if fetchErr == nil {
 		if err := a.recordAIRadarHistory(fetchContext, result.response.Points, result.observedAt); err != nil {
+			if stateErr := a.checkAIRadarOperation(ctx); stateErr != nil {
+				return stateErr
+			}
 			log.Printf("ai radar history sampling failed: %v", err)
 		}
 	}
@@ -753,33 +781,34 @@ func (a *App) serveAIRadar(w http.ResponseWriter, r *http.Request, force bool) e
 	flight.result = result
 	flight.err = fetchErr
 
-	a.aiRadarMu.Lock()
-	// Network calls run without the mutex. Publish only if no newer attempt has
-	// already committed, and preserve the latest shared response on failure.
-	// This prevents a slow old success or failure from replacing a newer result.
-	if generation > a.aiRadarSnapshot.generation {
-		if fetchErr != nil {
-			current := a.aiRadarSnapshot
-			current.attemptAt = completedAt
-			current.lastError = fetchErr.Error()
-			current.generation = generation
-			a.aiRadarSnapshot = current
-		} else {
-			response := result.response
-			a.aiRadarSnapshot = aiRadarSnapshot{
-				response:   &response,
-				fetchedAt:  completedAt,
-				attemptAt:  completedAt,
-				generation: generation,
+	var current aiRadarSnapshot
+	if err := a.withAIRadarCommit(ctx, func() error {
+		a.aiRadarMu.Lock()
+		defer a.aiRadarMu.Unlock()
+		// Generation orders live attempts; the feature gate separately rejects
+		// results from before a disable/re-enable transition.
+		if generation > a.aiRadarSnapshot.generation {
+			if fetchErr != nil {
+				current := a.aiRadarSnapshot
+				current.attemptAt = completedAt
+				current.lastError = fetchErr.Error()
+				current.generation = generation
+				a.aiRadarSnapshot = current
+			} else {
+				response := result.response
+				a.aiRadarSnapshot = aiRadarSnapshot{
+					response:   &response,
+					fetchedAt:  completedAt,
+					attemptAt:  completedAt,
+					generation: generation,
+				}
 			}
 		}
+		current = a.aiRadarSnapshot
+		return nil
+	}); err != nil {
+		return err
 	}
-	current := a.aiRadarSnapshot
-	a.aiRadarMu.Unlock()
-	if !force {
-		aiRadarLiveFlights.Delete(a)
-	}
-	close(flight.done)
 
 	writeJSON(w, http.StatusOK, aiRadarCachedResponse(current))
 	return nil
@@ -792,14 +821,22 @@ func (a *App) handleAIRadarHistory(w http.ResponseWriter, r *http.Request) error
 	if err := requireMethod(r, http.MethodGet); err != nil {
 		return err
 	}
+	ctx, done, err := a.beginAIRadarOperation(r.Context())
+	if err != nil {
+		return err
+	}
+	defer done()
 	since, err := parseAIRadarWindow(r.URL.Query().Get("window"))
 	if err != nil {
 		return err
 	}
 
-	backfillErr := a.ensureAIRadarBackfill(r.Context())
+	backfillErr := a.ensureAIRadarBackfill(ctx)
+	if err := a.checkAIRadarOperation(ctx); err != nil {
+		return err
+	}
 
-	series, err := a.loadAIRadarHistory(r.Context(), since)
+	series, err := a.loadAIRadarHistory(ctx, since)
 	if err != nil {
 		return err
 	}
@@ -812,6 +849,9 @@ func (a *App) handleAIRadarHistory(w http.ResponseWriter, r *http.Request) error
 	}
 	if backfillErr != nil {
 		response.Message = aiRadarStringPtr(backfillErr.Error())
+	}
+	if err := a.checkAIRadarOperation(ctx); err != nil {
+		return err
 	}
 	writeJSON(w, http.StatusOK, response)
 	return nil
@@ -877,6 +917,17 @@ func aiRadarShouldRecord(ctx context.Context, queryer interface {
 }
 
 func (a *App) recordAIRadarHistory(ctx context.Context, points []AIRadarPoint, observedAt time.Time) error {
+	ctx, done, err := a.beginAIRadarOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
+	return a.withAIRadarCommit(ctx, func() error {
+		return a.commitAIRadarHistory(ctx, points, observedAt)
+	})
+}
+
+func (a *App) commitAIRadarHistory(ctx context.Context, points []AIRadarPoint, observedAt time.Time) error {
 	if len(points) == 0 || observedAt.IsZero() {
 		return nil
 	}
@@ -933,6 +984,17 @@ func (a *App) aiRadarBackfillCompleted(ctx context.Context) (bool, error) {
 }
 
 func (a *App) markAIRadarBackfillCompleted(ctx context.Context) error {
+	ctx, done, err := a.beginAIRadarOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
+	return a.withAIRadarCommit(ctx, func() error {
+		return a.commitAIRadarBackfillCompleted(ctx)
+	})
+}
+
+func (a *App) commitAIRadarBackfillCompleted(ctx context.Context) error {
 	now := dbTime(time.Now())
 	_, err := a.db.ExecContext(ctx, `
 		INSERT INTO ai_radar_state (id, backfill_completed_at, updated_at)
@@ -947,6 +1009,11 @@ func (a *App) markAIRadarBackfillCompleted(ctx context.Context) error {
 // concurrent request skips instead of downloading the 6 MiB payload again, and
 // a failed attempt leaves no marker so a later request can retry.
 func (a *App) ensureAIRadarBackfill(ctx context.Context) error {
+	ctx, done, err := a.beginAIRadarOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
 	completed, err := a.aiRadarBackfillCompleted(ctx)
 	if err != nil || completed {
 		return err
@@ -988,6 +1055,17 @@ func (a *App) ensureAIRadarBackfill(ctx context.Context) error {
 // carry between 1 and 70 points each, so a frame with few or no usable points
 // is expected rather than an error.
 func (a *App) importAIRadarSnapshot(ctx context.Context, frames []aiRadarSnapshotFrame) error {
+	ctx, done, err := a.beginAIRadarOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
+	return a.withAIRadarCommit(ctx, func() error {
+		return a.commitAIRadarSnapshot(ctx, frames)
+	})
+}
+
+func (a *App) commitAIRadarSnapshot(ctx context.Context, frames []aiRadarSnapshotFrame) error {
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1073,6 +1151,11 @@ func aiRadarSnapshotPointValue(raw aiRadarSnapshotPoint) (AIRadarPoint, bool) {
 }
 
 func (a *App) loadAIRadarHistory(ctx context.Context, since *time.Time) ([]AIRadarHistorySeries, error) {
+	ctx, done, err := a.beginAIRadarOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
 	query := `
 		SELECT model, effort, observed_at, iq, average_price_usd, average_minutes, combined_cost_index,
 			average_agent_steps

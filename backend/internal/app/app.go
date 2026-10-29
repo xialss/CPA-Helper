@@ -74,6 +74,7 @@ type App struct {
 	aiRadarBackfillMu      sync.Mutex // single-flight guard for the one-time history backfill
 	aiRadarHTTPClient      func(time.Duration) (*http.Client, error)
 	aiRadarSampling        *aiRadarSamplingRunner
+	features               *featureCenterRuntime
 	loginAttemptsMu        sync.Mutex
 	loginFailures          map[string]loginFailureRecord
 	usageAuditMu           sync.Mutex
@@ -201,6 +202,10 @@ func NewWithOptions(ctx context.Context, options NewOptions) (*App, error) {
 		return nil, err
 	}
 	app.priceSelectors.retainConfig(modelPriceSelectorConfigKey(cfg))
+	if err := app.initializeFeatureCenter(ctx, options.StartBackground); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if options.StartUsageMaintenance {
 		app.startUsageMaintenance(ctx)
 	}
@@ -217,8 +222,7 @@ func (a *App) startBackground(ctx context.Context) {
 	a.collector.Start()
 	a.keeper.LoadPersistedState(ctx)
 	a.keeper.StartAutoIfConfigured()
-	a.aiRadarSampling = newAIRadarSamplingRunner(a)
-	a.aiRadarSampling.Start(ctx)
+	a.startFeatureCenterBackground()
 }
 
 func (a *App) startUsageMaintenance(ctx context.Context) {
@@ -230,15 +234,13 @@ func (a *App) startUsageMaintenance(ctx context.Context) {
 }
 
 func (a *App) Close() {
+	a.closeFeatureCenter()
 	if a.apiKeyExpiration != nil {
 		a.apiKeyExpiration.cancel()
 		<-a.apiKeyExpiration.done
 	}
 	if a.usageMaintenance != nil {
 		a.usageMaintenance.Stop()
-	}
-	if a.aiRadarSampling != nil {
-		a.aiRadarSampling.Stop()
 	}
 	if a.collector != nil {
 		a.collector.Stop()
@@ -339,6 +341,9 @@ func (a *App) Routes() http.Handler {
 
 	mux.HandleFunc("/api/auth/", a.wrap(a.handleAuth))
 	mux.HandleFunc("/api/settings", a.wrap(a.handleSettings))
+	mux.HandleFunc("/api/settings/features", a.wrap(a.handleFeatureCenterSettings))
+	mux.HandleFunc("/api/features", a.wrap(a.handleFeatures))
+	mux.HandleFunc("/api/features/events", a.wrap(a.handleFeatureCenterEvents))
 	mux.HandleFunc("/api/collector/status", a.wrap(a.handleCollectorStatus))
 	mux.HandleFunc("/api/usage/", a.wrap(a.handleUsage))
 	mux.HandleFunc("/api/model-prices", a.wrap(a.handleModelPrices))

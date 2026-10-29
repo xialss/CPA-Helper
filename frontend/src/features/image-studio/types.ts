@@ -145,7 +145,7 @@ export interface HistoryPage {
 }
 
 export interface GenerationPersistence {
-  saveTask(ownerId: number, task: StoredGenerationTask, image?: Blob): Promise<void>
+  saveTask(ownerId: number, task: StoredGenerationTask, image?: Blob, signal?: AbortSignal): Promise<void>
   getImage(ownerId: number, taskId: string): Promise<Blob>
   deleteTasks(ownerId: number, taskIds: string[]): Promise<void>
 }

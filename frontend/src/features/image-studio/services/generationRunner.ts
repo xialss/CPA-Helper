@@ -30,13 +30,15 @@ export function storedTask(task: GenerationTask): StoredGenerationTask {
 export class GenerationRunner {
   private ownerId: number | null = null
   private epoch = 0
+  private available = true
   private records = new Map<string, GenerationTask>()
   private executions = new Map<string, Execution>()
   private memoryImages = new Map<string, Blob>()
   private saveChains = new Map<string, Promise<boolean>>()
   private saveRevisions = new Map<string, number>()
+  private saves = new Set<AbortController>()
   private sessionBatches = new Set<string>()
-  private deleting = new Set<string>()
+  private deleting = new Map<string, object>()
   private listeners = new Set<() => void>()
 
   constructor(private readonly persistence: GenerationPersistence, private readonly generate: Generate = generateImage) {}
@@ -67,6 +69,8 @@ export class GenerationRunner {
     this.epoch++
     this.ownerId = ownerId
     for (const execution of this.executions.values()) execution.controller.abort()
+    for (const controller of this.saves) controller.abort()
+    this.saves.clear()
     this.executions.clear()
     this.records.clear()
     this.memoryImages.clear()
@@ -81,6 +85,38 @@ export class GenerationRunner {
     return this.ownerId === ownerId && this.epoch === epoch
   }
 
+  activate(): void { this.available = true }
+
+  deactivate(): void {
+    if (!this.available) return
+    this.available = false
+    this.epoch++
+    this.deleting.clear()
+    for (const controller of this.saves) controller.abort()
+    this.saves.clear()
+    for (const execution of this.executions.values()) execution.controller.abort()
+    this.executions.clear()
+    for (const task of this.records.values()) {
+      if (isTaskActive(task)) {
+        this.update(task.id, {
+          status: 'interrupted', finishedAt: Date.now(),
+          problem: { kind: 'interrupted', zh: '功能已暂停，本地请求已中断；上游可能已受理，不会自动重试', en: 'The feature is paused and local work was interrupted. The upstream may have accepted it; no automatic retry will run' },
+          save: { status: 'pending', problem: null },
+        })
+        // Only the interruption record may finish after suspension. Old queued
+        // generation/result writes are rejected by their captured epoch.
+        void this.save(task.id)
+      } else if (task.save.status === 'saving') {
+        this.update(task.id, { save: { status: 'failed', problem: { kind: 'storage', zh: '功能暂停中断了本地保存；原图仍在内存中，重新开启后可手动重试保存', en: 'Pausing interrupted local saving. The original remains in memory; retry saving manually after enabling the feature' } } })
+      }
+    }
+    this.notify()
+  }
+
+  private assertAvailable(): void {
+    if (!this.available) throw new ImageStudioError('cancelled', '生图功能已暂停，请验证功能状态后继续', 'Image Studio is paused. Verify feature state before continuing')
+  }
+
   private update(id: string, patch: Partial<GenerationTask>): GenerationTask | undefined {
     const task = this.records.get(id)
     if (!task) return undefined
@@ -91,6 +127,7 @@ export class GenerationRunner {
   }
 
   submit(draft: GenerationDraft, connection: StudioConnection, retryOf: string | null = null): string {
+    this.assertAvailable()
     if (this.ownerId === null) throw new ImageStudioError('validation', '请先登录', 'Sign in first')
     const input = Object.freeze(validateDraft(draft))
     const target = validateConnection(connection)
@@ -126,7 +163,7 @@ export class GenerationRunner {
 
   private async execute(id: string, ownerId: number, epoch: number, apiKey: string): Promise<void> {
     const task = this.records.get(id)
-    if (!task || task.status !== 'preparing' || !this.owns(ownerId, epoch)) return
+    if (!this.available || !task || task.status !== 'preparing' || !this.owns(ownerId, epoch)) return
     const execution: Execution = { ownerId, epoch, controller: new AbortController() }
     this.executions.set(id, execution)
     const isCurrent = () => this.owns(ownerId, epoch) && this.executions.get(id) === execution
@@ -169,8 +206,10 @@ export class GenerationRunner {
     // Generation requests never await this chain.
     const operation = previous.then(async () => {
       if (!this.owns(ownerId, epoch)) return false
+      const controller = new AbortController()
+      this.saves.add(controller)
       try {
-        await this.persistence.saveTask(ownerId, record, image)
+        await this.persistence.saveTask(ownerId, record, image, controller.signal)
         if (isLatest()) {
           if (image) this.memoryImages.delete(id)
           this.update(id, { save: { status: 'saved', problem: null } })
@@ -180,6 +219,7 @@ export class GenerationRunner {
         if (isLatest()) this.update(id, { save: { status: 'failed', problem: storageProblem(error) } })
         return false
       } finally {
+        this.saves.delete(controller)
         if (this.saveChains.get(id) === operation) this.saveChains.delete(id)
       }
     })
@@ -210,6 +250,7 @@ export class GenerationRunner {
   }
 
   retrySave(id: string): Promise<boolean> {
+    this.assertAvailable()
     const task = this.records.get(id)
     if (!task || this.deleting.has(id) || task.save.status === 'saving' || isTaskActive(task)) return Promise.resolve(false)
     return this.save(id)
@@ -247,6 +288,7 @@ export class GenerationRunner {
   }
 
   async getImage(id: string): Promise<Blob> {
+    this.assertAvailable()
     if (this.ownerId === null || !this.records.has(id)) {
       throw new ImageStudioError('storage', '当前账号无法读取该图片', 'This image is not available to the current account')
     }
@@ -258,6 +300,7 @@ export class GenerationRunner {
   }
 
   async deleteTasks(ids: string[]): Promise<void> {
+    this.assertAvailable()
     if (this.ownerId === null) throw cancelledError()
     const ownerId = this.ownerId
     const epoch = this.epoch
@@ -266,14 +309,15 @@ export class GenerationRunner {
       const task = this.records.get(id)
       return task && isTaskActive(task)
     })) throw new ImageStudioError('validation', '请先取消运行中的任务，再删除记录', 'Cancel running tasks before deleting their records')
-    if (selected.some((id) => this.deleting.has(id))) return
-    for (const id of selected) this.deleting.add(id)
+    if (selected.some((id) => this.deleting.has(id))) throw cancelledError()
+    const operation = {}
+    for (const id of selected) this.deleting.set(id, operation)
     try {
       // Prevent a pending save from recreating a record after its explicit deletion.
       await Promise.all(selected.map((id) => this.saveChains.get(id)))
       if (!this.owns(ownerId, epoch)) throw cancelledError()
       await this.persistence.deleteTasks(ownerId, selected)
-      if (!this.owns(ownerId, epoch)) return
+      if (!this.owns(ownerId, epoch)) throw cancelledError()
       for (const id of selected) {
         this.records.delete(id)
         this.memoryImages.delete(id)
@@ -281,7 +325,7 @@ export class GenerationRunner {
       }
       this.notify()
     } finally {
-      if (this.owns(ownerId, epoch)) for (const id of selected) this.deleting.delete(id)
+      for (const id of selected) if (this.deleting.get(id) === operation) this.deleting.delete(id)
     }
   }
 }

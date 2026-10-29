@@ -18,6 +18,7 @@ const acceptanceCallerKey = "sk-cpa-acceptance-unrestricted-0001cafe"
 type fakeCPA struct {
 	mu              sync.Mutex
 	providers       map[string][]map[string]any
+	providerGroups  map[string][]map[string]any
 	downstreamKeys  []string
 	policy          policySnapshot
 	policyAccepted  time.Time
@@ -75,6 +76,10 @@ func (s *fakeCPA) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/v0/management/api-keys" {
 		s.serveAPIKeys(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/v8/management/config/api-keys/") {
+		s.serveV8ProviderFamily(w, r)
 		return
 	}
 	switch r.URL.Path {
@@ -171,6 +176,11 @@ func (s *fakeCPA) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		previous := s.credentials()
 		s.providers[key] = entries
+		for _, kind := range providerKinds {
+			if kind.ConfigKey == key {
+				delete(s.providerGroups, kind.Provider)
+			}
+		}
 		s.fillAuthIndexes(previous)
 		fakeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	default:

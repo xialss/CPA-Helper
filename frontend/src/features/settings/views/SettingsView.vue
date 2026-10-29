@@ -29,6 +29,7 @@ import {
   updateCPAHelperResponseModelConfig,
 } from '@/features/plugin/api/cpaHelperPluginApi'
 import { useCurrentUser } from '@/features/auth/state/currentUser'
+import FeatureSettingsPanel from '@/features/feature-center/components/FeatureSettingsPanel.vue'
 import { ApiRequestError } from '@/shared/api/apiClient'
 import { useI18n } from '@/shared/i18n'
 import type { CPAHelperResponseModelConfig, CollectorStatus, SettingsUpdatePayload } from '@/shared/types/api'
@@ -320,6 +321,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
+    <FeatureSettingsPanel />
     <div class="grid-two">
       <section class="panel">
         <div class="panel-inner">

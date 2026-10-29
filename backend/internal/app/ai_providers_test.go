@@ -420,6 +420,9 @@ type fakeAIProviderManagement struct {
 	providerPutBodies []json.RawMessage
 	providerPutStatus int
 	providerGetStatus int
+	v8Config          map[string]any
+	v8IgnoreFields    []string
+	preserveFields    []string
 }
 
 func newFakeAIProviderManagement(t *testing.T) (*fakeAIProviderManagement, *httptest.Server) {
@@ -455,6 +458,41 @@ func (f *fakeAIProviderManagement) handle(w http.ResponseWriter, r *http.Request
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if r.URL.Path == "/v8/management/config" && f.v8Config != nil && r.Method == http.MethodGet {
+		_ = json.NewEncoder(w).Encode(f.v8Config)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/v8/management/config/api-keys/") && f.v8Config != nil && r.Method == http.MethodPut {
+		var rawBody json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&rawBody); err != nil {
+			f.t.Fatalf("decode v8 PUT body: %v", err)
+		}
+		var groups []any
+		decoder := json.NewDecoder(bytes.NewReader(rawBody))
+		decoder.UseNumber()
+		if err := decoder.Decode(&groups); err != nil {
+			f.t.Fatalf("decode v8 PUT groups: %v", err)
+		}
+		f.providerPutCount++
+		f.providerPutBodies = append(f.providerPutBodies, append(json.RawMessage(nil), rawBody...))
+		if f.providerPutStatus >= 300 {
+			w.WriteHeader(f.providerPutStatus)
+			return
+		}
+		for _, value := range groups {
+			group := value.(map[string]any)
+			for _, field := range f.v8IgnoreFields {
+				delete(group, field)
+				for _, key := range group["keys"].([]any) {
+					delete(key.(map[string]any), field)
+				}
+			}
+		}
+		family := strings.TrimPrefix(r.URL.Path, "/v8/management/config/api-keys/")
+		f.v8Config["api-keys"].(map[string]any)[family] = groups
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	}
 	if r.URL.Path == "/v0/management/config" && r.Method == http.MethodGet {
 		_ = json.NewEncoder(w).Encode(f.config)
 		return
@@ -522,6 +560,19 @@ func (f *fakeAIProviderManagement) handle(w http.ResponseWriter, r *http.Request
 				w.WriteHeader(f.providerPutStatus)
 				_ = json.NewEncoder(w).Encode(map[string]string{"status": "failed"})
 				return
+			}
+			if previous, ok := f.config[key].([]map[string]any); ok {
+				for index, entry := range next {
+					if index < len(previous) {
+						for _, field := range f.preserveFields {
+							if value, exists := previous[index][field]; exists {
+								entry[field] = value
+							} else {
+								delete(entry, field)
+							}
+						}
+					}
+				}
 			}
 			f.config[key] = next
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -2322,7 +2373,7 @@ func TestAIProviderUpdatePreservesUnknownClaudeCloakFields(t *testing.T) {
 		"models":        []map[string]any{},
 		"headers":       []map[string]any{},
 		"cloak": map[string]any{
-			"mode":            "new",
+			"mode":            "always",
 			"strict_mode":     true,
 			"sensitive_words": []string{"new-secret"},
 			"cache_user_id":   true,
@@ -2332,7 +2383,7 @@ func TestAIProviderUpdatePreservesUnknownClaudeCloakFields(t *testing.T) {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	cloak := fake.config["claude-api-key"].([]map[string]any)[0]["cloak"].(map[string]any)
-	if cloak["mode"] != "new" || cloak["strict-mode"] != true || cloak["cache-user-id"] != true {
+	if cloak["mode"] != "always" || cloak["strict-mode"] != true || cloak["cache-user-id"] != true {
 		t.Fatalf("cloak known fields = %#v, want updated mode/strict-mode/cache-user-id", cloak)
 	}
 	if cloak["unknown-cloak"] != "keep-me" {

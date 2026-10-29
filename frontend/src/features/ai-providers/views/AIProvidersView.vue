@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onMounted, ref } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NAlert,
@@ -68,6 +68,11 @@ import type {
   AIProviderSummary,
 } from '@/shared/types/api'
 import { formatInteger } from '@/shared/utils/format'
+import ProviderBehaviorEditor from '../components/ProviderBehaviorEditor.vue'
+import ProviderRuntimePolicyEditor from '../components/ProviderRuntimePolicyEditor.vue'
+import ClaudeCloakEditor from '../components/ClaudeCloakEditor.vue'
+import ExcludedModelsPicker from '../components/ExcludedModelsPicker.vue'
+import { advancedConfigPayload, providerAdvancedDraft, type ProviderAdvancedDraft } from '../utils/providerAdvancedConfig'
 
 type ProviderEnabledFilter = 'all' | 'enabled' | 'disabled'
 
@@ -91,6 +96,7 @@ interface ModelDraft {
   max_context_length: number | null
   max_context_length_state: OptionalFieldState
   force_mapping: boolean
+  force_mapping_state: OptionalFieldState
   is_compat: boolean
   is_compat_state: OptionalFieldState
   image: boolean
@@ -103,13 +109,6 @@ interface KeyEntryDraft {
   api_key_hash: string | null
   api_key_masked: string | null
   proxy_url: string
-}
-
-interface CloakDraft {
-  mode: string
-  strict_mode: boolean
-  sensitive_words: string[]
-  cache_user_id: boolean
 }
 
 interface DiscoveryModelItem {
@@ -144,6 +143,7 @@ interface ProviderDraft {
   brand_label: string
   index: number
   identity_hash: string
+  source_hash: string | null
   api_key: string
   api_key_hash: string | null
   api_key_masked: string | null
@@ -160,12 +160,11 @@ interface ProviderDraft {
   models: ModelDraft[]
   headers: AIProviderHeader[]
   excluded_models: string[]
-  disable_cooling: boolean
+  advanced: ProviderAdvancedDraft
+  advanced_original: ProviderAdvancedDraft
+  runtime_policy_effective: AIProviderItem['runtime_policy_effective']
   websockets: boolean
   websockets_state: OptionalFieldState
-  rebuild_mid_system_message: boolean
-  experimental_cch_signing: boolean
-  cloak: CloakDraft
   api_key_entries: KeyEntryDraft[]
   recent_success: number
   recent_failure: number
@@ -218,6 +217,9 @@ const enabledFilter = ref<ProviderEnabledFilter>('all')
 const search = ref('')
 
 const drawerOpen = ref(false)
+const editorGeneration = ref(0)
+let discoveryGeneration = 0
+let connectivityGeneration = 0
 const editorMode = ref<'create' | 'edit'>('create')
 const form = ref<ProviderDraft>(defaultDraft('gemini'))
 const originalFormText = ref('')
@@ -232,6 +234,8 @@ const aliasModalOpen = ref(false)
 const aliasLabel = ref('')
 const isDiscovering = ref(false)
 const isTesting = ref(false)
+const discoveryLoaded = ref(false)
+const discoveryError = ref<string | null>(null)
 const discoveredModels = ref<AIProviderModel[]>([])
 const discoverySearch = ref('')
 const selectedDiscoveryModelKeys = ref<string[]>([])
@@ -312,6 +316,7 @@ function defaultDraft(brand: AIProviderBrand): ProviderDraft {
     brand_label: config.label,
     index: -1,
     identity_hash: '',
+    source_hash: null,
     api_key: '',
     api_key_hash: null,
     api_key_masked: null,
@@ -328,17 +333,11 @@ function defaultDraft(brand: AIProviderBrand): ProviderDraft {
     models: [],
     headers: [],
     excluded_models: [],
-    disable_cooling: false,
+    advanced: providerAdvancedDraft(),
+    advanced_original: providerAdvancedDraft(),
+    runtime_policy_effective: null,
     websockets: false,
     websockets_state: brand === 'xai' ? 'omitted' : 'value',
-    rebuild_mid_system_message: false,
-    experimental_cch_signing: false,
-    cloak: {
-      mode: '',
-      strict_mode: false,
-      sensitive_words: [],
-      cache_user_id: false,
-    },
     api_key_entries:
       brand === 'openai_compatibility'
         ? [{ api_key: '', api_key_hash: null, api_key_masked: null, proxy_url: '' }]
@@ -364,6 +363,7 @@ function modelToDraft(model: AIProviderModel): ModelDraft {
     max_context_length: model.max_context_length ?? null,
     max_context_length_state: !hasMaxContextLength ? 'omitted' : model.max_context_length === null ? 'null' : 'value',
     force_mapping: model.force_mapping ?? false,
+    force_mapping_state: !Object.prototype.hasOwnProperty.call(model, 'force_mapping') ? 'omitted' : model.force_mapping === null ? 'null' : 'value',
     is_compat: model.is_compat ?? false,
     is_compat_state: !hasIsCompat ? 'omitted' : model.is_compat === null ? 'null' : 'value',
     image: model.image ?? false,
@@ -381,6 +381,7 @@ function providerToDraft(provider: AIProviderItem): ProviderDraft {
     brand_label: provider.brand_label,
     index: provider.index,
     identity_hash: provider.identity_hash,
+    source_hash: provider.source_hash ?? null,
     api_key_hash: provider.api_key_hash ?? null,
     api_key_masked: provider.api_key_masked ?? null,
     auth_index: provider.auth_index ?? null,
@@ -396,18 +397,12 @@ function providerToDraft(provider: AIProviderItem): ProviderDraft {
     models: provider.models.map(modelToDraft),
     headers: provider.headers.map((header) => ({ ...header })),
     excluded_models: provider.excluded_models.filter((item) => !providerUsesExcludedModelsDisabled(provider.brand) || item.trim() !== '*'),
-    disable_cooling: provider.disable_cooling ?? false,
+    advanced: providerAdvancedDraft(provider),
+    advanced_original: providerAdvancedDraft(provider),
+    runtime_policy_effective: provider.runtime_policy_effective ?? null,
     websockets: provider.websockets ?? false,
     websockets_state:
       provider.brand === 'xai' ? (!hasWebsockets ? 'omitted' : provider.websockets === null ? 'null' : 'value') : 'value',
-    rebuild_mid_system_message: provider.rebuild_mid_system_message ?? false,
-    experimental_cch_signing: provider.experimental_cch_signing ?? false,
-    cloak: {
-      mode: provider.cloak?.mode ?? '',
-      strict_mode: provider.cloak?.strict_mode ?? false,
-      sensitive_words: provider.cloak?.sensitive_words ? [...provider.cloak.sensitive_words] : [],
-      cache_user_id: provider.cloak?.cache_user_id ?? false,
-    },
     api_key_entries:
       provider.brand === 'openai_compatibility'
         ? provider.api_key_entries.map((entry) => ({
@@ -478,10 +473,24 @@ async function refresh() {
   }
 }
 
+function invalidateEditorActions() {
+  discoveryGeneration += 1
+  connectivityGeneration += 1
+  isDiscovering.value = false
+  isTesting.value = false
+  discoveredModels.value = []
+  discoveryLoaded.value = false
+  discoveryError.value = null
+  selectedDiscoveryModelKeys.value = []
+  actionResult.value = null
+}
+
 function openCreateDialog() {
   if (providerWriteControlsDisabled.value) {
     return
   }
+  editorGeneration.value += 1
+  invalidateEditorActions()
   editorMode.value = 'create'
   form.value = defaultDraft(activeBrand.value)
   originalFormText.value = JSON.stringify(form.value)
@@ -498,6 +507,8 @@ function openEditDialog(provider: AIProviderItem) {
   if (providerWriteControlsDisabled.value) {
     return
   }
+  editorGeneration.value += 1
+  invalidateEditorActions()
   editorMode.value = 'edit'
   form.value = providerToDraft(provider)
   originalFormText.value = JSON.stringify(form.value)
@@ -511,6 +522,8 @@ function openEditDialog(provider: AIProviderItem) {
 }
 
 function handleBrandChange(value: string) {
+  editorGeneration.value += 1
+  invalidateEditorActions()
   form.value = defaultDraft(value as AIProviderBrand)
   originalFormText.value = JSON.stringify(form.value)
   originalDisabled.value = false
@@ -530,6 +543,7 @@ function addModel(name = '') {
     max_context_length: null,
     max_context_length_state: 'omitted',
     force_mapping: false,
+    force_mapping_state: 'omitted',
     is_compat: false,
     is_compat_state: 'omitted',
     image: false,
@@ -545,6 +559,11 @@ function removeModel(index: number) {
 function updateModelThinking(model: ModelDraft, value: string) {
   model.thinking_text = value
   model.thinking_state = value.trim() === '' ? 'null' : 'value'
+}
+
+function updateModelForceMapping(model: ModelDraft, value: boolean) {
+  model.force_mapping = value
+  model.force_mapping_state = 'value'
 }
 
 function updateModelThinkingText(model: ModelDraft, value: string) {
@@ -568,36 +587,12 @@ function removeHeader(index: number) {
   form.value.headers.splice(index, 1)
 }
 
-function addExcludedModel() {
-  form.value.excluded_models.push('')
-}
-
-function removeExcludedModel(index: number) {
-  form.value.excluded_models.splice(index, 1)
-}
-
-function setExcludedModel(index: number, value: string) {
-  form.value.excluded_models[index] = value
-}
-
 function addKeyEntry() {
   form.value.api_key_entries.push({ api_key: '', api_key_hash: null, api_key_masked: null, proxy_url: '' })
 }
 
 function removeKeyEntry(index: number) {
   form.value.api_key_entries.splice(index, 1)
-}
-
-function addSensitiveWord() {
-  form.value.cloak.sensitive_words.push('')
-}
-
-function removeSensitiveWord(index: number) {
-  form.value.cloak.sensitive_words.splice(index, 1)
-}
-
-function setSensitiveWord(index: number, value: string) {
-  form.value.cloak.sensitive_words[index] = value
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -629,8 +624,9 @@ function draftToPayload(draft: ProviderDraft, mode: 'create' | 'edit' = editorMo
       }
       const payload: AIProviderModel = {
         name,
-        force_mapping: model.force_mapping,
       }
+      if (model.force_mapping_state === 'null') payload.force_mapping = null
+      else if (model.force_mapping_state === 'value') payload.force_mapping = model.force_mapping
       const alias = model.alias.trim()
       if (alias) {
         payload.alias = alias
@@ -679,6 +675,7 @@ function draftToPayload(draft: ProviderDraft, mode: 'create' | 'edit' = editorMo
     brand_label: draft.brand_label,
     index: draft.index,
     identity_hash: draft.identity_hash,
+    ...(draft.source_hash ? { source_hash: draft.source_hash } : {}),
     api_key: draft.api_key.trim(),
     api_key_hash: draft.api_key_hash,
     api_key_masked: draft.api_key_masked,
@@ -697,18 +694,7 @@ function draftToPayload(draft: ProviderDraft, mode: 'create' | 'edit' = editorMo
     excluded_models: draft.excluded_models
       .map((item) => item.trim())
       .filter((item) => item !== '' && (!providerUsesExcludedModelsDisabled(draft.brand) || item !== '*')),
-    disable_cooling: draft.brand === 'vertex' ? null : draft.disable_cooling,
-    rebuild_mid_system_message: draft.brand === 'claude' ? draft.rebuild_mid_system_message : null,
-    experimental_cch_signing: draft.brand === 'claude' ? draft.experimental_cch_signing : null,
-    cloak:
-      draft.brand === 'claude'
-        ? {
-            mode: draft.cloak.mode.trim() || null,
-            strict_mode: draft.cloak.strict_mode,
-            sensitive_words: draft.cloak.sensitive_words.map((item) => item.trim()).filter((item) => item !== ''),
-            cache_user_id: draft.cloak.cache_user_id,
-          }
-        : null,
+    ...advancedConfigPayload(draft.advanced, draft.advanced_original, draft.brand, mode),
     api_key_entries:
       draft.brand === 'openai_compatibility'
         ? draft.api_key_entries
@@ -1009,13 +995,20 @@ function toggleDiscoveredModel(item: DiscoveryModelItem, checked: boolean) {
 }
 
 async function runDiscovery() {
+  if (!drawerOpen.value || isDiscovering.value) return
+  const generation = ++discoveryGeneration
+  const editor = editorGeneration.value
+  const ownsRequest = () => drawerOpen.value && editor === editorGeneration.value && generation === discoveryGeneration
   isDiscovering.value = true
+  discoveryError.value = null
   actionResult.value = null
   try {
     const payload = draftToPayload(form.value)
     const result = await discoverAIProviderModels({ brand: payload.brand, provider: payload })
+    if (!ownsRequest()) return
     actionResult.value = result
     if (result.ok) {
+      discoveryLoaded.value = true
       discoveredModels.value = result.models ?? []
       discoverySearch.value = ''
       selectedDiscoveryModelKeys.value = []
@@ -1024,12 +1017,15 @@ async function runDiscovery() {
         .map((item) => item.key)
       message.success(t('模型发现完成', 'Model discovery completed'))
     } else {
-      message.error(result.error || t('模型发现失败', 'Model discovery failed'))
+      discoveryError.value = result.error || t('模型发现失败', 'Model discovery failed')
+      message.error(discoveryError.value)
     }
   } catch (error) {
-    message.error(errorText(error, '模型发现失败', 'Model discovery failed'))
+    if (!ownsRequest()) return
+    discoveryError.value = errorText(error, '模型发现失败', 'Model discovery failed')
+    message.error(discoveryError.value)
   } finally {
-    isDiscovering.value = false
+    if (ownsRequest()) isDiscovering.value = false
   }
 }
 
@@ -1054,6 +1050,10 @@ function applySelectedDiscoveredModels() {
 }
 
 async function runConnectivityTest() {
+  if (!drawerOpen.value || isTesting.value) return
+  const generation = ++connectivityGeneration
+  const editor = editorGeneration.value
+  const ownsRequest = () => drawerOpen.value && editor === editorGeneration.value && generation === connectivityGeneration
   isTesting.value = true
   actionResult.value = null
   try {
@@ -1069,6 +1069,7 @@ async function runConnectivityTest() {
       ...(model ? { model } : {}),
       ...(testText ? { message: testText } : {}),
     })
+    if (!ownsRequest()) return
     actionResult.value = result
     if (result.ok) {
       message.success(t('连通性测试成功', 'Connectivity test succeeded'))
@@ -1076,9 +1077,10 @@ async function runConnectivityTest() {
       message.error(result.error || t('连通性测试失败', 'Connectivity test failed'))
     }
   } catch (error) {
+    if (!ownsRequest()) return
     message.error(errorText(error, '连通性测试失败', 'Connectivity test failed'))
   } finally {
-    isTesting.value = false
+    if (ownsRequest()) isTesting.value = false
   }
 }
 
@@ -1591,6 +1593,7 @@ function providerPosition(provider: AIProviderItem): { list: AIProviderItem[]; i
 
 function providerOrderItem(provider: AIProviderItem): AIProviderOrderItem {
   const item: AIProviderOrderItem = { index: provider.index }
+  if (provider.source_hash) item.source_hash = provider.source_hash
   const identityHash = provider.identity_hash?.trim()
   const apiKeyHash = provider.api_key_hash?.trim()
   const name = provider.name?.trim()
@@ -1820,6 +1823,19 @@ const columns = computed<DataTableColumns<AIProviderItem>>(() => {
   ]
 })
 
+watch(drawerOpen, () => invalidateEditorActions(), { flush: 'sync' })
+watch(
+  () => JSON.stringify([
+    form.value.brand, form.value.base_url, form.value.proxy_url, form.value.api_key,
+    form.value.api_key_hash, form.value.source_hash, form.value.headers, form.value.api_key_entries,
+  ]),
+  () => invalidateEditorActions(),
+  { flush: 'sync' },
+)
+onBeforeUnmount(() => {
+  invalidateEditorActions()
+  providerSnapshotGeneration.value += 1
+})
 onMounted(refresh)
 </script>
 
@@ -1973,20 +1989,14 @@ onMounted(refresh)
                   </span>
                 </div>
               </NFormItem>
-              <NFormItem v-if="form.brand !== 'vertex'" :label="t('禁用冷却调度', 'Disable cooling')">
-                <NSwitch v-model:value="form.disable_cooling" />
-              </NFormItem>
               <NFormItem v-if="form.brand === 'codex' || form.brand === 'xai'" :label="t('WebSockets', 'WebSockets')">
                 <NSwitch :value="form.websockets" @update:value="(value) => updateWebsockets(value as boolean)" />
               </NFormItem>
-              <NFormItem v-if="form.brand === 'claude'" :label="t('重建 mid system message', 'Rebuild mid system message')">
-                <NSwitch v-model:value="form.rebuild_mid_system_message" />
-              </NFormItem>
-              <NFormItem v-if="form.brand === 'claude'" :label="t('Experimental CCH signing', 'Experimental CCH signing')">
-                <NSwitch v-model:value="form.experimental_cch_signing" />
-              </NFormItem>
             </div>
           </NForm>
+
+          <ProviderBehaviorEditor :key="`behavior:${editorGeneration}`" v-model="form.advanced" :brand="form.brand" class="field-section" />
+          <ProviderRuntimePolicyEditor :key="`runtime:${editorGeneration}`" v-model="form.advanced" :supports-errors="form.brand !== 'vertex'" :effective="form.runtime_policy_effective ?? null" class="field-section" />
 
           <section v-if="form.brand === 'openai_compatibility'" class="field-section">
             <div class="section-head">
@@ -2013,7 +2023,7 @@ onMounted(refresh)
             <div v-for="(model, index) in form.models" :key="index" class="model-row" :class="{ 'is-xai': form.brand === 'xai' }">
               <NInput v-model:value="model.name" :placeholder="t('模型名称', 'Model name')" />
               <NInput v-model:value="model.alias" clearable :placeholder="t('Alias', 'Alias')" />
-              <label class="inline-switch"><span>force-mapping</span><NSwitch v-model:value="model.force_mapping" /></label>
+              <label class="inline-switch"><span>force-mapping</span><NSwitch :value="model.force_mapping" @update:value="(value) => updateModelForceMapping(model, value)" /></label>
               <label v-if="form.brand === 'openai_compatibility'" class="inline-switch"><span>image</span><NSwitch v-model:value="model.image" /></label>
               <NInput
                 v-if="form.brand === 'openai_compatibility' || form.brand === 'xai'"
@@ -2040,42 +2050,25 @@ onMounted(refresh)
             </div>
           </section>
 
-          <section v-if="form.brand !== 'openai_compatibility'" class="field-section">
-            <div class="section-head">
-              <h3>{{ t('Excluded models', 'Excluded models') }}</h3>
-              <NButton size="small" secondary @click="addExcludedModel">{{ t('新增排除项', 'Add excluded') }}</NButton>
-            </div>
-            <div v-for="(_, index) in form.excluded_models" :key="index" class="list-row single-list-row">
-              <NInput
-                :value="form.excluded_models[index] ?? ''"
-                :placeholder="t('模型名称', 'Model name')"
-                @update:value="(value) => setExcludedModel(index, value)"
-              />
-              <NButton tertiary type="error" @click="removeExcludedModel(index)">{{ t('删除', 'Delete') }}</NButton>
-            </div>
-          </section>
+          <ExcludedModelsPicker
+            v-if="form.brand !== 'openai_compatibility'"
+            :key="`excluded:${editorGeneration}`"
+            v-model="form.excluded_models"
+            :configured="form.models"
+            :discovered="discoveredModels"
+            :loading="isDiscovering"
+            :load-error="discoveryError"
+            :loaded="discoveryLoaded"
+            class="field-section"
+            @discover="runDiscovery"
+          />
 
-          <section v-if="form.brand === 'claude'" class="field-section">
-            <div class="section-head">
-              <h3>{{ t('Cloak', 'Cloak') }}</h3>
-            </div>
-            <div class="form-grid">
-              <NFormItem label="mode"><NInput v-model:value="form.cloak.mode" clearable /></NFormItem>
-              <NFormItem label="strict-mode"><NSwitch v-model:value="form.cloak.strict_mode" /></NFormItem>
-              <NFormItem label="cache-user-id"><NSwitch v-model:value="form.cloak.cache_user_id" /></NFormItem>
-            </div>
-            <div class="section-head compact-head">
-              <h3>{{ t('Sensitive words', 'Sensitive words') }}</h3>
-              <NButton size="small" secondary @click="addSensitiveWord">{{ t('新增词', 'Add word') }}</NButton>
-            </div>
-            <div v-for="(_, index) in form.cloak.sensitive_words" :key="index" class="list-row single-list-row">
-              <NInput
-                :value="form.cloak.sensitive_words[index] ?? ''"
-                @update:value="(value) => setSensitiveWord(index, value)"
-              />
-              <NButton tertiary type="error" @click="removeSensitiveWord(index)">{{ t('删除', 'Delete') }}</NButton>
-            </div>
-          </section>
+          <ClaudeCloakEditor
+            v-if="form.brand === 'claude'"
+            :key="`cloak:${editorGeneration}`"
+            v-model="form.advanced.cloak"
+            v-model:legacy-signing="form.advanced.experimental_cch_signing"
+          />
 
           <section class="field-section">
             <div class="section-head">

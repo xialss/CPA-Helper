@@ -84,6 +84,7 @@ type aiProviderItem struct {
 	BrandLabel              string                    `json:"brand_label"`
 	Index                   int                       `json:"index"`
 	IdentityHash            string                    `json:"identity_hash"`
+	SourceHash              string                    `json:"source_hash,omitempty"`
 	APIKey                  string                    `json:"api_key,omitempty"`
 	APIKeyHash              *string                   `json:"api_key_hash,omitempty"`
 	APIKeyMasked            *string                   `json:"api_key_masked,omitempty"`
@@ -103,6 +104,13 @@ type aiProviderItem struct {
 	Headers                 []aiProviderHeader        `json:"headers"`
 	ExcludedModels          []string                  `json:"excluded_models"`
 	DisableCooling          *bool                     `json:"disable_cooling,omitempty"`
+	RequestRetry            *int                      `json:"request_retry,omitempty"`
+	RequestScopedErrors     *[]aiProviderErrorRule    `json:"request_scoped_errors,omitempty"`
+	RuntimePolicyEffective  *aiProviderRuntimePolicy  `json:"runtime_policy_effective,omitempty"`
+	AlphaSearch             *bool                     `json:"alpha_search,omitempty"`
+	DisableCodexCloaking    *bool                     `json:"disable_codex_cloaking,omitempty"`
+	SupportPromptCacheKey   *bool                     `json:"support_prompt_cache_key,omitempty"`
+	FingerprintProfile      *string                   `json:"fingerprint_profile,omitempty"`
 	Websockets              *bool                     `json:"-"`
 	WebsocketsJSON          json.RawMessage           `json:"websockets,omitempty"`
 	RebuildMidSystemMessage *bool                     `json:"rebuild_mid_system_message,omitempty"`
@@ -126,6 +134,7 @@ type aiProviderItem struct {
 	websocketsSet bool
 
 	excludedModelsSet bool
+	policyFieldsSet   map[string]bool
 }
 
 type aiProviderModel struct {
@@ -173,6 +182,8 @@ type aiProviderCloak struct {
 	StrictMode     *bool    `json:"strict_mode,omitempty"`
 	SensitiveWords []string `json:"sensitive_words"`
 	CacheUserID    *bool    `json:"cache_user_id,omitempty"`
+
+	fieldsSet map[string]bool
 }
 
 func (item *aiProviderItem) UnmarshalJSON(data []byte) error {
@@ -205,6 +216,10 @@ func (item *aiProviderItem) UnmarshalJSON(data []byte) error {
 	_, item.headersSet = raw["headers"]
 	_, item.entriesSet = raw["api_key_entries"]
 	_, item.excludedModelsSet = raw["excluded_models"]
+	item.policyFieldsSet = make(map[string]bool)
+	for _, field := range aiProviderPolicyInputFields {
+		_, item.policyFieldsSet[field] = raw[field]
+	}
 	websockets, websocketsSet := raw["websockets"]
 	item.websocketsSet = websocketsSet
 	if websocketsSet {
@@ -331,6 +346,7 @@ type aiProviderOrderRequest struct {
 type aiProviderOrderItem struct {
 	Index        *int    `json:"index"`
 	IdentityHash *string `json:"identity_hash,omitempty"`
+	SourceHash   *string `json:"source_hash,omitempty"`
 	APIKeyHash   *string `json:"api_key_hash,omitempty"`
 	Name         *string `json:"name,omitempty"`
 	BaseURL      *string `json:"base_url,omitempty"`
@@ -348,6 +364,7 @@ type aiProviderActionResponse struct {
 
 type aiProviderSelector struct {
 	IdentityHash string
+	SourceHash   string
 	APIKeyHash   string
 	BaseURL      string
 	Name         string
@@ -550,6 +567,13 @@ func (a *App) aiProviderConfigSnapshotForConfig(ctx context.Context, cfg AppConf
 }
 
 func (a *App) aiProviderConfigSnapshotWithConfig(ctx context.Context, cfg AppConfig) ([]aiProviderItem, error) {
+	raw, supported, err := a.aiProviderV8Config(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if supported {
+		return aiProviderV8Snapshot(raw, cfg)
+	}
 	providers := []aiProviderItem{}
 	for _, brandConfig := range aiProviderBrandConfigs {
 		payload, err := a.aiProviderManagementPayload(ctx, cfg, http.MethodGet, brandConfig.UpstreamPath, nil, aiProviderManagementTimeout)
@@ -571,9 +595,12 @@ func (a *App) createAIProvider(ctx context.Context, brandConfig aiProviderBrandC
 	a.aiProviderWriteMu.Lock()
 	defer a.aiProviderWriteMu.Unlock()
 
-	cfg, rawConfig, err := a.aiProviderRemoteConfig(ctx)
+	cfg, rawConfig, v8, etag, err := a.aiProviderRemoteConfig(ctx)
 	if err != nil {
 		return aiProvidersResponse{}, err
+	}
+	if v8 {
+		return a.createAIProviderV8(ctx, cfg, rawConfig, etag, brandConfig, payload)
 	}
 	list, err := rawAIProviderList(rawConfig, brandConfig.ConfigKey)
 	if err != nil {
@@ -587,16 +614,22 @@ func (a *App) createAIProvider(ctx context.Context, brandConfig aiProviderBrandC
 	if err := a.putAIProviderList(ctx, cfg, brandConfig, list); err != nil {
 		return aiProvidersResponse{}, err
 	}
-	return a.aiProvidersSnapshotForConfig(ctx, cfg)
+	if err := a.verifyAIProviderPolicyWrite(ctx, cfg, brandConfig, list, len(list)-1, payload); err != nil {
+		return aiProvidersResponse{}, err
+	}
+	return a.aiProviderSnapshotAfterWrite(ctx, cfg)
 }
 
 func (a *App) updateAIProvider(ctx context.Context, brandConfig aiProviderBrandConfig, index int, payload aiProviderItem) (aiProvidersResponse, error) {
 	a.aiProviderWriteMu.Lock()
 	defer a.aiProviderWriteMu.Unlock()
 
-	cfg, rawConfig, err := a.aiProviderRemoteConfig(ctx)
+	cfg, rawConfig, v8, etag, err := a.aiProviderRemoteConfig(ctx)
 	if err != nil {
 		return aiProvidersResponse{}, err
+	}
+	if v8 {
+		return a.updateAIProviderV8(ctx, cfg, rawConfig, etag, brandConfig, index, payload)
 	}
 	list, err := rawAIProviderList(rawConfig, brandConfig.ConfigKey)
 	if err != nil {
@@ -614,16 +647,22 @@ func (a *App) updateAIProvider(ctx context.Context, brandConfig aiProviderBrandC
 	if err := a.putAIProviderList(ctx, cfg, brandConfig, list); err != nil {
 		return aiProvidersResponse{}, err
 	}
-	return a.aiProvidersSnapshotForConfig(ctx, cfg)
+	if err := a.verifyAIProviderPolicyWrite(ctx, cfg, brandConfig, list, target, payload); err != nil {
+		return aiProvidersResponse{}, err
+	}
+	return a.aiProviderSnapshotAfterWrite(ctx, cfg)
 }
 
 func (a *App) deleteAIProvider(ctx context.Context, brandConfig aiProviderBrandConfig, index int, selector aiProviderSelector) (aiProvidersResponse, error) {
 	a.aiProviderWriteMu.Lock()
 	defer a.aiProviderWriteMu.Unlock()
 
-	cfg, rawConfig, err := a.aiProviderRemoteConfig(ctx)
+	cfg, rawConfig, v8, etag, err := a.aiProviderRemoteConfig(ctx)
 	if err != nil {
 		return aiProvidersResponse{}, err
+	}
+	if v8 {
+		return a.deleteAIProviderV8(ctx, cfg, rawConfig, etag, brandConfig, index, selector)
 	}
 	list, err := rawAIProviderList(rawConfig, brandConfig.ConfigKey)
 	if err != nil {
@@ -648,9 +687,12 @@ func (a *App) reorderAIProviders(ctx context.Context, brandConfig aiProviderBran
 	a.aiProviderWriteMu.Lock()
 	defer a.aiProviderWriteMu.Unlock()
 
-	cfg, rawConfig, err := a.aiProviderRemoteConfig(ctx)
+	cfg, rawConfig, v8, etag, err := a.aiProviderRemoteConfig(ctx)
 	if err != nil {
 		return aiProvidersResponse{}, err
+	}
+	if v8 {
+		return a.reorderAIProvidersV8(ctx, cfg, rawConfig, etag, brandConfig, payload)
 	}
 	list, err := rawAIProviderList(rawConfig, brandConfig.ConfigKey)
 	if err != nil {
@@ -873,12 +915,15 @@ func (a *App) resolveAIProviderActionProvider(ctx context.Context, brandConfig a
 	if isOpenAINoAuthActionPayload(brandConfig.Brand, payload) {
 		return aiProviderActionPayloadWithoutAuthIndex(payload), nil
 	}
-	cfg, rawConfig, err := a.aiProviderRemoteConfig(ctx)
+	cfg, rawConfig, v8, _, err := a.aiProviderRemoteConfig(ctx)
 	if err != nil {
 		return aiProviderItem{}, err
 	}
-	_ = cfg
 	list, err := rawAIProviderList(rawConfig, brandConfig.ConfigKey)
+	if v8 {
+		list, payload.Index, err = aiProviderV8ActionList(rawConfig, cfg, brandConfig, payload)
+		payload.SourceHash = ""
+	}
 	if err != nil {
 		return aiProviderItem{}, err
 	}
@@ -958,25 +1003,31 @@ func (a *App) aiProviderManagementConfig(ctx context.Context) (AppConfig, error)
 	return cfg, nil
 }
 
-func (a *App) aiProviderRemoteConfig(ctx context.Context) (AppConfig, map[string]any, error) {
+func (a *App) aiProviderRemoteConfig(ctx context.Context) (AppConfig, map[string]any, bool, string, error) {
 	cfg, err := a.aiProviderManagementConfig(ctx)
 	if err != nil {
-		return AppConfig{}, nil, err
+		return AppConfig{}, nil, false, "", err
+	}
+	if raw, supported, etag, err := a.aiProviderV8Read(ctx, cfg); err != nil || supported {
+		return cfg, raw, supported, etag, err
 	}
 	payload, err := a.aiProviderManagementPayload(ctx, cfg, http.MethodGet, "/v0/management/config", nil, aiProviderManagementTimeout)
 	if err != nil {
-		return AppConfig{}, nil, err
+		return AppConfig{}, nil, false, "", err
 	}
 	var raw map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.UseNumber()
 	if err := decoder.Decode(&raw); err != nil {
-		return AppConfig{}, nil, validationError("CLIProxyAPI 配置响应不是有效 JSON object")
+		return AppConfig{}, nil, false, "", validationError("CLIProxyAPI 配置响应不是有效 JSON object")
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return AppConfig{}, nil, validationError("CLIProxyAPI 配置响应不是有效 JSON object")
+		return AppConfig{}, nil, false, "", validationError("CLIProxyAPI 配置响应不是有效 JSON object")
 	}
-	return cfg, raw, nil
+	if raw == nil {
+		return AppConfig{}, nil, false, "", validationError("CLIProxyAPI 配置响应不是有效 JSON object")
+	}
+	return cfg, raw, false, "", nil
 }
 
 func (a *App) aiProviderManagementPayload(ctx context.Context, cfg AppConfig, method, path string, body any, timeout time.Duration) ([]byte, error) {
@@ -999,13 +1050,21 @@ func (a *App) aiProviderManagementResponse(ctx context.Context, cfg AppConfig, m
 }
 
 func (a *App) aiProviderManagementResponseWithQuery(ctx context.Context, cfg AppConfig, method, path string, query url.Values, body any, timeout time.Duration) (*http.Response, []byte, error) {
+	return a.aiProviderManagementResponseWithHeaders(ctx, cfg, method, path, query, nil, body, timeout)
+}
+
+func (a *App) aiProviderManagementResponseWithHeaders(ctx context.Context, cfg AppConfig, method, path string, query url.Values, extra http.Header, body any, timeout time.Duration) (*http.Response, []byte, error) {
 	managementURL, err := collectorManagementHTTPURL(cfg.Collector.CLIProxyURL)
 	if err != nil {
 		return nil, nil, validationError("CLIProxyAPI 管理地址无效：" + err.Error())
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	response, payload, err := doJSON(requestCtx, httpClient(timeout), method, makeURL(managementURL, path, query), managementHeaders(cfg.Collector.ManagementKey), body)
+	headers := managementHeaders(cfg.Collector.ManagementKey)
+	for key, values := range extra {
+		headers[key] = values
+	}
+	response, payload, err := doJSON(requestCtx, httpClient(timeout), method, makeURL(managementURL, path, query), headers, body)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 			return nil, nil, validationError("CLIProxyAPI 管理请求超时，请检查地址和管理密钥")
@@ -1047,8 +1106,13 @@ func parseAIProviderIndex(value string) (int, error) {
 
 func parseAIProviderList(payload []byte, key string) ([]map[string]any, error) {
 	var raw any
-	if err := json.Unmarshal(payload, &raw); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&raw); err != nil {
 		return nil, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("provider list has trailing data")
 	}
 	return aiProviderListFromAny(raw, key)
 }
@@ -1140,6 +1204,14 @@ func aiProviderItemFromRaw(brandConfig aiProviderBrandConfig, index int, raw map
 	} else if websockets != nil {
 		websocketsJSON, _ = aiProviderRawJSONFromKeys(raw, "websockets")
 	}
+	requestScopedErrors := aiProviderErrorRulesFromAny(raw["request-scoped-errors"])
+	if brandConfig.Brand == aiProviderBrandVertex {
+		requestScopedErrors = nil
+	}
+	var cloak *aiProviderCloak
+	if brandConfig.Brand == aiProviderBrandClaude {
+		cloak = aiProviderCloakFromAny(raw["cloak"])
+	}
 	return aiProviderItem{
 		Brand:                   brandConfig.Brand,
 		BrandLabel:              brandConfig.Label,
@@ -1160,11 +1232,17 @@ func aiProviderItemFromRaw(brandConfig aiProviderBrandConfig, index int, raw map
 		Headers:                 aiProviderHeadersFromAny(raw["headers"]),
 		ExcludedModels:          excludedModels,
 		DisableCooling:          aiProviderBoolPtrFromKeys(raw, "disable-cooling", "disable_cooling"),
+		RequestRetry:            aiProviderIntPtrFromKeys(raw, "request-retry", "request_retry"),
+		RequestScopedErrors:     requestScopedErrors,
+		AlphaSearch:             aiProviderBehaviorBool(raw, brandConfig.Brand, aiProviderBrandCodex, "alpha-search"),
+		DisableCodexCloaking:    aiProviderBehaviorBool(raw, brandConfig.Brand, aiProviderBrandCodex, "disable-codex-cloaking"),
+		SupportPromptCacheKey:   aiProviderBehaviorBool(raw, brandConfig.Brand, aiProviderBrandOpenAICompatibility, "support-prompt-cache-key"),
+		FingerprintProfile:      aiProviderFingerprintFromRaw(raw, brandConfig.Brand),
 		Websockets:              websockets,
 		WebsocketsJSON:          websocketsJSON,
 		RebuildMidSystemMessage: aiProviderBoolPtrFromKeys(raw, "rebuild-mid-system-message", "rebuild_mid_system_message"),
 		ExperimentalCCHSigning:  aiProviderBoolPtrFromKeys(raw, "experimental-cch-signing", "experimental_cch_signing"),
-		Cloak:                   aiProviderCloakFromAny(raw["cloak"]),
+		Cloak:                   cloak,
 		APIKeyEntries:           aiProviderKeyEntriesFromAny(raw["api-key-entries"]),
 		RecentStatus:            "unknown",
 		RecentRequests:          []aiProviderRecentRequest{},
@@ -1244,8 +1322,8 @@ func aiProviderPayloadToUpstream(brandConfig aiProviderBrandConfig, payload aiPr
 	} else if payload.excludedModelsSet {
 		next["excluded-models"] = aiProviderStringListToUpstream(payload.ExcludedModels)
 	}
-	if payload.DisableCooling != nil && brandConfig.Brand != aiProviderBrandVertex {
-		next["disable-cooling"] = *payload.DisableCooling
+	if err := applyAIProviderPolicies(brandConfig, payload, current, next); err != nil {
+		return nil, err
 	}
 	if brandConfig.Brand == aiProviderBrandCodex && payload.Websockets != nil {
 		next["websockets"] = *payload.Websockets
@@ -1255,17 +1333,6 @@ func aiProviderPayloadToUpstream(brandConfig aiProviderBrandConfig, payload aiPr
 			next["websockets"] = nil
 		} else {
 			next["websockets"] = *payload.Websockets
-		}
-	}
-	if brandConfig.Brand == aiProviderBrandClaude {
-		if payload.RebuildMidSystemMessage != nil {
-			next["rebuild-mid-system-message"] = *payload.RebuildMidSystemMessage
-		}
-		if payload.ExperimentalCCHSigning != nil {
-			next["experimental-cch-signing"] = *payload.ExperimentalCCHSigning
-		}
-		if payload.Cloak != nil {
-			next["cloak"] = aiProviderCloakToUpstream(*payload.Cloak, current)
 		}
 	}
 	return next, nil
@@ -1378,6 +1445,9 @@ func (selector aiProviderSelector) validForOrder(brandConfig aiProviderBrandConf
 }
 
 func matchesAIProviderSelector(brandConfig aiProviderBrandConfig, raw map[string]any, index int, selector aiProviderSelector) bool {
+	if selector.SourceHash != "" {
+		return false // A v8 snapshot cannot authorize a write through the legacy view.
+	}
 	item := aiProviderItemFromRaw(brandConfig, index, raw)
 	if selector.IdentityHash != "" && item.IdentityHash != selector.IdentityHash {
 		return false
@@ -1397,6 +1467,7 @@ func matchesAIProviderSelector(brandConfig aiProviderBrandConfig, raw map[string
 func selectorFromAIProviderPayload(payload aiProviderItem) aiProviderSelector {
 	selector := aiProviderSelector{
 		IdentityHash: strings.TrimSpace(payload.IdentityHash),
+		SourceHash:   strings.TrimSpace(payload.SourceHash),
 	}
 	if payload.APIKeyHash != nil {
 		selector.APIKeyHash = strings.TrimSpace(*payload.APIKeyHash)
@@ -1412,6 +1483,9 @@ func selectorFromAIProviderPayload(payload aiProviderItem) aiProviderSelector {
 
 func selectorFromAIProviderOrderItem(item aiProviderOrderItem) aiProviderSelector {
 	selector := aiProviderSelector{}
+	if item.SourceHash != nil {
+		selector.SourceHash = strings.TrimSpace(*item.SourceHash)
+	}
 	if item.IdentityHash != nil {
 		selector.IdentityHash = strings.TrimSpace(*item.IdentityHash)
 	}
@@ -1498,6 +1572,7 @@ func aiProviderUsesFallbackOrderIdentity(brandConfig aiProviderBrandConfig, item
 func aiProviderSelectorFromQuery(query url.Values) aiProviderSelector {
 	return aiProviderSelector{
 		IdentityHash: strings.TrimSpace(query.Get("identity_hash")),
+		SourceHash:   strings.TrimSpace(query.Get("source_hash")),
 		APIKeyHash:   strings.TrimSpace(query.Get("api_key_hash")),
 		BaseURL:      strings.TrimSpace(query.Get("base_url")),
 		Name:         strings.TrimSpace(query.Get("name")),
@@ -2652,15 +2727,32 @@ func aiProviderCloakToUpstream(cloak aiProviderCloak, current map[string]any) ma
 	if currentCloak, ok := current["cloak"].(map[string]any); ok {
 		result = cloneAIProviderMap(currentCloak)
 	}
-	removeAIProviderKnownCloakFields(result)
-	result["sensitive-words"] = aiProviderStringListToUpstream(cloak.SensitiveWords)
+	if cloak.fieldsSet["sensitive_words"] || cloak.SensitiveWords != nil {
+		delete(result, "sensitive_words")
+		if cloak.SensitiveWords == nil {
+			delete(result, "sensitive-words")
+		} else {
+			result["sensitive-words"] = aiProviderStringListToUpstream(cloak.SensitiveWords)
+		}
+	}
+	if cloak.fieldsSet["mode"] || cloak.Mode != nil {
+		delete(result, "mode")
+	}
 	if cloak.Mode != nil {
 		if mode := strings.TrimSpace(*cloak.Mode); mode != "" {
 			result["mode"] = mode
 		}
 	}
+	if cloak.fieldsSet["strict_mode"] || cloak.StrictMode != nil {
+		delete(result, "strict_mode")
+		delete(result, "strict-mode")
+	}
 	if cloak.StrictMode != nil {
 		result["strict-mode"] = *cloak.StrictMode
+	}
+	if cloak.fieldsSet["cache_user_id"] || cloak.CacheUserID != nil {
+		delete(result, "cache_user_id")
+		delete(result, "cache-user-id")
 	}
 	if cloak.CacheUserID != nil {
 		result["cache-user-id"] = *cloak.CacheUserID
@@ -2940,6 +3032,7 @@ func removeAIProviderResponseOnlyFields(raw map[string]any) {
 		"auth-index", "auth_index", "api_key_hash", "api-key-hash", "api_key_masked", "api-key-masked",
 		"identity_hash", "identity-hash", "brand", "brand_label", "index", "recent_success", "recent_failure", "recent_status",
 		"recent_status_available", "recent_requests", "recent-requests",
+		"source_hash", "runtime_policy_effective",
 	} {
 		delete(raw, key)
 	}

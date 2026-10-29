@@ -1,17 +1,19 @@
 import { computed, ref, shallowReadonly, shallowRef, watch } from 'vue'
 
 import { useCurrentUser } from '@/features/auth/state/currentUser'
+import { useFeatureState } from '@/features/feature-center/state/useFeatureState'
 
 import { loadUpstreamModels, validateConnection } from '../api/imageStudioApi'
 import { GenerationRunner } from '../services/generationRunner'
 import { ImageStudioStorage } from '../storage/imageStudioStorage'
 import type { GenerationTask, HistoryCursor, PresetKind, SaveState, StudioConnection, StudioFavoriteTag, StudioProblem, TextPreset } from '../types'
-import { copyDraft, createDefaultDraft, createStudioId, draftFromTask } from '../utils/generationParameters'
+import { copyDraft, createDefaultDraft, createStudioId, draftFromTask, validateDraft } from '../utils/generationParameters'
 import { cancelledError, ImageStudioError, toStudioProblem } from '../utils/studioErrors'
 
 const storage = new ImageStudioStorage()
 const runner = new GenerationRunner(storage)
 const { currentUser } = useCurrentUser()
+const { imageStudio: availability, verify } = useFeatureState()
 const defaultConnection = (): StudioConnection => ({ baseUrl: '', apiKey: '' })
 const ownerId = shallowRef<number | null>(null)
 const tasks = shallowRef<GenerationTask[]>([])
@@ -45,9 +47,16 @@ let connectionRevision = 0
 let draftRevision = 0
 let galleryPreferencesRevision = 0
 let tagFavoritesRevision = 0
+let presetsRevision = 0
 let modelVersion = 0
 let modelController: AbortController | null = null
 let applyingSaved = false
+let loadedOwner: number | null = null
+type CollectionKind = 'presets' | 'favorites'
+interface CollectionWrite { kind: CollectionKind; promise: Promise<void> }
+const collectionWrites = new Map<number, Set<CollectionWrite>>()
+const collectionsNeedRefresh = new Set<number>()
+let collectionRead: { owner: number; epoch: number } | null = null
 
 runner.subscribe(() => {
   tasks.value = runner.tasks
@@ -57,11 +66,74 @@ runner.subscribe(() => {
 
 function context() {
   if (ownerId.value === null) throw cancelledError()
+  if (availability.value !== 'enabled') throw new ImageStudioError('cancelled', '生图功能已暂停，请重新验证功能状态', 'Image Studio is paused. Verify feature state to continue')
   return { owner: ownerId.value, epoch }
 }
 
 function isCurrent(captured: { owner: number; epoch: number }): boolean {
   return ownerId.value === captured.owner && epoch === captured.epoch
+}
+
+function syncCollectionBusy(): void {
+  const owner = ownerId.value
+  const writes = owner === null ? [] : [...(collectionWrites.get(owner) ?? [])]
+  const reading = collectionRead !== null && isCurrent(collectionRead)
+  presetsSaving.value = reading || writes.some((write) => write.kind === 'presets')
+  tagFavoritesSaving.value = reading || writes.some((write) => write.kind === 'favorites')
+}
+
+function trackCollectionWrite(captured: { owner: number; epoch: number }, kind: CollectionKind, promise: Promise<void>): Promise<void> {
+  const writes = collectionWrites.get(captured.owner) ?? new Set<CollectionWrite>()
+  collectionWrites.set(captured.owner, writes)
+  const operation: CollectionWrite = { kind, promise: promise.finally(() => {
+    writes.delete(operation)
+    if (!writes.size) collectionWrites.delete(captured.owner)
+    // A transaction may already have committed when its feature/account UI
+    // epoch ends. Keep its account fenced until the canonical collections sync.
+    if (!isCurrent(captured)) collectionsNeedRefresh.add(captured.owner)
+    syncCollectionBusy()
+    if (ownerId.value === captured.owner && availability.value === 'enabled' && collectionsNeedRefresh.has(captured.owner)) void refreshLocalCollections()
+  }) }
+  writes.add(operation)
+  syncCollectionBusy()
+  return operation.promise
+}
+
+async function refreshLocalCollections(): Promise<void> {
+  const owner = ownerId.value
+  if (owner === null || availability.value !== 'enabled' || !collectionsNeedRefresh.has(owner) || (collectionRead && isCurrent(collectionRead))) return
+  const captured = context()
+  const operation = { ...captured }
+  collectionRead = operation
+  const presetsRead = ++presetsRevision
+  const favoritesRead = ++tagFavoritesRevision
+  syncCollectionBusy()
+  const ownsRead = () => isCurrent(captured) && collectionRead === operation
+  try {
+    // This fence survives A -> B -> A. Account B has its own independent set,
+    // while returning A cannot write a stale full list ahead of A's old commit.
+    await Promise.allSettled([...(collectionWrites.get(owner) ?? [])].map((write) => write.promise))
+    if (!ownsRead()) return
+    const [savedPresets, savedFavorites] = await Promise.allSettled([storage.listPresets(owner), storage.getTagFavorites(owner)])
+    if (!ownsRead()) return
+    if (savedPresets.status === 'fulfilled') {
+      if (presetsRead === presetsRevision) presets.value = savedPresets.value
+    } else loadProblems.value.push(readProblem(savedPresets.reason, '读取个人预设失败', 'Failed to read personal presets'))
+    if (savedFavorites.status === 'fulfilled') {
+      if (favoritesRead === tagFavoritesRevision) tagFavorites.value = [...(savedFavorites.value?.tags ?? [])]
+    } else loadProblems.value.push(readProblem(savedFavorites.reason, '读取标签收藏失败', 'Failed to read tag favorites'))
+    if (savedPresets.status === 'fulfilled' && savedFavorites.status === 'fulfilled') collectionsNeedRefresh.delete(owner)
+  } finally {
+    if (collectionRead === operation) { collectionRead = null; syncCollectionBusy() }
+  }
+}
+
+async function reviewRefreshedCollections(): Promise<never> {
+  await refreshLocalCollections()
+  if (ownerId.value !== null && collectionsNeedRefresh.has(ownerId.value)) {
+    throw new ImageStudioError('storage', '本地收藏和预设尚无法确认，请重试后再修改', 'Local favorites and presets could not be verified. Retry before editing them')
+  }
+  throw new ImageStudioError('storage', '本地收藏和预设已更新，请根据最新内容重试操作', 'Local favorites and presets were updated. Review the current entries and retry the action')
 }
 
 function invalidateModels(): void {
@@ -99,6 +171,8 @@ async function refreshLocalData(): Promise<void> {
   const draftRead = draftRevision
   const galleryPreferencesRead = galleryPreferencesRevision
   const tagFavoritesRead = tagFavoritesRevision
+  const presetsRead = presetsRevision
+  const collectionsBlocked = collectionsNeedRefresh.has(captured.owner) || (collectionWrites.get(captured.owner)?.size ?? 0) > 0
   localLoading.value = true
   loadProblems.value = []
   const results = await Promise.allSettled([
@@ -111,6 +185,7 @@ async function refreshLocalData(): Promise<void> {
   ])
   if (!isCurrent(captured) || localReadVersion !== version) return
   const [savedConnection, savedDraft, savedPresets, savedGalleryPreferences, savedTagFavorites, history] = results
+  loadedOwner = captured.owner
   applyingSaved = true
   try {
     if (savedConnection.status === 'fulfilled') {
@@ -125,14 +200,16 @@ async function refreshLocalData(): Promise<void> {
         draftSave.value = { status: 'saved', problem: null }
       }
     } else loadProblems.value.push(readProblem(savedDraft.reason, '读取本地生成设置失败', 'Failed to read the local generation settings'))
-    if (savedPresets.status === 'fulfilled') presets.value = savedPresets.value
-    else loadProblems.value.push(readProblem(savedPresets.reason, '读取个人预设失败', 'Failed to read personal presets'))
+    if (!collectionsBlocked && presetsRevision === presetsRead) {
+      if (savedPresets.status === 'fulfilled') presets.value = savedPresets.value
+      else loadProblems.value.push(readProblem(savedPresets.reason, '读取个人预设失败', 'Failed to read personal presets'))
+    }
     if (savedGalleryPreferences.status === 'fulfilled') {
       if (!previewBlurSaving.value && galleryPreferencesRevision === galleryPreferencesRead) previewBlurred.value = savedGalleryPreferences.value?.previewBlurred === true
     } else loadProblems.value.push(readProblem(savedGalleryPreferences.reason, '读取图库偏好失败', 'Failed to read gallery preferences'))
-    if (savedTagFavorites.status === 'fulfilled') {
+    if (!collectionsBlocked && savedTagFavorites.status === 'fulfilled') {
       if (tagFavoritesRevision === tagFavoritesRead) tagFavorites.value = [...(savedTagFavorites.value?.tags ?? [])]
-    } else loadProblems.value.push(readProblem(savedTagFavorites.reason, '读取标签收藏失败', 'Failed to read tag favorites'))
+    } else if (!collectionsBlocked && savedTagFavorites.status === 'rejected') loadProblems.value.push(readProblem(savedTagFavorites.reason, '读取标签收藏失败', 'Failed to read tag favorites'))
     if (historyVersion === historyRead) {
       if (history.status === 'fulfilled') {
         runner.mergeHistory(captured.owner, history.value.tasks, true)
@@ -184,6 +261,8 @@ async function loadModels(): Promise<void> {
   modelProblem.value = null
   const ownsLoad = () => isCurrent(captured) && modelVersion === version && modelController === controller
   try {
+    await verify('image_studio')
+    if (!ownsLoad()) return
     const result = await loadUpstreamModels({ ...connection.value }, controller.signal)
     if (ownsLoad()) {
       models.value = result
@@ -276,11 +355,12 @@ async function setPreviewBlurred(enabled: boolean): Promise<boolean> {
 async function saveTagFavorites(tags: readonly StudioFavoriteTag[]): Promise<boolean> {
   if (tagFavoritesSaving.value) return false
   const captured = context()
+  if (collectionsNeedRefresh.has(captured.owner)) return reviewRefreshedCollections()
   const revision = ++tagFavoritesRevision
   const value = tags.map((tag) => ({ ...tag, ...(tag.aliases ? { aliases: [...tag.aliases] } : {}) }))
   tagFavoritesSaving.value = true
   try {
-    await storage.saveTagFavorites(captured.owner, { tags: value })
+    await trackCollectionWrite(captured, 'favorites', storage.saveTagFavorites(captured.owner, { tags: value }))
     if (!isCurrent(captured) || revision !== tagFavoritesRevision) return false
     tagFavorites.value = value
     return true
@@ -292,12 +372,14 @@ async function saveTagFavorites(tags: readonly StudioFavoriteTag[]): Promise<boo
 async function savePreset(kind: PresetKind, name: string, text: string, id: string | null): Promise<TextPreset | null> {
   if (presetsSaving.value) return null
   const captured = context()
+  if (collectionsNeedRefresh.has(captured.owner)) return reviewRefreshedCollections()
   if (!name.trim() || !text.trim()) throw new ImageStudioError('validation', '请填写预设名称和内容', 'Enter a preset name and content')
   if (id && !presets.value.some((preset) => preset.id === id && preset.kind === kind)) throw new ImageStudioError('validation', '请重新选择当前账号的预设', 'Select a preset belonging to the current account')
   const preset: TextPreset = { ownerId: captured.owner, id: id ?? createStudioId(), kind, name: name.trim(), text }
+  presetsRevision++
   presetsSaving.value = true
   try {
-    await storage.savePreset(captured.owner, preset)
+    await trackCollectionWrite(captured, 'presets', storage.savePreset(captured.owner, preset))
     if (!isCurrent(captured)) return null
     presets.value = [...presets.value.filter((item) => item.id !== preset.id), preset]
     return preset
@@ -309,9 +391,11 @@ async function savePreset(kind: PresetKind, name: string, text: string, id: stri
 async function deletePreset(id: string): Promise<boolean> {
   if (presetsSaving.value) return false
   const captured = context()
+  if (collectionsNeedRefresh.has(captured.owner)) return reviewRefreshedCollections()
+  presetsRevision++
   presetsSaving.value = true
   try {
-    await storage.deletePreset(captured.owner, id)
+    await trackCollectionWrite(captured, 'presets', storage.deletePreset(captured.owner, id))
     if (!isCurrent(captured)) return false
     presets.value = presets.value.filter((preset) => preset.id !== id)
     return true
@@ -343,10 +427,13 @@ async function deleteTasks(ids: string[]): Promise<boolean> {
 
 const stopOwnerWatch = watch(() => currentUser.value?.id ?? null, (next) => {
   epoch++
+  loadedOwner = null
   localReadVersion++
   historyVersion++
   galleryPreferencesRevision++
   tagFavoritesRevision++
+  presetsRevision++
+  collectionRead = null
   ownerId.value = next
   runner.setOwner(next)
   connection.value = defaultConnection()
@@ -362,12 +449,55 @@ const stopOwnerWatch = watch(() => currentUser.value?.id ?? null, (next) => {
   nextCursor.value = null
   localLoading.value = false
   historyLoading.value = false
-  presetsSaving.value = false
-  tagFavoritesSaving.value = false
+  if (next !== null && (collectionWrites.get(next)?.size ?? 0) > 0) collectionsNeedRefresh.add(next)
+  syncCollectionBusy()
   deleting.value = false
   invalidateModels()
-  if (next !== null) void refreshLocalData()
+  if (next !== null && availability.value === 'enabled') { void refreshLocalData(); void refreshLocalCollections() }
 }, { immediate: true, flush: 'sync' })
+
+function deactivate(): void {
+  if (ownerId.value !== null && ((collectionWrites.get(ownerId.value)?.size ?? 0) > 0 || collectionRead?.owner === ownerId.value)) collectionsNeedRefresh.add(ownerId.value)
+  epoch++
+  collectionRead = null
+  localReadVersion++
+  historyVersion++
+  invalidateModels()
+  runner.deactivate()
+  localLoading.value = false
+  historyLoading.value = false
+  syncCollectionBusy()
+  previewBlurSaving.value = false
+  deleting.value = false
+  if (connectionSave.value.status === 'saving') connectionSave.value = { status: 'pending', problem: null }
+  if (draftSave.value.status === 'saving') draftSave.value = { status: 'pending', problem: null }
+}
+
+const stopFeatureWatch = watch(availability, (next) => {
+  if (next !== 'enabled') { deactivate(); return }
+  runner.activate()
+  void refreshLocalCollections()
+  if (ownerId.value !== null && loadedOwner !== ownerId.value && !localLoading.value) void refreshLocalData()
+}, { immediate: true, flush: 'sync' })
+
+async function submit(): Promise<string> {
+  const captured = context()
+  const input = copyDraft(draft.value)
+  const target = { ...connection.value }
+  validateDraft(input)
+  validateConnection(target)
+  await verify('image_studio')
+  if (!isCurrent(captured)) throw cancelledError()
+  return runner.submit(input, target)
+}
+
+async function retry(id: string): Promise<string> {
+  const captured = context()
+  const target = { ...connection.value }
+  await verify('image_studio')
+  if (!isCurrent(captured)) throw cancelledError()
+  return runner.retry(id, target)
+}
 
 const naiModels = computed(() => models.value.filter((model) => /nai/i.test(model)))
 const otherModels = computed(() => models.value.filter((model) => !/nai/i.test(model)))
@@ -379,6 +509,7 @@ if (import.meta.hot) {
     stopOwnerWatch()
     stopConnectionWatch()
     stopDraftWatch()
+    stopFeatureWatch()
     modelController?.abort()
     runner.setOwner(null)
   })
@@ -387,6 +518,7 @@ if (import.meta.hot) {
 export function useImageStudio() {
   return {
     ownerId: shallowReadonly(ownerId),
+    availability,
     tasks: shallowReadonly(tasks),
     batchIds: shallowReadonly(batchIds),
     activeCount: shallowReadonly(activeCount),
@@ -427,8 +559,8 @@ export function useImageStudio() {
     deletePreset,
     reuseTask,
     deleteTasks,
-    submit: () => runner.submit(draft.value, connection.value),
-    retry: (id: string) => runner.retry(id, connection.value),
+    submit,
+    retry,
     retrySave: (id: string) => runner.retrySave(id),
     cancelTask: (id: string) => runner.cancelTask(id),
     cancelBatch: (id: string) => runner.cancelBatch(id),

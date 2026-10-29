@@ -5,15 +5,15 @@ import type {
   AIRadarResponse,
 } from '@/shared/types/api'
 
-export function getAIRadar(): Promise<AIRadarResponse> {
-  return apiClient.get<AIRadarResponse>('/ai-radar')
+export function getAIRadar(signal?: AbortSignal): Promise<AIRadarResponse> {
+  return apiClient.get<AIRadarResponse>('/ai-radar', {}, signal)
 }
 
-export function getAIRadarHistory(window: AIRadarHistoryWindow): Promise<AIRadarHistoryResponse> {
-  return apiClient.get<AIRadarHistoryResponse>('/ai-radar/history', { window })
+export function getAIRadarHistory(window: AIRadarHistoryWindow, signal?: AbortSignal): Promise<AIRadarHistoryResponse> {
+  return apiClient.get<AIRadarHistoryResponse>('/ai-radar/history', { window }, signal)
 }
 
 /** Administrator-only. Bypasses the shared cache and forces an upstream fetch. */
-export function refreshAIRadar(): Promise<AIRadarResponse> {
-  return apiClient.post<AIRadarResponse>('/ai-radar/refresh')
+export function refreshAIRadar(signal?: AbortSignal): Promise<AIRadarResponse> {
+  return apiClient.post<AIRadarResponse>('/ai-radar/refresh', undefined, signal)
 }

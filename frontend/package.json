@@ -9,6 +9,8 @@
     "lint": "eslint . --max-warnings=0",
     "test:i18n": "node scripts/i18n-smoke.mjs",
     "test:ai-radar": "node scripts/ai-radar-metrics-smoke.mjs",
+    "test:ai-providers": "node scripts/ai-providers-config-smoke.mjs",
+    "test:feature-center": "node scripts/feature-center-lifecycle-smoke.mjs",
     "test:image-studio": "node scripts/image-studio-smoke.mjs"
   },
   "dependencies": {

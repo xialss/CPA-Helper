@@ -22,7 +22,7 @@ export function useStudioImage(taskId: () => string | null, visible: () => boole
   async function load(): Promise<void> {
     clear()
     const id = taskId()
-    if (!id || !visible()) return
+    if (!id || !visible() || studio.availability.value !== 'enabled') return
     const owner = studio.ownerId.value
     const current = version
     loading.value = true
@@ -37,7 +37,7 @@ export function useStudioImage(taskId: () => string | null, visible: () => boole
     }
   }
 
-  watch([taskId, visible, () => studio.ownerId.value], () => { void load() }, { immediate: true })
+  watch([taskId, visible, () => studio.ownerId.value, () => studio.availability.value], () => { void load() }, { immediate: true, flush: 'sync' })
   onScopeDispose(clear)
   return { url, loading, problem, reload: load }
 }

@@ -339,6 +339,10 @@ func requireSchemaShape(ctx context.Context, db *sql.DB) error {
 		{"ai_radar_points", "created_at"},
 		{"ai_radar_state", "backfill_completed_at"},
 		{"ai_radar_state", "updated_at"},
+		{"feature_center_settings", "image_studio_enabled"},
+		{"feature_center_settings", "ai_radar_enabled"},
+		{"feature_center_settings", "revision"},
+		{"feature_center_settings", "updated_at"},
 		{"usage_records", "response_model"},
 		{"usage_records", "request_alias"},
 		{"usage_records", "collector_origin"},
@@ -376,7 +380,8 @@ func requireSchemaShape(ctx context.Context, db *sql.DB) error {
 			return fmt.Errorf("%w: missing schema column %s.%s; run `cpa-helper migrate`", ErrDatabaseNeedsMigration, item.table, item.column)
 		}
 	}
-	return nil
+	_, err := readFeatureCenterSettings(ctx, db)
+	return err
 }
 
 func columnExists(ctx context.Context, db *sql.DB, table, column string) (bool, error) {

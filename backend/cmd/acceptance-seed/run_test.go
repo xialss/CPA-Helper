@@ -153,6 +153,8 @@ func newSeedTestCPA(t *testing.T) *httptest.Server {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
+		case "/v8/management/config":
+			http.NotFound(w, r)
 		case "/v0/management/openai-compatibility":
 			json.NewEncoder(w).Encode([]map[string]any{{
 				"name": "deepseek", "base-url": "http://127.0.0.1/v1", "api-key-entries": []any{},
