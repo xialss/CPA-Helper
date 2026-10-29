@@ -196,6 +196,9 @@ try {
   )
   assert.equal(localizedApiErrorMessage(null, null), 'Request failed')
   assert.equal(localizedServerMessage('渠道身份不完整'), 'Channel identity is incomplete')
+  assert.equal(localizedServerMessage('ultrafast 倍率必须是大于 0 的有限数值'), 'The ultrafast multiplier must be a finite number greater than 0')
+  assert.equal(localizedServerMessage('ultrafast 倍率会产生无法安全计价的金额'), 'The ultrafast multiplier produces an amount that cannot be priced safely')
+  assert.equal(localizedServerMessage('ultrafast 倍率仅支持 OpenAI 兼容或 Codex 渠道的 gpt-6.1-sol 和 gpt-6-astra'), 'ultrafast multipliers only support gpt-6.1-sol and gpt-6-astra on OpenAI-compatible or Codex channels')
   assert.equal(localizedApiErrorMessage('not_found', '峰谷时段模板不存在'), 'Time pricing template does not exist')
   const claudePricingErrors = [
     ['峰谷定价仅支持 DeepSeek 或 Claude 渠道 Token 价格', 'Time pricing only supports DeepSeek or Claude channel token prices'],

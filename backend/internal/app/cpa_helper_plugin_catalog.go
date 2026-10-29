@@ -18,9 +18,8 @@ import (
 )
 
 const (
-	pluginModelCatalogVersion = "0.1.8"
-	pluginModelCatalogCPA     = "v8.0.32"
-	pluginModelCatalogMaxRev  = uint64(9007199254740991)
+	pluginModelCatalogCPA    = "v8.0.32"
+	pluginModelCatalogMaxRev = uint64(9007199254740991)
 )
 
 type pluginModelCatalogCredential struct {
@@ -58,29 +57,42 @@ type pluginCatalogRecovery struct {
 }
 
 func pluginSupportsModelCatalog(capabilities map[string]json.RawMessage) bool {
-	target := pluginCatalogCPATarget(rawString(capabilities["plugin_version"]))
-	return target != "" && rawString(capabilities["cpa_version"]) == target
+	contract, err := pluginManagementCompatibility(capabilities)
+	return err == nil && contract.ModelCatalog
 }
 
-func pluginCatalogCPATarget(version string) string {
+func pluginCatalogProvenanceValid(version, origin string) bool {
+	if !pluginValidCatalogText(version) || !pluginValidCatalogText(origin) {
+		return false
+	}
 	switch version {
+	case "0.1.0", "0.1.1", "0.1.2", "0.1.3", "0.1.4", "0.1.5", "0.1.6", "0.1.7":
+		return false
 	case "0.1.8":
-		return pluginModelCatalogCPA
+		return origin == pluginModelCatalogCPA
 	case "0.1.9", "0.1.10":
-		return "v8.0.45"
+		return origin == "v8.0.45"
 	default:
-		return ""
+		return true
 	}
 }
 
-func pluginCatalogProducerCompatible(version, producer string) bool {
-	switch version {
+func pluginCatalogProducerCompatible(contract pluginManagementContract, snapshot pluginModelCatalogSnapshot) bool {
+	if snapshot.PluginVersion == contract.PluginVersion {
+		return snapshot.CPAVersion == contract.CPAOrigin
+	}
+	if contract.Negotiated {
+		// The authenticated, compatible plugin has already validated its stored
+		// producer. Preserve that provenance instead of rewriting it to this release.
+		return true
+	}
+	switch contract.PluginVersion {
 	case "0.1.8":
-		return producer == "0.1.8"
+		return false
 	case "0.1.9":
-		return producer == "0.1.8" || producer == "0.1.9"
+		return snapshot.PluginVersion == "0.1.8"
 	case "0.1.10":
-		return producer == "0.1.8" || producer == "0.1.9" || producer == "0.1.10"
+		return snapshot.PluginVersion == "0.1.8" || snapshot.PluginVersion == "0.1.9"
 	default:
 		return false
 	}
@@ -102,10 +114,14 @@ func pluginCatalogSyncFailed(message string) error {
 // Coalesce only in-flight work for the same captured management configuration.
 // Every later explicit refresh starts a new transaction; there is no TTL cache.
 func (a *App) syncPluginModelCatalog(ctx context.Context, cfg AppConfig, capabilities map[string]json.RawMessage) (pluginCatalogSyncResult, error) {
-	if !pluginSupportsModelCatalog(capabilities) {
+	contract, err := pluginManagementCompatibility(capabilities)
+	if err != nil {
+		return pluginCatalogSyncResult{}, err
+	}
+	if !contract.ModelCatalog {
 		return pluginCatalogSyncResult{}, pluginIncompatibleError()
 	}
-	key := strings.TrimRight(strings.TrimSpace(cfg.Collector.CLIProxyURL), "/") + "\x00" + strings.TrimSpace(cfg.Collector.ManagementKey) + "\x00" + rawString(capabilities["plugin_version"])
+	key := strings.TrimRight(strings.TrimSpace(cfg.Collector.CLIProxyURL), "/") + "\x00" + strings.TrimSpace(cfg.Collector.ManagementKey) + "\x00" + contract.PluginVersion + "\x00" + contract.CPAOrigin
 	a.pluginCatalogMu.Lock()
 	if flight := a.pluginCatalogFlights[key]; flight != nil {
 		a.pluginCatalogMu.Unlock()
@@ -126,7 +142,7 @@ func (a *App) syncPluginModelCatalog(ctx context.Context, cfg AppConfig, capabil
 	// the leader. Each caller still observes its own cancellation while the
 	// in-flight work keeps running for all other waiters.
 	go func() {
-		result, err := a.performPluginCatalogSync(context.WithoutCancel(ctx), cfg, capabilities)
+		result, err := a.performPluginCatalogSync(context.WithoutCancel(ctx), cfg, contract)
 		a.pluginCatalogMu.Lock()
 		flight.result, flight.err = result, err
 		delete(a.pluginCatalogFlights, key)
@@ -162,7 +178,7 @@ func (a *App) pluginV8HostDirectory(ctx context.Context, cfg AppConfig) (map[str
 	return config, credentials, err
 }
 
-func (a *App) pluginCatalogState(ctx context.Context, cfg AppConfig, capabilities map[string]json.RawMessage) (uint64, *pluginModelCatalogSnapshot, error) {
+func (a *App) pluginCatalogState(ctx context.Context, cfg AppConfig, contract pluginManagementContract) (uint64, *pluginModelCatalogSnapshot, error) {
 	status, headers, payload, err := a.cpaHelperPluginRequest(ctx, cfg, http.MethodGet, cpaHelperPluginManagementPrefix+"/model-catalog", nil, nil)
 	if err != nil {
 		return 0, nil, appErrorFromPlugin(err, status)
@@ -189,7 +205,7 @@ func (a *App) pluginCatalogState(ctx context.Context, cfg AppConfig, capabilitie
 	if err != nil {
 		return 0, nil, err
 	}
-	if !pluginCatalogProducerCompatible(rawString(capabilities["plugin_version"]), snapshot.PluginVersion) {
+	if !pluginCatalogProducerCompatible(contract, snapshot) {
 		return 0, nil, pluginIncompatibleError()
 	}
 	if snapshot.Revision != revision || rawString(health["status"]) != "ok" {
@@ -198,20 +214,19 @@ func (a *App) pluginCatalogState(ctx context.Context, cfg AppConfig, capabilitie
 	return revision, &snapshot, nil
 }
 
-func (a *App) performPluginCatalogSync(ctx context.Context, cfg AppConfig, capabilities map[string]json.RawMessage) (pluginCatalogSyncResult, error) {
+func (a *App) performPluginCatalogSync(ctx context.Context, cfg AppConfig, contract pluginManagementContract) (pluginCatalogSyncResult, error) {
 	config, credentials, err := a.pluginV8HostDirectory(ctx, cfg)
 	if err != nil {
 		return pluginCatalogSyncResult{}, err
 	}
-	version := rawString(capabilities["plugin_version"])
 	var registered []pluginRegisteredCredentialModels
-	if version != pluginModelCatalogVersion {
+	if contract.AuthoritativeModels {
 		registered, err = a.pluginRegisteredCredentialModels(ctx, cfg)
 		if err != nil {
 			return pluginCatalogSyncResult{}, err
 		}
 	}
-	base, _, err := a.pluginCatalogState(ctx, cfg, capabilities)
+	base, _, err := a.pluginCatalogState(ctx, cfg, contract)
 	if err != nil {
 		return pluginCatalogSyncResult{}, err
 	}
@@ -219,10 +234,10 @@ func (a *App) performPluginCatalogSync(ctx context.Context, cfg AppConfig, capab
 		return pluginCatalogSyncResult{}, pluginIncompatibleError()
 	}
 	snapshot := pluginModelCatalogSnapshot{
-		ContractVersion: "v1", PluginVersion: version, CPAVersion: pluginCatalogCPATarget(version),
+		ContractVersion: "v1", PluginVersion: contract.PluginVersion, CPAVersion: contract.CPAOrigin,
 		Revision: base + 1, GeneratedAt: time.Now().UTC(), Credentials: make([]pluginModelCatalogCredential, 0, len(credentials)),
 	}
-	if version != pluginModelCatalogVersion {
+	if contract.AuthoritativeModels {
 		snapshot.Credentials, credentials, err = pluginJoinRegisteredCredentialModels(credentials, registered)
 		if err != nil {
 			return pluginCatalogSyncResult{}, err
@@ -260,13 +275,16 @@ func (a *App) performPluginCatalogSync(ctx context.Context, cfg AppConfig, capab
 	if !reflect.DeepEqual(config, latestConfig) || !pluginHostIdentityEqual(credentials, latestCredentials) {
 		return pluginCatalogSyncResult{}, appError("model_catalog_out_of_sync", http.StatusConflict, "同步期间 CPA 配置或凭据已变化，请刷新后重试")
 	}
-	if version != pluginModelCatalogVersion {
+	if contract.AuthoritativeModels {
 		latestRegistered, err := a.pluginRegisteredCredentialModels(ctx, cfg)
 		if err != nil {
 			return pluginCatalogSyncResult{}, err
 		}
 		if !reflect.DeepEqual(registered, latestRegistered) {
 			return pluginCatalogSyncResult{}, appError("model_catalog_out_of_sync", http.StatusConflict, "同步期间 CPA 凭据模型注册已变化，请刷新后重试")
+		}
+		if err := a.confirmPluginCatalogContract(ctx, cfg, contract); err != nil {
+			return pluginCatalogSyncResult{}, err
 		}
 	}
 	headers := http.Header{}
@@ -295,14 +313,34 @@ func (a *App) performPluginCatalogSync(ctx context.Context, cfg AppConfig, capab
 	if err != nil || rawString(modelHealth["status"]) != "ok" || rawUint(modelHealth["catalog_revision"]) != snapshot.Revision {
 		return pluginCatalogSyncResult{}, pluginCatalogSyncFailed("CPA Helper Plugin 模型目录已提交，但未确认生效")
 	}
-	_, confirmed, err := a.pluginCatalogState(ctx, cfg, capabilities)
+	_, confirmed, err := a.pluginCatalogState(ctx, cfg, contract)
 	if err != nil {
 		return pluginCatalogSyncResult{}, err
 	}
 	if confirmed == nil || !reflect.DeepEqual(*confirmed, snapshot) {
 		return pluginCatalogSyncResult{}, pluginCatalogSyncFailed("CPA Helper Plugin 模型目录已提交，但未确认生效")
 	}
+	if contract.AuthoritativeModels {
+		if err := a.confirmPluginCatalogContract(ctx, cfg, contract); err != nil {
+			return pluginCatalogSyncResult{}, err
+		}
+	}
 	return pluginCatalogSyncResult{Config: config, Credentials: credentials, Snapshot: snapshot}, nil
+}
+
+func (a *App) confirmPluginCatalogContract(ctx context.Context, cfg AppConfig, expected pluginManagementContract) error {
+	capabilities, err := a.cpaHelperPluginCapabilities(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	current, err := pluginManagementCompatibility(capabilities)
+	if err != nil {
+		return err
+	}
+	if current != expected {
+		return pluginModelCatalogError("model_catalog_out_of_sync")
+	}
+	return nil
 }
 
 func pluginHostIdentityEqual(left, right []pluginHostCredential) bool {
@@ -379,7 +417,7 @@ func decodePluginCatalogSnapshot(raw []byte) (pluginModelCatalogSnapshot, error)
 		return pluginModelCatalogSnapshot{}, err
 	}
 	var snapshot pluginModelCatalogSnapshot
-	if json.Unmarshal(mapToRawObject(object), &snapshot) != nil || snapshot.ContractVersion != "v1" || pluginCatalogCPATarget(snapshot.PluginVersion) == "" || snapshot.CPAVersion != pluginCatalogCPATarget(snapshot.PluginVersion) || snapshot.GeneratedAt.IsZero() {
+	if json.Unmarshal(mapToRawObject(object), &snapshot) != nil || snapshot.ContractVersion != "v1" || !pluginCatalogProvenanceValid(snapshot.PluginVersion, snapshot.CPAVersion) || snapshot.GeneratedAt.IsZero() {
 		return pluginModelCatalogSnapshot{}, pluginIncompatibleError()
 	}
 	if _, err := pluginCatalogRevision(object["catalog_revision"], false); err != nil {

@@ -519,39 +519,13 @@ func (a *App) cpaHelperPluginCapabilities(ctx context.Context, cfg AppConfig) (m
 	if _, err := pluginUsesV8Management(capabilities); err != nil {
 		return nil, err
 	}
-	if version := rawString(capabilities["plugin_version"]); version == "0.1.9" || version == "0.1.10" {
-		if rawUint(capabilities["abi_version"]) != 1 || rawUint(capabilities["schema_version"]) != 7 {
-			return nil, pluginIncompatibleError()
-		}
-	}
 	return capabilities, nil
 }
 
-// pluginUsesV8Management selects the host management bridge for known releases.
-// cpa_version is the plugin's build target, not the running CPA version.
+// cpa_version describes contract provenance, not the running CPA version.
 func pluginUsesV8Management(capabilities map[string]json.RawMessage) (bool, error) {
-	var expectedCPATarget string
-	switch rawString(capabilities["plugin_version"]) {
-	case "0.1.0", "0.1.1", "0.1.2", "0.1.3", "0.1.4":
-		// Preserve the legacy config/auth-files contract for older releases.
-		return false, nil
-	case "0.1.5":
-		expectedCPATarget = "v8.0.12"
-	case "0.1.6":
-		expectedCPATarget = "v8.0.17"
-	case "0.1.7":
-		expectedCPATarget = "v8.0.29"
-	case "0.1.8":
-		expectedCPATarget = pluginModelCatalogCPA
-	case "0.1.9", "0.1.10":
-		expectedCPATarget = "v8.0.45"
-	default:
-		return false, appError("plugin_incompatible", http.StatusServiceUnavailable, "CPA Helper Plugin 版本不兼容")
-	}
-	if rawString(capabilities["cpa_version"]) != expectedCPATarget {
-		return false, pluginIncompatibleError()
-	}
-	return true, nil
+	contract, err := pluginManagementCompatibility(capabilities)
+	return contract.V8, err
 }
 
 type cpaHelperPluginKeySummary struct {

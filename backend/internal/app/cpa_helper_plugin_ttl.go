@@ -52,9 +52,10 @@ func pluginSupportsResponseVerification(capabilities map[string]json.RawMessage)
 	if _, exists := capabilities["modules"]; exists {
 		return pluginContainsCapability(modules, "response_model_mismatch")
 	}
-	// Older published contracts exposed the config before modules was required.
-	// The removed 0.1.10 feature must never be restored by a stale config field.
-	if rawString(capabilities["plugin_version"]) == "0.1.10" {
+	// Only historical contracts may infer this feature from the old config.
+	// Modern producers must declare it, never revive it through a stale field.
+	contract, err := pluginManagementCompatibility(capabilities)
+	if err != nil || (contract.AuthoritativeModels && contract.PluginVersion != "0.1.9") {
 		return false
 	}
 	raw, exists := capabilities["response_model_mismatch"]
@@ -93,10 +94,11 @@ func (a *App) pluginClaudeTTLFeature(ctx context.Context, cfg AppConfig) (cpaHel
 
 func (a *App) pluginClaudeTTLFeatureFromState(ctx context.Context, cfg AppConfig, capabilities, health map[string]json.RawMessage) (cpaHelperPluginClaudeTTLFeature, error) {
 	feature := cpaHelperPluginClaudeTTLFeature{Status: "unsupported"}
-	if _, err := pluginUsesV8Management(capabilities); err != nil {
+	contract, err := pluginManagementCompatibility(capabilities)
+	if err != nil {
 		return feature, err
 	}
-	if rawString(capabilities["plugin_version"]) != "0.1.10" {
+	if !contract.AuthoritativeModels || contract.PluginVersion == "0.1.9" {
 		return feature, nil
 	}
 	modules, err := pluginCapabilityStrings(capabilities, "modules")

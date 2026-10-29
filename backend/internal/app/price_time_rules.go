@@ -460,7 +460,7 @@ func snapshotLongContextArgs(p ModelPrice) (threshold, input, output, read, writ
 
 func materializePriceSnapshot(ctx context.Context, tx *sql.Tx, p ModelPrice) error {
 	threshold, input, output, read, write, write1h := snapshotLongContextArgs(p)
-	_, err := tx.ExecContext(ctx, `UPDATE model_prices SET input_usd_per_million=?,output_usd_per_million=?,cache_read_usd_per_million=?,cache_creation_usd_per_million=?,cache_creation_1h_usd_per_million=?,request_usd=?,billing_unit=?,priority_multiplier=?,long_context_threshold_tokens=?,long_context_input_usd_per_million=?,long_context_output_usd_per_million=?,long_context_cache_read_usd_per_million=?,long_context_cache_creation_usd_per_million=?,long_context_cache_creation_1h_usd_per_million=?,time_pricing=? WHERE id=?`, p.InputUSDPerMillion, p.OutputUSDPerMillion, p.CacheReadUSDPerMillion, p.CacheCreationUSDPerMillion, nullableFloatArg(p.CacheCreation1hUSDPerMillion), nullableFloatArg(p.RequestUSD), p.BillingUnit, nullableFloatArg(p.PriorityMultiplier), threshold, input, output, read, write, write1h, priceTimeRuleJSON(p.TimePricing), p.ID)
+	_, err := tx.ExecContext(ctx, `UPDATE model_prices SET input_usd_per_million=?,output_usd_per_million=?,cache_read_usd_per_million=?,cache_creation_usd_per_million=?,cache_creation_1h_usd_per_million=?,request_usd=?,billing_unit=?,priority_multiplier=?,ultrafast_multiplier=?,long_context_threshold_tokens=?,long_context_input_usd_per_million=?,long_context_output_usd_per_million=?,long_context_cache_read_usd_per_million=?,long_context_cache_creation_usd_per_million=?,long_context_cache_creation_1h_usd_per_million=?,time_pricing=? WHERE id=?`, p.InputUSDPerMillion, p.OutputUSDPerMillion, p.CacheReadUSDPerMillion, p.CacheCreationUSDPerMillion, nullableFloatArg(p.CacheCreation1hUSDPerMillion), nullableFloatArg(p.RequestUSD), p.BillingUnit, nullableFloatArg(p.PriorityMultiplier), nullableFloatArg(p.UltrafastMultiplier), threshold, input, output, read, write, write1h, priceTimeRuleJSON(p.TimePricing), p.ID)
 	return err
 }
 
@@ -493,6 +493,7 @@ func effectivePriceFromVersions(p ModelPrice, versions modelPriceVersionIndex, a
 	p.CacheCreation1hUSDPerMillion = selected.CacheCreation1hUSDPerMillion
 	p.LongContext = selected.LongContext
 	p.PriorityMultiplier = selected.PriorityMultiplier
+	p.UltrafastMultiplier = selected.UltrafastMultiplier
 	p.RequestUSD = selected.RequestUSD
 	p.BillingUnit = selected.BillingUnit
 	p.longContextInvalid = selected.longContextInvalid

@@ -619,6 +619,7 @@ export interface UsageCostBreakdown {
   unpriced: boolean
   unpriced_reason: string | null
   tier_multiplier?: number
+  ultrafast_eligible: boolean
   context_input_tokens: number
   long_context_threshold_tokens: number | null
   long_context_applied: boolean
@@ -754,6 +755,7 @@ export interface ModelPrice {
   cache_creation_1h_usd_per_million: number | null
   request_usd: number | null
   priority_multiplier: number | null
+  ultrafast_multiplier: number | null
   long_context: ModelPriceLongContext | null
   preserved_long_context: ModelPriceLibraryConflictLongContext | null
   billing_unit: ModelPriceBillingUnit
@@ -781,6 +783,7 @@ export interface ModelPricePayload {
   cache_creation_usd_per_million: number
   cache_creation_1h_usd_per_million?: number | null
   request_usd: number | null
+  ultrafast_multiplier?: number
   long_context: ModelPriceLongContext | null
   preserve_invalid_long_context?: boolean
   correct_latest_version?: boolean
@@ -810,7 +813,8 @@ export interface ModelPriceLibraryConflictPromotePayload {
 }
 
 export interface PriorityMultiplierPayload {
-  priority_multiplier: number
+  priority_multiplier?: number
+  ultrafast_multiplier?: number
   correct_latest_version?: boolean
 }
 
@@ -859,6 +863,7 @@ export interface ModelPriceVersion {
   request_usd: number | null
   billing_unit: ModelPriceBillingUnit
   priority_multiplier: number | null
+  ultrafast_multiplier: number | null
   long_context: ModelPriceLongContext | null
   preserved_long_context: ModelPriceLibraryConflictLongContext | null
 }

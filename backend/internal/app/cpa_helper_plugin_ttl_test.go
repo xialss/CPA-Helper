@@ -127,7 +127,7 @@ func TestPluginClaudeTTLFeatureProbe(t *testing.T) {
 		{"missing policy field", func(f *pluginTTLHTTPFixture) { delete(f.caps, "policy_fields") }, false, "", true},
 		{"null modules", func(f *pluginTTLHTTPFixture) { f.caps["modules"] = mustRaw(nil) }, false, "", true},
 		{"wrong CPA target", func(f *pluginTTLHTTPFixture) { f.caps["cpa_version"] = mustRawString("v8.0.32") }, false, "", true},
-		{"unknown future release", func(f *pluginTTLHTTPFixture) { f.caps["plugin_version"] = mustRawString("0.1.11") }, false, "", true},
+		{"incomplete modern capabilities", func(f *pluginTTLHTTPFixture) { f.caps["plugin_version"] = mustRawString("0.1.11") }, false, "", true},
 		{"unknown metadata protocol", func(f *pluginTTLHTTPFixture) {
 			f.requirements = strings.Replace(f.requirements, `"metadata_version":"v1"`, `"metadata_version":"v2"`, 1)
 		}, false, "", true},
@@ -325,7 +325,7 @@ func TestPluginManagementPolicyRejectsUnknownOrMismatchedRelease(t *testing.T) {
 		name, version, target string
 		abi, schema           int
 	}{
-		{"unknown version", "0.1.11", "v8.0.45", 1, 7},
+		{"incomplete modern capabilities", "0.1.11", "v8.0.45", 1, 7},
 		{"new target mismatch", "0.1.10", "v8.0.32", 1, 7},
 		{"old target mismatch", "0.1.8", "v8.0.45", 1, 7},
 		{"unknown abi", "0.1.10", "v8.0.45", 2, 7},

@@ -15,16 +15,17 @@ import (
 const collectorTTLTestKey = "sk-collector-ttl-private-key"
 
 type collectorTTLFixture struct {
-	mu          sync.Mutex
-	facts       map[string]usageTTLExecutionMetadata
-	status      int
-	health      string
-	unsupported bool
-	calls       int
-	lookupIDs   [][]string
-	queueCalls  int
-	onLookup    func()
-	response    *usageTTLMetadataResponse
+	mu           sync.Mutex
+	facts        map[string]usageTTLExecutionMetadata
+	status       int
+	health       string
+	unsupported  bool
+	capabilities map[string]json.RawMessage
+	calls        int
+	lookupIDs    [][]string
+	queueCalls   int
+	onLookup     func()
+	response     *usageTTLMetadataResponse
 }
 
 func newCollectorTTLFixture(t *testing.T) (*collectorTTLFixture, AppConfig) {
@@ -46,6 +47,10 @@ func newCollectorTTLFixture(t *testing.T) (*collectorTTLFixture, AppConfig) {
 		case "GET /v0/management/usage-statistics-enabled":
 			_, _ = w.Write([]byte(`{"usage-statistics-enabled":true}`))
 		case "GET " + cpaHelperPluginManagementPrefix + "/capabilities":
+			if f.capabilities != nil {
+				_ = json.NewEncoder(w).Encode(f.capabilities)
+				return
+			}
 			modules, fields := []string{"model_rules", "claude_cache_ttl"}, []string{"keys[].claude_cache_ttl"}
 			version := "0.1.10"
 			if f.unsupported {
@@ -276,6 +281,55 @@ func TestCollectorTTLAsyncFreezeRedactionAndNoLateReprice(t *testing.T) {
 	defer f.mu.Unlock()
 	if f.calls != lookupCount {
 		t.Fatal("late metadata queried and could reprice a completed record")
+	}
+}
+
+func TestCollectorTTLStablePluginContractFirstCharge(t *testing.T) {
+	for _, version := range []string{"0.1.11", "0.1.42"} {
+		t.Run(version, func(t *testing.T) {
+			a, _, pricing := newCollectorTTLApp(t)
+			f, cfg := newCollectorTTLFixture(t)
+			f.capabilities = pluginStableCapabilitiesFixture(version, "v8.0.45", true)
+			ctx := context.Background()
+			now := time.Date(2026, 10, 29, 10, 0, 0, 0, appTimeLocation)
+			id := collectorTTLID(91)
+			raw := collectorTTLMessage(t, id, now, nil)
+			if err := a.persistCollectorUsageBatch(ctx, cfg.Collector, []string{raw}, now); err != nil {
+				t.Fatal(err)
+			}
+			if completed, err := a.processCollectorUsageInbox(ctx, cfg, pricing, now); err != nil || completed != 0 {
+				t.Fatalf("missing modern execution metadata completed early: %d/%v", completed, err)
+			}
+			if got := collectorTTLCount(t, a, `SELECT COUNT(*) FROM user_quota_charges`); got != 0 {
+				t.Fatal("pending modern usage was charged")
+			}
+			f.mu.Lock()
+			f.health = "disabled"
+			f.facts[id] = collectorTTLFact(id, "1h", now.Add(time.Second))
+			f.mu.Unlock()
+			if completed, err := a.processCollectorUsageInbox(ctx, cfg, pricing, now.Add(10*time.Second)); err != nil || completed != 1 {
+				t.Fatalf("retained modern metadata was unavailable after disable: %d/%v", completed, err)
+			}
+			record := collectorTTLRecord(t, a, raw)
+			if record.CacheCreationMetadata.Status == nil || *record.CacheCreationMetadata.Status != "matched" || record.CacheCreationMetadata.Source == nil || *record.CacheCreationMetadata.Source != "enforced_request" {
+				t.Fatalf("modern execution provenance was lost: %#v", record.CacheCreationMetadata)
+			}
+			assertCollectorTTLCharge(t, a, record.ID, 8, false)
+			f.mu.Lock()
+			f.facts[id] = collectorTTLFact(id, "5m", now)
+			calls := f.calls
+			f.mu.Unlock()
+			if err := a.persistCollectorUsageBatch(ctx, cfg.Collector, []string{raw}, now.Add(time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+			if completed, err := a.processCollectorUsageInbox(ctx, cfg, pricing, now.Add(time.Minute)); err != nil || completed != 0 {
+				t.Fatalf("completed modern usage was replayed: %d/%v", completed, err)
+			}
+			assertCollectorTTLCharge(t, a, record.ID, 8, false)
+			if f.calls != calls || collectorTTLCount(t, a, `SELECT COUNT(*) FROM user_quota_charges`) != 1 {
+				t.Fatal("late modern metadata repriced or recharged a completed record")
+			}
+		})
 	}
 }
 

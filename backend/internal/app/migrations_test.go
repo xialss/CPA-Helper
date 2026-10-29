@@ -57,6 +57,11 @@ func TestRunMigrationsCreatesGooseVersionAndFinalSchema(t *testing.T) {
 	if !testColumnExists(t, app.db, "model_prices", "priority_multiplier") {
 		t.Fatal("model_prices.priority_multiplier was not created")
 	}
+	for _, table := range []string{"model_prices", "model_price_versions", "model_price_library_conflicts"} {
+		if !testColumnExists(t, app.db, table, "ultrafast_multiplier") {
+			t.Fatalf("%s.ultrafast_multiplier was not created", table)
+		}
+	}
 	for _, column := range []string{"price_scope", "channel_auth_type", "channel_brand", "channel_key"} {
 		if !testColumnExists(t, app.db, "model_prices", column) {
 			t.Fatalf("model_prices.%s was not created", column)
