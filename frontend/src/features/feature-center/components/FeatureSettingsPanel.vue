@@ -107,24 +107,30 @@ onBeforeUnmount(() => { generation++; controller?.abort() })
 
 <template>
   <section class="panel feature-settings" :aria-label="t('功能配置', 'Feature configuration')">
-    <div class="panel-header"><div><h2 class="panel-title">{{ t('功能配置', 'Feature configuration') }}</h2><p>{{ t('超级管理员的全局设置，对所有账号和在线会话生效。关闭会停止相关任务，并保留历史和配置。', 'Global settings managed by the super administrator apply to every account and online session. Disabling stops related work while retaining history and settings.') }}</p></div></div>
-    <div class="feature-body">
-      <NAlert v-if="!canManage" type="info">{{ t('仅超级管理员可修改功能配置', 'Only the super administrator can change feature settings') }}</NAlert>
-      <NAlert v-if="error" type="error" :bordered="false">{{ error }}</NAlert>
-      <NAlert v-if="feedback" type="info" :bordered="false">{{ feedback }}</NAlert>
-      <NAlert v-if="conflict" type="warning" :bordered="false">{{ t('设置已被其他会话修改。您的草稿已保留；请重新读取并审阅后再保存。', 'Another session changed these settings. Your draft is retained. Reload and review before saving again.') }}</NAlert>
-      <div v-for="entry in [{ key: 'image_studio_enabled' as const, zh: '生图广场', en: 'Image Studio' }, { key: 'ai_radar_enabled' as const, zh: 'AI 雷达', en: 'AI Radar' }]" :key="entry.key" class="feature-row">
-        <div><strong>{{ t(entry.zh, entry.en) }}</strong><div class="effective">{{ t('服务端已保存', 'Saved on server') }}: {{ effective ? (effective[entry.key] ? t('开启', 'On') : t('关闭', 'Off')) : t('未知', 'Unknown') }}</div></div>
-        <NSwitch v-model:value="draft[entry.key]" :disabled="!canManage || !saved || loading || saving" :aria-label="t(entry.zh, entry.en)" />
+    <div class="panel-inner">
+      <div class="panel-header"><div><h2 class="section-title">{{ t('功能配置', 'Feature configuration') }}</h2><p>{{ t('超级管理员的全局设置，对所有账号和在线会话生效。关闭会停止相关任务，并保留历史和配置。', 'Global settings managed by the super administrator apply to every account and online session. Disabling stops related work while retaining history and settings.') }}</p></div></div>
+      <div class="feature-body">
+        <NAlert v-if="!canManage" type="info">{{ t('仅超级管理员可修改功能配置', 'Only the super administrator can change feature settings') }}</NAlert>
+        <NAlert v-if="error" type="error" :bordered="false">{{ error }}</NAlert>
+        <NAlert v-if="feedback" type="info" :bordered="false">{{ feedback }}</NAlert>
+        <NAlert v-if="conflict" type="warning" :bordered="false">{{ t('设置已被其他会话修改。您的草稿已保留；请重新读取并审阅后再保存。', 'Another session changed these settings. Your draft is retained. Reload and review before saving again.') }}</NAlert>
+        <div v-for="entry in [{ key: 'image_studio_enabled' as const, zh: '生图广场', en: 'Image Studio' }, { key: 'ai_radar_enabled' as const, zh: 'AI 雷达', en: 'AI Radar' }]" :key="entry.key" class="feature-row">
+          <div><strong>{{ t(entry.zh, entry.en) }}</strong><div class="effective">{{ t('服务端已保存', 'Saved on server') }}: {{ effective ? (effective[entry.key] ? t('开启', 'On') : t('关闭', 'Off')) : t('未知', 'Unknown') }}</div></div>
+          <NSwitch v-model:value="draft[entry.key]" :disabled="!canManage || !saved || loading || saving" :aria-label="t(entry.zh, entry.en)" />
+        </div>
+        <div class="feature-actions"><NTag :type="state.verified ? 'success' : 'warning'" :bordered="false">{{ state.verified ? t('本会话已验证', 'Session verified') : t('本会话已暂停', 'Session paused') }}</NTag><span v-if="dirty">{{ t('有未保存的草稿', 'Unsaved changes') }}</span><NButton :loading="loading" :disabled="saving || loading" @click="load()">{{ t('重新读取并重置草稿', 'Reload and reset draft') }}</NButton><NButton type="primary" :loading="saving" :disabled="!canManage || !saved || loading || saving || conflict || !dirty" @click="save">{{ t('保存功能配置', 'Save feature settings') }}</NButton></div>
       </div>
-      <div class="feature-actions"><NTag :type="state.verified ? 'success' : 'warning'" :bordered="false">{{ state.verified ? t('本会话已验证', 'Session verified') : t('本会话已暂停', 'Session paused') }}</NTag><span v-if="dirty">{{ t('有未保存的草稿', 'Unsaved changes') }}</span><NButton :loading="loading" :disabled="saving || loading" @click="load()">{{ t('重新读取并重置草稿', 'Reload and reset draft') }}</NButton><NButton type="primary" :loading="saving" :disabled="!canManage || !saved || loading || saving || conflict || !dirty" @click="save">{{ t('保存功能配置', 'Save feature settings') }}</NButton></div>
     </div>
   </section>
 </template>
 
 <style scoped>
-.feature-body { display: grid; gap: 16px; padding: 20px; }
-.panel-header p, .effective { margin: 6px 0 0; color: var(--cpa-text-muted); font-size: 12px; }
+.panel-header { margin-bottom: 16px; }
+.section-title { margin: 0 0 8px; }
+.feature-body { display: grid; gap: 16px; }
+.panel-header p, .effective { color: var(--cpa-text-muted); font-size: 12px; }
+.panel-header p { margin: 0; }
+.effective { margin: 6px 0 0; }
 .feature-row, .feature-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .feature-row { border-bottom: 1px solid var(--cpa-border); padding-bottom: 14px; }
 .feature-actions { flex-wrap: wrap; justify-content: flex-end; }

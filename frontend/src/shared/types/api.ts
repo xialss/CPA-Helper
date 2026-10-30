@@ -285,7 +285,9 @@ export interface AIProviderItem {
   metadata?: Record<string, unknown>
 }
 
-export type AIProviderPayload = Omit<AIProviderItem, 'channel_key' | 'local_alias' | 'runtime_policy_effective'>
+export type AIProviderPayload = Omit<AIProviderItem, 'channel_key' | 'local_alias' | 'runtime_policy_effective' | 'excluded_models'> & {
+  excluded_models?: string[]
+}
 
 export interface AIProviderUsage {
   provider?: string
@@ -687,6 +689,7 @@ export interface UsageRecordsResponse {
 }
 
 export interface UsageRecordDetail extends UsageRecordListItem {
+  remote_compaction?: boolean
   raw_json: Record<string, unknown> | unknown[] | string
 }
 

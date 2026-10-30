@@ -75,6 +75,16 @@ func (s *fakeCPA) serveV8ProviderFamily(w http.ResponseWriter, r *http.Request) 
 		fakeProblem(w, http.StatusBadRequest, "invalid", "Expected a complete provider group array")
 		return
 	}
+	// This fixture models the v8.0.47 OpenAI exclusion-field rejection only,
+	// not the complete KnownFields validator in internal/config/config_v8.go.
+	if family == "openai-compatibility" {
+		for _, group := range groups {
+			if _, exists := group["excluded-models"]; exists {
+				fakeProblem(w, http.StatusBadRequest, "invalid_config", "OpenAI-compatible providers do not support excluded-models")
+				return
+			}
+		}
+	}
 	entries, err := flattenFixtureV8Groups(groups, family)
 	if err != nil || validateProviderEntries(configKey, entries) != nil {
 		fakeProblem(w, http.StatusBadRequest, "invalid", "Invalid provider group or key fields")

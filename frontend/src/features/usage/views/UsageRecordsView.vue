@@ -1199,6 +1199,8 @@ function handleRecordsLayoutChange(event: MediaQueryListEvent) {
   isDesktopRecordsLayout.value = event.matches
 }
 
+const remoteCompactionLabel = computed(() => selectedRecord.value?.remote_compaction === true ? t('压缩', 'Compaction') : null)
+
 const detailRows = computed(() => {
   const record = selectedRecord.value
   if (!record) {
@@ -1539,6 +1541,9 @@ onBeforeUnmount(() => {
 
     <NDrawer v-model:show="drawerOpen" placement="right" width="min(760px, 100vw)" :auto-focus="false">
       <NDrawerContent :title="t('请求事件详情', 'Request event details')">
+        <NTag v-if="remoteCompactionLabel" type="info" size="small" style="margin-bottom: 12px">
+          {{ remoteCompactionLabel }}
+        </NTag>
         <h3 class="drawer-section-title">{{ t('结构化信息', 'Structured information') }}</h3>
         <div class="detail-grid">
           <div v-for="row in detailRows" :key="row.label" class="detail-item">

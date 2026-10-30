@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 
 import { compileScript, compileTemplate, parse } from '@vue/compiler-sfc'
 import { createServer, transformWithEsbuild } from 'vite'
-import { createRenderer, nextTick } from 'vue'
+import { createRenderer, h, nextTick } from 'vue'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const env = { errors: [], saved: [], failSave: false, versionRequests: [], numberUpdates: [] }
@@ -138,6 +138,14 @@ const mount = async (name, props = {}) => {
   await settle()
   return { state, host, app }
 }
+const renderCell = async render => {
+  const host = { children: [] }
+  const app = renderer.createApp({ render })
+  apps.add(app)
+  app.mount(host)
+  await settle()
+  return { host, app }
+}
 const price = {
   id: 1, provider: 'openai', model: 'gpt-6.1-sol', price_scope: 'library',
   channel_brand: null, channel_key: null, channel_auth_type: null, billing_unit: 'token',
@@ -153,6 +161,68 @@ try {
     prices.state.openPriorityMultiplierEditor({ ...price, ...overrides })
     await settle()
     return ui(prices.host, 'NInputNumber')
+  }
+  const compatible = { price_scope: 'channel', channel_brand: 'openai_compatibility', channel_key: 'Vendor A', channel_auth_type: 'apikey', provider: 'Vendor A' }
+  const visibilityCases = [
+    { model: 'gemini-4-argon', ...compatible, visible: false },
+    { model: 'claude-sonnet-4', ...compatible, visible: false },
+    { model: 'deepseek-v3', ...compatible, visible: false },
+    { model: 'o3', ...compatible, visible: false },
+    { model: 'vendor-gpt-6-sol', ...compatible, visible: false },
+    { model: 'gpt-6-sol', ...compatible, visible: true },
+    { model: ' models/GPT-6-SOL ', ...compatible, visible: true },
+    { model: 'publishers/google/models/gpt-6-sol', ...compatible, visible: true },
+    { model: 'gpt-6-sol', ...compatible, channel_brand: 'codex', visible: true },
+    { model: 'gpt-6-sol', ...compatible, channel_brand: 'claude', visible: false },
+    { model: 'gpt-6-sol', provider: 'openai', visible: true },
+    { model: 'gpt-6-sol', provider: 'anthropic', visible: false },
+    { model: 'gemini-4-argon', provider: 'openai', visible: false },
+    { model: 'gemini-4-argon', ...compatible, priority_multiplier: 1.00001, visible: true },
+    { model: 'gemini-4-argon', ...compatible, priority_multiplier: 0, visible: false },
+    { model: 'gemini-4-argon', ...compatible, priority_multiplier: Number.POSITIVE_INFINITY, visible: false },
+  ]
+  for (const language of ['zh', 'en']) {
+    setLanguage(language)
+    for (const [index, { visible, ...overrides }] of visibilityCases.entries()) {
+      const candidate = { ...price, priority_multiplier: null, ultrafast_multiplier: null, ...overrides, id: 100 + index }
+      const row = prices.state.pricedDisplayRow(candidate, null, 'ready')
+      const cell = await renderCell(() => h('div', null, [prices.state.renderActionsCell(row), prices.state.renderPriorityMultiplier(row)]))
+      const label = language === 'zh' ? '设置 Fast 倍率' : 'Set Fast multiplier'
+      assert.equal(textContent(cell.host).includes(label), visible, `${candidate.model}: row action uses model eligibility`)
+      assert.equal(ui(cell.host, 'NTag').length > 0, visible, `${candidate.model}: row tags use the same eligibility`)
+      const group = prices.state.createPriceGroupRow('model', candidate.model, candidate.model, [row])
+      assert.equal(group.priorityEligibleCount, Number(visible), `${candidate.model}: group count matches visible controls`)
+      assert.equal(group.priorityConfiguredCount, Number(visible && candidate.priority_multiplier !== null), `${candidate.model}: configured count excludes hidden values`)
+      cell.app.unmount()
+      apps.delete(cell.app)
+      prices.state.priorityModalOpen.value = false
+      const requestCount = env.versionRequests.length
+      await open(candidate)
+      assert.equal(prices.state.priorityModalOpen.value, visible, `${candidate.model}: direct modal opening cannot bypass eligibility`)
+      assert.equal(env.versionRequests.length - requestCount, Number(visible && candidate.price_scope === 'channel'), 'Blocked controls make no version request')
+      if (visible && candidate.price_scope === 'channel') {
+        env.versionRequests.at(-1).resolve(Response.json([]))
+        await settle()
+      }
+      assert.equal(candidate.priority_multiplier, overrides.priority_multiplier ?? null, 'Visibility checks do not rewrite legacy values')
+    }
+    prices.state.priorityModalOpen.value = false
+    for (const [model, currentMultiplier, historyMultiplier, visible] of [
+      ['gpt-6-sol', null, null, true],
+      ['gemini-4-argon', null, null, false],
+      ['gemini-4-argon', 2, 2, true],
+      ['gemini-4-argon', null, 2, true],
+    ]) {
+      const candidate = { ...price, ...compatible, id: 180, model, priority_multiplier: currentMultiplier, ultrafast_multiplier: null }
+      prices.state.prices.value = [candidate]
+      prices.state.openEdit(prices.state.pricedDisplayRow(candidate, null, 'ready'))
+      env.versionRequests.at(-1).resolve(Response.json([{ ...candidate, id: 181, priority_multiplier: historyMultiplier, effective_at: '2026-10-29T00:00:00Z', baseline: false }]))
+      await settle()
+      assert.equal(textContent(prices.host).includes('Fast:'), visible, 'Actual history retains explicit multipliers without suggesting unconfigured non-GPT values')
+      prices.state.modalOpen.value = false
+      await settle()
+    }
+    prices.state.prices.value = []
   }
   for (const language of ['zh', 'en']) {
     setLanguage(language)
@@ -184,8 +254,9 @@ try {
     assert.equal(prices.state.priorityModalOpen.value, false)
     const other = await open({ model: 'gpt-6-sol' })
     assert.equal(other.length, 1, 'Other models keep their original Fast editor')
-    const unsupported = await open({ provider: 'anthropic' })
-    assert.equal(unsupported.length, 1, 'Provider scope cannot be inferred from a GPT model name')
+    prices.state.priorityModalOpen.value = false
+    await open({ provider: 'anthropic' })
+    assert.equal(prices.state.priorityModalOpen.value, false, 'Provider scope cannot be inferred from a GPT model name')
   }
 
   await open({ id: 21, price_scope: 'channel', channel_brand: 'openai_compatibility', provider: 'Vendor A' })

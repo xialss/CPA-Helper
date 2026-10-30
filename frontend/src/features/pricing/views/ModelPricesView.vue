@@ -208,8 +208,8 @@ const visiblePriceVersions = computed(() => {
   const newestFirst = [...priceVersions.value].reverse()
   return showAllVersions.value ? newestFirst : newestFirst.slice(0, collapsedVersionCount)
 })
-const editingSupportsFast = computed(() => supportsPriorityMultiplier(prices.value.find(price => price.id === editingId.value) ?? null))
-const editingSupportsUltrafast = computed(() => supportsUltrafastMultiplier(prices.value.find(price => price.id === editingId.value) ?? null))
+const editingPrice = computed(() => prices.value.find(price => price.id === editingId.value) ?? null)
+const editingSupportsUltrafast = computed(() => supportsUltrafastMultiplier(editingPrice.value))
 function invalidateTimeTemplateRequest() {
   timeTemplateRequest += 1
   timeRuleLoading.value = false
@@ -1383,14 +1383,19 @@ async function savePrice() {
   }
 }
 
-function supportsPriorityMultiplier(price: ModelPrice | null): boolean {
+function supportsPriorityMultiplier(price: ModelPrice | null, multiplier = price?.priority_multiplier): boolean {
   if (!price) {
     return false
   }
-  if (price.price_scope === 'channel') {
-    return price.channel_brand === 'codex' || price.channel_brand === 'openai_compatibility'
+  const eligibleProvider = price.price_scope === 'channel'
+    ? price.channel_brand === 'codex' || price.channel_brand === 'openai_compatibility'
+    : ['openai', 'codex'].includes(price.provider.trim().toLowerCase())
+  if (!eligibleProvider) {
+    return false
   }
-  return ['openai', 'codex'].includes(price.provider.trim().toLowerCase())
+  // Keep existing explicit settings manageable without offering Fast for other model families.
+  return normalizeModelComparisonKey(price.model.toLowerCase()).startsWith('gpt-') ||
+    (typeof multiplier === 'number' && Number.isFinite(multiplier) && multiplier > 0)
 }
 
 function supportsUltrafastMultiplier(price: ModelPrice | null): boolean {
@@ -1399,7 +1404,7 @@ function supportsUltrafastMultiplier(price: ModelPrice | null): boolean {
 }
 
 function openPriorityMultiplierEditor(price: ModelPrice) {
-  if (isPrioritySaving.value) return
+  if (isPrioritySaving.value || !supportsPriorityMultiplier(price)) return
   priorityVersionRequest += 1
   priorityEditingPrice.value = price
   priorityMultiplier.value = price.priority_multiplier
@@ -2731,7 +2736,7 @@ onBeforeUnmount(() => {
                   :request-usd="version.request_usd"
                   :priority-multiplier="version.priority_multiplier"
                   :ultrafast-multiplier="version.ultrafast_multiplier"
-                  :show-fast="editingSupportsFast"
+                  :show-fast="supportsPriorityMultiplier(editingPrice, version.priority_multiplier)"
                   :show-ultrafast="editingSupportsUltrafast"
                   :show-time-disabled="timePricingForm"
                 />

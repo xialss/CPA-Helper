@@ -559,6 +559,13 @@ try {
       env.state.selectedRecord.value = zero
       assert.equal(rows().get(label('缓存写 Token', 'Cache write tokens')), '0')
       assert.equal(cacheColumn.render(zero), '0')
+      for (const flag of [true, false, undefined, 'true']) {
+        env.state.selectedRecord.value = { ...record, remote_compaction: flag }
+        assert.equal(env.state.remoteCompactionLabel.value, flag === true ? label('压缩', 'Compaction') : null,
+          'Only a strict native-log marker displays the localized compaction label')
+        assert.equal(rows().get(label('记录模型', 'Record model')), 'claude-sonnet')
+        assert.equal(env.state.selectedRecord.value.estimated_cost_usd, record.estimated_cost_usd)
+      }
     }
     env.state.currentLanguage.value = 'zh'
   })

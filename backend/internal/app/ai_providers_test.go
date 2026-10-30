@@ -422,6 +422,7 @@ type fakeAIProviderManagement struct {
 	providerGetStatus int
 	v8Config          map[string]any
 	v8IgnoreFields    []string
+	v8ValidateFamily  func(string, json.RawMessage) error
 	preserveFields    []string
 }
 
@@ -479,6 +480,14 @@ func (f *fakeAIProviderManagement) handle(w http.ResponseWriter, r *http.Request
 			w.WriteHeader(f.providerPutStatus)
 			return
 		}
+		family := strings.TrimPrefix(r.URL.Path, "/v8/management/config/api-keys/")
+		if f.v8ValidateFamily != nil {
+			if err := f.v8ValidateFamily(family, rawBody); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_config", "message": err.Error()})
+				return
+			}
+		}
 		for _, value := range groups {
 			group := value.(map[string]any)
 			for _, field := range f.v8IgnoreFields {
@@ -488,7 +497,6 @@ func (f *fakeAIProviderManagement) handle(w http.ResponseWriter, r *http.Request
 				}
 			}
 		}
-		family := strings.TrimPrefix(r.URL.Path, "/v8/management/config/api-keys/")
 		f.v8Config["api-keys"].(map[string]any)[family] = groups
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 		return

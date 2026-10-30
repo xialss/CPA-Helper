@@ -11,6 +11,7 @@ const exactServerMessages: MessagePair[] = [
   ['功能配置需要完整的开关状态和有效版本', 'Feature settings require both switches and a valid revision'],
   ['功能状态事件仅允许同源连接', 'Feature state events require a same-origin connection'],
   ['Vertex 不支持请求错误规则', 'Vertex does not support request error rules'],
+  ['CPA v8 OpenAI-compatible provider 不支持修改排除模型', 'CPA v8 OpenAI-compatible providers do not support changing excluded models'],
   ['当前提供商不支持 Codex 专属行为', 'This provider does not support Codex-specific behavior'],
   ['当前提供商不支持提示词缓存键注入', 'This provider does not support prompt cache key injection'],
   ['当前提供商不支持 Claude 请求指纹或 Cloak', 'This provider does not support Claude request fingerprints or Cloak'],

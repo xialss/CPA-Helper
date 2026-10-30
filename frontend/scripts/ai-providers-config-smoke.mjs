@@ -119,7 +119,7 @@ async function mount(relative, input = {}, env = environment()) {
   await settle()
   return { env, props, tree, unmount: () => app.unmount() }
 }
-function findTag(node, tag) { return node.tag === tag ? node : node.children?.map(child => findTag(child, tag)).find(Boolean) }
+function findTag(node, tag, matches = () => true) { return node.tag === tag && matches(node) ? node : node.children?.map(child => findTag(child, tag, matches)).find(Boolean) }
 function treeText(node) { return `${node.text ?? ''}${(node.children ?? []).map(treeText).join('')}` }
 function controls(node, name) { return [...(node.props?.['data-control'] === name ? [node] : []), ...(node.children ?? []).flatMap(child => controls(child, name))] }
 
@@ -168,6 +168,10 @@ try {
   cloak.unmount()
 
   const policy = await mount('components/ProviderRuntimePolicyEditor', { modelValue: advanced.providerAdvancedDraft(), supportsErrors: true })
+  const policyDisclosure = findTag(policy.tree, 'details')
+  assert.ok(policyDisclosure, 'Runtime policy is an expandable disclosure')
+  assert.equal(policyDisclosure.props.open, undefined, 'Runtime policy starts collapsed')
+  assert.equal(policy.env.requests.length, 0, 'Rendering policy does not discover models')
   policy.env.state.setRuleMode('override')
   await settle()
   policy.env.state.updateRule(0, { action: 'stop' })
@@ -185,7 +189,19 @@ try {
   assert.match(treeText(statusRule), /正整数/)
   policy.unmount()
 
-  const picker = await mount('components/ExcludedModelsPicker', { modelValue: ['legacy-absent', 'claude-*', 'claude-a'], configured: [{ name: 'claude-a' }], discovered: [], loading: false, loadError: null, loaded: false })
+  const picker = await mount('components/ExcludedModelsPicker', { modelValue: ['legacy-absent', 'claude-*', 'claude-a'], configured: [{ name: 'claude-a', display_name: 'Claude Alpha' }], discovered: [] })
+  const pickerDisclosure = findTag(picker.tree, 'details')
+  assert.ok(pickerDisclosure, 'Excluded models is an expandable disclosure')
+  assert.equal(pickerDisclosure.props.open, undefined, 'Excluded models starts collapsed')
+  assert.ok(!controls(picker.tree, 'NButton').some(node => /获取模型|Load models/.test(treeText(node))), 'Exclusions do not offer a discovery action')
+  picker.env.state.search.value = 'Alpha'
+  await settle()
+  assert.deepEqual(picker.env.state.visible.value.map(model => model.name), ['claude-a'], 'Configured display names remain searchable without a request')
+  picker.props.discovered = [{ name: 'claude-b', alias: 'Discovered Beta' }]
+  picker.env.state.search.value = 'Beta'
+  await settle()
+  assert.deepEqual(picker.env.state.visible.value.map(model => model.name), ['claude-b'], 'Same-draft discovery results remain passive local candidates')
+  picker.env.state.search.value = ''
   picker.env.state.toggle('claude-a', false)
   await settle()
   assert.deepEqual(picker.props.modelValue, ['legacy-absent', 'claude-*'])
@@ -199,10 +215,24 @@ try {
   picker.env.state.addRule()
   await settle()
   assert.deepEqual(picker.props.modelValue, ['legacy-absent', 'claude-*-thinking'], 'Wildcard rules can be edited without losing unknown exact exclusions')
+  assert.equal(picker.env.requests.length, 0, 'Local search, selection and rule editing issue no discovery requests')
   picker.unmount()
+
+  const emptyPicker = await mount('components/ExcludedModelsPicker', { modelValue: [], configured: [], discovered: [] })
+  assert.match(treeText(emptyPicker.tree), /模型名称或通配符规则/, 'Empty candidates explain manual exact and wildcard rules')
+  assert.ok(!/获取模型|Load models/.test(treeText(emptyPicker.tree)), 'Empty candidates do not point to a removed fetch action')
+  emptyPicker.unmount()
 
   const view = await mount('views/AIProvidersView')
   const state = view.env.state
+  for (const mode of ['create', 'edit']) {
+    const compatibleDraft = state.defaultDraft('openai_compatibility')
+    compatibleDraft.name = 'compatible'
+    compatibleDraft.excluded_models = ['legacy-*']
+    const compatiblePayload = JSON.parse(JSON.stringify(state.draftToPayload(compatibleDraft, mode)))
+    assert.equal(Object.hasOwn(compatiblePayload, 'excluded_models'), false, `OpenAI ${mode} omits unsupported exclusions even when historical data exists`)
+    assert.deepEqual(compatibleDraft.excluded_models, ['legacy-*'], 'Omitting a write field does not clear the draft history')
+  }
   const inheritedModel = state.modelToDraft({ name: 'gpt-5' })
   const inheritedModelProvider = state.defaultDraft('codex')
   inheritedModelProvider.models = [inheritedModel]
@@ -220,10 +250,27 @@ try {
   sourceDraft.api_key = 'fixture-only'
   sourceDraft.base_url = 'https://fixture.invalid/v1'
   sourceDraft.source_hash = 'safe-source-snapshot'
+  sourceDraft.excluded_models = ['gpt-*', 'gpt-5']
   const sourcePayload = state.draftToPayload(sourceDraft, 'create')
+  assert.deepEqual(sourcePayload.excluded_models, ['gpt-*', 'gpt-5'], 'Native model selections and wildcard rules remain writable')
   assert.equal(sourcePayload.source_hash, 'safe-source-snapshot', 'Source snapshot travels through action/save payload')
   assert.equal(state.providerOrderItem({ ...sourcePayload, index: 0 }).source_hash, 'safe-source-snapshot', 'Reordering preserves source identity')
   state.openCreateDialog()
+  state.handleBrandChange('codex')
+  state.form.value.api_key = 'fixture-only'
+  state.form.value.base_url = 'https://fixture.invalid/v1'
+  await settle()
+  const runtimeTitle = '高级运行策略'
+  const exclusionsTitle = '排除模型'
+  const runtimeDisclosure = findTag(view.tree, 'details', node => treeText(node).includes(runtimeTitle))
+  const exclusionsDisclosure = findTag(view.tree, 'details', node => treeText(node).includes(exclusionsTitle))
+  assert.ok(runtimeDisclosure && exclusionsDisclosure)
+  runtimeDisclosure.props.open = true
+  exclusionsDisclosure.props.open = true
+  state.handleBrandChange('claude')
+  await settle()
+  assert.equal(findTag(view.tree, 'details', node => treeText(node).includes(runtimeTitle)).props.open, undefined, 'Switching provider type remounts the runtime disclosure collapsed')
+  assert.equal(findTag(view.tree, 'details', node => treeText(node).includes(exclusionsTitle)).props.open, undefined, 'Switching provider type remounts the exclusion disclosure collapsed')
   state.handleBrandChange('codex')
   state.form.value.api_key = 'fixture-only'
   state.form.value.base_url = 'https://fixture.invalid/v1'

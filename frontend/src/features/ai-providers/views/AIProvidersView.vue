@@ -234,7 +234,6 @@ const aliasModalOpen = ref(false)
 const aliasLabel = ref('')
 const isDiscovering = ref(false)
 const isTesting = ref(false)
-const discoveryLoaded = ref(false)
 const discoveryError = ref<string | null>(null)
 const discoveredModels = ref<AIProviderModel[]>([])
 const discoverySearch = ref('')
@@ -479,7 +478,6 @@ function invalidateEditorActions() {
   isDiscovering.value = false
   isTesting.value = false
   discoveredModels.value = []
-  discoveryLoaded.value = false
   discoveryError.value = null
   selectedDiscoveryModelKeys.value = []
   actionResult.value = null
@@ -691,9 +689,6 @@ function draftToPayload(draft: ProviderDraft, mode: 'create' | 'edit' = editorMo
     headers: draft.headers
       .map((header) => ({ name: header.name.trim(), value: header.value }))
       .filter((header) => header.name !== ''),
-    excluded_models: draft.excluded_models
-      .map((item) => item.trim())
-      .filter((item) => item !== '' && (!providerUsesExcludedModelsDisabled(draft.brand) || item !== '*')),
     ...advancedConfigPayload(draft.advanced, draft.advanced_original, draft.brand, mode),
     api_key_entries:
       draft.brand === 'openai_compatibility'
@@ -711,6 +706,11 @@ function draftToPayload(draft: ProviderDraft, mode: 'create' | 'edit' = editorMo
     recent_status: draft.recent_status,
     recent_status_available: draft.recent_status_available,
     recent_requests: draft.recent_requests,
+  }
+  if (draft.brand !== 'openai_compatibility') {
+    payload.excluded_models = draft.excluded_models
+      .map((item) => item.trim())
+      .filter((item) => item !== '' && item !== '*')
   }
   if (draft.brand === 'codex') {
     payload.websockets = draft.websockets
@@ -1008,7 +1008,6 @@ async function runDiscovery() {
     if (!ownsRequest()) return
     actionResult.value = result
     if (result.ok) {
-      discoveryLoaded.value = true
       discoveredModels.value = result.models ?? []
       discoverySearch.value = ''
       selectedDiscoveryModelKeys.value = []
@@ -2056,11 +2055,7 @@ onMounted(refresh)
             v-model="form.excluded_models"
             :configured="form.models"
             :discovered="discoveredModels"
-            :loading="isDiscovering"
-            :load-error="discoveryError"
-            :loaded="discoveryLoaded"
             class="field-section"
-            @discover="runDiscovery"
           />
 
           <ClaudeCloakEditor

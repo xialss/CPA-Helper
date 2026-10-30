@@ -543,6 +543,9 @@ func (a *App) usageRecordDetail(w http.ResponseWriter, r *http.Request, recordID
 		item["source_label"] = sourceLabels.labelFor(record)
 	}
 	item["raw_json"] = redactedRawJSON(record.RawJSON, usageRecordAuth(record), redaction)
+	if usageRemoteCompaction(record) {
+		item["remote_compaction"] = true
+	}
 	writeJSON(w, http.StatusOK, item)
 	return nil
 }
@@ -2036,6 +2039,18 @@ func normalizeUsage(raw []byte) (normalizedUsage, error) {
 	if err != nil {
 		return normalizedUsage{}, err
 	}
+	sum := sha256.Sum256(canonical)
+	// Preserve the queue's dedupe identity, but never import server-owned log
+	// provenance from a queue payload. Only the native log reader writes it.
+	if object, ok := parsed.(map[string]any); ok {
+		if _, exists := object[remoteCompactionMetadataField]; exists {
+			delete(object, remoteCompactionMetadataField)
+			canonical, err = json.Marshal(object)
+			if err != nil {
+				return normalizedUsage{}, err
+			}
+		}
+	}
 	apiKey := toString(findFirst(parsed, "api_key", "apiKey", "apikey", "key"))
 	if apiKey == nil {
 		unknown := "unknown"
@@ -2078,7 +2093,6 @@ func normalizeUsage(raw []byte) (normalizedUsage, error) {
 		}
 	}
 	source := toString(findFirst(parsed, usageSourcePayloadFields...))
-	sum := sha256.Sum256(canonical)
 	normalized := normalizedUsage{
 		Timestamp:             parseUsageTimestamp(findFirst(parsed, "timestamp", "time", "created_at", "createdAt", "request_time")),
 		APIKeyHash:            hashAPIKey(*apiKey),
