@@ -203,7 +203,7 @@ func (a *App) createAIProviderV8(ctx context.Context, cfg AppConfig, raw map[str
 	if err != nil {
 		return aiProvidersResponse{}, err
 	}
-	next, err := aiProviderPayloadToUpstream(brand, payload, nil, true)
+	next, err := aiProviderV8PayloadToUpstream(brand, payload, nil, true)
 	if err != nil {
 		return aiProvidersResponse{}, err
 	}
@@ -244,6 +244,19 @@ func aiProviderV8OpenAIGroup(flat map[string]any) map[string]any {
 	return group
 }
 
+func aiProviderV8PayloadToUpstream(brand aiProviderBrandConfig, payload aiProviderItem, current map[string]any, create bool) (map[string]any, error) {
+	if brand.Brand == aiProviderBrandOpenAICompatibility && payload.excludedModelsSet {
+		previous, _ := aiProviderExcludedModelsFromRaw(current, false)
+		if !aiProviderJSONEqual(aiProviderStringListToUpstream(previous), aiProviderStringListToUpstream(payload.ExcludedModels)) {
+			return nil, validationError("CPA v8 OpenAI-compatible provider 不支持修改排除模型")
+		}
+		// Empty editor defaults must not add an unsupported field. Omission also
+		// preserves an unchanged historical extension without rewriting its raw value.
+		payload.excludedModelsSet = false
+	}
+	return aiProviderPayloadToUpstream(brand, payload, current, create)
+}
+
 func (a *App) updateAIProviderV8(ctx context.Context, cfg AppConfig, raw map[string]any, etag string, brand aiProviderBrandConfig, index int, payload aiProviderItem) (aiProvidersResponse, error) {
 	entries, err := aiProviderV8Entries(raw, cfg, brand)
 	if err != nil {
@@ -254,7 +267,7 @@ func (a *App) updateAIProviderV8(ctx context.Context, cfg AppConfig, raw map[str
 		return aiProvidersResponse{}, err
 	}
 	groups, _ := aiProviderV8Groups(raw, brand)
-	next, err := aiProviderPayloadToUpstream(brand, payload, target.Effective, false)
+	next, err := aiProviderV8PayloadToUpstream(brand, payload, target.Effective, false)
 	if err != nil {
 		return aiProvidersResponse{}, err
 	}

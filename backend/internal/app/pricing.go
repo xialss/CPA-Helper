@@ -2232,7 +2232,7 @@ func findCatalogPrice(prices libraryPriceIndex, allPrices []ModelPrice, suggeste
 	}
 	for _, provider := range providers {
 		for _, candidate := range modelCandidates {
-			if price := findMatchingLibraryPrice(prices, &provider, &candidate); price != nil {
+			if price := findExactMatchingLibraryPrice(prices, &provider, &candidate); price != nil {
 				return price
 			}
 		}
@@ -2240,25 +2240,82 @@ func findCatalogPrice(prices libraryPriceIndex, allPrices []ModelPrice, suggeste
 	if geminiLookup {
 		provider := "google"
 		for _, candidate := range catalogModelCandidates(modelID) {
-			if price := findMatchingLibraryPrice(prices, &provider, &candidate); price != nil {
+			if price := findExactMatchingLibraryPrice(prices, &provider, &candidate); price != nil {
 				return price
 			}
 		}
-		return nil
-	}
-	var matched *ModelPrice
-	for _, price := range allPrices {
-		scope := price.PriceScope
-		if scope == "" {
-			scope = modelPriceScopeLibrary
+	} else {
+		var matched *ModelPrice
+		for _, price := range allPrices {
+			scope := price.PriceScope
+			if scope == "" {
+				scope = modelPriceScopeLibrary
+			}
+			if scope != modelPriceScopeLibrary {
+				continue
+			}
+			priceModel := strings.ToLower(strings.TrimSpace(price.Model))
+			modelMatches := false
+			for _, candidate := range modelCandidates {
+				if priceModel == strings.ToLower(strings.TrimSpace(candidate)) {
+					modelMatches = true
+					break
+				}
+			}
+			if !modelMatches {
+				continue
+			}
+			if matched != nil {
+				return nil // An ambiguous exact match must not fall through to an affix template.
+			}
+			candidate := price
+			matched = &candidate
 		}
-		if scope != modelPriceScopeLibrary {
+		if matched != nil {
+			return matched
+		}
+	}
+	for _, provider := range providers {
+		if price, found := findMatchingLibraryAffixPrice(prices, provider, modelCandidates); found {
+			return price
+		}
+	}
+	if geminiLookup {
+		price, _ := findMatchingLibraryAffixPrice(prices, "google", catalogModelCandidates(modelID))
+		return price
+	}
+	price, _ := findLibraryModelAffixPrice(prices, "", modelCandidates)
+	return price
+}
+
+// The boolean distinguishes no candidate from equally specific ambiguous templates.
+func findMatchingLibraryAffixPrice(prices libraryPriceIndex, provider string, models []string) (*ModelPrice, bool) {
+	for _, candidate := range libraryPriceProviderCandidates(provider) {
+		if price, found := findLibraryModelAffixPrice(prices, candidate, models); found {
+			return price, true
+		}
+	}
+	return nil, false
+}
+
+func findLibraryModelAffixPrice(prices libraryPriceIndex, provider string, models []string) (*ModelPrice, bool) {
+	var matched *ModelPrice
+	longest := 0
+	ambiguous := false
+	for key, price := range prices {
+		if provider != "" && key[0] != provider {
 			continue
 		}
-		priceModel := strings.ToLower(strings.TrimSpace(price.Model))
+		template := normalizeModelPriceChannelModel(strings.ToLower(strings.TrimSpace(price.Model)))
+		if idx := strings.Index(template, "/"); idx > 0 && idx < len(template)-1 {
+			template = template[idx+1:]
+		}
+		if len(template) == 0 || len(template) < longest {
+			continue
+		}
 		modelMatches := false
-		for _, candidate := range modelCandidates {
-			if priceModel == strings.ToLower(strings.TrimSpace(candidate)) {
+		for _, model := range models {
+			if modelNameContainsTemplate(strings.ToLower(strings.TrimSpace(model)), template) {
 				modelMatches = true
 				break
 			}
@@ -2266,13 +2323,35 @@ func findCatalogPrice(prices libraryPriceIndex, allPrices []ModelPrice, suggeste
 		if !modelMatches {
 			continue
 		}
-		if matched != nil {
-			return nil
+		if len(template) > longest {
+			candidate := price
+			matched, longest, ambiguous = &candidate, len(template), false
+		} else {
+			ambiguous = true
 		}
-		candidate := price
-		matched = &candidate
 	}
-	return matched
+	if ambiguous {
+		return nil, true
+	}
+	return matched, matched != nil
+}
+
+func modelNameContainsTemplate(model, template string) bool {
+	for offset := 0; offset < len(model); {
+		index := strings.Index(model[offset:], template)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		end := index + len(template)
+		leftBoundary := index == 0 || strings.IndexByte("-_./:", model[index-1]) >= 0
+		rightBoundary := end == len(model) || strings.IndexByte("-_./:", model[end]) >= 0
+		if leftBoundary && rightBoundary {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
 }
 
 func catalogModelCandidates(modelID string) []string {
@@ -3538,9 +3617,19 @@ func findMatchingLibraryPrice(prices libraryPriceIndex, provider, model *string)
 	if provider == nil || model == nil {
 		return nil
 	}
-	providerKey := strings.ToLower(strings.TrimSpace(*provider))
-	modelKey := strings.ToLower(strings.TrimSpace(*model))
-	if providerKey == "" || modelKey == "" {
+	models := catalogModelCandidates(*model)
+	for _, candidate := range models {
+		if price := findExactMatchingLibraryPrice(prices, provider, &candidate); price != nil {
+			return price
+		}
+	}
+	price, _ := findMatchingLibraryAffixPrice(prices, *provider, models)
+	return price
+}
+
+func libraryPriceProviderCandidates(provider string) []string {
+	providerKey := strings.ToLower(strings.TrimSpace(provider))
+	if providerKey == "" {
 		return nil
 	}
 	candidates := []string{providerKey}
@@ -3550,7 +3639,18 @@ func findMatchingLibraryPrice(prices libraryPriceIndex, provider, model *string)
 	if providerKey == "claude" {
 		candidates = append(candidates, "anthropic")
 	}
-	for _, candidate := range candidates {
+	return candidates
+}
+
+func findExactMatchingLibraryPrice(prices libraryPriceIndex, provider, model *string) *ModelPrice {
+	if provider == nil || model == nil {
+		return nil
+	}
+	modelKey := strings.ToLower(strings.TrimSpace(*model))
+	if modelKey == "" {
+		return nil
+	}
+	for _, candidate := range libraryPriceProviderCandidates(*provider) {
 		if price, ok := prices[[2]string{candidate, modelKey}]; ok {
 			return &price
 		}

@@ -343,6 +343,7 @@ try {
   ]
   for (const [code, input, expected] of pluginOpaqueErrors) assert.equal(localizedApiErrorMessage(code, input), expected)
   const providerPolicyErrors = [
+    ['validation_error', 'CPA v8 OpenAI-compatible provider 不支持修改排除模型', 'CPA v8 OpenAI-compatible providers do not support changing excluded models'],
     ['validation_error', '请求错误规则需要正整数状态码', 'Request error rules require a positive integer status code'],
     ['validation_error', '请求错误规则动作无效', 'Request error rule action is invalid'],
     ['validation_error', '请求错误规则至少需要一个匹配条件', 'Request error rules require at least one match condition'],

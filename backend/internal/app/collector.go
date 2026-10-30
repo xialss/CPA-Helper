@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -106,6 +107,9 @@ func (r *CollectorRunner) loop(ctx context.Context) {
 		r.mu.Unlock()
 	}()
 
+	compactions := newRemoteCompactionReader(ctx, r.app)
+	defer compactions.stop() // Drain log readers before closing the runner's done channel.
+
 	var unpersisted []string
 	var batchCollector CollectorConfig
 	var batchReceivedAt time.Time
@@ -192,6 +196,9 @@ func (r *CollectorRunner) loop(ctx context.Context) {
 		if err != nil {
 			r.setCollectorError(fmt.Errorf("process persisted usage batch: %w", err), durationSeconds(collector.RetryIntervalSeconds))
 			continue
+		}
+		if err := compactions.scheduleBatch(ctx, collector, messages, now); err != nil && ctx.Err() == nil {
+			log.Printf("remote compaction labels unavailable: %v", err)
 		}
 		successAt := time.Now()
 		emptyError := ""

@@ -96,6 +96,63 @@ func TestV8ProviderFamilyWritePreservesRawAndLegacyViews(t *testing.T) {
 	call(http.MethodPut, "/v8/management/config/api-keys/unknown", `[]`, http.StatusNotFound)
 }
 
+func TestV8OpenAIExclusionsAreRejectedWithoutChangingState(t *testing.T) {
+	fixture := newFakeCPA()
+	call := func(t *testing.T, method, path, body string, status int) []byte {
+		t.Helper()
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer acceptance-management-key")
+		response := httptest.NewRecorder()
+		fixture.ServeHTTP(response, request)
+		if response.Code != status {
+			t.Fatalf("%s %s = %d, want %d: %s", method, path, response.Code, status, response.Body.String())
+		}
+		return response.Body.Bytes()
+	}
+	const familyPath = "/v8/management/config/api-keys/openai-compatibility"
+	const legacyPath = "/v0/management/openai-compatibility"
+	beforeFamily := call(t, http.MethodGet, familyPath, "", http.StatusOK)
+	beforeLegacy := call(t, http.MethodGet, legacyPath, "", http.StatusOK)
+	for _, test := range []struct {
+		name string
+		list string
+	}{
+		{name: "empty", list: `[]`},
+		{name: "nonempty", list: `["*"]`},
+		{name: "null", list: `null`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := `[{"name":"must-not-replace-current","base-url":"https://synthetic.example/v1","keys":[{"api-key":"synthetic-key"}],"excluded-models":` + test.list + `}]`
+			problem := call(t, http.MethodPut, familyPath, body, http.StatusBadRequest)
+			if !bytes.Contains(problem, []byte(`"invalid_config"`)) {
+				t.Fatalf("missing strict-config error: %s", problem)
+			}
+			if after := call(t, http.MethodGet, familyPath, "", http.StatusOK); !bytes.Equal(beforeFamily, after) {
+				t.Fatal("rejected write changed the raw OpenAI family")
+			}
+			if after := call(t, http.MethodGet, legacyPath, "", http.StatusOK); !bytes.Equal(beforeLegacy, after) {
+				t.Fatal("rejected write changed the legacy OpenAI view")
+			}
+		})
+	}
+	call(t, http.MethodPut, familyPath, `[{"name":"accepted","base-url":"https://synthetic.example/v1","keys":[{"api-key":"synthetic-key"}]}]`, http.StatusOK)
+	var groups []map[string]any
+	if err := json.Unmarshal(call(t, http.MethodGet, familyPath, "", http.StatusOK), &groups); err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || groups[0]["name"] != "accepted" || len(groups[0]["keys"].([]any)) != 1 {
+		t.Fatalf("valid OpenAI write was not retained: %#v", groups)
+	}
+	if _, exists := groups[0]["excluded-models"]; exists {
+		t.Fatal("valid OpenAI write introduced excluded-models")
+	}
+	const nativePath = "/v8/management/config/api-keys/codex"
+	call(t, http.MethodPut, nativePath, `[{"name":"native","base-url":"https://synthetic.example/v1","excluded-models":["*","gpt-*"],"keys":[{"api-key":"synthetic-native-key"}]}]`, http.StatusOK)
+	if body := call(t, http.MethodGet, nativePath, "", http.StatusOK); !bytes.Contains(body, []byte(`"excluded-models":["*","gpt-*"]`)) {
+		t.Fatalf("native exclusions were not retained: %s", body)
+	}
+}
+
 func TestValidateLoopbackListenAddress(t *testing.T) {
 	for _, test := range []struct {
 		address string
